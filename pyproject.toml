@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "future-self-bot"
+version = "0.1.0"
+description = "A reusable Telegram future-self assistant with voice inbox"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.15",
+  "aiosqlite>=0.20",
+  "asyncpg>=0.30",
+  "openai>=1.68",
+  "pydantic-settings>=2.8",
+  "python-dotenv>=1.0",
+  "python-telegram-bot[job-queue]>=22.0",
+  "sqlalchemy[asyncio]>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.25", "ruff>=0.11"]
+
+[project.scripts]
+future-self-bot = "future_self.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/future_self"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
