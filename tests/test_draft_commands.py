@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.models import ConversationSession, DraftInboxItem, InboxItem
-from future_self.schemas import ParsedThought
+from future_self.schemas import ParsedThought, TemporalResolution
 
 
 class FakeMessage:
@@ -661,19 +661,58 @@ async def test_drafts_pagination_groups_duplicates_and_isolates_user(db, fake_ai
     assert "Чужая карточка" not in listing.replies[-1]["text"]
 
 
-async def test_drafts_group_same_semantics_despite_raw_voice_variation(db, fake_ai):
+def temporal_resolution(
+    *,
+    resolved_at: datetime = datetime(2026, 7, 20, 18, tzinfo=UTC),
+    timezone: str = "Europe/Moscow",
+    local_date: date = date(2026, 7, 20),
+    local_time: time | None = time(21),
+    precision: str = "datetime",
+    original_expression: str = "вечером 20 июля",
+) -> TemporalResolution:
+    return TemporalResolution(
+        resolved_at=resolved_at,
+        timezone=timezone,
+        resolved_local_date=local_date,
+        resolved_local_time=local_time,
+        precision=precision,
+        original_expression=original_expression,
+        resolution_status="resolved",
+    )
+
+
+async def test_drafts_group_same_canonical_semantics_despite_raw_audit_variation(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
     user = await bot._user(1210)
-    parsed = ParsedThought(
-        kind="idea",
-        title="Записывать одну победу дня каждый вечер",
-        description="Каждый вечер записывать одну победу дня",
-        next_step="Начать сегодня вечером",
+    variants = (
+        (
+            "Записывать одну победу дня каждый вечер.",
+            ParsedThought(
+                kind="idea",
+                title="Записывать одну победу дня каждый вечер",
+                description="Каждый вечер записывать одну победу дня",
+                next_step="Начать сегодня вечером",
+                resolved_date=date(2026, 7, 20),
+                temporal_resolution=temporal_resolution(
+                    original_expression="вечером двадцатого июля"
+                ),
+            ),
+        ),
+        (
+            "Я хочу каждый вечер записывать одну свою победу дня",
+            ParsedThought(
+                kind="idea",
+                title="Записывать одну победу дня каждый вечер",
+                description="Каждый вечер записывать одну победу дня",
+                next_step="Открыть дневник после ужина",
+                resolved_date=date(2026, 7, 20),
+                temporal_resolution=temporal_resolution(
+                    original_expression="20.07 в девять вечера"
+                ),
+            ),
+        ),
     )
-    for raw_text in (
-        "Записывать одну победу дня каждый вечер.",
-        "Я хочу каждый вечер записывать одну свою победу дня",
-    ):
+    for raw_text, parsed in variants:
         await bot.draft_service.create(
             user_id=user.id,
             telegram_user_id=1210,
@@ -693,44 +732,24 @@ async def test_drafts_group_same_semantics_despite_raw_voice_variation(db, fake_
     assert await active_count(db, 1210, 2210) == 2
 
 
-async def test_drafts_do_not_group_different_type_date_or_structured_data(db, fake_ai):
+async def test_drafts_do_not_group_different_descriptions(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
     user = await bot._user(1211)
-    variants = (
-        ParsedThought(
-            kind="idea",
-            title="Победа дня",
-            description="Записать победу дня",
-            next_step="Начать вечером",
-        ),
-        ParsedThought(
-            kind="task",
-            title="Победа дня",
-            description="Записать победу дня",
-            next_step="Начать вечером",
-        ),
-        ParsedThought(
-            kind="idea",
-            title="Победа дня",
-            description="Записать победу дня",
-            next_step="Начать вечером",
-            resolved_date=date(2026, 7, 20),
-        ),
-        ParsedThought(
-            kind="idea",
-            title="Победа дня",
-            description="Записать победу дня",
-            next_step="Начать утром",
-        ),
-    )
-    for parsed in variants:
+    for description in (
+        "Записывать личную победу дня",
+        "Записывать победу команды за день",
+    ):
         await bot.draft_service.create(
             user_id=user.id,
             telegram_user_id=1211,
             chat_id=2211,
             source="text",
-            raw_text="Записать победу дня",
-            parsed=parsed,
+            raw_text="Победа дня",
+            parsed=ParsedThought(
+                kind="idea",
+                title="Победа дня",
+                description=description,
+            ),
         )
 
     listing = FakeMessage()
@@ -738,7 +757,87 @@ async def test_drafts_do_not_group_different_type_date_or_structured_data(db, fa
 
     text = listing.replies[-1]["text"]
     item_lines = [line for line in text.splitlines() if line[:1].isdigit() and ". " in line]
-    assert len(item_lines) == 4
+    assert len(item_lines) == 2
+    assert "×" not in text
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        ParsedThought(
+            kind="task",
+            title="Победа дня",
+            description="Записать победу дня",
+            resolved_date=date(2026, 7, 20),
+            temporal_resolution=temporal_resolution(),
+        ),
+        ParsedThought(
+            kind="idea",
+            title="Победа дня",
+            description="Записать победу дня",
+            resolved_date=date(2026, 7, 21),
+            temporal_resolution=temporal_resolution(
+                resolved_at=datetime(2026, 7, 21, 18, tzinfo=UTC),
+                local_date=date(2026, 7, 21),
+            ),
+        ),
+        ParsedThought(
+            kind="idea",
+            title="Победа дня",
+            description="Записать победу дня",
+            resolved_date=date(2026, 7, 20),
+            temporal_resolution=temporal_resolution(
+                resolved_at=datetime(2026, 7, 20, 19, tzinfo=UTC),
+                local_time=time(22),
+            ),
+        ),
+        ParsedThought(
+            kind="idea",
+            title="Победа дня",
+            description="Записать победу дня",
+            resolved_date=date(2026, 7, 20),
+            temporal_resolution=temporal_resolution(timezone="Asia/Tbilisi"),
+        ),
+        ParsedThought(
+            kind="idea",
+            title="Победа дня",
+            description="Записать победу дня",
+            resolved_date=date(2026, 7, 20),
+            temporal_resolution=temporal_resolution(
+                resolved_at=datetime(2026, 7, 20, tzinfo=UTC),
+                local_time=None,
+                precision="date",
+            ),
+        ),
+    ],
+    ids=("kind", "date", "time", "timezone", "precision"),
+)
+async def test_drafts_do_not_group_different_canonical_semantics(db, fake_ai, variant):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    user = await bot._user(1212)
+    base = ParsedThought(
+        kind="idea",
+        title="Победа дня",
+        description="Записать победу дня",
+        resolved_date=date(2026, 7, 20),
+        temporal_resolution=temporal_resolution(),
+    )
+    for parsed in (base, variant):
+        await bot.draft_service.create(
+            user_id=user.id,
+            telegram_user_id=1212,
+            chat_id=2212,
+            source="text",
+            raw_text="Записать победу дня",
+            parsed=parsed,
+        )
+
+    listing = FakeMessage()
+    await bot.drafts_command(update_for(listing, 1212, 2212), context_with_bot())
+
+    text = listing.replies[-1]["text"]
+    item_lines = [line for line in text.splitlines() if line[:1].isdigit() and ". " in line]
+    assert len(item_lines) == 2
     assert "×" not in text
 
 

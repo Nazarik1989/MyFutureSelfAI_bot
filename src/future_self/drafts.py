@@ -1,5 +1,4 @@
 import hashlib
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -631,18 +630,22 @@ class DraftInboxService:
 
     @classmethod
     def semantic_key(cls, draft: DraftInboxItem) -> tuple[str, ...]:
-        semantic_text = draft.description or draft.raw_text
-        temporal = json.dumps(
-            draft.temporal_resolution or {},
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
+        temporal = draft.temporal_resolution or {}
+        canonical_temporal = tuple(
+            str(temporal.get(field) or "")
+            for field in (
+                "resolved_at",
+                "resolved_local_date",
+                "resolved_local_time",
+                "timezone",
+                "precision",
+                "resolution_status",
+            )
         )
         return (
             draft.kind,
             cls._normalize(draft.title),
-            cls._normalize(semantic_text),
-            cls._normalize(draft.next_step or ""),
+            cls._normalize(draft.description or ""),
             draft.resolved_date.isoformat() if draft.resolved_date else "",
-            temporal,
+            *canonical_temporal,
         )
