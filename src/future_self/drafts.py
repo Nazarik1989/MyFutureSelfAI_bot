@@ -629,9 +629,23 @@ class DraftInboxService:
         return re.sub(r"[^a-zа-я0-9]+", " ", value.lower().replace("ё", "е")).strip()
 
     @classmethod
-    def semantic_key(cls, draft: DraftInboxItem) -> tuple[str, str, str]:
+    def semantic_key(cls, draft: DraftInboxItem) -> tuple[str, ...]:
+        temporal = draft.temporal_resolution or {}
+        canonical_temporal = tuple(
+            str(temporal.get(field) or "")
+            for field in (
+                "resolved_at",
+                "resolved_local_date",
+                "resolved_local_time",
+                "timezone",
+                "precision",
+                "resolution_status",
+            )
+        )
         return (
             draft.kind,
             cls._normalize(draft.title),
-            cls._normalize(draft.raw_text),
+            cls._normalize(draft.description or ""),
+            draft.resolved_date.isoformat() if draft.resolved_date else "",
+            *canonical_temporal,
         )
