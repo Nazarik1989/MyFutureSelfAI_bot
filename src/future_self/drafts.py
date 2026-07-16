@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -629,9 +630,19 @@ class DraftInboxService:
         return re.sub(r"[^a-zа-я0-9]+", " ", value.lower().replace("ё", "е")).strip()
 
     @classmethod
-    def semantic_key(cls, draft: DraftInboxItem) -> tuple[str, str, str]:
+    def semantic_key(cls, draft: DraftInboxItem) -> tuple[str, ...]:
+        semantic_text = draft.description or draft.raw_text
+        temporal = json.dumps(
+            draft.temporal_resolution or {},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
         return (
             draft.kind,
             cls._normalize(draft.title),
-            cls._normalize(draft.raw_text),
+            cls._normalize(semantic_text),
+            cls._normalize(draft.next_step or ""),
+            draft.resolved_date.isoformat() if draft.resolved_date else "",
+            temporal,
         )

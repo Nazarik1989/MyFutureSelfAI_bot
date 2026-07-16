@@ -30,6 +30,8 @@ class NaturalCommandRouter:
             "что в drafts",
         ),
         "show_inbox": (
+            "что у меня сохранено",
+            "что у меня сохранилось",
             "что у меня в inbox",
             "что в inbox",
             "покажи сохраненные записи",
@@ -37,6 +39,7 @@ class NaturalCommandRouter:
             "покажи мой inbox",
         ),
         "show_last_saved": (
+            "что сохранилось",
             "что сохранилось последним",
             "что ты сохранил",
             "покажи последнюю сохраненную запись",
@@ -55,10 +58,22 @@ class NaturalCommandRouter:
         "help": (
             "покажи помощь",
             "какие есть команды",
+            "какие у тебя есть команды",
+            "какие у тебя команды",
+            "какие команды у тебя есть",
             "что ты умеешь",
         ),
     }
-    WRITE_INBOX = ("сохрани в inbox", "добавь в inbox", "запиши в inbox")
+    WRITE_INBOX = (
+        "сохрани inbox",
+        "сохрани инбокс",
+        "сохрани в inbox",
+        "сохрани в инбокс",
+        "добавь в inbox",
+        "добавь в инбокс",
+        "запиши в inbox",
+        "запиши в инбокс",
+    )
 
     def route(self, text: str) -> NaturalCommand | None:
         normalized = self._normalize(text)

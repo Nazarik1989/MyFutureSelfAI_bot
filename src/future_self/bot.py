@@ -2102,7 +2102,7 @@ class FutureSelfBot:
         )
 
     def _group_drafts(self, drafts: list[DraftInboxItem]) -> list[list[DraftInboxItem]]:
-        groups: dict[tuple[str, str, str], list[DraftInboxItem]] = {}
+        groups: dict[tuple[str, ...], list[DraftInboxItem]] = {}
         for draft in drafts:
             groups.setdefault(self.draft_service.semantic_key(draft), []).append(draft)
         return list(groups.values())

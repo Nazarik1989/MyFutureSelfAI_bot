@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -661,6 +661,87 @@ async def test_drafts_pagination_groups_duplicates_and_isolates_user(db, fake_ai
     assert "Чужая карточка" not in listing.replies[-1]["text"]
 
 
+async def test_drafts_group_same_semantics_despite_raw_voice_variation(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    user = await bot._user(1210)
+    parsed = ParsedThought(
+        kind="idea",
+        title="Записывать одну победу дня каждый вечер",
+        description="Каждый вечер записывать одну победу дня",
+        next_step="Начать сегодня вечером",
+    )
+    for raw_text in (
+        "Записывать одну победу дня каждый вечер.",
+        "Я хочу каждый вечер записывать одну свою победу дня",
+    ):
+        await bot.draft_service.create(
+            user_id=user.id,
+            telegram_user_id=1210,
+            chat_id=2210,
+            source="voice",
+            raw_text=raw_text,
+            parsed=parsed,
+        )
+
+    listing = FakeMessage()
+    await bot.drafts_command(update_for(listing, 1210, 2210), context_with_bot())
+
+    text = listing.replies[-1]["text"]
+    item_lines = [line for line in text.splitlines() if line[:1].isdigit() and ". " in line]
+    assert len(item_lines) == 1
+    assert "[идея] Записывать одну победу дня каждый вечер ×2" in item_lines[0]
+    assert await active_count(db, 1210, 2210) == 2
+
+
+async def test_drafts_do_not_group_different_type_date_or_structured_data(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    user = await bot._user(1211)
+    variants = (
+        ParsedThought(
+            kind="idea",
+            title="Победа дня",
+            description="Записать победу дня",
+            next_step="Начать вечером",
+        ),
+        ParsedThought(
+            kind="task",
+            title="Победа дня",
+            description="Записать победу дня",
+            next_step="Начать вечером",
+        ),
+        ParsedThought(
+            kind="idea",
+            title="Победа дня",
+            description="Записать победу дня",
+            next_step="Начать вечером",
+            resolved_date=date(2026, 7, 20),
+        ),
+        ParsedThought(
+            kind="idea",
+            title="Победа дня",
+            description="Записать победу дня",
+            next_step="Начать утром",
+        ),
+    )
+    for parsed in variants:
+        await bot.draft_service.create(
+            user_id=user.id,
+            telegram_user_id=1211,
+            chat_id=2211,
+            source="text",
+            raw_text="Записать победу дня",
+            parsed=parsed,
+        )
+
+    listing = FakeMessage()
+    await bot.drafts_command(update_for(listing, 1211, 2211), context_with_bot())
+
+    text = listing.replies[-1]["text"]
+    item_lines = [line for line in text.splitlines() if line[:1].isdigit() and ". " in line]
+    assert len(item_lines) == 4
+    assert "×" not in text
+
+
 async def test_saved_receipt_and_last_saved_phrase_use_inbox(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
     context = context_with_bot()
@@ -701,6 +782,88 @@ async def test_voice_natural_read_uses_same_slash_handler(
     assert calls == [(1301, 2301)]
     assert await counts(db) == (0, 0)
     assert fake_ai.route_calls == []
+
+
+@pytest.mark.parametrize(
+    ("phrase", "handler_name"),
+    [
+        ("  ЧТО   У МЕНЯ СОХРАНЕНО?!  ", "inbox"),
+        ("Что сохранилось?", "last_saved_command"),
+        ("Что сохранилось последним...", "last_saved_command"),
+        ("Какие у тебя есть команды?", "help_command"),
+        ("Покажи мои черновики", "drafts_command"),
+        ("Покажи фокус дня", "today"),
+    ],
+)
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_natural_read_commands_are_identical_for_text_and_voice(
+    db, fake_ai, monkeypatch, phrase, handler_name, source
+):
+    transcription = PhraseTranscription(phrase) if source == "voice" else NoopTranscription()
+    bot = FutureSelfBot(settings(), db, fake_ai, transcription)
+    calls = []
+
+    async def handler(update, context):
+        calls.append((update.effective_user.id, update.effective_chat.id))
+
+    monkeypatch.setattr(bot, handler_name, handler)
+    message = FakeMessage(voice=FakeVoice()) if source == "voice" else FakeMessage(phrase)
+    update = update_for(message, 1310, 2310)
+    if source == "voice":
+        await bot.voice(update, context_with_bot())
+    else:
+        await bot.text(update, context_with_bot())
+
+    assert calls == [(1310, 2310)]
+    assert fake_ai.route_calls == []
+    assert await counts(db) == (0, 0)
+
+
+@pytest.mark.parametrize("command", ["Сохрани инбокс", "Сохрани в инбокс", "Сохрани в inbox"])
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_natural_save_inbox_confirms_focused_draft_once(db, fake_ai, command, source):
+    transcription = PhraseTranscription(command) if source == "voice" else NoopTranscription()
+    bot = FutureSelfBot(settings(), db, fake_ai, transcription)
+    context = context_with_bot()
+    await make_named_preview(
+        bot,
+        1311,
+        2311,
+        context,
+        "Победа дня",
+        "Записывать одну победу дня каждый вечер",
+    )
+    routed_before = len(fake_ai.route_calls)
+
+    first = FakeMessage(voice=FakeVoice()) if source == "voice" else FakeMessage(command)
+    second = FakeMessage(voice=FakeVoice()) if source == "voice" else FakeMessage(command)
+    route = bot.voice if source == "voice" else bot.text
+    await route(update_for(first, 1311, 2311), context)
+    await route(update_for(second, 1311, 2311), context)
+
+    assert (
+        f"Сохранено в inbox по {'голосовой' if source == 'voice' else 'текстовой'} команде"
+        in (first.replies[-1]["text"])
+    )
+    assert "Нет одной актуальной" in second.replies[-1]["text"]
+    assert await counts(db) == (1, 1)
+    assert len(fake_ai.route_calls) == routed_before
+
+
+async def test_natural_save_inbox_does_not_guess_between_drafts_or_create_preview(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    context = context_with_bot()
+    await make_named_preview(bot, 1312, 2312, context, "Первый", "Первое содержание")
+    await make_named_preview(bot, 1312, 2312, context, "Второй", "Второе содержание")
+    await bot.conversation.clear_focus(1312, 2312)
+    routed_before = len(fake_ai.route_calls)
+
+    command = FakeMessage("Сохрани в инбокс")
+    await bot.text(update_for(command, 1312, 2312), context)
+
+    assert command.replies[-1]["text"] == "К какой карточке применить команду?"
+    assert await counts(db) == (2, 0)
+    assert len(fake_ai.route_calls) == routed_before
 
 
 async def test_natural_inbox_is_isolated_and_write_phrase_is_not_read_command(db, fake_ai):
