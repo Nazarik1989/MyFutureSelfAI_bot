@@ -8,6 +8,11 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 
 from future_self.bot import (
+    DOCTOR_DURATION,
+    DOCTOR_MEDICATIONS,
+    DOCTOR_QUESTIONS,
+    DOCTOR_REASON,
+    DOCTOR_SYMPTOMS,
     HEALTH_ENERGY,
     HEALTH_MOOD,
     HEALTH_PHYSICAL,
@@ -19,10 +24,12 @@ from future_self.bot import (
 from future_self.config import Settings
 from future_self.db import Database
 from future_self.models import (
+    DoctorVisitPrep,
     DraftInboxItem,
     HealthCheckIn,
     HealthReminderPreference,
     InboxItem,
+    TaskReminder,
 )
 from future_self.schemas import IntentResult
 
@@ -44,6 +51,7 @@ StepKind = Literal[
     "voice",
     "callback",
     "command",
+    "doctor_answer",
     "health_answer",
     "switch_user",
     "setup_clear_focus",
@@ -93,6 +101,8 @@ class ExpectedState:
     health_reminder_time: str | None = None
     health_reminder_schedules: tuple[str, ...] = ()
     health_reminder_removals: int = 0
+    doctor_prep_count: int = 0
+    task_reminder_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +203,7 @@ class BotAutotester:
         self.chat_id = chat_id
         self.messages: list[FakeMessage] = []
         self.health_state: int | None = None
+        self.doctor_state: int | None = None
         self.contexts = {telegram_user_id: context}
 
     @classmethod
@@ -258,6 +269,8 @@ class BotAutotester:
             inbox_items = list((await session.scalars(select(InboxItem))).all())
             health_records = list((await session.scalars(select(HealthCheckIn))).all())
             health_preference = await session.scalar(select(HealthReminderPreference))
+            doctor_preps = list((await session.scalars(select(DoctorVisitPrep))).all())
+            task_reminders = list((await session.scalars(select(TaskReminder))).all())
         return ExpectedState(
             drafts=tuple(
                 sorted(
@@ -276,6 +289,8 @@ class BotAutotester:
             ),
             health_reminder_schedules=tuple(self.bot.scheduler.scheduled_times),
             health_reminder_removals=len(self.bot.scheduler.removed_users),
+            doctor_prep_count=len(doctor_preps),
+            task_reminder_count=len(task_reminders),
         )
 
     async def _run_step(self, step: ScenarioStep) -> StepResult:
@@ -290,6 +305,8 @@ class BotAutotester:
             return await self._run_command(step.value)
         if step.kind == "health_answer":
             return await self._run_health_answer(step.value)
+        if step.kind == "doctor_answer":
+            return await self._run_doctor_answer(step.value)
 
         if step.kind == "voice":
             self.transcription.queue(step.value)
@@ -318,10 +335,27 @@ class BotAutotester:
             "health_reminder_on": self.bot.health_reminder_on,
             "health_reminder_off": self.bot.health_reminder_off,
             "cancel": self.bot.cancel_health_checkin,
+            "doctor_prepare": self.bot.doctor_prepare_start,
+            "doctor_prepare_edit": self.bot.doctor_prepare_start,
+            "doctor_preparations": self.bot.doctor_preparations,
+            "doctor_prepare_show": self.bot.doctor_prepare_show,
+            "doctor_prepare_delete": self.bot.doctor_prepare_delete,
+            "doctor_prepare_task": self.bot.doctor_prepare_task,
         }
-        result = await handlers[command](update, self.context)
+        if command == "cancel" and self.doctor_state in {
+            DOCTOR_REASON,
+            DOCTOR_DURATION,
+            DOCTOR_SYMPTOMS,
+            DOCTOR_MEDICATIONS,
+            DOCTOR_QUESTIONS,
+        }:
+            result = await self.bot.cancel_doctor_prepare(update, self.context)
+        else:
+            result = await handlers[command](update, self.context)
         if command in {"checkin", "health_edit", "cancel"}:
             self.health_state = result
+        if command in {"doctor_prepare", "doctor_prepare_edit", "cancel"}:
+            self.doctor_state = result
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult("command", value, outputs)
 
@@ -348,6 +382,25 @@ class BotAutotester:
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult("health_answer", value, outputs)
 
+    async def _run_doctor_answer(self, value: str) -> StepResult:
+        handlers = {
+            DOCTOR_REASON: self.bot.doctor_prepare_reason,
+            DOCTOR_DURATION: self.bot.doctor_prepare_duration,
+            DOCTOR_SYMPTOMS: self.bot.doctor_prepare_symptoms,
+            DOCTOR_MEDICATIONS: self.bot.doctor_prepare_medications,
+            DOCTOR_QUESTIONS: self.bot.doctor_prepare_questions,
+        }
+        if self.doctor_state not in handlers:
+            raise AssertionError("No active doctor preparation state")
+        message = FakeMessage(value)
+        self.messages.append(message)
+        self.doctor_state = await handlers[self.doctor_state](
+            self._update_for(message),
+            self.context,
+        )
+        outputs = tuple(str(reply["text"]) for reply in message.replies)
+        return StepResult("doctor_answer", value, outputs)
+
     def _switch_user(self, value: str) -> StepResult:
         parts = value.split(":", maxsplit=1)
         self.telegram_user_id = int(parts[0])
@@ -357,6 +410,7 @@ class BotAutotester:
             SimpleNamespace(user_data={}, bot=FakeBot()),
         )
         self.health_state = None
+        self.doctor_state = None
         return StepResult("switch_user", value, ())
 
     async def _run_callback(self, action: str) -> StepResult:
