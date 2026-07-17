@@ -926,6 +926,8 @@ async def test_natural_read_commands_are_identical_for_text_and_voice(
         "Сохраним инбокс",
         "Сохраним в инбокс",
         "Сохрани в inbox",
+        "Сохрани это в инбокс!",
+        "Сохраним это в inbox?!",
     ],
 )
 @pytest.mark.parametrize("source", ["text", "voice"])
@@ -1031,6 +1033,43 @@ async def test_plural_save_without_focus_requires_draft_choice(db, fake_ai, sour
     assert message.replies[-1]["text"] == "К какой карточке применить команду?"
     assert await counts(db) == (2, 0)
     assert len(fake_ai.route_calls) == routed_before
+
+
+@pytest.mark.parametrize("phrase", ["Не сохраняй в инбокс", "Не надо сохранять"])
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_negative_save_commands_discard_without_llm_or_inbox(db, fake_ai, phrase, source):
+    transcription = PhraseTranscription(phrase) if source == "voice" else NoopTranscription()
+    bot = FutureSelfBot(settings(), db, fake_ai, transcription)
+    context = context_with_bot()
+    await make_named_preview(bot, 1316, 2316, context, "Исходная идея", "Исходное содержание")
+    message = FakeMessage(voice=FakeVoice()) if source == "voice" else FakeMessage(phrase)
+    route = bot.voice if source == "voice" else bot.text
+    routed_before = len(fake_ai.route_calls)
+
+    await route(update_for(message, 1316, 2316), context)
+
+    async with db.sessions() as session:
+        drafts = list((await session.scalars(select(DraftInboxItem))).all())
+        inbox_items = list((await session.scalars(select(InboxItem))).all())
+    assert [(draft.title, draft.status) for draft in drafts] == [("Исходная идея", "discarded")]
+    assert inbox_items == []
+    assert "удалена без сохранения" in message.replies[-1]["text"]
+    assert len(fake_ai.route_calls) == routed_before
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_content_mentioning_save_and_inbox_still_reaches_llm(db, fake_ai, source):
+    phrase = "Хочу понять, стоит ли сохранять полезные статьи в инбокс для чтения"
+    transcription = PhraseTranscription(phrase) if source == "voice" else NoopTranscription()
+    bot = FutureSelfBot(settings(), db, fake_ai, transcription)
+    message = FakeMessage(voice=FakeVoice()) if source == "voice" else FakeMessage(phrase)
+    route = bot.voice if source == "voice" else bot.text
+
+    await route(update_for(message, 1317, 2317), context_with_bot())
+
+    assert len(fake_ai.route_calls) == 1
+    assert await counts(db) == (1, 0)
+    assert "Заголовок" in message.replies[-1]["text"]
 
 
 async def test_natural_save_inbox_does_not_guess_between_drafts_or_create_preview(db, fake_ai):
