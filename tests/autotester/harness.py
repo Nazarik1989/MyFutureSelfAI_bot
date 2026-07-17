@@ -341,6 +341,8 @@ class BotAutotester:
             "doctor_prepare_show": self.bot.doctor_prepare_show,
             "doctor_prepare_delete": self.bot.doctor_prepare_delete,
             "doctor_prepare_task": self.bot.doctor_prepare_task,
+            "doctor_find": self.bot.doctor_find,
+            "doctor_find_task": self.bot.doctor_find_task,
         }
         if command == "cancel" and self.doctor_state in {
             DOCTOR_REASON,

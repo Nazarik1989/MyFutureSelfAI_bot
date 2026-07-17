@@ -153,6 +153,8 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "doctor_prepare_show",
         "doctor_prepare_delete",
         "doctor_prepare_task",
+        "doctor_find",
+        "doctor_find_task",
     } <= commands
     assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 9
     assert sum(isinstance(handler, MessageHandler) for handler in handlers) == 2
