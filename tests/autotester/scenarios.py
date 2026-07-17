@@ -455,6 +455,54 @@ CALLBACK_SCENARIOS = (
 )
 
 
+HEALTH_SCENARIOS = (
+    Scenario(
+        name="health-empty-is-private-and-read-only",
+        steps=(
+            ScenarioStep(
+                "command",
+                "/health",
+                reply_contains=("история пока пуста", "не является медицинским диагнозом"),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="health-checkin-one-question-at-a-time",
+        steps=(
+            ScenarioStep("command", "/checkin", reply_contains=("Энергия",)),
+            ScenarioStep("health_answer", "7", reply_contains=("Сон",)),
+            ScenarioStep("health_answer", "6", reply_contains=("Настроение",)),
+            ScenarioStep("health_answer", "8", reply_contains=("Стресс",)),
+            ScenarioStep("health_answer", "3", reply_contains=("Физическое",)),
+            ScenarioStep("health_answer", "7", reply_contains=("симптомы",)),
+            ScenarioStep(
+                "health_answer",
+                "нет",
+                reply_contains=("70/100", "не медицинский диагноз"),
+            ),
+        ),
+        expected=ExpectedState(health_scores=(70,)),
+    ),
+    Scenario(
+        name="health-reminder-explicit-opt-in-and-opt-out",
+        steps=(
+            ScenarioStep(
+                "command",
+                "/health_reminder_on 20:15",
+                reply_contains=("добровольное напоминание включено", "20:15"),
+            ),
+            ScenarioStep(
+                "command",
+                "/health_reminder_off",
+                reply_contains=("отключено",),
+            ),
+        ),
+        expected=ExpectedState(health_reminder_enabled=False),
+    ),
+)
+
+
 SCENARIOS = (
     *CORE_SCENARIOS,
     *GENERATED_SAVE_SCENARIOS,
@@ -465,4 +513,5 @@ SCENARIOS = (
     *CALLBACK_SCENARIOS,
     *RESOLVED_SAVE_REGRESSION_SCENARIOS,
     *RESOLVED_NEGATIVE_REGRESSION_SCENARIOS,
+    *HEALTH_SCENARIOS,
 )

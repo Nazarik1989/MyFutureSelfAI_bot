@@ -107,3 +107,48 @@ class JobQueueScheduler:
             first=interval_seconds,
             name="task-reminders:persistent-outbox",
         )
+
+    def schedule_health_reminder(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        timezone: str,
+        local_time: time,
+    ) -> None:
+        self.remove_health_reminder(user_id)
+        zone = ZoneInfo(timezone)
+        now = datetime.now(UTC).astimezone(zone)
+        target = datetime.combine(now.date(), local_time, tzinfo=zone)
+        if target <= now:
+            target += timedelta(days=1)
+        self.job_queue.run_once(
+            self._health_checkin,
+            when=target.astimezone(UTC),
+            data={
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "timezone": timezone,
+                "local_time": local_time.isoformat(),
+            },
+            name=f"health:{user_id}:daily",
+        )
+
+    async def _health_checkin(self, context: object) -> None:
+        data = context.job.data
+        await self.send(
+            data["chat_id"],
+            "Добровольный health check-in: /checkin. Это самонаблюдение, не медицинский диагноз.",
+        )
+        self.schedule_health_reminder(
+            user_id=data["user_id"],
+            chat_id=data["chat_id"],
+            timezone=data["timezone"],
+            local_time=time.fromisoformat(data["local_time"]),
+        )
+
+    def remove_health_reminder(self, user_id: int) -> None:
+        get_jobs = getattr(self.job_queue, "get_jobs_by_name", None)
+        if get_jobs:
+            for job in get_jobs(f"health:{user_id}:daily"):
+                job.schedule_removal()

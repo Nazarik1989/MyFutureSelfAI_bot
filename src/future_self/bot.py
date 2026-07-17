@@ -1,6 +1,7 @@
 import logging
+import re
 import warnings
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from html import escape
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -39,6 +40,12 @@ from .domain import (
     PendingIntent,
 )
 from .drafts import DraftInboxService
+from .health import (
+    METRIC_LABELS,
+    HealthService,
+    prolonged_weakness_message,
+    urgent_safety_message,
+)
 from .models import DraftInboxItem, Goal, InboxItem, Routine, User, VisionProfile
 from .natural_commands import NaturalAction, NaturalCommandRouter
 from .reminders import TaskReminderEngine
@@ -58,6 +65,14 @@ logger = logging.getLogger(__name__)
 
 ONBOARDING_INPUT, PROFILE_CONFIRM = range(2)
 EVENING_WORKED, EVENING_FAILED, EVENING_ENERGY, EVENING_OBSTACLE, EVENING_TOMORROW = range(10, 15)
+(
+    HEALTH_ENERGY,
+    HEALTH_SLEEP,
+    HEALTH_MOOD,
+    HEALTH_STRESS,
+    HEALTH_PHYSICAL,
+    HEALTH_SYMPTOMS,
+) = range(20, 26)
 LABELS = {"idea": "идея", "task": "задача", "desire": "желание", "note": "заметка"}
 ACTION_LABELS = {
     "idea": "идею",
@@ -109,6 +124,7 @@ class FutureSelfBot:
         self.date_resolver = DateResolver()
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
+        self.health_service = HealthService(db)
         self.scheduler: JobQueueScheduler | None = None
         self.reminder_engine: TaskReminderEngine | None = None
 
@@ -173,8 +189,41 @@ class FutureSelfBot:
             },
             fallbacks=[CommandHandler("cancel", self.cancel_evening)],
         )
+        health_checkin = ConversationHandler(
+            entry_points=[
+                CommandHandler("checkin", self.health_checkin_start),
+                CommandHandler("health_edit", self.health_checkin_start),
+            ],
+            states={
+                HEALTH_ENERGY: [
+                    MessageHandler(filters.Regex(r"^(?:10|[0-9])$"), self.health_energy),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.health_invalid_rating),
+                ],
+                HEALTH_SLEEP: [
+                    MessageHandler(filters.Regex(r"^(?:10|[0-9])$"), self.health_sleep),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.health_invalid_rating),
+                ],
+                HEALTH_MOOD: [
+                    MessageHandler(filters.Regex(r"^(?:10|[0-9])$"), self.health_mood),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.health_invalid_rating),
+                ],
+                HEALTH_STRESS: [
+                    MessageHandler(filters.Regex(r"^(?:10|[0-9])$"), self.health_stress),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.health_invalid_rating),
+                ],
+                HEALTH_PHYSICAL: [
+                    MessageHandler(filters.Regex(r"^(?:10|[0-9])$"), self.health_physical),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.health_invalid_rating),
+                ],
+                HEALTH_SYMPTOMS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.health_symptoms)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_health_checkin)],
+        )
         app.add_handler(onboarding)
         app.add_handler(evening)
+        app.add_handler(health_checkin)
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
         app.add_handler(CommandHandler("goals", self.goals_command))
@@ -183,6 +232,10 @@ class FutureSelfBot:
         app.add_handler(CommandHandler("last_saved", self.last_saved_command))
         app.add_handler(CommandHandler("cleanup_drafts", self.cleanup_drafts_command))
         app.add_handler(CommandHandler("today", self.today))
+        app.add_handler(CommandHandler("health", self.health_command))
+        app.add_handler(CommandHandler("health_delete", self.health_delete_command))
+        app.add_handler(CommandHandler("health_reminder_on", self.health_reminder_on))
+        app.add_handler(CommandHandler("health_reminder_off", self.health_reminder_off))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -234,6 +287,13 @@ class FutureSelfBot:
             users = (await session.scalars(select(User).where(User.onboarding_completed))).all()
         for user in users:
             self.scheduler.schedule_user(user.telegram_id, user.timezone)
+        for preference in await self.health_service.reminder_preferences():
+            self.scheduler.schedule_health_reminder(
+                user_id=preference.user_id,
+                chat_id=preference.chat_id,
+                timezone=preference.timezone,
+                local_time=preference.local_time,
+            )
 
     async def _user(self, telegram_id: int) -> User:
         async with self.db.session() as session:
@@ -2330,11 +2390,207 @@ class FutureSelfBot:
         await update.effective_message.reply_text("Рефлексия отменена, ничего не сохранено.")
         return ConversationHandler.END
 
+    async def health_checkin_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = await self._user(update.effective_user.id)
+        record_id = None
+        command_text = update.effective_message.text or ""
+        if command_text.startswith("/health_edit"):
+            args = getattr(context, "args", [])
+            if not args or not args[0].isdigit():
+                await update.effective_message.reply_text(
+                    "Укажи ID записи: /health_edit 12. ID виден в /health."
+                )
+                return ConversationHandler.END
+            record_id = int(args[0])
+            if await self.health_service.get_owned(user.id, record_id) is None:
+                await update.effective_message.reply_text("Такой health-записи у тебя нет.")
+                return ConversationHandler.END
+        context.user_data["health_checkin"] = {"record_id": record_id}
+        prefix = "Исправляем запись. " if record_id is not None else ""
+        await update.effective_message.reply_text(
+            f"{prefix}Энергия от 0 до 10? Отвечай одним числом."
+        )
+        return HEALTH_ENERGY
+
+    async def health_energy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data["health_checkin"]["energy"] = int(update.effective_message.text)
+        await update.effective_message.reply_text("Сон от 0 до 10?")
+        return HEALTH_SLEEP
+
+    @staticmethod
+    async def health_invalid_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text("Нужно одно целое число от 0 до 10.")
+
+    async def health_sleep(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data["health_checkin"]["sleep"] = int(update.effective_message.text)
+        await update.effective_message.reply_text("Настроение от 0 до 10?")
+        return HEALTH_MOOD
+
+    async def health_mood(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data["health_checkin"]["mood"] = int(update.effective_message.text)
+        await update.effective_message.reply_text("Стресс от 0 до 10, где 10 — максимальный?")
+        return HEALTH_STRESS
+
+    async def health_stress(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data["health_checkin"]["stress"] = int(update.effective_message.text)
+        await update.effective_message.reply_text("Физическое самочувствие от 0 до 10?")
+        return HEALTH_PHYSICAL
+
+    async def health_physical(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data["health_checkin"]["physical_wellbeing"] = int(
+            update.effective_message.text
+        )
+        await update.effective_message.reply_text(
+            "Есть симптомы или наблюдения? Напиши кратко или ответь «нет»."
+        )
+        return HEALTH_SYMPTOMS
+
+    async def health_symptoms(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        answers = context.user_data.pop("health_checkin", {})
+        symptoms = (update.effective_message.text or "").strip()
+        answers["symptoms"] = (
+            None if symptoms.lower() in {"нет", "нет симптомов", "-"} else symptoms
+        )
+        record_id = answers.pop("record_id", None)
+        user = await self._user(update.effective_user.id)
+        record = await self.health_service.save(
+            user_id=user.id,
+            timezone=user.timezone,
+            answers=answers,
+            record_id=record_id,
+        )
+        if record is None:
+            await update.effective_message.reply_text(
+                "Не удалось изменить запись: она не найдена или принадлежит другому пользователю."
+            )
+            return ConversationHandler.END
+        response = (
+            f"Health check-in сохранён. Субъективная линейка состояния: "
+            f"{record.state_score}/100.\n"
+            "Это инструмент самонаблюдения, а не медицинский диагноз."
+        )
+        if urgent := urgent_safety_message(record.symptoms):
+            response += f"\n\n{urgent}"
+        weakness_days = await self.health_service.recent_weakness_days(user.id)
+        if weakness := prolonged_weakness_message(record.symptoms, weakness_days):
+            response += f"\n\n{weakness}"
+        await update.effective_message.reply_text(response)
+        return ConversationHandler.END
+
+    async def cancel_health_checkin(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        context.user_data.pop("health_checkin", None)
+        await update.effective_message.reply_text("Health check-in отменён, ничего не сохранено.")
+        return ConversationHandler.END
+
+    async def health_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._user(update.effective_user.id)
+        records = await self.health_service.history(user.id, limit=14)
+        if not records:
+            await update.effective_message.reply_text(
+                "Health-история пока пуста. Начни с /checkin.\n"
+                "Линейка 0–100 субъективна и не является медицинским диагнозом."
+            )
+            return
+        latest = records[0]
+        report = await self.health_service.weekly_report(user.id, user.timezone)
+        current_lines = [
+            f"Текущее состояние за {latest.local_date.strftime('%d.%m.%Y')}:",
+            f"Линейка: {latest.state_score}/100",
+            f"Энергия {latest.energy}/10 · Сон {latest.sleep}/10 · Настроение {latest.mood}/10",
+            f"Стресс {latest.stress}/10 · Физическое самочувствие {latest.physical_wellbeing}/10",
+        ]
+        if latest.symptoms:
+            current_lines.append(f"Наблюдения: {latest.symptoms}")
+        current_lines.append(
+            "Линейка субъективна, показывает динамику самонаблюдения и не является диагнозом."
+        )
+        if report.current_count:
+            current_lines.append(f"\nНеделя: {report.current_count} check-in.")
+            for name, value in report.current.items():
+                change = report.changes[name]
+                suffix = (
+                    " · нет предыдущей недели" if change is None else f" · изменение {change:+.1f}"
+                )
+                current_lines.append(f"{METRIC_LABELS[name]}: {value:.1f}{suffix}")
+        history = ", ".join(
+            f"#{record.id} {record.local_date.strftime('%d.%m')} — {record.state_score}/100"
+            for record in records[:7]
+        )
+        current_lines.append(f"\nИстория: {history}")
+        current_lines.append(
+            "Исправить: /health_edit ID · удалить: /health_delete ID\n"
+            "Напоминание: /health_reminder_on 20:00 или /health_reminder_off"
+        )
+        await update.effective_message.reply_text("\n".join(current_lines))
+
+    async def health_delete_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        args = getattr(context, "args", [])
+        if not args or not args[0].isdigit():
+            await update.effective_message.reply_text(
+                "Укажи ID записи: /health_delete 12. ID виден в /health."
+            )
+            return
+        user = await self._user(update.effective_user.id)
+        deleted = await self.health_service.delete_owned(user.id, int(args[0]))
+        await update.effective_message.reply_text(
+            "Health-запись удалена." if deleted else "Такая health-запись не найдена."
+        )
+
+    async def health_reminder_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = getattr(context, "args", [])
+        raw_time = args[0] if args else "20:00"
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw_time):
+            await update.effective_message.reply_text(
+                "Время нужно в формате HH:MM, например /health_reminder_on 20:00."
+            )
+            return
+        try:
+            local_time = time.fromisoformat(raw_time)
+        except ValueError:
+            await update.effective_message.reply_text(
+                "Время нужно в формате HH:MM, например /health_reminder_on 20:00."
+            )
+            return
+        user = await self._user(update.effective_user.id)
+        await self.health_service.set_reminder(
+            user_id=user.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            timezone=user.timezone,
+            local_time=local_time,
+            enabled=True,
+        )
+        if self.scheduler:
+            self.scheduler.schedule_health_reminder(
+                user_id=user.id,
+                chat_id=update.effective_chat.id,
+                timezone=user.timezone,
+                local_time=local_time,
+            )
+        await update.effective_message.reply_text(
+            f"Ежедневное добровольное напоминание включено на {local_time.strftime('%H:%M')} "
+            f"({user.timezone}). Отключить: /health_reminder_off."
+        )
+
+    async def health_reminder_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._user(update.effective_user.id)
+        disabled = await self.health_service.disable_reminder(user.id)
+        if self.scheduler:
+            self.scheduler.remove_health_reminder(user.id)
+        await update.effective_message.reply_text(
+            "Health-напоминание отключено." if disabled else "Health-напоминание не было включено."
+        )
+
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             "/start — онбординг, /profile — профиль, /goals — обновить цели, /today — фокус дня, "
             "/evening — рефлексия, /inbox — сохранённые мысли, /drafts — активные черновики, "
-            "/last_saved — последняя запись, /cleanup_drafts — безопасная очистка черновиков."
+            "/last_saved — последняя запись, /cleanup_drafts — безопасная очистка черновиков, "
+            "/health — состояние и динамика, /checkin — health check-in."
         )
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
