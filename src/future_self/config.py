@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     system_action_ttl_minutes: int = Field(default=10, ge=1, le=60)
     conversation_context_messages: int = Field(default=12, ge=10, le=20)
     conversation_context_ttl_hours: int = Field(default=24, ge=1, le=168)
+    task_date_event_hour: int = Field(default=9, ge=0, le=23)
+    task_reminder_lead_minutes: int = Field(default=30, ge=0, le=10080)
+    task_reminder_poll_seconds: int = Field(default=15, ge=5, le=300)
+    task_reminder_lease_seconds: int = Field(default=120, ge=30, le=3600)
+    enable_task_reminders: bool = True
     enable_voice: bool = True
     enable_weekly_review: bool = True
     log_level: str = "INFO"

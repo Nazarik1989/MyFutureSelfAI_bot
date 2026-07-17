@@ -188,6 +188,33 @@ class InboxItem(TimestampMixin, Base):
     source: Mapped[str] = mapped_column(String(20), default="text")
     status: Mapped[str] = mapped_column(String(20), default="confirmed", index=True)
     user: Mapped[User] = relationship(back_populates="inbox_items")
+    reminder: Mapped[TaskReminder | None] = relationship(
+        back_populates="inbox_item", uselist=False, cascade="all, delete-orphan"
+    )
+
+
+class TaskReminder(TimestampMixin, Base):
+    __tablename__ = "task_reminders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    inbox_item_id: Mapped[int] = mapped_column(
+        ForeignKey("inbox_items.id", ondelete="CASCADE"), unique=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    timezone: Mapped[str] = mapped_column(String(64))
+    delivery_key: Mapped[str] = mapped_column(String(80), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    last_error_type: Mapped[str | None] = mapped_column(String(120))
+    inbox_item: Mapped[InboxItem] = relationship(back_populates="reminder")
 
 
 class DailyCheckIn(TimestampMixin, Base):

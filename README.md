@@ -14,6 +14,8 @@ MVP Telegram-ассистента, который связывает образ 
 - изолированные system actions для списка и batch-очистки drafts с отдельным TTL, snapshot и подтверждением;
 - детерминированные natural read-команды для `/drafts`, `/inbox`, `/last_saved`, `/profile`, `/today` и `/help` без LLM;
 - canonical `temporal_resolution` для выбранной даты/времени с UTC, timezone и локальным представлением;
+- persistent Task & Reminder Engine: раздельные `event_at`/`remind_at`, Telegram-доставка,
+  IANA timezone, восстановление после рестарта, lease и защита от повторной отправки;
 - текстовый и голосовой inbox с проверкой расшифровки и отдельным callback до сохранения;
 - персональный `/today` и пятишаговая неосуждающая рефлексия `/evening`;
 - async SQLAlchemy, Alembic, SQLite локально и PostgreSQL в production;
@@ -129,6 +131,25 @@ CONVERSATION_CONTEXT_TTL_HOURS=24
 Новый preview автоматически становится focused. При нескольких карточках без focus бот сохраняет pending action и предлагает выбрать draft; focus по умолчанию живёт 15 минут (`DRAFT_FOCUS_TTL_MINUTES`).
 `/drafts` показывает не более пяти сгруппированных строк на страницу. Массовая очистка использует отдельный `system_pending_action`, проверяет неизменность snapshot и по умолчанию ожидает подтверждение до 10 минут (`SYSTEM_ACTION_TTL_MINUTES`). Сохранённые InboxItem batch-очисткой не изменяются.
 
+Для подтверждённой task-карточки с canonical датой engine атомарно создаёт одну persistent
+запись напоминания. Точное событие сохраняется как `event_at`, доставка — как независимое
+`remind_at`; оба значения хранятся в UTC, а исходный IANA timezone используется в Telegram.
+Для даты без времени событие по умолчанию назначается на 09:00 локального времени, для
+datetime напоминание приходит за 30 минут. Настройки:
+
+```dotenv
+TASK_DATE_EVENT_HOUR=9
+TASK_REMINDER_LEAD_MINUTES=30
+TASK_REMINDER_POLL_SECONDS=15
+TASK_REMINDER_LEASE_SECONDS=120
+ENABLE_TASK_REMINDERS=true
+```
+
+Pending-доставка переживает рестарт процесса. Worker атомарно захватывает запись по lease,
+а уникальные `inbox_item_id` и `delivery_key` вместе со статусом `sent` защищают обычные,
+повторные и конкурентные poll-циклы от дублей. Ошибки Telegram повторяются с ограниченным
+exponential backoff без сохранения текста ответа провайдера.
+
 Text LLM и транскрипция никогда не используют один клиент автоматически. Для официального OpenAI Speech-to-Text задайте отдельный ключ:
 
 ```dotenv
@@ -165,6 +186,7 @@ src/future_self/
   ai.py              интерфейс и OpenRouter/OpenAI-compatible text adapter
   transcription.py   независимый OpenAI/local/disabled STT adapter
   scheduler.py       изолированный JobQueue adapter
+  reminders.py       persistent outbox задач и Telegram-доставка напоминаний
   config.py          personality, schedule и feature flags
   prompts.py         системные промпты
 alembic/              миграции схемы

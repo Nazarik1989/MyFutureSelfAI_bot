@@ -4,8 +4,9 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from .domain import next_notification_utc
+from .reminders import TaskReminderEngine
 
-SendCallback = Callable[[int, str], Awaitable[None]]
+SendCallback = Callable[[int, str], Awaitable[int | None]]
 
 
 class Scheduler(Protocol):
@@ -90,3 +91,19 @@ class JobQueueScheduler:
             for suffix in ("morning", "evening", "weekly"):
                 for job in get_jobs(f"user:{telegram_id}:{suffix}"):
                     job.schedule_removal()
+
+    def start_task_reminders(
+        self,
+        engine: TaskReminderEngine,
+        *,
+        interval_seconds: int,
+    ) -> None:
+        async def deliver_due(context: object) -> None:
+            await engine.deliver_due()
+
+        self.job_queue.run_repeating(
+            deliver_due,
+            interval=interval_seconds,
+            first=interval_seconds,
+            name="task-reminders:persistent-outbox",
+        )

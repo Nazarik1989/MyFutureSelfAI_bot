@@ -8,7 +8,8 @@ from uuid import uuid4
 from sqlalchemy import select, update
 
 from .db import Database
-from .models import DraftInboxItem, InboxItem
+from .models import DraftInboxItem, InboxItem, TaskReminder
+from .reminders import reminder_for_inbox_item
 from .schemas import ParsedThought
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ class DraftResult:
     ok: bool
     draft: DraftInboxItem | None = None
     inbox_item: InboxItem | None = None
+    reminder: TaskReminder | None = None
 
 
 @dataclass(slots=True)
@@ -65,9 +67,18 @@ def log_transition(
 class DraftInboxService:
     """Persistent draft state machine. Only confirm creates an InboxItem."""
 
-    def __init__(self, db: Database, ttl_minutes: int):
+    def __init__(
+        self,
+        db: Database,
+        ttl_minutes: int,
+        *,
+        task_date_event_hour: int = 9,
+        task_reminder_lead_minutes: int = 30,
+    ):
         self.db = db
         self.ttl = timedelta(minutes=ttl_minutes)
+        self.task_date_event_hour = task_date_event_hour
+        self.task_reminder_lead_minutes = task_reminder_lead_minutes
 
     async def create(
         self,
@@ -568,6 +579,16 @@ class DraftInboxService:
             )
             session.add(inbox_item)
             await session.flush()
+            reminder = reminder_for_inbox_item(
+                inbox_item,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                date_event_hour=self.task_date_event_hour,
+                lead_minutes=self.task_reminder_lead_minutes,
+            )
+            if reminder is not None:
+                session.add(reminder)
+                await session.flush()
         log_transition(
             draft_id,
             telegram_user_id,
@@ -576,7 +597,7 @@ class DraftInboxService:
             "save",
             inbox_created=True,
         )
-        return DraftResult(True, draft=draft, inbox_item=inbox_item)
+        return DraftResult(True, draft=draft, inbox_item=inbox_item, reminder=reminder)
 
     async def _transition_preview(
         self,
