@@ -14,7 +14,7 @@ The harness deliberately uses:
 Every LLM input must be explicitly stubbed. An unexpected LLM call fails the
 scenario instead of silently producing a fake response.
 
-The catalog currently contains 70 deterministic E2E scenarios. Variations are
+The catalog contains 80+ deterministic E2E scenarios. Variations are
 generated from fixed tuples only; no randomness, wall-clock input, or external
 data is used. Regressions found during matrix expansion and their resolved
 coverage are documented in `DEFECTS.md`.
