@@ -188,7 +188,7 @@ ORDINARY_CONTENT = (
     "Не надо сохранять каждую случайную мысль в инбокс автоматически",
 )
 
-NOISY_SAVE_DEFECTS = (
+NOISY_SAVE_VARIANTS = (
     "Ну сохрани в инбокс",
     "Пожалуйста, сохрани в inbox",
     "Сохрани это в инбокс, пожалуйста",
@@ -197,14 +197,14 @@ NOISY_SAVE_DEFECTS = (
     "Сохрани, пожалуйста, это в inbox",
 )
 
-CLIPPED_SAVE_DEFECTS = (
+CLIPPED_SAVE_VARIANTS = (
     "Это в инбокс",
     "Это в inbox",
     "В инбокс",
     "Сохрани в инбок",
 )
 
-NEGATIVE_DEFECTS = (
+EXTENDED_NEGATIVE_VARIANTS = (
     "Не сохраняй это в инбокс",
     "Пожалуйста, не сохраняй в inbox",
     "Не надо это сохранять в инбокс",
@@ -257,32 +257,29 @@ GENERATED_AMBIGUOUS_SCENARIOS = tuple(
     for index in range(1, 5)
 )
 
-KNOWN_SAVE_DEFECT_SCENARIOS = tuple(
+RESOLVED_SAVE_REGRESSION_SCENARIOS = tuple(
     focused_save_scenario(
         100 + index,
         command,
         "voice" if index % 2 else "text",
-        known_defect="AUTOTEST-D001: save command with filler or politeness reaches LLM",
     )
-    for index, command in enumerate(NOISY_SAVE_DEFECTS, start=1)
+    for index, command in enumerate(NOISY_SAVE_VARIANTS, start=1)
 ) + tuple(
     focused_save_scenario(
         110 + index,
         command,
         "voice" if index % 2 else "text",
-        known_defect="AUTOTEST-D002: clipped save transcription reaches LLM",
     )
-    for index, command in enumerate(CLIPPED_SAVE_DEFECTS, start=1)
+    for index, command in enumerate(CLIPPED_SAVE_VARIANTS, start=1)
 )
 
-KNOWN_NEGATIVE_DEFECT_SCENARIOS = tuple(
+RESOLVED_NEGATIVE_REGRESSION_SCENARIOS = tuple(
     negative_scenario(
         120 + index,
         command,
         "voice" if index % 2 else "text",
-        known_defect="AUTOTEST-D003: extended negative command reaches LLM",
     )
-    for index, command in enumerate(NEGATIVE_DEFECTS, start=1)
+    for index, command in enumerate(EXTENDED_NEGATIVE_VARIANTS, start=1)
 )
 
 
@@ -466,6 +463,6 @@ SCENARIOS = (
     *GENERATED_CONTENT_SCENARIOS,
     *GENERATED_AMBIGUOUS_SCENARIOS,
     *CALLBACK_SCENARIOS,
-    *KNOWN_SAVE_DEFECT_SCENARIOS,
-    *KNOWN_NEGATIVE_DEFECT_SCENARIOS,
+    *RESOLVED_SAVE_REGRESSION_SCENARIOS,
+    *RESOLVED_NEGATIVE_REGRESSION_SCENARIOS,
 )

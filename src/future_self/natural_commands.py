@@ -2,7 +2,9 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-SAVE_INBOX_PATTERN = re.compile(r"^сохрани(?:м)?(?:\s+это)?(?:\s+в)?\s+(?:инбокс|inbox)$")
+INBOX_TARGETS = {"инбокс", "inbox", "инбок"}
+SAVE_VERBS = {"сохрани", "сохраним"}
+COMMAND_FILLERS = {"ну", "пожалуйста", "короче", "эээ"}
 
 
 def normalize_command_text(text: str) -> str:
@@ -11,8 +13,54 @@ def normalize_command_text(text: str) -> str:
     return re.sub(r"\s+", " ", lowered).strip()
 
 
+def _trim_command_fillers(tokens: list[str]) -> list[str]:
+    trimmed = list(tokens)
+    for _ in range(2):
+        if trimmed and trimmed[0] in COMMAND_FILLERS:
+            trimmed.pop(0)
+    if trimmed and trimmed[0] in COMMAND_FILLERS:
+        return []
+    if trimmed and trimmed[-1] == "пожалуйста":
+        trimmed.pop()
+    return trimmed
+
+
 def is_save_inbox_command(text: str) -> bool:
-    return SAVE_INBOX_PATTERN.fullmatch(normalize_command_text(text)) is not None
+    tokens = _trim_command_fillers(normalize_command_text(text).split())
+    if len(tokens) == 2 and tokens[0] == "в" and tokens[1] in INBOX_TARGETS:
+        return True
+    if len(tokens) == 3 and tokens[0] == "это" and tokens[1] == "в" and tokens[2] in INBOX_TARGETS:
+        return True
+    if not tokens or tokens.pop(0) not in SAVE_VERBS:
+        return False
+    if tokens and tokens[0] == "пожалуйста":
+        tokens.pop(0)
+    if tokens and tokens[0] == "это":
+        tokens.pop(0)
+    if tokens and tokens[0] == "в":
+        tokens.pop(0)
+    return len(tokens) == 1 and tokens[0] in INBOX_TARGETS
+
+
+def is_discard_inbox_command(text: str) -> bool:
+    tokens = _trim_command_fillers(normalize_command_text(text).split())
+    if len(tokens) < 3 or tokens[:2] not in (["не", "сохраняй"], ["не", "надо"]):
+        return False
+
+    if tokens[:2] == ["не", "сохраняй"]:
+        remainder = tokens[2:]
+    else:
+        remainder = tokens[2:]
+        if remainder and remainder[0] == "это":
+            remainder.pop(0)
+        if not remainder or remainder.pop(0) != "сохранять":
+            return False
+
+    if remainder and remainder[0] == "это":
+        remainder.pop(0)
+    if remainder and remainder[0] == "в":
+        remainder.pop(0)
+    return len(remainder) == 1 and remainder[0] in INBOX_TARGETS
 
 
 NaturalAction = Literal[
