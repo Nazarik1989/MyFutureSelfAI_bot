@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Integer,
     String,
     Text,
+    Time,
     UniqueConstraint,
     func,
 )
@@ -44,6 +46,7 @@ class User(TimestampMixin, Base):
     goals: Mapped[list[Goal]] = relationship(back_populates="user")
     routines: Mapped[list[Routine]] = relationship(back_populates="user")
     inbox_items: Mapped[list[InboxItem]] = relationship(back_populates="user")
+    health_check_ins: Mapped[list[HealthCheckIn]] = relationship(back_populates="user")
 
 
 class DraftInboxItem(Base):
@@ -231,6 +234,49 @@ class DailyCheckIn(TimestampMixin, Base):
     tomorrow_adjustment: Mapped[str | None] = mapped_column(Text)
     completed_actions: Mapped[list[str]] = mapped_column(JSON, default=list)
     skipped_actions: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+
+class HealthCheckIn(TimestampMixin, Base):
+    __tablename__ = "health_check_ins"
+    __table_args__ = (
+        UniqueConstraint("user_id", "local_date", name="uq_health_checkin_user_date"),
+        CheckConstraint("energy BETWEEN 0 AND 10", name="ck_health_energy"),
+        CheckConstraint("sleep BETWEEN 0 AND 10", name="ck_health_sleep"),
+        CheckConstraint("mood BETWEEN 0 AND 10", name="ck_health_mood"),
+        CheckConstraint("stress BETWEEN 0 AND 10", name="ck_health_stress"),
+        CheckConstraint(
+            "physical_wellbeing BETWEEN 0 AND 10",
+            name="ck_health_physical_wellbeing",
+        ),
+        CheckConstraint("state_score BETWEEN 0 AND 100", name="ck_health_state_score"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    local_date: Mapped[date] = mapped_column(Date, index=True)
+    timezone: Mapped[str] = mapped_column(String(64))
+    energy: Mapped[int] = mapped_column(Integer)
+    sleep: Mapped[int] = mapped_column(Integer)
+    mood: Mapped[int] = mapped_column(Integer)
+    stress: Mapped[int] = mapped_column(Integer)
+    physical_wellbeing: Mapped[int] = mapped_column(Integer)
+    symptoms: Mapped[str | None] = mapped_column(Text)
+    state_score: Mapped[int] = mapped_column(Integer)
+    user: Mapped[User] = relationship(back_populates="health_check_ins")
+
+
+class HealthReminderPreference(TimestampMixin, Base):
+    __tablename__ = "health_reminder_preferences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    timezone: Mapped[str] = mapped_column(String(64))
+    local_time: Mapped[time] = mapped_column(Time)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class OnboardingState(TimestampMixin, Base):

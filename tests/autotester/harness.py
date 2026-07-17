@@ -6,10 +6,23 @@ from typing import Literal
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
 
-from future_self.bot import FutureSelfBot
+from future_self.bot import (
+    HEALTH_ENERGY,
+    HEALTH_MOOD,
+    HEALTH_PHYSICAL,
+    HEALTH_SLEEP,
+    HEALTH_STRESS,
+    HEALTH_SYMPTOMS,
+    FutureSelfBot,
+)
 from future_self.config import Settings
 from future_self.db import Database
-from future_self.models import DraftInboxItem, InboxItem
+from future_self.models import (
+    DraftInboxItem,
+    HealthCheckIn,
+    HealthReminderPreference,
+    InboxItem,
+)
 from future_self.schemas import IntentResult
 
 from .fakes import (
@@ -25,7 +38,14 @@ AUTOTEST_TELEGRAM_TOKEN = "000000:AUTOTEST_ONLY"
 AUTOTEST_AI_KEY = "autotest-key"
 AUTOTEST_BASE_URL = "https://invalid.autotest"
 
-StepKind = Literal["text", "voice", "callback", "setup_clear_focus"]
+StepKind = Literal[
+    "text",
+    "voice",
+    "callback",
+    "command",
+    "health_answer",
+    "setup_clear_focus",
+]
 
 
 class UnsafeAutotestConfiguration(RuntimeError):
@@ -66,6 +86,8 @@ class ExpectedState:
     drafts: tuple[DraftState, ...] = ()
     inbox: tuple[InboxState, ...] = ()
     llm_inputs: tuple[str, ...] = ()
+    health_scores: tuple[int, ...] = ()
+    health_reminder_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +174,7 @@ class BotAutotester:
         self.telegram_user_id = telegram_user_id
         self.chat_id = chat_id
         self.messages: list[FakeMessage] = []
+        self.health_state: int | None = None
 
     @classmethod
     async def create(cls, sandbox: Path, stubs: tuple[LLMStub, ...]) -> "BotAutotester":
@@ -211,6 +234,8 @@ class BotAutotester:
         async with self.database.sessions() as session:
             drafts = list((await session.scalars(select(DraftInboxItem))).all())
             inbox_items = list((await session.scalars(select(InboxItem))).all())
+            health_records = list((await session.scalars(select(HealthCheckIn))).all())
+            health_preference = await session.scalar(select(HealthReminderPreference))
         return ExpectedState(
             drafts=tuple(
                 sorted(
@@ -222,6 +247,8 @@ class BotAutotester:
                 sorted(InboxState(item.title, item.kind, item.source) for item in inbox_items)
             ),
             llm_inputs=tuple(self.ai.route_calls),
+            health_scores=tuple(sorted(record.state_score for record in health_records)),
+            health_reminder_enabled=bool(health_preference and health_preference.enabled),
         )
 
     async def _run_step(self, step: ScenarioStep) -> StepResult:
@@ -230,6 +257,10 @@ class BotAutotester:
             return StepResult(step.kind, step.value, ())
         if step.kind == "callback":
             return await self._run_callback(step.value)
+        if step.kind == "command":
+            return await self._run_command(step.value)
+        if step.kind == "health_answer":
+            return await self._run_health_answer(step.value)
 
         if step.kind == "voice":
             self.transcription.queue(step.value)
@@ -242,6 +273,45 @@ class BotAutotester:
         await route(self._update_for(message), self.context)
         outputs = tuple(str(reply["text"]) for reply in message.replies) + tuple(message.edits)
         return StepResult(step.kind, step.value, outputs)
+
+    async def _run_command(self, value: str) -> StepResult:
+        parts = value.split()
+        command = parts[0].removeprefix("/")
+        self.context.args = parts[1:]
+        message = FakeMessage(value)
+        self.messages.append(message)
+        update = self._update_for(message)
+        handlers = {
+            "health": self.bot.health_command,
+            "checkin": self.bot.health_checkin_start,
+            "health_reminder_on": self.bot.health_reminder_on,
+            "health_reminder_off": self.bot.health_reminder_off,
+        }
+        result = await handlers[command](update, self.context)
+        if command == "checkin":
+            self.health_state = result
+        outputs = tuple(str(reply["text"]) for reply in message.replies)
+        return StepResult("command", value, outputs)
+
+    async def _run_health_answer(self, value: str) -> StepResult:
+        handlers = {
+            HEALTH_ENERGY: self.bot.health_energy,
+            HEALTH_SLEEP: self.bot.health_sleep,
+            HEALTH_MOOD: self.bot.health_mood,
+            HEALTH_STRESS: self.bot.health_stress,
+            HEALTH_PHYSICAL: self.bot.health_physical,
+            HEALTH_SYMPTOMS: self.bot.health_symptoms,
+        }
+        if self.health_state not in handlers:
+            raise AssertionError("No active health check-in state")
+        message = FakeMessage(value)
+        self.messages.append(message)
+        self.health_state = await handlers[self.health_state](
+            self._update_for(message),
+            self.context,
+        )
+        outputs = tuple(str(reply["text"]) for reply in message.replies)
+        return StepResult("health_answer", value, outputs)
 
     async def _run_callback(self, action: str) -> StepResult:
         data, message = self._latest_preview_callback(action)
