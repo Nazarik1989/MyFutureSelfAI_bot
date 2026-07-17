@@ -1,4 +1,5 @@
 import re
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -65,12 +66,112 @@ class DateResolution(BaseModel):
     options: list[DateOption] = Field(default_factory=list)
 
 
+class RelativeReminderResolution(BaseModel):
+    title: str
+    remind_at: datetime
+    temporal: TemporalResolution
+
+
 class DateResolver:
     DATE_PATTERN = re.compile(
         r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|"
         r"сентября|октября|ноября|декабря)(?:\s+(\d{4}))?\b",
         re.IGNORECASE,
     )
+    RELATIVE_NUMBER_WORDS = {
+        "один": 1,
+        "одну": 1,
+        "два": 2,
+        "две": 2,
+        "три": 3,
+        "четыре": 4,
+        "пять": 5,
+        "шесть": 6,
+        "семь": 7,
+        "восемь": 8,
+        "девять": 9,
+        "десять": 10,
+    }
+    RELATIVE_INTERVAL_PATTERN = re.compile(
+        r"(?:(?P<count>\d{1,4}|один|одну|два|две|три|четыре|пять|шесть|семь|"
+        r"восемь|девять|десять)\s+)?"
+        r"(?P<unit>минут(?:у|ы)?|час(?:а|ов)?)",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, now_provider: Callable[[], datetime] | None = None):
+        self._now_provider = now_provider or (lambda: datetime.now(UTC))
+
+    def resolve_relative_reminder(
+        self,
+        text: str,
+        timezone_name: str,
+        *,
+        now: datetime | None = None,
+    ) -> RelativeReminderResolution | None:
+        normalized = re.sub(r"\s+", " ", text.strip().replace("ё", "е"))
+        command = re.match(r"^напомни(?:\s+мне)?\s+(.+)$", normalized, re.IGNORECASE)
+        if command is None:
+            return None
+        body = command.group(1).strip()
+        interval_first = re.match(
+            rf"^через\s+({self.RELATIVE_INTERVAL_PATTERN.pattern})"
+            rf"(?:\s*[,;:]\s*|\s+)(.+?)\s*[.!?]*$",
+            body,
+            re.IGNORECASE,
+        )
+        interval_last = re.match(
+            rf"^(.+?)\s+через\s+({self.RELATIVE_INTERVAL_PATTERN.pattern})\s*[.!?]*$",
+            body,
+            re.IGNORECASE,
+        )
+        match = interval_first or interval_last
+        if match is None:
+            return None
+        if interval_first:
+            interval_text, title = match.group(1), match.group(4)
+        else:
+            title, interval_text = match.group(1), match.group(2)
+        interval = self.RELATIVE_INTERVAL_PATTERN.fullmatch(interval_text)
+        if interval is None:
+            return None
+        raw_count = interval.group("count")
+        count = (
+            1
+            if raw_count is None
+            else int(raw_count)
+            if raw_count.isdigit()
+            else self.RELATIVE_NUMBER_WORDS[raw_count.lower()]
+        )
+        unit = interval.group("unit").lower()
+        delta = timedelta(minutes=count) if unit.startswith("минут") else timedelta(hours=count)
+        if count <= 0 or delta > timedelta(days=7):
+            return None
+        cleaned_title = title.strip(" \t.,!?;:()[]{}\"'«»")
+        if not cleaned_title:
+            return None
+        cleaned_title = cleaned_title[:1].upper() + cleaned_title[1:]
+        current = now or self._now_provider()
+        current_utc = (
+            current.replace(tzinfo=UTC) if current.tzinfo is None else current.astimezone(UTC)
+        )
+        remind_at = current_utc + delta
+        local = remind_at.astimezone(ZoneInfo(timezone_name))
+        temporal = TemporalResolution(
+            resolved_at=remind_at,
+            remind_at=remind_at,
+            timezone=timezone_name,
+            resolved_local_date=local.date(),
+            resolved_local_time=local.time().replace(tzinfo=None),
+            precision="datetime",
+            original_expression=text,
+            resolution_status="resolved",
+        )
+        return RelativeReminderResolution(
+            title=cleaned_title,
+            remind_at=remind_at,
+            temporal=temporal,
+        )
 
     def resolve(
         self, text: str, timezone_name: str, *, now: datetime | None = None

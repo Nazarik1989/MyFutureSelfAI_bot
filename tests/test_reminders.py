@@ -7,8 +7,9 @@ from sqlalchemy import func, select
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
+from future_self.dates import DateResolver
 from future_self.drafts import DraftInboxService
-from future_self.models import InboxItem, TaskReminder
+from future_self.models import DraftInboxItem, InboxItem, TaskReminder
 from future_self.reminders import TaskReminderEngine, as_utc, schedule_from_temporal
 from future_self.repositories import UserRepository
 from future_self.scheduler import JobQueueScheduler
@@ -172,6 +173,49 @@ def test_date_only_schedule_uses_configured_local_hour_across_timezone():
     assert result.remind_at == datetime(2026, 1, 15, 13, 30, tzinfo=UTC)
 
 
+@pytest.mark.parametrize(
+    ("phrase", "expected_delta", "expected_title"),
+    [
+        ("Напомни через 5 минут выпить воды", timedelta(minutes=5), "Выпить воды"),
+        ("напомни через 1 час проверить духовку!", timedelta(hours=1), "Проверить духовку"),
+        ("Напомни через час, проверить почту", timedelta(hours=1), "Проверить почту"),
+        ("Напомни через минуту сделать вдох", timedelta(minutes=1), "Сделать вдох"),
+        ("Напомни мне позвонить врачу через 2 часа", timedelta(hours=2), "Позвонить врачу"),
+        ("НАПОМНИ ЧЕРЕЗ ПЯТЬ МИНУТ размяться", timedelta(minutes=5), "Размяться"),
+    ],
+)
+def test_relative_reminder_parser_uses_exact_interval(phrase, expected_delta, expected_title):
+    now = datetime(2026, 7, 17, 10, 0, tzinfo=UTC)
+    result = DateResolver(now_provider=lambda: now).resolve_relative_reminder(
+        phrase,
+        "Europe/Moscow",
+    )
+    assert result is not None
+    assert result.remind_at == now + expected_delta
+    assert result.title == expected_title
+    assert result.temporal.remind_at == now + expected_delta
+    assert result.temporal.resolved_at == now + expected_delta
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Не напоминай через 5 минут пить воду",
+        "Напоминание через 5 минут",
+        "Через 5 минут я выпью воду",
+        "Напомни через 0 минут выпить воды",
+        "Напомни через 999 часов выпить воды",
+    ],
+)
+def test_non_commands_and_unsafe_relative_intervals_are_not_intercepted(phrase):
+    assert (
+        DateResolver(
+            now_provider=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=UTC)
+        ).resolve_relative_reminder(phrase, "Europe/Moscow")
+        is None
+    )
+
+
 async def test_confirm_task_with_temporal_data_creates_one_persistent_reminder(db):
     item, reminder = await create_reminder(
         db,
@@ -241,6 +285,67 @@ async def test_real_text_and_voice_routing_persists_task_reminder(db, fake_ai, s
     assert as_utc(reminder.event_at) - as_utc(reminder.remind_at) == timedelta(minutes=30)
     assert reminder.timezone == "Europe/Moscow"
     assert "Напоминание:" in save.replies[-1]["text"]
+
+
+@pytest.mark.parametrize(
+    ("source", "phrase", "delta"),
+    [
+        ("text", "Напомни через 5 минут выпить воды", timedelta(minutes=5)),
+        ("voice", "Напомни через 5 минут выпить воды", timedelta(minutes=5)),
+        ("text", "Напомни через 2 часа проверить духовку", timedelta(hours=2)),
+        ("voice", "Напомни через 2 часа проверить духовку", timedelta(hours=2)),
+    ],
+)
+async def test_relative_reminder_text_and_voice_route_save_and_deliver(
+    db,
+    fake_ai,
+    source,
+    phrase,
+    delta,
+):
+    now = datetime(2026, 7, 17, 10, 0, tzinfo=UTC)
+    bot = FutureSelfBot(route_settings(), db, fake_ai, PhraseTranscription(phrase))
+    bot.date_resolver = DateResolver(now_provider=lambda: now)
+    user_id = 901 + len(fake_ai.route_calls)
+    chat_id = user_id + 10_000
+    capture = RouteMessage(phrase if source == "text" else None, voice=RouteVoice())
+    context = SimpleNamespace(user_data={}, bot=RouteBot())
+    if source == "text":
+        await bot.text(route_update(capture, user_id, chat_id), context)
+    else:
+        await bot.voice(route_update(capture, user_id, chat_id), context)
+    assert fake_ai.route_calls == []
+
+    async with db.sessions() as session:
+        draft = await session.scalar(
+            select(DraftInboxItem).where(DraftInboxItem.telegram_user_id == user_id)
+        )
+    assert draft.kind == "task"
+    assert draft.temporal_resolution["remind_at"] == (now + delta).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+    save = RouteMessage("сохрани")
+    await bot.text(route_update(save, user_id, chat_id), context)
+    async with db.sessions() as session:
+        reminder = await session.scalar(
+            select(TaskReminder).where(TaskReminder.telegram_user_id == user_id)
+        )
+    assert as_utc(reminder.remind_at) == now + delta
+    assert as_utc(reminder.event_at) == now + delta
+
+    sent: list[tuple[int, str]] = []
+
+    async def send(target_chat_id: int, text: str) -> int:
+        sent.append((target_chat_id, text))
+        return 700
+
+    engine = TaskReminderEngine(db, send)
+    assert await engine.deliver_due(now=now + delta - timedelta(seconds=1)) == 0
+    assert await engine.deliver_due(now=now + delta) == 1
+    assert await engine.deliver_due(now=now + delta + timedelta(seconds=1)) == 0
+    assert len(sent) == 1
+    assert sent[0][0] == chat_id
 
 
 async def test_due_reminder_is_delivered_to_original_chat_and_marked_sent(db):
