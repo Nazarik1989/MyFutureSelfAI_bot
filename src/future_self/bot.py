@@ -32,6 +32,7 @@ from .config import Settings
 from .conversation import ConversationContextService, ConversationSnapshot
 from .dates import DateResolver
 from .db import Database
+from .doctor_prep import DoctorVisitPrepService
 from .domain import (
     ONBOARDING_QUESTIONS,
     FocusService,
@@ -73,6 +74,13 @@ EVENING_WORKED, EVENING_FAILED, EVENING_ENERGY, EVENING_OBSTACLE, EVENING_TOMORR
     HEALTH_PHYSICAL,
     HEALTH_SYMPTOMS,
 ) = range(20, 26)
+(
+    DOCTOR_REASON,
+    DOCTOR_DURATION,
+    DOCTOR_SYMPTOMS,
+    DOCTOR_MEDICATIONS,
+    DOCTOR_QUESTIONS,
+) = range(30, 35)
 LABELS = {"idea": "идея", "task": "задача", "desire": "желание", "note": "заметка"}
 ACTION_LABELS = {
     "idea": "идею",
@@ -125,6 +133,11 @@ class FutureSelfBot:
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
+        self.doctor_prep_service = DoctorVisitPrepService(
+            db,
+            task_date_event_hour=settings.task_date_event_hour,
+            task_reminder_lead_minutes=settings.task_reminder_lead_minutes,
+        )
         self.scheduler: JobQueueScheduler | None = None
         self.reminder_engine: TaskReminderEngine | None = None
 
@@ -221,9 +234,35 @@ class FutureSelfBot:
             },
             fallbacks=[CommandHandler("cancel", self.cancel_health_checkin)],
         )
+        doctor_prepare = ConversationHandler(
+            entry_points=[
+                CommandHandler("doctor_prepare", self.doctor_prepare_start),
+                CommandHandler("doctor_prepare_edit", self.doctor_prepare_start),
+            ],
+            states={
+                DOCTOR_REASON: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.doctor_prepare_reason)
+                ],
+                DOCTOR_DURATION: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.doctor_prepare_duration)
+                ],
+                DOCTOR_SYMPTOMS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.doctor_prepare_symptoms)
+                ],
+                DOCTOR_MEDICATIONS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.doctor_prepare_medications)
+                ],
+                DOCTOR_QUESTIONS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.doctor_prepare_questions)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_doctor_prepare)],
+            allow_reentry=True,
+        )
         app.add_handler(onboarding)
         app.add_handler(evening)
         app.add_handler(health_checkin)
+        app.add_handler(doctor_prepare)
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
         app.add_handler(CommandHandler("goals", self.goals_command))
@@ -236,6 +275,10 @@ class FutureSelfBot:
         app.add_handler(CommandHandler("health_delete", self.health_delete_command))
         app.add_handler(CommandHandler("health_reminder_on", self.health_reminder_on))
         app.add_handler(CommandHandler("health_reminder_off", self.health_reminder_off))
+        app.add_handler(CommandHandler("doctor_preparations", self.doctor_preparations))
+        app.add_handler(CommandHandler("doctor_prepare_show", self.doctor_prepare_show))
+        app.add_handler(CommandHandler("doctor_prepare_delete", self.doctor_prepare_delete))
+        app.add_handler(CommandHandler("doctor_prepare_task", self.doctor_prepare_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -2585,12 +2628,288 @@ class FutureSelfBot:
             "Health-напоминание отключено." if disabled else "Health-напоминание не было включено."
         )
 
+    async def doctor_prepare_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = await self._user(update.effective_user.id)
+        command = (update.effective_message.text or "").split(maxsplit=1)[0]
+        command = command.split("@", maxsplit=1)[0]
+        record_id = None
+        if command == "/doctor_prepare_edit":
+            args = getattr(context, "args", [])
+            if not args or not args[0].isdigit():
+                await update.effective_message.reply_text(
+                    "Укажи ID: /doctor_prepare_edit 12. ID виден в /doctor_preparations."
+                )
+                return ConversationHandler.END
+            record_id = int(args[0])
+            if await self.doctor_prep_service.get_owned(user.id, record_id) is None:
+                await update.effective_message.reply_text(
+                    "Такая подготовка не найдена или принадлежит другому пользователю."
+                )
+                return ConversationHandler.END
+        context.user_data["doctor_prepare"] = {"record_id": record_id}
+        prefix = "Исправляем подготовку. " if record_id is not None else ""
+        await update.effective_message.reply_text(
+            f"{prefix}Кратко: какова основная причина обращения к врачу?"
+        )
+        return DOCTOR_REASON
+
+    async def doctor_prepare_reason(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        reason = update.effective_message.text.strip()
+        if not reason:
+            await update.effective_message.reply_text(
+                "Причина обращения не должна быть пустой. Опиши её одной фразой."
+            )
+            return DOCTOR_REASON
+        context.user_data["doctor_prepare"]["reason"] = reason
+        prompt = "Как долго это продолжается? Например: «5 дней» или «около месяца»."
+        if urgent := urgent_safety_message(reason):
+            prompt = f"{urgent}\nНе жди завершения опроса для обращения за помощью.\n\n{prompt}"
+        await update.effective_message.reply_text(prompt)
+        return DOCTOR_DURATION
+
+    async def doctor_prepare_duration(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        duration = update.effective_message.text.strip()
+        if not duration:
+            await update.effective_message.reply_text(
+                "Длительность не должна быть пустой. Например: «5 дней»."
+            )
+            return DOCTOR_DURATION
+        context.user_data["doctor_prepare"]["duration"] = duration
+        await update.effective_message.reply_text(
+            "Перечисли симптомы и наблюдения фактически, без попытки поставить диагноз."
+        )
+        return DOCTOR_SYMPTOMS
+
+    async def doctor_prepare_symptoms(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        symptoms = update.effective_message.text.strip()
+        if not symptoms:
+            await update.effective_message.reply_text(
+                "Симптомы или наблюдения не должны быть пустыми. Если симптомов нет, "
+                "так и напиши: «нет симптомов»."
+            )
+            return DOCTOR_SYMPTOMS
+        context.user_data["doctor_prepare"]["symptoms"] = symptoms
+        prompt = "Какие лекарства, витамины или добавки ты принимаешь? Если нет — ответь «нет»."
+        reason = context.user_data["doctor_prepare"].get("reason", "")
+        if urgent := urgent_safety_message(f"{reason}. {symptoms}"):
+            prompt = f"{urgent}\nНе жди завершения опроса для обращения за помощью.\n\n{prompt}"
+        await update.effective_message.reply_text(prompt)
+        return DOCTOR_MEDICATIONS
+
+    async def doctor_prepare_medications(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        context.user_data["doctor_prepare"]["medications"] = update.effective_message.text.strip()
+        await update.effective_message.reply_text(
+            "Какие вопросы хочешь задать врачу? Если пока нет — ответь «нет»."
+        )
+        return DOCTOR_QUESTIONS
+
+    async def doctor_prepare_questions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        answers = context.user_data.pop("doctor_prepare", {})
+        answers["questions"] = update.effective_message.text.strip()
+        record_id = answers.pop("record_id", None)
+        user = await self._user(update.effective_user.id)
+        try:
+            record = await self.doctor_prep_service.save(
+                user_id=user.id,
+                timezone=user.timezone,
+                answers=answers,
+                record_id=record_id,
+            )
+        except ValueError:
+            await update.effective_message.reply_text(
+                "Не удалось сохранить: обязательные ответы не должны быть пустыми. "
+                "Запусти /doctor_prepare ещё раз."
+            )
+            return ConversationHandler.END
+        if record is None:
+            await update.effective_message.reply_text(
+                "Не удалось изменить запись: она не найдена или принадлежит другому пользователю."
+            )
+            return ConversationHandler.END
+
+        response = (
+            f"Подготовка #{record.id} сохранена.\n\n{record.summary}\n\n"
+            f"Исправить: /doctor_prepare_edit {record.id}\n"
+            f"Удалить: /doctor_prepare_delete {record.id}\n"
+            f"Создать задачу с reminder: /doctor_prepare_task {record.id} через 2 часа"
+        )
+        safety_text = f"{record.reason}. {record.duration}. {record.symptoms}"
+        if urgent := urgent_safety_message(safety_text):
+            response += (
+                f"\n\n{urgent}\nОбычная запись к врачу и reminder не заменяют срочную помощь."
+            )
+        weakness_days = await self.health_service.recent_weakness_days(user.id)
+        if weakness := prolonged_weakness_message(safety_text, weakness_days):
+            response += f"\n\n{weakness}"
+        await update.effective_message.reply_text(response)
+        return ConversationHandler.END
+
+    async def cancel_doctor_prepare(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        context.user_data.pop("doctor_prepare", None)
+        await update.effective_message.reply_text(
+            "Подготовка к визиту отменена, медицинская запись не создана."
+        )
+        return ConversationHandler.END
+
+    async def doctor_preparations(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._user(update.effective_user.id)
+        records = await self.doctor_prep_service.history(user.id, limit=10)
+        if not records:
+            await update.effective_message.reply_text(
+                "Подготовок к врачу пока нет. Начать: /doctor_prepare."
+            )
+            return
+        lines = ["Твои подготовки к врачу:"]
+        for record in records:
+            reason = " ".join(record.reason.split())
+            if len(reason) > 80:
+                reason = f"{reason[:77]}..."
+            lines.append(f"#{record.id} — {reason}")
+        lines.append("Открыть: /doctor_prepare_show ID")
+        await update.effective_message.reply_text("\n".join(lines))
+
+    async def doctor_prepare_show(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = getattr(context, "args", [])
+        if not args or not args[0].isdigit():
+            await update.effective_message.reply_text("Укажи ID: /doctor_prepare_show 12.")
+            return
+        user = await self._user(update.effective_user.id)
+        record = await self.doctor_prep_service.get_owned(user.id, int(args[0]))
+        if record is None:
+            await update.effective_message.reply_text(
+                "Такая подготовка не найдена или принадлежит другому пользователю."
+            )
+            return
+        await update.effective_message.reply_text(
+            f"Подготовка #{record.id}\n\n{record.summary}\n\n"
+            f"Исправить: /doctor_prepare_edit {record.id} · "
+            f"удалить: /doctor_prepare_delete {record.id}"
+        )
+
+    async def doctor_prepare_delete(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        args = getattr(context, "args", [])
+        if not args or not args[0].isdigit():
+            await update.effective_message.reply_text("Укажи ID: /doctor_prepare_delete 12.")
+            return
+        user = await self._user(update.effective_user.id)
+        deleted = await self.doctor_prep_service.delete_owned(user.id, int(args[0]))
+        await update.effective_message.reply_text(
+            "Подготовка к врачу удалена."
+            if deleted
+            else "Такая подготовка не найдена или принадлежит другому пользователю."
+        )
+
+    async def doctor_prepare_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = getattr(context, "args", [])
+        if len(args) < 2 or not args[0].isdigit():
+            await update.effective_message.reply_text(
+                "Формат: /doctor_prepare_task ID через 2 часа "
+                "или /doctor_prepare_task ID завтра в 10:00."
+            )
+            return
+        user = await self._user(update.effective_user.id)
+        record_id = int(args[0])
+        record = await self.doctor_prep_service.get_owned(user.id, record_id)
+        if record is None:
+            await update.effective_message.reply_text(
+                "Такая подготовка не найдена или принадлежит другому пользователю."
+            )
+            return
+        expression = " ".join(args[1:]).strip()
+        temporal = self._doctor_task_temporal(expression, user.timezone)
+        if temporal is None:
+            await update.effective_message.reply_text(
+                "Не понял будущее время reminder. Примеры: «через 2 часа», "
+                "«завтра в 10:00», «20 июля в 09:30»."
+            )
+            return
+        result = await self.doctor_prep_service.create_appointment_task(
+            user_id=user.id,
+            record_id=record_id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            temporal=temporal,
+        )
+        if result.status == "existing":
+            await update.effective_message.reply_text(
+                "Задача «Записаться к врачу» для этой подготовки уже создана; дубликат не добавлен."
+            )
+            return
+        if result.status != "created" or result.reminder is None:
+            await update.effective_message.reply_text(
+                "Не удалось создать задачу с reminder. Медицинская запись не изменена."
+            )
+            return
+        local_reminder = result.reminder.remind_at
+        if local_reminder.tzinfo is None:
+            local_reminder = local_reminder.replace(tzinfo=UTC)
+        local_reminder = local_reminder.astimezone(ZoneInfo(user.timezone))
+        response = (
+            "Задача «Записаться к врачу» создана без медицинских подробностей. "
+            f"Reminder: {local_reminder.strftime('%d.%m.%Y %H:%M')} ({user.timezone})."
+        )
+        if urgent_safety_message(f"{record.reason}. {record.symptoms}"):
+            response += " Эта задача не заменяет срочную медицинскую помощь."
+        await update.effective_message.reply_text(response)
+
+    def _doctor_task_temporal(
+        self, expression: str, timezone_name: str
+    ) -> TemporalResolution | None:
+        relative_command = (
+            expression if expression.lower().startswith("напомни") else f"Напомни {expression}"
+        )
+        relative = self.date_resolver.resolve_relative_reminder(
+            f"{relative_command} Записаться к врачу",
+            timezone_name,
+        )
+        if relative is not None:
+            return relative.temporal
+        resolution = self.date_resolver.resolve(expression, timezone_name)
+        if resolution.status != "resolved" or resolution.target_date is None:
+            return None
+        local_time = self.date_resolver.extract_local_time(expression)
+        precision = "datetime" if local_time is not None else "date"
+        local_time = local_time or time(hour=self.settings.task_date_event_hour)
+        local_event = datetime.combine(
+            resolution.target_date,
+            local_time,
+            tzinfo=ZoneInfo(timezone_name),
+        )
+        event_at = local_event.astimezone(UTC)
+        if event_at <= datetime.now(UTC):
+            return None
+        return TemporalResolution(
+            resolved_at=event_at,
+            remind_at=event_at if precision == "datetime" else None,
+            timezone=timezone_name,
+            resolved_local_date=resolution.target_date,
+            resolved_local_time=local_time if precision == "datetime" else None,
+            precision=precision,
+            original_expression=expression,
+            resolution_status="resolved",
+        )
+
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             "/start — онбординг, /profile — профиль, /goals — обновить цели, /today — фокус дня, "
             "/evening — рефлексия, /inbox — сохранённые мысли, /drafts — активные черновики, "
             "/last_saved — последняя запись, /cleanup_drafts — безопасная очистка черновиков, "
-            "/health — состояние и динамика, /checkin — health check-in."
+            "/health — состояние и динамика, /checkin — health check-in, "
+            "/doctor_prepare — подготовка к визиту к врачу."
         )
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

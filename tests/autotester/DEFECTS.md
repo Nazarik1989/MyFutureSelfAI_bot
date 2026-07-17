@@ -83,3 +83,30 @@ Resolved behavior: conservative deterministic markers cover these forms while
 local negation still prevents escalation for statements such as
 `Я не задыхаюсь, дыхание нормальное`. Health text remains outside the LLM and
 application logs.
+
+## DOCTOR-D001 — red flags were delayed until the end of visit preparation
+
+Initial implementation collected medications and questions after a red-flag
+reason or symptom before showing urgent guidance.
+
+Resolved behavior: the deterministic safety check runs immediately after the
+reason and symptom steps. The user is explicitly told not to wait for the form
+before seeking urgent help; the final factual summary repeats the guidance.
+
+## DOCTOR-D002 — task idempotency was not concurrency-safe
+
+Initial implementation prevented sequential duplicate appointment tasks but two
+concurrent identical commands could both observe an empty task link.
+
+Resolved behavior: task creation and the owner-scoped preparation link use one
+transaction with a compare-and-set update. A losing concurrent transaction is
+rolled back and returns the already-created generic task and reminder.
+
+## DOCTOR-D003 — structured duration was omitted from prolonged-weakness safety
+
+Initial implementation checked only the reason and symptom fields. If
+`несколько недель` was supplied in the dedicated duration answer, the
+long-lasting weakness recommendation could be missed.
+
+Resolved behavior: reason, structured duration, and current symptoms are all
+included in the deterministic prolonged-weakness safety check.

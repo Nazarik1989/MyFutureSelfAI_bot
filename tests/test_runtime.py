@@ -48,7 +48,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260717_0010')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260717_0011')")
         )
 
     async def forbidden_network(*args, **kwargs):
@@ -100,6 +100,7 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     assert isinstance(handlers[0], ConversationHandler)
     assert isinstance(handlers[1], ConversationHandler)
     assert isinstance(handlers[2], ConversationHandler)
+    assert isinstance(handlers[3], ConversationHandler)
     onboarding_commands = {
         command
         for handler in handlers[0].entry_points
@@ -121,6 +122,13 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         for command in handler.commands
     }
     assert health_commands == {"checkin", "health_edit"}
+    doctor_commands = {
+        command
+        for handler in handlers[3].entry_points
+        if isinstance(handler, CommandHandler)
+        for command in handler.commands
+    }
+    assert doctor_commands == {"doctor_prepare", "doctor_prepare_edit"}
     commands = {
         command
         for handler in handlers
@@ -141,6 +149,10 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "health_delete",
         "health_reminder_on",
         "health_reminder_off",
+        "doctor_preparations",
+        "doctor_prepare_show",
+        "doctor_prepare_delete",
+        "doctor_prepare_task",
     } <= commands
     assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 9
     assert sum(isinstance(handler, MessageHandler) for handler in handlers) == 2

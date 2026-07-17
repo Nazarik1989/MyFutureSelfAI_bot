@@ -26,6 +26,31 @@ def sorted_drafts(*drafts: DraftState) -> tuple[DraftState, ...]:
     return tuple(sorted(drafts))
 
 
+def doctor_steps(
+    *,
+    reason: str = "Слабость",
+    duration: str = "Три недели",
+    symptoms: str = "Быстро устаю к вечеру",
+    medications: str = "нет",
+    questions: str = "Что важно наблюдать дальше?",
+) -> tuple[ScenarioStep, ...]:
+    return (
+        ScenarioStep("command", "/doctor_prepare", reply_contains=("причина обращения",)),
+        ScenarioStep("doctor_answer", reason, reply_contains=("Как долго",)),
+        ScenarioStep("doctor_answer", duration, reply_contains=("Перечисли симптомы",)),
+        ScenarioStep("doctor_answer", symptoms, reply_contains=("лекарства",)),
+        ScenarioStep("doctor_answer", medications, reply_contains=("вопросы",)),
+        ScenarioStep(
+            "doctor_answer",
+            questions,
+            reply_contains=(
+                "Краткое фактическое резюме",
+                "не медицинский диагноз",
+            ),
+        ),
+    )
+
+
 def focused_save_scenario(
     index: int,
     command: str,
@@ -740,6 +765,205 @@ HEALTH_SCENARIOS = (
 )
 
 
+DOCTOR_PREP_SCENARIOS = (
+    Scenario(
+        name="doctor-prep-full-factual-flow-without-health-data",
+        steps=doctor_steps(),
+        expected=ExpectedState(doctor_prep_count=1),
+    ),
+    Scenario(
+        name="doctor-prep-includes-owner-health-track-dynamics",
+        steps=(
+            ScenarioStep("command", "/checkin"),
+            ScenarioStep("health_answer", "7"),
+            ScenarioStep("health_answer", "6"),
+            ScenarioStep("health_answer", "8"),
+            ScenarioStep("health_answer", "3"),
+            ScenarioStep("health_answer", "7"),
+            ScenarioStep("health_answer", "нет"),
+            *doctor_steps(),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_show 1",
+                reply_contains=("Health Track: 1 check-in", "линейка 70/100"),
+            ),
+        ),
+        expected=ExpectedState(health_scores=(70,), doctor_prep_count=1),
+    ),
+    Scenario(
+        name="doctor-prep-cancel-and-resume-does-not-save-partial-record",
+        steps=(
+            ScenarioStep("command", "/doctor_prepare"),
+            ScenarioStep("doctor_answer", "Головная боль"),
+            ScenarioStep(
+                "command",
+                "/cancel",
+                reply_contains=("отменена", "не создана"),
+            ),
+            ScenarioStep(
+                "command",
+                "/doctor_preparations",
+                reply_contains=("пока нет",),
+            ),
+            *doctor_steps(reason="Головная боль"),
+        ),
+        expected=ExpectedState(doctor_prep_count=1),
+    ),
+    Scenario(
+        name="doctor-prep-required-blank-answers-do-not-advance",
+        steps=(
+            ScenarioStep("command", "/doctor_prepare"),
+            ScenarioStep("doctor_answer", "   ", reply_contains=("не должна быть пустой",)),
+            ScenarioStep("doctor_answer", "Слабость", reply_contains=("Как долго",)),
+            ScenarioStep("doctor_answer", " ", reply_contains=("не должна быть пустой",)),
+            ScenarioStep("doctor_answer", "Две недели", reply_contains=("симптомы",)),
+            ScenarioStep("doctor_answer", "  ", reply_contains=("не должны быть пустыми",)),
+            ScenarioStep("doctor_answer", "Усталость к вечеру", reply_contains=("лекарства",)),
+            ScenarioStep("doctor_answer", "нет", reply_contains=("вопросы",)),
+            ScenarioStep("doctor_answer", "нет", reply_contains=("сохранена",)),
+        ),
+        expected=ExpectedState(doctor_prep_count=1),
+    ),
+    Scenario(
+        name="doctor-prep-edit-show-and-delete-owner-record",
+        steps=(
+            *doctor_steps(),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_edit 1",
+                reply_contains=("Исправляем",),
+            ),
+            ScenarioStep("doctor_answer", "Обновлённая причина"),
+            ScenarioStep("doctor_answer", "Пять дней"),
+            ScenarioStep("doctor_answer", "Наблюдение изменилось"),
+            ScenarioStep("doctor_answer", "витамин D"),
+            ScenarioStep(
+                "doctor_answer",
+                "Нужна ли повторная консультация?",
+                reply_contains=("Обновлённая причина",),
+            ),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_show 1",
+                reply_contains=("Обновлённая причина", "витамин D"),
+            ),
+            ScenarioStep("command", "/doctor_prepare_delete 1", reply_contains=("удалена",)),
+            ScenarioStep("command", "/doctor_preparations", reply_contains=("пока нет",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="doctor-prep-owner-isolation-for-list-show-edit-delete",
+        steps=(
+            *doctor_steps(reason="Приватная причина 7c2"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep("command", "/doctor_preparations", reply_contains=("пока нет",)),
+            ScenarioStep("command", "/doctor_prepare_show 1", reply_contains=("не найдена",)),
+            ScenarioStep("command", "/doctor_prepare_edit 1", reply_contains=("не найдена",)),
+            ScenarioStep("command", "/doctor_prepare_delete 1", reply_contains=("не найдена",)),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_show 1",
+                reply_contains=("Приватная причина 7c2",),
+            ),
+        ),
+        expected=ExpectedState(doctor_prep_count=1),
+    ),
+    Scenario(
+        name="doctor-prep-red-flag-recommends-urgent-help-not-routine-delay",
+        steps=(
+            ScenarioStep("command", "/doctor_prepare"),
+            ScenarioStep(
+                "doctor_answer",
+                "Боль в груди",
+                reply_contains=(
+                    "экстренную медицинскую службу",
+                    "Не жди завершения опроса",
+                ),
+            ),
+            ScenarioStep("doctor_answer", "Началось сегодня"),
+            ScenarioStep(
+                "doctor_answer",
+                "Сильная боль в груди и трудно дышать",
+                reply_contains=(
+                    "экстренную медицинскую службу",
+                    "Не жди завершения опроса",
+                ),
+            ),
+            ScenarioStep("doctor_answer", "нет"),
+            ScenarioStep(
+                "doctor_answer",
+                "Что делать?",
+                reply_contains=(
+                    "экстренную медицинскую службу",
+                    "не заменяют срочную помощь",
+                ),
+                reply_excludes=("принимайте", "диагноз:"),
+            ),
+        ),
+        expected=ExpectedState(doctor_prep_count=1),
+    ),
+    Scenario(
+        name="doctor-prep-prolonged-weakness-suggests-visit-observation-list",
+        steps=doctor_steps(
+            reason="Слабость",
+            duration="Несколько недель",
+            symptoms="Слабость усиливается к вечеру",
+        )[:-1]
+        + (
+            ScenarioStep(
+                "doctor_answer",
+                "Что важно наблюдать?",
+                reply_contains=("записаться", "подготовить наблюдения", "не диагноз"),
+                reply_excludes=("назначить лечение",),
+            ),
+        ),
+        expected=ExpectedState(doctor_prep_count=1),
+    ),
+    Scenario(
+        name="doctor-prep-creates-one-generic-reminder-task-idempotently",
+        steps=(
+            *doctor_steps(reason="Чувствительная причина не для reminder"),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_task 1 через 2 часа",
+                reply_contains=("Задача «Записаться к врачу» создана", "Reminder"),
+                reply_excludes=("Чувствительная причина",),
+            ),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_task 1 через 2 часа",
+                reply_contains=("дубликат не добавлен",),
+            ),
+        ),
+        expected=ExpectedState(
+            inbox=(InboxState("Записаться к врачу", "task", "doctor_prepare"),),
+            doctor_prep_count=1,
+            task_reminder_count=1,
+        ),
+    ),
+    Scenario(
+        name="doctor-prep-task-invalid-time-and-foreign-record-create-nothing",
+        steps=(
+            *doctor_steps(),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_task 1 когда-нибудь",
+                reply_contains=("Не понял будущее время",),
+            ),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "command",
+                "/doctor_prepare_task 1 через 2 часа",
+                reply_contains=("не найдена",),
+            ),
+        ),
+        expected=ExpectedState(doctor_prep_count=1),
+    ),
+)
+
+
 SCENARIOS = (
     *CORE_SCENARIOS,
     *GENERATED_SAVE_SCENARIOS,
@@ -751,4 +975,5 @@ SCENARIOS = (
     *RESOLVED_SAVE_REGRESSION_SCENARIOS,
     *RESOLVED_NEGATIVE_REGRESSION_SCENARIOS,
     *HEALTH_SCENARIOS,
+    *DOCTOR_PREP_SCENARIOS,
 )

@@ -47,6 +47,7 @@ class User(TimestampMixin, Base):
     routines: Mapped[list[Routine]] = relationship(back_populates="user")
     inbox_items: Mapped[list[InboxItem]] = relationship(back_populates="user")
     health_check_ins: Mapped[list[HealthCheckIn]] = relationship(back_populates="user")
+    doctor_visit_preps: Mapped[list[DoctorVisitPrep]] = relationship(back_populates="user")
 
 
 class DraftInboxItem(Base):
@@ -277,6 +278,27 @@ class HealthReminderPreference(TimestampMixin, Base):
     timezone: Mapped[str] = mapped_column(String(64))
     local_time: Mapped[time] = mapped_column(Time)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class DoctorVisitPrep(TimestampMixin, Base):
+    __tablename__ = "doctor_visit_preps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    timezone: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+    duration: Mapped[str] = mapped_column(Text)
+    symptoms: Mapped[str] = mapped_column(Text)
+    medications: Mapped[str | None] = mapped_column(Text)
+    questions: Mapped[str | None] = mapped_column(Text)
+    health_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    summary: Mapped[str] = mapped_column(Text)
+    appointment_inbox_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("inbox_items.id", ondelete="SET NULL"),
+        unique=True,
+    )
+    user: Mapped[User] = relationship(back_populates="doctor_visit_preps")
+    appointment_inbox_item: Mapped[InboxItem | None] = relationship()
 
 
 class OnboardingState(TimestampMixin, Base):
