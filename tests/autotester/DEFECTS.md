@@ -1,20 +1,20 @@
-# Defects found by the deterministic scenario matrix
+# Resolved routing defects from the deterministic scenario matrix
 
-This report contains application defects reproduced by `tests/autotester`.
-Application code is intentionally not changed in PR #3. Each listed case is a
-strict `xfail`: it remains visible in the full suite, and an unexpected fix
-becomes an `XPASS(strict)` failure until this report and the marker are updated.
+The 70-scenario matrix introduced in PR #3 found three application-routing
+defects. They were first reproduced as 14 strict `xfail` scenarios, then fixed
+in a separate application-code PR. All 14 scenarios now run as ordinary passing
+tests through the real text and voice entry points.
 
-## AUTOTEST-D001 — filler and politeness break focused-draft save routing
+## AUTOTEST-D001 — filler and politeness broke focused-draft save routing
 
-Expected: with one focused draft, the command is handled before Intent Router,
-saves that draft once, and never creates another preview.
+Previous behavior: the exact save predicate rejected bounded filler or
+politeness, so the command reached Intent Router and could become a new preview.
 
-Observed: the command reaches the LLM route because the save predicate requires
-an exact normalized phrase. A note-like preview can be created from the command
-instead of saving the focused draft.
+Resolved behavior: a conservative token grammar accepts a maximum of two known
+leading fillers and one bounded `пожалуйста`, while still requiring an exact
+save verb and inbox target.
 
-Reproduced through alternating text and voice entry points:
+Passing variants:
 
 - `Ну сохрани в инбокс`
 - `Пожалуйста, сохрани в inbox`
@@ -23,51 +23,40 @@ Reproduced through alternating text and voice entry points:
 - `Эээ сохрани в инбокс`
 - `Сохрани, пожалуйста, это в inbox`
 
-Impact: the original focused card remains unsaved, and a later valid save
-command can target the erroneous command-preview.
+## AUTOTEST-D002 — clipped transcription was treated as inbox content
 
-## AUTOTEST-D002 — clipped transcription is treated as inbox content
+Previous behavior: short command-shaped transcriptions reached Intent Router
+and could replace the effective focus with an erroneous preview.
 
-Expected in these scenarios: when exactly one focused draft exists, the short
-command-shaped transcription saves that draft. With no draft or ambiguous
-drafts, a future fix should clarify without invoking the LLM or creating a
-preview.
+Resolved behavior: the explicitly supported clipped forms route as a save
+action. One focused draft is saved; no draft returns the existing missing-draft
+response; multiple drafts use the existing clarification flow.
 
-Observed: clipped variants reach Intent Router and can become new inbox
-previews.
-
-Reproduced through alternating text and voice entry points:
+Passing variants:
 
 - `Это в инбокс`
 - `Это в inbox`
 - `В инбокс`
 - `Сохрани в инбок`
 
-Impact: a common lost-word or truncated voice transcription can replace the
-effective focus with an erroneous preview.
+## AUTOTEST-D003 — extended negative commands reached the LLM
 
-## AUTOTEST-D003 — extended negative commands reach the LLM
+Previous behavior: adding `это`, politeness, or the supported clipped inbox
+target prevented the negative command from matching. The original draft stayed
+active and a command-preview could be created.
 
-Expected: negative control language never saves anything, never invokes the
-LLM, and discards the focused draft when the instruction is unambiguous.
+Resolved behavior: a separate negative grammar recognizes only bounded
+command-shaped forms and routes them to the existing discard action.
 
-Observed: only the exact negative phrases are recognized. Adding `это`,
-politeness, or a clipped final word sends the phrase to Intent Router and can
-create a preview while leaving the original draft active.
-
-Reproduced through alternating text and voice entry points:
+Passing variants:
 
 - `Не сохраняй это в инбокс`
 - `Пожалуйста, не сохраняй в inbox`
 - `Не надо это сохранять в инбокс`
 - `Не сохраняй в инбок`
 
-Impact: the user's explicit negative instruction is not honored
-deterministically and can generate additional state.
+## False-positive protection
 
-## Suggested follow-up scope
-
-Fix these defects in a separate application-code PR. Keep the parser
-conservative: accept bounded filler/politeness and explicitly supported clipped
-forms only when draft context makes the action safe; do not turn arbitrary
-sentences containing `сохранить` or `инбокс` into control commands.
+The matrix still sends ordinary sentences containing `сохранить`, `сохранять`,
+`инбокс`, or `inbox` to Intent Router. The fix does not use open-ended substring
+matching and does not broaden read-only natural-command patterns.

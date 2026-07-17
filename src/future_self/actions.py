@@ -6,7 +6,7 @@ from typing import Literal
 
 from .drafts import DraftInboxService, DraftResult, masked_user
 from .models import DraftInboxItem
-from .natural_commands import is_save_inbox_command
+from .natural_commands import is_discard_inbox_command, is_save_inbox_command
 from .schemas import ParsedThought
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ class DraftCommandInterpreter:
             return CommandMatch(action="create_task", confidence=1.0)
         if normalized in self.EDIT:
             return CommandMatch(action="edit", confidence=1.0)
-        if normalized in self.DISCARD:
+        if normalized in self.DISCARD or is_discard_inbox_command(text):
             return CommandMatch(action="discard", confidence=1.0)
         if normalized in self.CANCEL:
             return CommandMatch(action="cancel", confidence=1.0)
