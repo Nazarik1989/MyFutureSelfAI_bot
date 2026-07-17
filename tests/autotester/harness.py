@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,7 @@ StepKind = Literal[
     "callback",
     "command",
     "health_answer",
+    "switch_user",
     "setup_clear_focus",
 ]
 
@@ -88,6 +90,9 @@ class ExpectedState:
     llm_inputs: tuple[str, ...] = ()
     health_scores: tuple[int, ...] = ()
     health_reminder_enabled: bool = False
+    health_reminder_time: str | None = None
+    health_reminder_schedules: tuple[str, ...] = ()
+    health_reminder_removals: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +115,19 @@ class StepResult:
 class ScenarioResult:
     steps: tuple[StepResult, ...]
     state: ExpectedState
+
+
+class RecordingHealthScheduler:
+    def __init__(self) -> None:
+        self.scheduled_times: list[str] = []
+        self.removed_users: list[int] = []
+
+    def schedule_health_reminder(self, **kwargs: object) -> None:
+        local_time = kwargs["local_time"]
+        self.scheduled_times.append(local_time.strftime("%H:%M"))
+
+    def remove_health_reminder(self, user_id: int) -> None:
+        self.removed_users.append(user_id)
 
 
 def build_autotest_settings(database_url: str) -> Settings:
@@ -175,6 +193,7 @@ class BotAutotester:
         self.chat_id = chat_id
         self.messages: list[FakeMessage] = []
         self.health_state: int | None = None
+        self.contexts = {telegram_user_id: context}
 
     @classmethod
     async def create(cls, sandbox: Path, stubs: tuple[LLMStub, ...]) -> "BotAutotester":
@@ -191,9 +210,12 @@ class BotAutotester:
         ai = StrictAI(responses)
         transcription = ScriptedTranscription()
         context = SimpleNamespace(user_data={}, bot=FakeBot())
+        bot = FutureSelfBot(settings, database, ai, transcription)
+        scheduler = RecordingHealthScheduler()
+        bot.scheduler = scheduler
         return cls(
             database=database,
-            bot=FutureSelfBot(settings, database, ai, transcription),
+            bot=bot,
             ai=ai,
             transcription=transcription,
             context=context,
@@ -249,9 +271,16 @@ class BotAutotester:
             llm_inputs=tuple(self.ai.route_calls),
             health_scores=tuple(sorted(record.state_score for record in health_records)),
             health_reminder_enabled=bool(health_preference and health_preference.enabled),
+            health_reminder_time=(
+                health_preference.local_time.strftime("%H:%M") if health_preference else None
+            ),
+            health_reminder_schedules=tuple(self.bot.scheduler.scheduled_times),
+            health_reminder_removals=len(self.bot.scheduler.removed_users),
         )
 
     async def _run_step(self, step: ScenarioStep) -> StepResult:
+        if step.kind == "switch_user":
+            return self._switch_user(step.value)
         if step.kind == "setup_clear_focus":
             await self.bot.conversation.clear_focus(self.telegram_user_id, self.chat_id)
             return StepResult(step.kind, step.value, ())
@@ -284,11 +313,14 @@ class BotAutotester:
         handlers = {
             "health": self.bot.health_command,
             "checkin": self.bot.health_checkin_start,
+            "health_edit": self.bot.health_checkin_start,
+            "health_delete": self.bot.health_delete_command,
             "health_reminder_on": self.bot.health_reminder_on,
             "health_reminder_off": self.bot.health_reminder_off,
+            "cancel": self.bot.cancel_health_checkin,
         }
         result = await handlers[command](update, self.context)
-        if command == "checkin":
+        if command in {"checkin", "health_edit", "cancel"}:
             self.health_state = result
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult("command", value, outputs)
@@ -306,12 +338,26 @@ class BotAutotester:
             raise AssertionError("No active health check-in state")
         message = FakeMessage(value)
         self.messages.append(message)
-        self.health_state = await handlers[self.health_state](
-            self._update_for(message),
-            self.context,
-        )
+        if self.health_state != HEALTH_SYMPTOMS and re.fullmatch(r"(?:10|[0-9])", value) is None:
+            await self.bot.health_invalid_rating(self._update_for(message), self.context)
+        else:
+            self.health_state = await handlers[self.health_state](
+                self._update_for(message),
+                self.context,
+            )
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult("health_answer", value, outputs)
+
+    def _switch_user(self, value: str) -> StepResult:
+        parts = value.split(":", maxsplit=1)
+        self.telegram_user_id = int(parts[0])
+        self.chat_id = int(parts[1]) if len(parts) == 2 else self.telegram_user_id + 10_000
+        self.context = self.contexts.setdefault(
+            self.telegram_user_id,
+            SimpleNamespace(user_data={}, bot=FakeBot()),
+        )
+        self.health_state = None
+        return StepResult("switch_user", value, ())
 
     async def _run_callback(self, action: str) -> StepResult:
         data, message = self._latest_preview_callback(action)

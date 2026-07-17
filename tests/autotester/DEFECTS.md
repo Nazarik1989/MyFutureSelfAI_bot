@@ -1,6 +1,6 @@
 # Resolved routing defects from the deterministic scenario matrix
 
-The 70-scenario matrix introduced in PR #3 found three application-routing
+The deterministic matrix introduced in PR #3 found three application-routing
 defects. They were first reproduced as 14 strict `xfail` scenarios, then fixed
 in a separate application-code PR. All 14 scenarios now run as ordinary passing
 tests through the real text and voice entry points.
@@ -60,3 +60,26 @@ Passing variants:
 The matrix still sends ordinary sentences containing `сохранить`, `сохранять`,
 `инбокс`, or `inbox` to Intent Router. The fix does not use open-ended substring
 matching and does not broaden read-only natural-command patterns.
+
+## HEALTH-D001 — daily reminder disappeared after a delivery failure
+
+Previous behavior: the health reminder used a one-shot job and scheduled the
+next day only after a successful Telegram send. A transient send failure left
+the opt-in preference in the database but no active job until process restart.
+It also created a race where an in-flight callback could schedule a job again
+after `/health_reminder_off`.
+
+Resolved behavior: the existing scheduler owns one timezone-aware recurring
+daily job per user. Updating or disabling the preference removes that named job;
+delivery success is no longer responsible for scheduling the next occurrence.
+
+## HEALTH-D002 — colloquial red flags were not escalated
+
+Previous behavior: phrases such as `Я задыхаюсь, мне не хватает воздуха` and
+`Есть мысли причинить себе вред` were stored but did not receive the urgent
+medical-help response.
+
+Resolved behavior: conservative deterministic markers cover these forms while
+local negation still prevents escalation for statements such as
+`Я не задыхаюсь, дыхание нормальное`. Health text remains outside the LLM and
+application logs.

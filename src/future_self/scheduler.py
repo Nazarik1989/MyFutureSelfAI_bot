@@ -118,18 +118,12 @@ class JobQueueScheduler:
     ) -> None:
         self.remove_health_reminder(user_id)
         zone = ZoneInfo(timezone)
-        now = datetime.now(UTC).astimezone(zone)
-        target = datetime.combine(now.date(), local_time, tzinfo=zone)
-        if target <= now:
-            target += timedelta(days=1)
-        self.job_queue.run_once(
+        self.job_queue.run_daily(
             self._health_checkin,
-            when=target.astimezone(UTC),
+            time=local_time.replace(tzinfo=zone),
             data={
                 "user_id": user_id,
                 "chat_id": chat_id,
-                "timezone": timezone,
-                "local_time": local_time.isoformat(),
             },
             name=f"health:{user_id}:daily",
         )
@@ -139,12 +133,6 @@ class JobQueueScheduler:
         await self.send(
             data["chat_id"],
             "Добровольный health check-in: /checkin. Это самонаблюдение, не медицинский диагноз.",
-        )
-        self.schedule_health_reminder(
-            user_id=data["user_id"],
-            chat_id=data["chat_id"],
-            timezone=data["timezone"],
-            local_time=time.fromisoformat(data["local_time"]),
         )
 
     def remove_health_reminder(self, user_id: int) -> None:

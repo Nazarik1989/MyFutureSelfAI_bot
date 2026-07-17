@@ -95,6 +95,8 @@ def test_subjective_score_is_bounded_and_inverts_stress():
         "Перекос лица и неразборчивая речь",
         "Сильное кровотечение",
         "Судороги",
+        "Я задыхаюсь, мне не хватает воздуха",
+        "Есть мысли причинить себе вред",
     ],
 )
 def test_red_flags_recommend_emergency_help_without_diagnosis(symptoms):
@@ -107,6 +109,7 @@ def test_red_flags_recommend_emergency_help_without_diagnosis(symptoms):
 
 def test_negated_or_mild_symptoms_do_not_trigger_emergency_message():
     assert urgent_safety_message("Нет боли в груди, просто устал") is None
+    assert urgent_safety_message("Я не задыхаюсь, дыхание нормальное") is None
     assert urgent_safety_message("Небольшая усталость после работы") is None
     assert urgent_safety_message("Нет боли в груди, но сильная одышка") is not None
 
@@ -308,7 +311,7 @@ async def test_health_reminder_rejects_non_hhmm_time(db, fake_ai):
         assert await session.scalar(select(func.count(HealthReminderPreference.id))) == 0
 
 
-def test_scheduler_health_reminder_uses_timezone_and_deduplicated_job_name():
+def test_scheduler_health_reminder_uses_recurring_timezone_job_and_deduplicated_name():
     jobs: list[dict[str, object]] = []
     removals: list[str] = []
 
@@ -321,7 +324,7 @@ def test_scheduler_health_reminder_uses_timezone_and_deduplicated_job_name():
             assert name == "health:12:daily"
             return [Job()]
 
-        def run_once(self, callback, **kwargs):
+        def run_daily(self, callback, **kwargs):
             jobs.append({"callback": callback, **kwargs})
 
     async def send(chat_id: int, text: str):
@@ -337,3 +340,40 @@ def test_scheduler_health_reminder_uses_timezone_and_deduplicated_job_name():
     assert removals == ["removed"]
     assert jobs[0]["name"] == "health:12:daily"
     assert jobs[0]["data"]["chat_id"] == 99
+    assert jobs[0]["time"].hour == 20
+    assert jobs[0]["time"].tzinfo.key == "Europe/Moscow"
+
+
+async def test_health_reminder_delivery_is_generic_and_recurring_job_survives_error():
+    jobs: list[dict[str, object]] = []
+    sent: list[tuple[int, str]] = []
+
+    class Queue:
+        def get_jobs_by_name(self, name):
+            return []
+
+        def run_daily(self, callback, **kwargs):
+            jobs.append({"callback": callback, **kwargs})
+
+    async def failing_send(chat_id: int, text: str):
+        sent.append((chat_id, text))
+        raise RuntimeError("synthetic delivery failure")
+
+    scheduler = JobQueueScheduler(Queue(), failing_send, 8, 21, 6)
+    scheduler.schedule_health_reminder(
+        user_id=12,
+        chat_id=99,
+        timezone="Europe/Moscow",
+        local_time=time(20),
+    )
+    context = SimpleNamespace(job=SimpleNamespace(data=jobs[0]["data"]))
+
+    with pytest.raises(RuntimeError, match="synthetic delivery failure"):
+        await jobs[0]["callback"](context)
+
+    assert len(jobs) == 1
+    assert sent[0][0] == 99
+    assert "/checkin" in sent[0][1]
+    assert "диагноз" in sent[0][1]
+    assert "симптом" not in sent[0][1].lower()
+    assert "100" not in sent[0][1]
