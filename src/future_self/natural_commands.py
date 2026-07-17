@@ -2,6 +2,19 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+SAVE_INBOX_PATTERN = re.compile(r"^сохрани(?:м)?(?:\s+это)?(?:\s+в)?\s+(?:инбокс|inbox)$")
+
+
+def normalize_command_text(text: str) -> str:
+    lowered = text.lower().replace("ё", "е")
+    lowered = re.sub(r"[^a-zа-я0-9]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def is_save_inbox_command(text: str) -> bool:
+    return SAVE_INBOX_PATTERN.fullmatch(normalize_command_text(text)) is not None
+
+
 NaturalAction = Literal[
     "show_drafts",
     "show_inbox",
@@ -64,20 +77,13 @@ class NaturalCommandRouter:
             "что ты умеешь",
         ),
     }
-    WRITE_INBOX = (
-        "сохрани inbox",
-        "сохрани инбокс",
-        "сохрани в inbox",
-        "сохрани в инбокс",
-        "добавь в inbox",
-        "добавь в инбокс",
-        "запиши в inbox",
-        "запиши в инбокс",
-    )
+    WRITE_INBOX = ("добавь в inbox", "добавь в инбокс", "запиши в inbox", "запиши в инбокс")
 
     def route(self, text: str) -> NaturalCommand | None:
         normalized = self._normalize(text)
-        if any(pattern in normalized for pattern in self.WRITE_INBOX):
+        if is_save_inbox_command(text) or any(
+            pattern in normalized for pattern in self.WRITE_INBOX
+        ):
             return None
         for action, patterns in self.PATTERNS.items():
             if any(pattern in normalized for pattern in patterns):
@@ -86,6 +92,4 @@ class NaturalCommandRouter:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        lowered = text.lower().replace("ё", "е")
-        lowered = re.sub(r"[^a-zа-я0-9]+", " ", lowered)
-        return re.sub(r"\s+", " ", lowered).strip()
+        return normalize_command_text(text)

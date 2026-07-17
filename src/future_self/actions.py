@@ -6,6 +6,7 @@ from typing import Literal
 
 from .drafts import DraftInboxService, DraftResult, masked_user
 from .models import DraftInboxItem
+from .natural_commands import is_save_inbox_command
 from .schemas import ParsedThought
 
 logger = logging.getLogger(__name__)
@@ -48,12 +49,6 @@ class DraftCommandInterpreter:
         "оставь это",
         "добавь в inbox",
         "добавь это в inbox",
-        "сохрани inbox",
-        "сохрани инбокс",
-        "сохрани в inbox",
-        "сохрани это в inbox",
-        "сохрани в инбокс",
-        "сохрани это в инбокс",
         "добавь в инбокс",
         "добавь это в инбокс",
     }
@@ -64,7 +59,16 @@ class DraftCommandInterpreter:
         "запланируй это",
     }
     EDIT = {"редактировать", "редактируй", "измени это", "измени последнее"}
-    DISCARD = {"не сохраняй", "не сохранять", "удали черновик"}
+    DISCARD = {
+        "не сохраняй",
+        "не сохранять",
+        "не сохраняй в инбокс",
+        "не сохраняй в inbox",
+        "не надо сохранять",
+        "не надо сохранять в инбокс",
+        "не надо сохранять в inbox",
+        "удали черновик",
+    }
     CANCEL = {"отмена", "отмени", "отменить"}
     DEFER = (
         "не сохраняй пока",
@@ -79,7 +83,7 @@ class DraftCommandInterpreter:
         normalized = self._normalize(text)
         if any(marker in normalized for marker in self.DEFER):
             return CommandMatch(handled_without_action=True)
-        if normalized in self.SAVE:
+        if normalized in self.SAVE or is_save_inbox_command(text):
             return CommandMatch(action="save", confidence=1.0)
         if normalized in self.CREATE_TASK:
             return CommandMatch(action="create_task", confidence=1.0)
