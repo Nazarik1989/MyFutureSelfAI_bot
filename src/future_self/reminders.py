@@ -63,9 +63,14 @@ def schedule_from_temporal(
         event_at = local_event.astimezone(UTC)
     else:
         event_at = as_utc(temporal.resolved_at)
+    remind_at = (
+        as_utc(temporal.remind_at)
+        if temporal.remind_at is not None
+        else event_at - timedelta(minutes=lead_minutes)
+    )
     return ReminderSchedule(
         event_at=event_at,
-        remind_at=event_at - timedelta(minutes=lead_minutes),
+        remind_at=remind_at,
         timezone=temporal.timezone,
     )
 

@@ -656,6 +656,7 @@ class DraftInboxService:
             str(temporal.get(field) or "")
             for field in (
                 "resolved_at",
+                "remind_at",
                 "resolved_local_date",
                 "resolved_local_time",
                 "timezone",

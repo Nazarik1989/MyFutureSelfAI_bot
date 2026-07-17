@@ -676,6 +676,33 @@ class FutureSelfBot:
         if action_route.kind != "none":
             await self._handle_action_route(update, context, user, snapshot, action_route, source)
             return
+        relative_reminder = self.date_resolver.resolve_relative_reminder(text, user.timezone)
+        if relative_reminder is not None:
+            await self.conversation.append(
+                telegram_user_id,
+                chat_id,
+                role="user",
+                content=text.strip(),
+                source=source,
+                intent="relative_reminder",
+                topic=relative_reminder.title,
+            )
+            await self._show_preview(
+                update.effective_message,
+                user.id,
+                telegram_user_id,
+                chat_id,
+                text.strip(),
+                source,
+                ParsedThought(
+                    kind="task",
+                    title=relative_reminder.title,
+                    resolved_date=relative_reminder.temporal.resolved_local_date,
+                    temporal_resolution=relative_reminder.temporal,
+                ),
+                include_original=source != "voice",
+            )
+            return
         date_resolution = self.date_resolver.resolve(text, user.timezone)
         if date_resolution.status == "conflict":
             response = self.date_resolver.conflict_message(date_resolution)
@@ -1645,7 +1672,10 @@ class FutureSelfBot:
             local_value = temporal.resolved_local_date.strftime("%d.%m.%Y")
             if temporal.resolved_local_time:
                 local_value += f" {temporal.resolved_local_time.strftime('%H:%M')}"
-            resolved = f"\nДата: {local_value}\nЧасовой пояс: {escape(temporal.timezone)}"
+            temporal_label = "Напоминание" if temporal.remind_at is not None else "Дата"
+            resolved = (
+                f"\n{temporal_label}: {local_value}\nЧасовой пояс: {escape(temporal.timezone)}"
+            )
         else:
             resolved = (
                 f"\nДата начала: {draft.resolved_date.strftime('%d.%m.%Y')}"

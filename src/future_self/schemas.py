@@ -40,6 +40,7 @@ class RoutineProposals(BaseModel):
 
 class TemporalResolution(BaseModel):
     resolved_at: datetime
+    remind_at: datetime | None = None
     timezone: str
     resolved_local_date: date
     resolved_local_time: time | None = None
