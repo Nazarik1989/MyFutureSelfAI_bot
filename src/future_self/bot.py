@@ -1,6 +1,6 @@
 import logging
 import warnings
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from html import escape
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -41,6 +41,7 @@ from .domain import (
 from .drafts import DraftInboxService
 from .models import DraftInboxItem, Goal, InboxItem, Routine, User, VisionProfile
 from .natural_commands import NaturalAction, NaturalCommandRouter
+from .reminders import TaskReminderEngine
 from .repositories import (
     CheckInRepository,
     GoalRepository,
@@ -88,7 +89,12 @@ class FutureSelfBot:
         self.db = db
         self.ai = ai
         self.transcription = transcription
-        self.draft_service = DraftInboxService(db, settings.inbox_draft_ttl_minutes)
+        self.draft_service = DraftInboxService(
+            db,
+            settings.inbox_draft_ttl_minutes,
+            task_date_event_hour=settings.task_date_event_hour,
+            task_reminder_lead_minutes=settings.task_reminder_lead_minutes,
+        )
         self.action_service = DraftActionService(self.draft_service)
         self.action_router = ActionCommandRouter()
         self.system_action_router = SystemActionRouter()
@@ -104,6 +110,7 @@ class FutureSelfBot:
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
         self.scheduler: JobQueueScheduler | None = None
+        self.reminder_engine: TaskReminderEngine | None = None
 
     @property
     def voice_enabled(self) -> bool:
@@ -194,8 +201,9 @@ class FutureSelfBot:
         return app
 
     async def _post_init(self, app: Application) -> None:
-        async def send(telegram_id: int, text: str) -> None:
-            await app.bot.send_message(chat_id=telegram_id, text=text)
+        async def send(telegram_id: int, text: str) -> int | None:
+            message = await app.bot.send_message(chat_id=telegram_id, text=text)
+            return getattr(message, "message_id", None)
 
         if app.job_queue is None:
             logger.warning("JobQueue is unavailable; scheduled messages are disabled")
@@ -208,6 +216,20 @@ class FutureSelfBot:
             self.settings.weekly_review_weekday,
             self.settings.enable_weekly_review,
         )
+        if self.settings.enable_task_reminders:
+            self.reminder_engine = TaskReminderEngine(
+                self.db,
+                send,
+                lease_seconds=self.settings.task_reminder_lease_seconds,
+                date_event_hour=self.settings.task_date_event_hour,
+                lead_minutes=self.settings.task_reminder_lead_minutes,
+            )
+            await self.reminder_engine.reconcile_missing()
+            await self.reminder_engine.deliver_due()
+            self.scheduler.start_task_reminders(
+                self.reminder_engine,
+                interval_seconds=self.settings.task_reminder_poll_seconds,
+            )
         async with self.db.sessions() as session:
             users = (await session.scalars(select(User).where(User.onboarding_completed))).all()
         for user in users:
@@ -684,6 +706,16 @@ class FutureSelfBot:
         editing = await self.draft_service.editing(update.effective_user.id, chat_id)
         prompt_context = snapshot.for_prompt()
         prompt_context["date_resolution"] = date_resolution.model_dump(mode="json")
+        temporal_resolution = (
+            self.date_resolver.temporal_resolution(
+                date_resolution.target_date,
+                user.timezone,
+                text,
+                self.date_resolver.extract_local_time(text),
+            )
+            if date_resolution.status == "resolved" and date_resolution.target_date
+            else None
+        )
         try:
             result = await self.intent_router.route(
                 text, user.timezone, conversation_context=prompt_context
@@ -720,6 +752,7 @@ class FutureSelfBot:
                 text,
                 fallback_kind=editing.kind,
                 resolved_date=date_resolution.target_date,
+                temporal_resolution=temporal_resolution,
             )
             revised = await self.draft_service.revise(
                 editing.id,
@@ -785,7 +818,10 @@ class FutureSelfBot:
                 return
             capture_text = candidate
         parsed = self._parsed_from_intent(
-            result, capture_text, resolved_date=date_resolution.target_date
+            result,
+            capture_text,
+            resolved_date=date_resolution.target_date,
+            temporal_resolution=temporal_resolution,
         )
         if parsed.resolved_date:
             await self.conversation.set_resolved_date(
@@ -1515,12 +1551,14 @@ class FutureSelfBot:
         *,
         fallback_kind: str = "note",
         resolved_date: date | None = None,
+        temporal_resolution: TemporalResolution | None = None,
     ) -> ParsedThought:
         return ParsedThought(
             kind=result.inbox_kind or fallback_kind,
             title=result.title or text.strip()[:80],
             next_step=result.next_step,
             resolved_date=resolved_date,
+            temporal_resolution=temporal_resolution,
         )
 
     async def _show_preview(
@@ -1615,9 +1653,8 @@ class FutureSelfBot:
                 else ""
             )
         task_notice = (
-            "\nЭто черновик задачи, напоминание ещё не настроено"
-            if draft.kind == "task"
-            and "напоминание ещё не настроено" not in (draft.next_step or "").lower()
+            "\nПосле сохранения напоминание будет настроено по указанной дате"
+            if draft.kind == "task" and draft.temporal_resolution
             else ""
         )
         original = f"Исходный текст: {escape(draft.raw_text)}\n" if include_original else ""
@@ -2133,7 +2170,18 @@ class FutureSelfBot:
         await self.conversation.record_saved(telegram_user_id, chat_id, item.id)
         receipt = f"Сохранено в inbox:\n{LABELS[item.kind]} — {item.title}"
         if item.kind == "task":
-            receipt += "\nЗадача сохранена. Автоматическое напоминание пока не настроено"
+            reminder = outcome.result.reminder if outcome.result else None
+            if reminder is None:
+                receipt += "\nЗадача сохранена без напоминания: сначала укажи дату и время"
+            else:
+                local_reminder = reminder.remind_at
+                if local_reminder.tzinfo is None:
+                    local_reminder = local_reminder.replace(tzinfo=UTC)
+                local_reminder = local_reminder.astimezone(ZoneInfo(reminder.timezone))
+                receipt += (
+                    "\nНапоминание: "
+                    f"{local_reminder.strftime('%d.%m.%Y %H:%M')} ({reminder.timezone})"
+                )
         return receipt
 
     async def last_saved_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -1157,8 +1157,7 @@ async def test_conflict_choice_regenerates_all_temporal_fields_and_survives_rest
     await restarted.text(update_for(save, 1303, 2303), context)
     receipt = save.replies[-1]["text"]
     assert "задача — Стрижка — 19 июля в 18:00" in receipt
-    assert "Задача сохранена. Автоматическое напоминание пока не настроено" in receipt
-    assert "напоминание создано" not in receipt.lower()
+    assert "Напоминание: 19.07.2026 17:30 (Europe/Moscow)" in receipt
     async with db.sessions() as session:
         item = await session.scalar(select(InboxItem))
     assert item.temporal_resolution["resolved_at"] == resolved_at
