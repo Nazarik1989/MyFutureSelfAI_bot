@@ -963,6 +963,90 @@ DOCTOR_PREP_SCENARIOS = (
     ),
 )
 
+DOCTOR_SEARCH_SCENARIOS = (
+    Scenario(
+        name="doctor-search-official-svetogorsk-then-vyborg-is-read-only",
+        steps=(
+            ScenarioStep(
+                "command",
+                "/doctor_find",
+                reply_contains=(
+                    "Светогорск",
+                    "Выборг",
+                    "Терапевт",
+                    "122",
+                    "https://zdrav.lenreg.ru/",
+                    "+7 (81378) 36-268",
+                    "+7 (81378) 2-83-46",
+                ),
+                reply_excludes=("диагноз", "частная клиника"),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="doctor-search-task-and-reminder-are-idempotent",
+        steps=(
+            ScenarioStep(
+                "command",
+                "/doctor_find_task через 2 часа",
+                reply_contains=("Записаться к терапевту", "Reminder"),
+            ),
+            ScenarioStep(
+                "command",
+                "/doctor_find_task через 2 часа",
+                reply_contains=("дубликат не добавлен",),
+            ),
+        ),
+        expected=ExpectedState(
+            inbox=(
+                InboxState(
+                    "Записаться к терапевту: Светогорск → Выборг",
+                    "task",
+                    "doctor_search",
+                ),
+            ),
+            task_reminder_count=1,
+        ),
+    ),
+    Scenario(
+        name="doctor-search-invalid-time-and-owner-isolation",
+        steps=(
+            ScenarioStep(
+                "command",
+                "/doctor_find_task когда-нибудь",
+                reply_contains=("Не понял будущее время",),
+            ),
+            ScenarioStep(
+                "command",
+                "/doctor_find_task через 3 часа",
+                reply_contains=("Записаться к терапевту",),
+            ),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "command",
+                "/doctor_find_task через 3 часа",
+                reply_contains=("Записаться к терапевту",),
+            ),
+        ),
+        expected=ExpectedState(
+            inbox=(
+                InboxState(
+                    "Записаться к терапевту: Светогорск → Выборг",
+                    "task",
+                    "doctor_search",
+                ),
+                InboxState(
+                    "Записаться к терапевту: Светогорск → Выборг",
+                    "task",
+                    "doctor_search",
+                ),
+            ),
+            task_reminder_count=2,
+        ),
+    ),
+)
+
 
 SCENARIOS = (
     *CORE_SCENARIOS,
@@ -976,4 +1060,5 @@ SCENARIOS = (
     *RESOLVED_NEGATIVE_REGRESSION_SCENARIOS,
     *HEALTH_SCENARIOS,
     *DOCTOR_PREP_SCENARIOS,
+    *DOCTOR_SEARCH_SCENARIOS,
 )

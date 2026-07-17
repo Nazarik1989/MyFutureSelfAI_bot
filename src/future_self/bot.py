@@ -33,6 +33,7 @@ from .conversation import ConversationContextService, ConversationSnapshot
 from .dates import DateResolver
 from .db import Database
 from .doctor_prep import DoctorVisitPrepService
+from .doctor_search import DoctorSearchService
 from .domain import (
     ONBOARDING_QUESTIONS,
     FocusService,
@@ -134,6 +135,11 @@ class FutureSelfBot:
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
         self.doctor_prep_service = DoctorVisitPrepService(
+            db,
+            task_date_event_hour=settings.task_date_event_hour,
+            task_reminder_lead_minutes=settings.task_reminder_lead_minutes,
+        )
+        self.doctor_search_service = DoctorSearchService(
             db,
             task_date_event_hour=settings.task_date_event_hour,
             task_reminder_lead_minutes=settings.task_reminder_lead_minutes,
@@ -279,6 +285,8 @@ class FutureSelfBot:
         app.add_handler(CommandHandler("doctor_prepare_show", self.doctor_prepare_show))
         app.add_handler(CommandHandler("doctor_prepare_delete", self.doctor_prepare_delete))
         app.add_handler(CommandHandler("doctor_prepare_task", self.doctor_prepare_task))
+        app.add_handler(CommandHandler("doctor_find", self.doctor_find))
+        app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -2903,13 +2911,59 @@ class FutureSelfBot:
             resolution_status="resolved",
         )
 
+    async def doctor_find(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(self.doctor_search_service.format_directory())
+
+    async def doctor_find_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = getattr(context, "args", [])
+        if not args:
+            await update.effective_message.reply_text(
+                "Формат: /doctor_find_task через 2 часа или /doctor_find_task завтра в 10:00."
+            )
+            return
+        user = await self._user(update.effective_user.id)
+        expression = " ".join(args).strip()
+        temporal = self._doctor_task_temporal(expression, user.timezone)
+        if temporal is None:
+            await update.effective_message.reply_text(
+                "Не понял будущее время reminder. Примеры: «через 2 часа», "
+                "«завтра в 10:00», «20 июля в 09:30»."
+            )
+            return
+        result = await self.doctor_search_service.create_booking_task(
+            user_id=user.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            temporal=temporal,
+        )
+        if result.status == "existing":
+            await update.effective_message.reply_text(
+                "Задача «Записаться к терапевту: Светогорск → Выборг» уже создана; "
+                "дубликат не добавлен."
+            )
+            return
+        if result.reminder is None:
+            await update.effective_message.reply_text(
+                "Не удалось создать reminder; задача не должна использоваться без времени."
+            )
+            return
+        local_reminder = result.reminder.remind_at
+        if local_reminder.tzinfo is None:
+            local_reminder = local_reminder.replace(tzinfo=UTC)
+        local_reminder = local_reminder.astimezone(ZoneInfo(user.timezone))
+        await update.effective_message.reply_text(
+            "Задача «Записаться к терапевту: Светогорск → Выборг» создана. "
+            f"Reminder: {local_reminder.strftime('%d.%m.%Y %H:%M')} ({user.timezone})."
+        )
+
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             "/start — онбординг, /profile — профиль, /goals — обновить цели, /today — фокус дня, "
             "/evening — рефлексия, /inbox — сохранённые мысли, /drafts — активные черновики, "
             "/last_saved — последняя запись, /cleanup_drafts — безопасная очистка черновиков, "
             "/health — состояние и динамика, /checkin — health check-in, "
-            "/doctor_prepare — подготовка к визиту к врачу."
+            "/doctor_prepare — подготовка к визиту к врачу, "
+            "/doctor_find — официальный поиск терапевта Светогорск → Выборг."
         )
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
