@@ -30,6 +30,9 @@ packages = ["src/future_self"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+markers = [
+  "autotester: isolated end-to-end bot scenarios with fake Telegram, AI, and transcription",
+]
 
 [tool.ruff]
 line-length = 100
