@@ -14,6 +14,11 @@ The harness deliberately uses:
 Every LLM input must be explicitly stubbed. An unexpected LLM call fails the
 scenario instead of silently producing a fake response.
 
+The catalog currently contains 70 deterministic E2E scenarios. Variations are
+generated from fixed tuples only; no randomness, wall-clock input, or external
+data is used. Known application defects are documented in `DEFECTS.md` and
+represented as strict `xfail` scenarios.
+
 Run only the scenario harness:
 
 ```bash

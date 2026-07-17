@@ -74,6 +74,7 @@ class Scenario:
     steps: tuple[ScenarioStep, ...]
     expected: ExpectedState
     llm_stubs: tuple[LLMStub, ...] = ()
+    known_defect: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

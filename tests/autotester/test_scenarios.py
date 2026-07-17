@@ -15,13 +15,29 @@ from .scenarios import SCENARIOS
 pytestmark = pytest.mark.autotester
 
 
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda scenario: scenario.name)
+def scenario_parameter(scenario):
+    if scenario.known_defect:
+        return pytest.param(
+            scenario,
+            id=scenario.name,
+            marks=pytest.mark.xfail(strict=True, reason=scenario.known_defect),
+        )
+    return pytest.param(scenario, id=scenario.name)
+
+
+@pytest.mark.parametrize("scenario", tuple(map(scenario_parameter, SCENARIOS)))
 async def test_bot_scenario(tmp_path: Path, scenario) -> None:
     harness = await BotAutotester.create(tmp_path, scenario.llm_stubs)
     try:
         await harness.run(scenario)
     finally:
         await harness.close()
+
+
+def test_scenario_catalog_has_at_least_fifty_unique_cases() -> None:
+    names = [scenario.name for scenario in SCENARIOS]
+    assert len(SCENARIOS) >= 50
+    assert len(names) == len(set(names))
 
 
 def test_safety_guard_rejects_database_outside_pytest_sandbox(tmp_path: Path) -> None:
