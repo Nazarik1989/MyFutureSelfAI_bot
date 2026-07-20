@@ -121,6 +121,13 @@ DATABASE_URL=postgresql+asyncpg://future_self:future_self@localhost:5432/future_
 первого шага создаётся через общий Task & Reminder Engine идемпотентно, но reminder
 назначается только отдельным действием пользователя.
 
+Кнопка «Создать визуализацию» локально строит детерминированные PNG 1080×1350 только из
+активных карточек владельца. Рендер выполняется в памяти без LLM, внешней сети, публичных
+ссылок и постоянного хранения файлов; исходный PNG можно получить отдельным document.
+Большая карта разбивается максимум на шесть страниц по пять карточек. Docker-образ
+устанавливает Debian-пакет `fonts-dejavu-core`; его лицензия и copyright доступны внутри
+образа в `/usr/share/doc/fonts-dejavu-core/copyright`.
+
 ## Разработка
 
 ```bash
@@ -238,6 +245,7 @@ src/future_self/
   transcription.py   независимый OpenAI/local/disabled STT adapter
   scheduler.py       изолированный JobQueue adapter
   reminders.py       persistent outbox задач и Telegram-доставка напоминаний
+  vision_renderer.py локальный owner-safe PNG renderer карты желаний
   config.py          personality, schedule и feature flags
   prompts.py         системные промпты
 alembic/              миграции схемы

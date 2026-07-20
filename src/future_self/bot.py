@@ -68,6 +68,11 @@ from .system_actions import SystemActionRoute, SystemActionRouter
 from .transcription import TranscriptionError, TranscriptionService
 from .vision import VisionService
 from .vision_handlers import VisionHandlers
+from .vision_renderer import (
+    VisionBoardRenderer,
+    VisionRenderLimiter,
+    VisionRenderSessionStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +147,9 @@ class FutureSelfBot(VisionHandlers):
         self.health_service = HealthService(db)
         self.location_service = LocationService(db)
         self.vision_service = VisionService(db)
+        self.vision_renderer = VisionBoardRenderer()
+        self.vision_render_sessions = VisionRenderSessionStore()
+        self.vision_render_limiter = VisionRenderLimiter()
         self.doctor_prep_service = DoctorVisitPrepService(
             db,
             task_date_event_hour=settings.task_date_event_hour,

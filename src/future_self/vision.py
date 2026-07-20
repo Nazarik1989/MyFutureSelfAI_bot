@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, select, update
 
 from .db import Database
 from .models import InboxItem, User, VisionDraft, VisionItem
@@ -248,6 +248,47 @@ class VisionService:
                 )
             ).all()
             return {category: int(count) for category, count in rows}
+
+    async def active_for_render(
+        self,
+        owner_id: int,
+        *,
+        category: str | None,
+        limit: int,
+    ) -> tuple[list[VisionItem], int]:
+        if category is not None and category not in CATEGORY_META:
+            return [], 0
+        category_order = case(
+            {code: index for index, code in enumerate(CATEGORY_META)},
+            value=VisionItem.category,
+            else_=len(CATEGORY_META),
+        )
+        conditions = [
+            VisionItem.owner_id == owner_id,
+            VisionItem.status == "active",
+        ]
+        if category is not None:
+            conditions.append(VisionItem.category == category)
+        async with self.db.sessions() as session:
+            total = int(
+                await session.scalar(select(func.count(VisionItem.id)).where(*conditions)) or 0
+            )
+            items = list(
+                (
+                    await session.scalars(
+                        select(VisionItem)
+                        .where(*conditions)
+                        .order_by(
+                            category_order,
+                            VisionItem.target_date.is_(None),
+                            VisionItem.target_date,
+                            VisionItem.id,
+                        )
+                        .limit(max(limit, 1))
+                    )
+                ).all()
+            )
+            return items, total
 
     async def set_status(self, owner_id: int, item_id: int, status: str) -> VisionItem | None:
         if status not in VISION_STATUSES:

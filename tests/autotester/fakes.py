@@ -88,6 +88,38 @@ class FakeMessage:
         self.replies.append({"text": text, **kwargs})
         return self
 
+    async def reply_photo(
+        self, photo: Any, caption: str | None = None, **kwargs: Any
+    ) -> "FakeMessage":
+        self.replies.append(
+            {
+                "text": caption or "",
+                "kind": "photo",
+                "filename": getattr(photo, "name", None),
+                "data": photo.getvalue(),
+                **kwargs,
+            }
+        )
+        return self
+
+    async def reply_document(
+        self,
+        document: Any,
+        filename: str | None = None,
+        caption: str | None = None,
+        **kwargs: Any,
+    ) -> "FakeMessage":
+        self.replies.append(
+            {
+                "text": caption or "",
+                "kind": "document",
+                "filename": filename or getattr(document, "name", None),
+                "data": document.getvalue(),
+                **kwargs,
+            }
+        )
+        return self
+
     async def edit_text(self, text: str) -> None:
         self.edits.append(text)
 

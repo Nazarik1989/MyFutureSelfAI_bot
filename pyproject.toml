@@ -12,6 +12,7 @@ dependencies = [
   "aiosqlite>=0.20",
   "asyncpg>=0.30",
   "openai>=1.68",
+  "Pillow>=11.0",
   "pydantic-settings>=2.8",
   "python-dotenv>=1.0",
   "python-telegram-bot[job-queue]>=22.0",
