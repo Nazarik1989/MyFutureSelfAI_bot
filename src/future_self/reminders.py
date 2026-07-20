@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import and_, or_, select, update
 
 from .db import Database
-from .models import DraftInboxItem, InboxItem, TaskReminder
+from .models import DraftInboxItem, InboxItem, TaskReminder, User
 from .schemas import TemporalResolution
 
 logger = logging.getLogger(__name__)
@@ -237,12 +237,19 @@ class TaskReminderEngine:
                 if changed.scalar_one_or_none() is None:
                     continue
                 reminder = await session.get(TaskReminder, reminder_id)
-                item = await session.get(InboxItem, reminder.inbox_item_id)
+                row = await session.execute(
+                    select(InboxItem, User)
+                    .join(User, User.id == InboxItem.user_id)
+                    .where(InboxItem.id == reminder.inbox_item_id)
+                )
+                item, owner = row.one()
                 claimed.append(
                     ClaimedReminder(
                         id=reminder.id,
                         claim_token=token,
-                        chat_id=reminder.chat_id,
+                        # The owner row is authoritative. Persisted reminder chat
+                        # metadata may predate the private-chat-only policy.
+                        chat_id=owner.telegram_id,
                         title=item.title,
                         description=item.description,
                         event_at=as_utc(reminder.event_at),

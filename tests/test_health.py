@@ -289,7 +289,7 @@ async def test_health_reminder_opt_in_is_persistent_and_opt_out_removes_job(db, 
     async with db.sessions() as session:
         preference = await session.scalar(select(HealthReminderPreference))
     assert preference.enabled is True
-    assert preference.chat_id == 300
+    assert preference.chat_id == 30
 
     off_update, _ = health_update("/health_reminder_off", user_id=30, chat_id=300)
     await bot.health_reminder_off(off_update, SimpleNamespace(user_data={}, args=[]))

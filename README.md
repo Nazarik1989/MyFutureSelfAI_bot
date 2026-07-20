@@ -16,6 +16,8 @@ MVP Telegram-ассистента, который связывает образ 
 - canonical `temporal_resolution` для выбранной даты/времени с UTC, timezone и локальным представлением;
 - persistent Task & Reminder Engine: раздельные `event_at`/`remind_at`, Telegram-доставка,
   IANA timezone, восстановление после рестарта, lease и защита от повторной отправки;
+- private-chat-only transport: любые сообщения и callback в группах/каналах блокируются до
+  feature handlers, а reminder доставляется по Telegram ID владельца, не по сохранённому chat ID;
 - Health Track MVP: приватные пошаговые check-in, субъективная шкала 0–100, недельная
   динамика, история/timezone, исправление, удаление и добровольные daily reminders;
 - Doctor Visit Prep: приватный `/doctor_prepare`, фактическое резюме с Health Track

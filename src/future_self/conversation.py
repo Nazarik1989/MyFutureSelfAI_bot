@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 from sqlalchemy import delete, select
 
 from .db import Database
-from .models import ConversationMessage, ConversationSession, DraftInboxItem
+from .models import ConversationMessage, ConversationSession, DraftInboxItem, InboxItem, User
 
 
 @dataclass(slots=True)
@@ -81,7 +81,12 @@ class ConversationContextService:
             active = None
             if conversation.active_draft_id:
                 draft = await session.get(DraftInboxItem, conversation.active_draft_id)
-                if draft and draft.status in {"preview", "editing"}:
+                if (
+                    draft
+                    and draft.telegram_user_id == telegram_user_id
+                    and draft.chat_id == chat_id
+                    and draft.status in {"preview", "editing"}
+                ):
                     active = {
                         "id": draft.id,
                         "version": draft.version,
@@ -245,8 +250,8 @@ class ConversationContextService:
                     expires_at=now + self.ttl,
                 )
                 session.add(conversation)
-            conversation.active_draft_id = draft_id
             if draft_id is None:
+                conversation.active_draft_id = None
                 conversation.focused_draft_id = None
                 conversation.focused_draft_version = None
                 conversation.pending_action = None
@@ -259,10 +264,17 @@ class ConversationContextService:
                     and draft.chat_id == chat_id
                     and draft.status == "preview"
                 ):
+                    conversation.active_draft_id = draft.id
                     conversation.focused_draft_id = draft.id
                     conversation.focused_draft_version = draft.version
                     conversation.pending_action = None
                     conversation.focus_expires_at = now + self.focus_ttl
+                else:
+                    conversation.active_draft_id = None
+                    conversation.focused_draft_id = None
+                    conversation.focused_draft_version = None
+                    conversation.pending_action = None
+                    conversation.focus_expires_at = None
             conversation.expires_at = now + self.ttl
 
     async def set_pending_action(self, telegram_user_id: int, chat_id: int, action: str) -> None:
@@ -340,6 +352,16 @@ class ConversationContextService:
             conversation = await self._get_or_create_session(
                 session, telegram_user_id, chat_id, now
             )
+            owned_item = await session.scalar(
+                select(InboxItem.id)
+                .join(User, User.id == InboxItem.user_id)
+                .where(
+                    InboxItem.id == inbox_item_id,
+                    User.telegram_id == telegram_user_id,
+                )
+            )
+            if owned_item is None:
+                return
             conversation.last_saved_inbox_item_id = inbox_item_id
             conversation.last_saved_at = now
             conversation.expires_at = now + self.ttl
@@ -388,6 +410,21 @@ class ConversationContextService:
                     expires_at=now + self.ttl,
                 )
                 session.add(conversation)
+            if focused_draft_id is not None:
+                draft = await session.scalar(
+                    select(DraftInboxItem).where(
+                        DraftInboxItem.id == focused_draft_id,
+                        DraftInboxItem.telegram_user_id == telegram_user_id,
+                        DraftInboxItem.chat_id == chat_id,
+                        DraftInboxItem.status == "preview",
+                        DraftInboxItem.version == focused_draft_version,
+                    )
+                )
+                if draft is None:
+                    focused_draft_id = None
+                    focused_draft_version = None
+                    pending_action = None
+                    expires = False
             conversation.focused_draft_id = focused_draft_id
             conversation.focused_draft_version = focused_draft_version
             conversation.pending_action = pending_action

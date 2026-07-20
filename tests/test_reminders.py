@@ -345,10 +345,10 @@ async def test_relative_reminder_text_and_voice_route_save_and_deliver(
     assert await engine.deliver_due(now=now + delta) == 1
     assert await engine.deliver_due(now=now + delta + timedelta(seconds=1)) == 0
     assert len(sent) == 1
-    assert sent[0][0] == chat_id
+    assert sent[0][0] == user_id
 
 
-async def test_due_reminder_is_delivered_to_original_chat_and_marked_sent(db):
+async def test_due_reminder_is_delivered_to_owners_private_chat_and_marked_sent(db):
     _, reminder = await create_reminder(
         db,
         temporal_resolution=temporal(resolved_at=datetime(2026, 7, 20, 15, tzinfo=UTC)),
@@ -363,7 +363,7 @@ async def test_due_reminder_is_delivered_to_original_chat_and_marked_sent(db):
     delivered = await engine.deliver_due(now=datetime(2026, 7, 20, 14, 30, tzinfo=UTC))
     assert delivered == 1
     assert len(sent) == 1
-    assert sent[0][0] == 100
+    assert sent[0][0] == 10
     assert "Записаться к врачу" in sent[0][1]
     assert "20.07.2026 18:00 (Europe/Moscow)" in sent[0][1]
     async with db.sessions() as session:
@@ -501,7 +501,7 @@ async def test_stale_claim_is_recovered_but_fresh_claim_is_not(db):
         return chat_id
 
     assert await TaskReminderEngine(db, send, lease_seconds=120).deliver_due(now=now) == 1
-    assert sent == [100]
+    assert sent == [10]
     async with db.sessions() as session:
         fresh_row = await session.get(TaskReminder, fresh.id)
     assert fresh_row.status == "processing"
@@ -557,7 +557,7 @@ async def test_bot_startup_delivers_persisted_due_reminder_via_telegram(db, fake
     )
     await bot._post_init(SimpleNamespace(bot=TelegramBot(), job_queue=Queue()))
     assert len(sent) == 1
-    assert sent[0][0] == 100
+    assert sent[0][0] == 10
     assert len(repeating) == 1
     async with db.sessions() as session:
         saved = await session.get(TaskReminder, reminder.id)
