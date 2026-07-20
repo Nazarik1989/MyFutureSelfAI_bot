@@ -48,7 +48,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260720_0013')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260720_0014')")
         )
 
     async def forbidden_network(*args, **kwargs):
@@ -168,7 +168,7 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     }
     assert gate_commands == {"vision", "cancel"}
     assert sum(isinstance(handler, CallbackQueryHandler) for handler in vision_gate_handlers) == 1
-    assert sum(isinstance(handler, MessageHandler) for handler in vision_gate_handlers) == 2
+    assert sum(isinstance(handler, MessageHandler) for handler in vision_gate_handlers) == 3
     assert bot.error_handler.__name__ in {
         callback.__name__ for callback in application.error_handlers
     }

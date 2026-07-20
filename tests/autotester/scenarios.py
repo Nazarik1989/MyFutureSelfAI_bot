@@ -1084,7 +1084,254 @@ VISION_PAGINATION_STEPS = tuple(
     )
 )
 
+
+def vision_image_item_steps(category: str, wish: str) -> tuple[ScenarioStep, ...]:
+    return (
+        ScenarioStep("command", "/vision"),
+        ScenarioStep("vision_callback", "add"),
+        ScenarioStep("vision_callback", category),
+        ScenarioStep("text", wish),
+        ScenarioStep("vision_callback", "skip"),
+        ScenarioStep("vision_callback", "skip"),
+        ScenarioStep("vision_callback", "skip"),
+        ScenarioStep("vision_callback", "confirm"),
+    )
+
+
+VISION_IMAGE_CREATE_STEPS = (
+    ScenarioStep("command", "/vision"),
+    ScenarioStep("vision_callback", "add"),
+    ScenarioStep("vision_callback", "travel"),
+    ScenarioStep("text", "Личная мечта с фотографией"),
+    ScenarioStep("vision_callback", "skip"),
+    ScenarioStep("vision_callback", "skip"),
+    ScenarioStep("vision_callback", "skip"),
+    ScenarioStep("vision_callback", "confirm"),
+)
+
 VISION_SCENARIOS = (
+    Scenario(
+        name="vision-image-jpeg-photo-confirm-repeat-render-and-download",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd", reply_contains=("Отправь одно фото",)),
+            ScenarioStep("vision_photo", "jpeg:red", reply_contains=("Preview",)),
+            ScenarioStep("vision_capture_callback", "imageconfirm"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "imageconfirm",
+                reply_contains=("Фото сохранено", "Личное фото"),
+            ),
+            ScenarioStep(
+                "vision_replay_callback",
+                "imageconfirm",
+                reply_contains=("устарело",),
+            ),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "render"),
+            ScenarioStep("vision_callback", "renderall", reply_contains=("Активных желаний: 1",)),
+            ScenarioStep("vision_callback", "download", reply_contains=("Активных желаний: 1",)),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState(
+                    "travel",
+                    "Личная мечта с фотографией",
+                    "active",
+                    has_image=True,
+                ),
+            ),
+            vision_image_count=1,
+        ),
+    ),
+    Scenario(
+        name="vision-image-png-cancel-then-webp-document-confirm",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_document", "png:blue", reply_contains=("Preview",)),
+            ScenarioStep("vision_callback", "imagecancel", reply_contains=("отменено",)),
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_document", "webp:green", reply_contains=("Preview",)),
+            ScenarioStep("vision_callback", "imageconfirm", reply_contains=("Фото сохранено",)),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState(
+                    "travel",
+                    "Личная мечта с фотографией",
+                    "active",
+                    has_image=True,
+                ),
+            ),
+            vision_image_count=1,
+        ),
+    ),
+    Scenario(
+        name="vision-image-replace-cancel-keeps-old-then-atomic-replace",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_photo", "jpeg:red"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+            ScenarioStep("vision_callback", "imagereplace"),
+            ScenarioStep("vision_document", "png:blue"),
+            ScenarioStep("vision_callback", "imagecancel", reply_contains=("отменено",)),
+            ScenarioStep("vision_callback", "imagereplace"),
+            ScenarioStep("vision_document", "png:blue"),
+            ScenarioStep("vision_callback", "imageconfirm", reply_contains=("Фото сохранено",)),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState(
+                    "travel",
+                    "Личная мечта с фотографией",
+                    "active",
+                    has_image=True,
+                ),
+            ),
+            vision_image_count=1,
+        ),
+    ),
+    Scenario(
+        name="vision-image-delete-owner-bound-and-single-use",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_photo", "jpeg:red"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+            ScenarioStep("vision_callback", "imagedeleteask"),
+            ScenarioStep("vision_capture_callback", "imagedelete"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "imagedelete",
+                reply_contains=("устарело",),
+            ),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "imagedelete",
+                reply_contains=("Фото удалено",),
+            ),
+            ScenarioStep(
+                "vision_replay_callback",
+                "imagedelete",
+                reply_contains=("устарело",),
+            ),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("travel", "Личная мечта с фотографией", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-image-invalid-magic-mime-animation-size-and-pixels-recover",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_document", "mismatch", reply_contains=("Файл отклонён",)),
+            ScenarioStep("vision_document", "corrupt", reply_contains=("Файл отклонён",)),
+            ScenarioStep(
+                "vision_document",
+                "animated-gif",
+                reply_contains=("GIF", "не поддерживаются"),
+            ),
+            ScenarioStep("vision_photo", "oversize-meta", reply_contains=("Файл отклонён",)),
+            ScenarioStep("vision_photo", "multipixel-meta", reply_contains=("Файл отклонён",)),
+            ScenarioStep("vision_document", "png:purple", reply_contains=("Preview",)),
+            ScenarioStep("vision_callback", "imageconfirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState(
+                    "travel",
+                    "Личная мечта с фотографией",
+                    "active",
+                    has_image=True,
+                ),
+            ),
+            vision_image_count=1,
+        ),
+    ),
+    Scenario(
+        name="vision-image-restart-drops-unconfirmed-upload-capability",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_capture_callback", "imagecancel"),
+            ScenarioStep("restart"),
+            ScenarioStep("vision_photo", "jpeg:red"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "imagecancel",
+                reply_contains=("устарело",),
+            ),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("travel", "Личная мечта с фотографией", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-image-identical-photos-remain-owner-isolated",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_photo", "jpeg:red"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+            ScenarioStep("switch_user", "900002:910002"),
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_photo", "jpeg:red"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState(
+                    "travel",
+                    "Личная мечта с фотографией",
+                    "active",
+                    has_image=True,
+                ),
+                VisionState(
+                    "travel",
+                    "Личная мечта с фотографией",
+                    "active",
+                    has_image=True,
+                ),
+            ),
+            vision_image_count=2,
+        ),
+    ),
+    Scenario(
+        name="vision-image-concurrent-begin-is-rejected-without-overwrite",
+        steps=(
+            *VISION_IMAGE_CREATE_STEPS,
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep(
+                "vision_raw_callback",
+                "vision:imageadd:1",
+                reply_contains=("текущую операцию",),
+            ),
+            ScenarioStep("vision_photo", "jpeg:red"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState(
+                    "travel",
+                    "Личная мечта с фотографией",
+                    "active",
+                    has_image=True,
+                ),
+            ),
+            vision_image_count=1,
+        ),
+    ),
+    Scenario(
+        name="vision-image-outside-active-flow-is-never-attached",
+        steps=(ScenarioStep("vision_photo", "jpeg:red"),),
+        expected=ExpectedState(),
+    ),
     Scenario(
         name="vision-render-empty-map-is-safe-and-read-only",
         steps=(
@@ -1465,6 +1712,140 @@ VISION_SCENARIOS = (
                     "active",
                 ),
             )
+        ),
+    ),
+    Scenario(
+        name="vision-personal-jpeg-photo-confirm-render-download-is-idempotent",
+        steps=(
+            *vision_image_item_steps("travel", "Увидеть океан"),
+            ScenarioStep("vision_callback", "imageadd", reply_contains=("Отправь одно фото",)),
+            ScenarioStep("vision_photo", "jpeg", reply_contains=("Preview",)),
+            ScenarioStep("vision_capture_callback", "imageconfirm"),
+            ScenarioStep("vision_replay_callback", "imageconfirm", reply_contains=("сохранено",)),
+            ScenarioStep("vision_replay_callback", "imageconfirm", reply_contains=("устарело",)),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "render"),
+            ScenarioStep("vision_callback", "renderall", reply_contains=("Активных желаний: 1",)),
+            ScenarioStep("vision_callback", "download", reply_contains=("Активных желаний: 1",)),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("travel", "Увидеть океан", "active", has_image=True),),
+            vision_image_count=1,
+        ),
+    ),
+    Scenario(
+        name="vision-personal-png-document-preview-cancel-does-not-attach",
+        steps=(
+            *vision_image_item_steps("home", "Создать светлый дом"),
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_document", "png", reply_contains=("Preview",)),
+            ScenarioStep("vision_callback", "imagecancel", reply_contains=("отменено",)),
+            ScenarioStep("vision_document", "png"),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("home", "Создать светлый дом", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-personal-webp-replace-delete-and-callbacks-are-owner-bound",
+        steps=(
+            *vision_image_item_steps("growth_creativity", "Научиться фотографии"),
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_document", "webp"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+            ScenarioStep("vision_callback", "imagereplace"),
+            ScenarioStep("vision_document", "png"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+            ScenarioStep("vision_callback", "imagedeleteask"),
+            ScenarioStep("vision_capture_callback", "imagedelete"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep("vision_replay_callback", "imagedelete", reply_contains=("недоступна",)),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep("vision_replay_callback", "imagedelete", reply_contains=("Фото удалено",)),
+            ScenarioStep("vision_replay_callback", "imagedelete", reply_contains=("недоступна",)),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("growth_creativity", "Научиться фотографии", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-personal-invalid-media-is-rejected-before-valid-retry",
+        steps=(
+            *vision_image_item_steps("other", "Сохранить личный образ"),
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_document", "mismatch", reply_contains=("отклонён",)),
+            ScenarioStep("vision_document", "corrupt", reply_contains=("отклонён",)),
+            ScenarioStep("vision_document", "animated-gif", reply_contains=("отклонён",)),
+            ScenarioStep("vision_document", "pdf", reply_contains=("отклонён",)),
+            ScenarioStep("vision_photo", "oversize-meta", reply_contains=("отклонён",)),
+            ScenarioStep("vision_photo", "multipixel-meta", reply_contains=("отклонён",)),
+            ScenarioStep("vision_photo", "jpeg", reply_contains=("Preview",)),
+            ScenarioStep("vision_callback", "imageconfirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState("other", "Сохранить личный образ", "active", has_image=True),
+            ),
+            vision_image_count=1,
+        ),
+    ),
+    Scenario(
+        name="vision-personal-upload-restart-and-stale-callback-save-nothing",
+        steps=(
+            *vision_image_item_steps("money", "Финансовая свобода"),
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_capture_callback", "imagecancel"),
+            ScenarioStep("restart"),
+            ScenarioStep("vision_photo", "jpeg"),
+            ScenarioStep("vision_replay_callback", "imagecancel", reply_contains=("недоступна",)),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("money", "Финансовая свобода", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-personal-identical-images-remain-owner-isolated",
+        steps=(
+            *vision_image_item_steps("health_energy", "Больше энергии"),
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_photo", "jpeg"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "vision_raw_callback", "vision:imageadd:1", reply_contains=("недоступна",)
+            ),
+            *vision_image_item_steps("health_energy", "Больше энергии"),
+            ScenarioStep("vision_callback", "imageadd"),
+            ScenarioStep("vision_photo", "jpeg"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState("health_energy", "Больше энергии", "active", has_image=True),
+                VisionState("health_energy", "Больше энергии", "active", has_image=True),
+            ),
+            vision_image_count=2,
+        ),
+    ),
+    Scenario(
+        name="vision-personal-concurrent-add-flow-has-one-owner-session",
+        steps=(
+            *vision_image_item_steps("travel", "Поехать в горы"),
+            ScenarioStep("vision_capture_callback", "imageadd"),
+            ScenarioStep(
+                "vision_replay_callback", "imageadd", reply_contains=("Отправь одно фото",)
+            ),
+            ScenarioStep(
+                "vision_replay_callback",
+                "imageadd",
+                reply_contains=("Сначала заверши",),
+            ),
+            ScenarioStep("vision_photo", "jpeg-second"),
+            ScenarioStep("vision_callback", "imageconfirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("travel", "Поехать в горы", "active", has_image=True),),
+            vision_image_count=1,
         ),
     ),
 )
