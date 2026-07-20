@@ -103,8 +103,33 @@ class VisionHandlers:
                 reply_markup=self._vision_category_keyboard(draft, edit=True),
             )
             return
+        if draft.step == "delete_confirm":
+            await message.reply_text(
+                "Удаление ожидает явного подтверждения.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Да, удалить",
+                                callback_data=(
+                                    f"vision:delete:{draft.editing_item_id}:"
+                                    f"{draft.id}:{draft.version}"
+                                ),
+                            ),
+                            InlineKeyboardButton(
+                                "Нет",
+                                callback_data=(
+                                    f"vision:deletecancel:{draft.editing_item_id}:"
+                                    f"{draft.id}:{draft.version}"
+                                ),
+                            ),
+                        ]
+                    ]
+                ),
+            )
+            return
         prompts = {
-            "wish": "Сформулируй желание текстом или голосом.",
+            "wish": "Сформулируй желание как желаемый результат текстом или голосом.",
             "why": "Почему это важно для тебя?",
             "target_date": "Желаемая дата? Формат: ДД.ММ.ГГГГ.",
             "first_step": "Какой первый небольшой шаг можно сделать?",
@@ -204,6 +229,8 @@ class VisionHandlers:
             await update.effective_message.reply_text(
                 "Карточка уже собрана. Используй кнопку «Сохранить» или «Отменить»."
             )
+            await self._vision_prompt(update.effective_message, outcome.draft)
+        elif outcome.status == "need_delete_confirm":
             await self._vision_prompt(update.effective_message, outcome.draft)
         elif outcome.status == "invalid":
             await update.effective_message.reply_text("Ответ не должен быть пустым.")
@@ -338,7 +365,6 @@ class VisionHandlers:
                 "view",
                 "edit",
                 "deleteask",
-                "delete",
                 "task",
                 "archive",
             }
@@ -350,6 +376,38 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await self._vision_item_action(query, user.id, chat_id, action, item_id)
+            return
+        if action in {"delete", "deletecancel"} and len(parts) == 5:
+            try:
+                item_id, draft_id, version = map(int, parts[2:5])
+            except ValueError:
+                await self._vision_stale(query)
+                return
+            if action == "delete":
+                outcome = await self.vision_service.confirm_delete(
+                    user.id,
+                    chat_id,
+                    item_id,
+                    draft_id,
+                    version,
+                )
+            else:
+                outcome = await self.vision_service.cancel_delete(
+                    user.id,
+                    chat_id,
+                    item_id,
+                    draft_id,
+                    version,
+                )
+            if outcome.status not in {"deleted", "cancelled"}:
+                await self._vision_stale(query)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                "Карточка удалена." if outcome.status == "deleted" else "Удаление отменено."
+            )
+            if outcome.status == "cancelled":
+                await self._vision_send_item(query.message, outcome.item)
             return
         if action == "status" and len(parts) == 4:
             try:
@@ -438,28 +496,18 @@ class VisionHandlers:
             )
             return
         if action == "deleteask":
-            await query.answer()
-            await query.message.reply_text(
-                "Удалить карточку без возможности восстановления?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "Да, удалить", callback_data=f"vision:delete:{item.id}"
-                            ),
-                            InlineKeyboardButton("Нет", callback_data=f"vision:view:{item.id}"),
-                        ]
-                    ]
-                ),
-            )
-            return
-        if action == "delete":
-            deleted = await self.vision_service.delete_item(owner_id, item.id)
-            if not deleted:
+            outcome = await self.vision_service.start_delete(owner_id, chat_id, item.id)
+            if outcome.status == "busy":
+                await query.answer(
+                    "Сначала закончи или отмени текущую операцию с карточкой.",
+                    show_alert=True,
+                )
+                return
+            if outcome.status != "confirming":
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await query.edit_message_text("Карточка удалена.")
+            await self._vision_prompt(query.message, outcome.draft)
             return
         if action == "task":
             result = await self.vision_service.create_task(owner_id, item.id)

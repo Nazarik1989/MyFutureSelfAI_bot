@@ -122,6 +122,8 @@ class VisionService:
                 return DraftAdvance("need_category", draft=draft)
             if draft.step == "preview":
                 return DraftAdvance("need_confirm", draft=draft)
+            if draft.step == "delete_confirm":
+                return DraftAdvance("need_delete_confirm", draft=draft)
             if draft.step == "edit_value":
                 return await self._apply_edit(session, owner_id, draft, clean, today=owner_today)
             if not clean:
@@ -282,6 +284,82 @@ class VisionService:
             session.add(draft)
             await session.flush()
             return DraftAdvance("editing", draft=draft, item=item)
+
+    async def start_delete(self, owner_id: int, chat_id: int, item_id: int) -> DraftAdvance:
+        async with self.db.session() as session:
+            await self._lock_owner(session, owner_id)
+            item = await self._owned_item(session, owner_id, item_id)
+            if item is None:
+                return DraftAdvance("stale")
+            existing = await session.scalar(
+                select(VisionDraft).where(VisionDraft.owner_id == owner_id)
+            )
+            if existing is not None:
+                if (
+                    existing.chat_id == chat_id
+                    and existing.step == "delete_confirm"
+                    and existing.editing_item_id == item.id
+                ):
+                    return DraftAdvance("confirming", draft=existing, item=item)
+                return DraftAdvance("busy", draft=existing, item=item)
+            draft = VisionDraft(
+                owner_id=owner_id,
+                chat_id=chat_id,
+                step="delete_confirm",
+                editing_item_id=item.id,
+            )
+            session.add(draft)
+            await session.flush()
+            return DraftAdvance("confirming", draft=draft, item=item)
+
+    async def confirm_delete(
+        self,
+        owner_id: int,
+        chat_id: int,
+        item_id: int,
+        draft_id: int,
+        version: int,
+    ) -> DraftAdvance:
+        async with self.db.session() as session:
+            await self._lock_owner(session, owner_id)
+            draft = await self._owned_draft(session, owner_id, chat_id, draft_id)
+            if (
+                draft is None
+                or draft.step != "delete_confirm"
+                or draft.editing_item_id != item_id
+                or draft.version != version
+            ):
+                return DraftAdvance("stale")
+            item = await self._owned_item(session, owner_id, item_id)
+            await session.delete(draft)
+            if item is None:
+                return DraftAdvance("stale")
+            await session.delete(item)
+            return DraftAdvance("deleted", item=item)
+
+    async def cancel_delete(
+        self,
+        owner_id: int,
+        chat_id: int,
+        item_id: int,
+        draft_id: int,
+        version: int,
+    ) -> DraftAdvance:
+        async with self.db.session() as session:
+            await self._lock_owner(session, owner_id)
+            draft = await self._owned_draft(session, owner_id, chat_id, draft_id)
+            if (
+                draft is None
+                or draft.step != "delete_confirm"
+                or draft.editing_item_id != item_id
+                or draft.version != version
+            ):
+                return DraftAdvance("stale")
+            item = await self._owned_item(session, owner_id, item_id)
+            await session.delete(draft)
+            if item is None:
+                return DraftAdvance("stale")
+            return DraftAdvance("cancelled", item=item)
 
     async def delete_item(self, owner_id: int, item_id: int) -> bool:
         async with self.db.session() as session:

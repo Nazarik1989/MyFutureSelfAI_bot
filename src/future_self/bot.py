@@ -2307,7 +2307,7 @@ class FutureSelfBot(VisionHandlers):
         user = await self._user(update.effective_user.id)
         if await self.vision_service.cancel(user.id, update.effective_chat.id):
             await update.effective_message.reply_text(
-                "Создание или редактирование карточки отменено, ничего не сохранено."
+                "Операция с карточкой отменена, ничего не сохранено и не удалено."
             )
             return
         await self.conversation.clear_focus(update.effective_user.id, update.effective_chat.id)

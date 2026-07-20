@@ -15,6 +15,7 @@ from telegram.ext import ApplicationHandlerStop
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.models import InboxItem, TaskReminder, VisionDraft, VisionItem
+from future_self.vision import CATEGORY_META
 
 
 def settings() -> Settings:
@@ -224,6 +225,27 @@ async def test_two_owners_can_have_identical_wishes_and_forged_callback_is_priva
     assert [item.id for item in own_items] == [second.item.id]
 
 
+async def test_foreign_draft_callback_cannot_advance_or_reveal_private_state(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    owner = await bot._user(7151)
+    draft = await bot.vision_service.begin(owner.id, 17151)
+    forged_data = f"vision:cat:{draft.id}:{draft.version}:travel"
+
+    forged_update, forged_query = callback_update(
+        forged_data,
+        FakeMessage(),
+        user_id=7152,
+        chat_id=17152,
+    )
+    await bot.vision_action(forged_update, None)
+
+    unchanged = await bot.vision_service.draft(owner.id, 17151)
+    assert unchanged is not None
+    assert unchanged.step == "category"
+    assert unchanged.category is None
+    assert any(text and "недоступна" in text for text, _show_alert in forged_query.answers)
+
+
 async def test_status_edit_archive_delete_and_pagination_are_owner_scoped(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     user = await bot._user(7201)
@@ -259,6 +281,45 @@ async def test_status_edit_archive_delete_and_pagination_are_owner_scoped(db, fa
     assert await bot.vision_service.delete_item(user.id, item.id) is False
 
 
+async def test_all_editable_fields_use_owned_persistent_business_logic(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created = await create_item(bot, "Начальная формулировка")
+    owner_id = created.item.owner_id
+    item_id = created.item.id
+
+    why = await bot.vision_service.start_edit(owner_id, 17001, item_id, "why")
+    assert why.status == "editing"
+    assert (
+        await bot.vision_service.consume_text(owner_id, 17001, "Это действительно важно")
+    ).status == "edited"
+
+    target = await bot.vision_service.start_edit(owner_id, 17001, item_id, "target_date")
+    assert target.status == "editing"
+    assert (await bot.vision_service.consume_text(owner_id, 17001, "31.12.2030")).status == "edited"
+
+    category = await bot.vision_service.start_edit(owner_id, 17001, item_id, "category")
+    assert category.status == "editing"
+    changed = await bot.vision_service.choose_category(
+        owner_id,
+        17001,
+        "health_energy",
+        draft_id=category.draft.id,
+    )
+    assert changed.status == "edited"
+    assert changed.item.category == "health_energy"
+
+    clear_why = await bot.vision_service.start_edit(owner_id, 17001, item_id, "why")
+    cleared = await bot.vision_service.skip(
+        owner_id,
+        17001,
+        clear_why.draft.id,
+        clear_why.draft.version,
+    )
+    assert cleared.status == "edited"
+    assert cleared.item.why_text is None
+    assert cleared.item.target_date == date(2030, 12, 31)
+
+
 async def test_archive_is_listable_and_restorable_and_invalid_list_callback_is_stale(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     created = await create_item(bot, "Сохранить в архиве")
@@ -275,6 +336,102 @@ async def test_archive_is_listable_and_restorable_and_invalid_list_callback_is_s
     await bot.vision_action(update, None)
     assert message.replies == []
     assert any(text and "устарело" in text for text, _show_alert in query.answers)
+
+
+async def test_delete_requires_exact_persistent_confirmation_and_is_idempotent(db, fake_ai):
+    first_bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created = await create_item(first_bot, "Удалить только после подтверждения")
+    item_id = created.item.id
+    owner_id = created.item.owner_id
+
+    forged_message = FakeMessage()
+    forged_update, forged_query = callback_update(
+        f"vision:delete:{item_id}:999999:1",
+        forged_message,
+    )
+    await first_bot.vision_action(forged_update, None)
+    assert await first_bot.vision_service.get_item(owner_id, item_id) is not None
+    assert any(text and "устарело" in text for text, _show_alert in forged_query.answers)
+
+    card = FakeMessage()
+    await first_bot._vision_send_item(card, created.item)
+    ask_update, _ = callback_update(callback_from(card, "vision:deleteask:"), card)
+    await first_bot.vision_action(ask_update, None)
+    confirm_data = callback_from(card, "vision:delete:")
+
+    restarted_bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    resume = FakeMessage("/vision")
+    await restarted_bot.vision_command(update_for(resume), None)
+    assert "Удаление ожидает явного подтверждения" in "\n".join(
+        reply["text"] for reply in resume.replies
+    )
+
+    unrelated = FakeMessage("Это не должно изменить карточку")
+    with pytest.raises(ApplicationHandlerStop):
+        await restarted_bot.vision_text_gate(
+            update_for(unrelated),
+            SimpleNamespace(user_data={}),
+        )
+    assert await restarted_bot.vision_service.get_item(owner_id, item_id) is not None
+    assert fake_ai.route_calls == []
+
+    confirm_update, confirm_query = callback_update(confirm_data, card)
+    await restarted_bot.vision_action(confirm_update, None)
+    assert any("Карточка удалена" in edit for edit in confirm_query.edits)
+    assert await restarted_bot.vision_service.get_item(owner_id, item_id) is None
+
+    repeated_update, repeated_query = callback_update(confirm_data, card)
+    await restarted_bot.vision_action(repeated_update, None)
+    assert any(text and "устарело" in text for text, _show_alert in repeated_query.answers)
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(VisionDraft.id))) == 0
+
+
+async def test_delete_cancel_and_foreign_callbacks_cannot_change_owner_item(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created = await create_item(bot, "Приватная карточка", user_id=7251, chat_id=17251)
+    item_id = created.item.id
+
+    card = FakeMessage()
+    await bot._vision_send_item(card, created.item)
+    ask_update, _ = callback_update(
+        callback_from(card, "vision:deleteask:"),
+        card,
+        user_id=7251,
+        chat_id=17251,
+    )
+    await bot.vision_action(ask_update, None)
+    confirm_data = callback_from(card, "vision:delete:")
+    cancel_data = callback_from(card, "vision:deletecancel:")
+
+    foreign_update, foreign_query = callback_update(
+        confirm_data,
+        FakeMessage(),
+        user_id=7252,
+        chat_id=17252,
+    )
+    await bot.vision_action(foreign_update, None)
+    assert any(text and "устарело" in text for text, _show_alert in foreign_query.answers)
+    assert await bot.vision_service.get_item(created.item.owner_id, item_id) is not None
+
+    cancel_update, cancel_query = callback_update(
+        cancel_data,
+        card,
+        user_id=7251,
+        chat_id=17251,
+    )
+    await bot.vision_action(cancel_update, None)
+    assert any("Удаление отменено" in edit for edit in cancel_query.edits)
+    assert await bot.vision_service.get_item(created.item.owner_id, item_id) is not None
+
+    stale_update, stale_query = callback_update(
+        confirm_data,
+        card,
+        user_id=7251,
+        chat_id=17251,
+    )
+    await bot.vision_action(stale_update, None)
+    assert any(text and "устарело" in text for text, _show_alert in stale_query.answers)
 
 
 async def test_create_task_is_atomic_idempotent_and_never_creates_reminder(db, fake_ai):
@@ -319,3 +476,16 @@ def test_target_date_parser_rejects_past_and_accepts_supported_formats():
     assert parse_target_date("2030-12-31", today=date(2026, 1, 1)) == date(2030, 12, 31)
     with pytest.raises(ValueError, match="будущем"):
         parse_target_date("01.01.2020", today=date(2026, 1, 1))
+
+
+def test_vision_categories_have_stable_machine_codes_and_russian_labels():
+    assert CATEGORY_META == {
+        "health_energy": ("🌿", "Здоровье и энергия"),
+        "relationships_family": ("❤️", "Отношения и семья"),
+        "work_purpose": ("💼", "Работа и предназначение"),
+        "money": ("💰", "Деньги"),
+        "home": ("🏡", "Дом"),
+        "travel": ("✈️", "Путешествия"),
+        "growth_creativity": ("🎨", "Развитие и творчество"),
+        "other": ("✨", "Другое"),
+    }
