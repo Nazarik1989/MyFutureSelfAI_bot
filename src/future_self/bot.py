@@ -51,6 +51,7 @@ from .health import (
     prolonged_weakness_message,
     urgent_safety_message,
 )
+from .location import LocationService, location_from_user, parse_location
 from .models import DraftInboxItem, Goal, InboxItem, Routine, User, VisionProfile
 from .natural_commands import NaturalAction, NaturalCommandRouter
 from .reminders import TaskReminderEngine
@@ -137,6 +138,7 @@ class FutureSelfBot:
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
+        self.location_service = LocationService(db)
         self.doctor_prep_service = DoctorVisitPrepService(
             db,
             task_date_event_hour=settings.task_date_event_hour,
@@ -278,6 +280,7 @@ class FutureSelfBot:
         app.add_handler(doctor_prepare)
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
+        app.add_handler(CommandHandler("location", self.location_command))
         app.add_handler(CommandHandler("goals", self.goals_command))
         app.add_handler(CommandHandler("inbox", self.inbox))
         app.add_handler(CommandHandler("drafts", self.drafts_command))
@@ -408,7 +411,14 @@ class FutureSelfBot:
                 return ConversationHandler.END
             context.user_data["vision_summary"] = summary.model_dump()
             await update.effective_message.reply_text(
-                self._profile_text(summary),
+                self._profile_text(
+                    summary,
+                    location_label=(
+                        parse_location(state.answers["location"]).label
+                        if state.answers.get("location")
+                        else None
+                    ),
+                ),
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
@@ -437,10 +447,13 @@ class FutureSelfBot:
         user_id, step, answers = await self._state(context)
         try:
             answers = OnboardingFlow.answer(answers, step, update.effective_message.text)
-            if ONBOARDING_QUESTIONS[step][0] == "timezone":
+            question_key = ONBOARDING_QUESTIONS[step][0]
+            if question_key == "timezone":
                 from .domain import validate_timezone
 
                 validate_timezone(update.effective_message.text.strip())
+            elif question_key == "location":
+                parse_location(update.effective_message.text)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return ONBOARDING_INPUT
@@ -481,7 +494,12 @@ class FutureSelfBot:
             return ConversationHandler.END
         context.user_data["vision_summary"] = summary.model_dump()
         await update.effective_message.reply_text(
-            self._profile_text(summary),
+            self._profile_text(
+                summary,
+                location_label=(
+                    parse_location(answers["location"]).label if answers.get("location") else None
+                ),
+            ),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
@@ -533,6 +551,10 @@ class FutureSelfBot:
             await ProfileRepository(session).upsert(user, answers, summary)
             user.display_name = answers.get("display_name")
             user.timezone = answers.get("timezone", user.timezone)
+            if location_value := answers.get("location"):
+                location = parse_location(location_value)
+                user.location_city = location.city
+                user.location_fallback_city = location.fallback_city
             state = await OnboardingRepository(session).get_or_create(user_id)
             state.status = "completed"
         if self.scheduler:
@@ -712,18 +734,48 @@ class FutureSelfBot:
                     desired_identity=profile.desired_identity,
                     constraints=profile.constraints,
                     motivation_style=profile.motivation_style,
-                )
+                ),
+                location_label=(location.label if (location := location_from_user(user)) else None),
             )
         )
 
     @staticmethod
-    def _profile_text(profile: VisionSummary) -> str:
+    def _profile_text(profile: VisionSummary, *, location_label: str | None = None) -> str:
         return (
             f"Твой Vision Profile:\n{profile.summary}\n\n"
             f"Ценности: {', '.join(profile.values) or 'не указаны'}\n"
             f"Желаемая идентичность: {', '.join(profile.desired_identity) or 'не указана'}\n"
             f"Ограничения: {', '.join(profile.constraints) or 'не указаны'}\n"
-            f"Стиль поддержки: {profile.motivation_style or 'не указан'}"
+            f"Стиль поддержки: {profile.motivation_style or 'не указан'}\n"
+            f"Локация: {location_label or 'не настроена — используй /location'}"
+        )
+
+    async def location_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._user(update.effective_user.id)
+        args = getattr(context, "args", [])
+        if not args:
+            location = location_from_user(user)
+            if location is None:
+                await update.effective_message.reply_text(
+                    "Локация не настроена. Укажи город: /location Саратов. "
+                    "Для маршрута с запасным городом: /location Саратов → Энгельс."
+                )
+                return
+            await update.effective_message.reply_text(
+                f"Твоя локация: {location.label}. Изменить: /location Новый город."
+            )
+            return
+        try:
+            location = await self.location_service.set(
+                user_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                value=" ".join(args),
+            )
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        await update.effective_message.reply_text(
+            f"Локация сохранена: {location.label}. /doctor_find будет использовать её."
         )
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2935,7 +2987,17 @@ class FutureSelfBot:
         )
 
     async def doctor_find(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.effective_message.reply_text(self.doctor_search_service.format_directory())
+        user = await self._user(update.effective_user.id)
+        location = location_from_user(user)
+        if location is None:
+            await update.effective_message.reply_text(
+                "Сначала настрой локацию: /location Саратов. "
+                "Для маршрута: /location Саратов → Энгельс."
+            )
+            return
+        await update.effective_message.reply_text(
+            self.doctor_search_service.format_directory(location)
+        )
 
     async def doctor_find_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         args = getattr(context, "args", [])
@@ -2945,6 +3007,11 @@ class FutureSelfBot:
             )
             return
         user = await self._user(update.effective_user.id)
+        if location_from_user(user) is None:
+            await update.effective_message.reply_text(
+                "Сначала настрой локацию через /location, затем создай задачу."
+            )
+            return
         expression = " ".join(args).strip()
         temporal = self._doctor_task_temporal(expression, user.timezone)
         if temporal is None:
@@ -2959,10 +3026,17 @@ class FutureSelfBot:
             chat_id=update.effective_chat.id,
             temporal=temporal,
         )
+        if result.status == "missing_location":
+            await update.effective_message.reply_text(
+                "Локация не найдена. Настрой её через /location."
+            )
+            return
+        if result.inbox_item is None:
+            await update.effective_message.reply_text("Не удалось создать задачу.")
+            return
         if result.status == "existing":
             await update.effective_message.reply_text(
-                "Задача «Записаться к терапевту: Светогорск → Выборг» уже создана; "
-                "дубликат не добавлен."
+                f"Задача «{result.inbox_item.title}» уже создана; дубликат не добавлен."
             )
             return
         if result.reminder is None:
@@ -2975,7 +3049,7 @@ class FutureSelfBot:
             local_reminder = local_reminder.replace(tzinfo=UTC)
         local_reminder = local_reminder.astimezone(ZoneInfo(user.timezone))
         await update.effective_message.reply_text(
-            "Задача «Записаться к терапевту: Светогорск → Выборг» создана. "
+            f"Задача «{result.inbox_item.title}» создана. "
             f"Reminder: {local_reminder.strftime('%d.%m.%Y %H:%M')} ({user.timezone})."
         )
 
@@ -2986,7 +3060,8 @@ class FutureSelfBot:
             "/last_saved — последняя запись, /cleanup_drafts — безопасная очистка черновиков, "
             "/health — состояние и динамика, /checkin — health check-in, "
             "/doctor_prepare — подготовка к визиту к врачу, "
-            "/doctor_find — официальный поиск терапевта Светогорск → Выборг."
+            "/location — личный город или маршрут, "
+            "/doctor_find — официальный поиск терапевта по твоей локации."
         )
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

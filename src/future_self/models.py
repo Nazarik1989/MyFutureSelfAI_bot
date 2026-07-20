@@ -39,6 +39,8 @@ class User(TimestampMixin, Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     display_name: Mapped[str | None] = mapped_column(String(120))
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Moscow")
+    location_city: Mapped[str | None] = mapped_column(String(120))
+    location_fallback_city: Mapped[str | None] = mapped_column(String(120))
     onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
     vision_profile: Mapped[VisionProfile | None] = relationship(
         back_populates="user", uselist=False

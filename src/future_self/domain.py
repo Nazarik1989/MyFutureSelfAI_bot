@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from .ai import AIService
 from .db import Database
+from .location import parse_location
 from .models import DailyCheckIn, Goal, InboxItem, Routine, User, VisionProfile
 from .repositories import ProfileRepository
 from .schemas import AssistantAnswer, IntentResult, ParsedThought, TodayPlan
@@ -23,6 +24,11 @@ ONBOARDING_QUESTIONS: tuple[tuple[str, str, bool], ...] = (
     ("values", "Какие ценности для тебя главные?", True),
     ("obstacles", "Что сейчас чаще всего мешает двигаться к этому?", False),
     ("support_style", "Какой стиль поддержки тебе подходит?", True),
+    (
+        "location",
+        "В каком городе искать врачей? Можно указать маршрут: основной город → запасной.",
+        True,
+    ),
 )
 
 
@@ -160,6 +166,10 @@ class ProfileService:
                 validate_timezone(timezone)
                 user.timezone = timezone
             user.display_name = answers.get("display_name")
+            if location_value := answers.get("location"):
+                location = parse_location(location_value)
+                user.location_city = location.city
+                user.location_fallback_city = location.fallback_city
             return await ProfileRepository(session).upsert(user, answers, summary)
 
 

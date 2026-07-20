@@ -22,8 +22,8 @@ MVP Telegram-ассистента, который связывает образ 
   динамика, история/timezone, исправление, удаление и добровольные daily reminders;
 - Doctor Visit Prep: приватный `/doctor_prepare`, фактическое резюме с Health Track
   dynamics, owner-only edit/delete и generic-задача записи к врачу с reminder;
-- Doctor Search: официальный маршрут к терапевту Светогорск → Выборг с адресами,
-  телефонами, ссылками и generic-задачей через существующий Reminder Engine;
+- Doctor Search: официальные маршруты к терапевту по личной локации пользователя
+  и owner-isolated задача через существующий Reminder Engine;
 - текстовый и голосовой inbox с проверкой расшифровки и отдельным callback до сохранения;
 - персональный `/today` и пятишаговая неосуждающая рефлексия `/evening`;
 - async SQLAlchemy, Alembic, SQLite локально и PostgreSQL в production;
@@ -86,7 +86,9 @@ DATABASE_URL=postgresql+asyncpg://future_self:future_self@localhost:5432/future_
 ## Команды
 
 - `/start` или `/onboarding` — начать или продолжить онбординг;
-- `/profile` — показать Vision Profile;
+- `/profile` — показать Vision Profile и личную локацию;
+- `/location Саратов` — сохранить свой город; запасной маршрут можно задать как
+  `/location Саратов → Энгельс`;
 - `/goals` — заново предложить набор целей;
 - `/today` — получить фокус дня;
 - `/evening` — пройти вечернюю рефлексию;
@@ -104,8 +106,9 @@ DATABASE_URL=postgresql+asyncpg://future_self:future_self@localhost:5432/future_
 - `/doctor_preparations`, `/doctor_prepare_show ID`, `/doctor_prepare_edit ID`,
   `/doctor_prepare_delete ID` — owner-only история и управление;
 - `/doctor_prepare_task ID через 2 часа` — создать generic-задачу записи с reminder.
-- `/doctor_find` — показать официальные варианты записи к терапевту Светогорск → Выборг;
-- `/doctor_find_task через 2 часа` — создать owner-isolated задачу с reminder.
+- `/doctor_find` — показать официальные варианты записи к терапевту по локации владельца;
+- `/doctor_find_task через 2 часа` — создать owner-isolated задачу с локацией владельца
+  и reminder.
 
 Обычный текст и расшифрованный voice/audio проходят через один Intent Router. Вопросы и общение получают ответ; идея, задача, желание, заметка или рефлексия показывают preview. При низкой уверенности бот спрашивает, что сделать. До отдельного нажатия «Сохранить» запись в БД не создаётся. Порог задаётся через `INTENT_CONFIDENCE_THRESHOLD` (по умолчанию `0.70`).
 

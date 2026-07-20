@@ -328,6 +328,7 @@ class BotAutotester:
         self.messages.append(message)
         update = self._update_for(message)
         handlers = {
+            "location": self.bot.location_command,
             "health": self.bot.health_command,
             "checkin": self.bot.health_checkin_start,
             "health_edit": self.bot.health_checkin_start,
