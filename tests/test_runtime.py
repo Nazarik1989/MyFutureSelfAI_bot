@@ -48,7 +48,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260720_0012')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260720_0013')")
         )
 
     async def forbidden_network(*args, **kwargs):
@@ -96,6 +96,7 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     bot = FutureSelfBot(settings, database, fake_ai, FakeTranscription())
     application = create_application(settings, database, fake_ai, FakeTranscription())
     handlers = application.handlers[0]
+    vision_gate_handlers = application.handlers[-1]
 
     assert isinstance(handlers[0], ConversationHandler)
     assert isinstance(handlers[1], ConversationHandler)
@@ -159,6 +160,15 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     } <= commands
     assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 9
     assert sum(isinstance(handler, MessageHandler) for handler in handlers) == 2
+    gate_commands = {
+        command
+        for handler in vision_gate_handlers
+        if isinstance(handler, CommandHandler)
+        for command in handler.commands
+    }
+    assert gate_commands == {"vision", "cancel"}
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in vision_gate_handlers) == 1
+    assert sum(isinstance(handler, MessageHandler) for handler in vision_gate_handlers) == 2
     assert bot.error_handler.__name__ in {
         callback.__name__ for callback in application.error_handlers
     }

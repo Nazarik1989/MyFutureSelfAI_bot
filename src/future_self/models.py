@@ -50,6 +50,7 @@ class User(TimestampMixin, Base):
     inbox_items: Mapped[list[InboxItem]] = relationship(back_populates="user")
     health_check_ins: Mapped[list[HealthCheckIn]] = relationship(back_populates="user")
     doctor_visit_preps: Mapped[list[DoctorVisitPrep]] = relationship(back_populates="user")
+    vision_items: Mapped[list[VisionItem]] = relationship(back_populates="owner")
 
 
 class DraftInboxItem(Base):
@@ -197,6 +198,56 @@ class InboxItem(TimestampMixin, Base):
     reminder: Mapped[TaskReminder | None] = relationship(
         back_populates="inbox_item", uselist=False, cascade="all, delete-orphan"
     )
+
+
+class VisionItem(TimestampMixin, Base):
+    __tablename__ = "vision_items"
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('health_energy', 'relationships_family', 'work_purpose', "
+            "'money', 'home', 'travel', 'growth_creativity', 'other')",
+            name="ck_vision_item_category",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'achieved', 'archived')",
+            name="ck_vision_item_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    wish_text: Mapped[str] = mapped_column(Text)
+    why_text: Mapped[str | None] = mapped_column(Text)
+    target_date: Mapped[date | None] = mapped_column(Date)
+    first_step: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    linked_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("inbox_items.id", ondelete="SET NULL"), unique=True
+    )
+    owner: Mapped[User] = relationship(back_populates="vision_items")
+    linked_task: Mapped[InboxItem | None] = relationship()
+
+
+class VisionDraft(TimestampMixin, Base):
+    __tablename__ = "vision_drafts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    step: Mapped[str] = mapped_column(String(30), default="category")
+    category: Mapped[str | None] = mapped_column(String(40))
+    wish_text: Mapped[str | None] = mapped_column(Text)
+    why_text: Mapped[str | None] = mapped_column(Text)
+    target_date: Mapped[date | None] = mapped_column(Date)
+    first_step: Mapped[str | None] = mapped_column(Text)
+    editing_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vision_items.id", ondelete="CASCADE")
+    )
+    edit_field: Mapped[str | None] = mapped_column(String(30))
+    version: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class TaskReminder(TimestampMixin, Base):
