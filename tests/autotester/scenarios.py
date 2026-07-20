@@ -969,6 +969,11 @@ DOCTOR_SEARCH_SCENARIOS = (
         steps=(
             ScenarioStep(
                 "command",
+                "/location Светогорск → Выборг",
+                reply_contains=("Локация сохранена", "Светогорск → Выборг"),
+            ),
+            ScenarioStep(
+                "command",
                 "/doctor_find",
                 reply_contains=(
                     "Светогорск",
@@ -987,6 +992,7 @@ DOCTOR_SEARCH_SCENARIOS = (
     Scenario(
         name="doctor-search-task-and-reminder-are-idempotent",
         steps=(
+            ScenarioStep("command", "/location Саратов", reply_contains=("Саратов",)),
             ScenarioStep(
                 "command",
                 "/doctor_find_task через 2 часа",
@@ -1001,7 +1007,7 @@ DOCTOR_SEARCH_SCENARIOS = (
         expected=ExpectedState(
             inbox=(
                 InboxState(
-                    "Записаться к терапевту: Светогорск → Выборг",
+                    "Записаться к терапевту: Саратов",
                     "task",
                     "doctor_search",
                 ),
@@ -1014,6 +1020,11 @@ DOCTOR_SEARCH_SCENARIOS = (
         steps=(
             ScenarioStep(
                 "command",
+                "/location Светогорск → Выборг",
+                reply_contains=("Светогорск → Выборг",),
+            ),
+            ScenarioStep(
+                "command",
                 "/doctor_find_task когда-нибудь",
                 reply_contains=("Не понял будущее время",),
             ),
@@ -1023,6 +1034,7 @@ DOCTOR_SEARCH_SCENARIOS = (
                 reply_contains=("Записаться к терапевту",),
             ),
             ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep("command", "/location Саратов", reply_contains=("Саратов",)),
             ScenarioStep(
                 "command",
                 "/doctor_find_task через 3 часа",
@@ -1032,7 +1044,7 @@ DOCTOR_SEARCH_SCENARIOS = (
         expected=ExpectedState(
             inbox=(
                 InboxState(
-                    "Записаться к терапевту: Светогорск → Выборг",
+                    "Записаться к терапевту: Саратов",
                     "task",
                     "doctor_search",
                 ),
