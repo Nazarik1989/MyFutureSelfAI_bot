@@ -7,6 +7,7 @@ from .harness import (
     LLMStub,
     Scenario,
     ScenarioStep,
+    VisionState,
 )
 
 
@@ -1059,6 +1060,145 @@ DOCTOR_SEARCH_SCENARIOS = (
     ),
 )
 
+VISION_SCENARIOS = (
+    Scenario(
+        name="vision-full-voice-skip-confirm-task-idempotent-without-llm",
+        steps=(
+            ScenarioStep("command", "/vision", reply_contains=("Карта желаний",)),
+            ScenarioStep("vision_callback", "add", reply_contains=("Выбери категорию",)),
+            ScenarioStep(
+                "vision_callback",
+                "travel",
+                reply_contains=("Сформулируй желание",),
+            ),
+            ScenarioStep(
+                "voice",
+                "Увидеть северное сияние",
+                reply_contains=("Почему это важно",),
+            ),
+            ScenarioStep("vision_callback", "skip", reply_contains=("Желаемая дата",)),
+            ScenarioStep("vision_callback", "skip", reply_contains=("первый небольшой шаг",)),
+            ScenarioStep(
+                "text",
+                "Выбрать месяц поездки",
+                reply_contains=("Preview карточки", "Увидеть северное сияние"),
+            ),
+            ScenarioStep("vision_callback", "confirm", reply_contains=("Желание сохранено",)),
+            ScenarioStep(
+                "vision_callback",
+                "confirm",
+                reply_contains=("действие устарело",),
+            ),
+            ScenarioStep("vision_callback", "task", reply_contains=("Задача создана",)),
+            ScenarioStep(
+                "vision_callback",
+                "task",
+                reply_contains=("дубликат не добавлен",),
+            ),
+        ),
+        expected=ExpectedState(
+            inbox=(
+                InboxState(
+                    "Шаг к желанию: Увидеть северное сияние",
+                    "task",
+                    "vision",
+                ),
+            ),
+            vision_items=(
+                VisionState(
+                    "travel",
+                    "Увидеть северное сияние",
+                    "active",
+                    True,
+                ),
+            ),
+        ),
+    ),
+    Scenario(
+        name="vision-cancel-removes-persistent-partial-draft",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "home"),
+            ScenarioStep("text", "Создать уютный дом"),
+            ScenarioStep(
+                "command",
+                "/cancel",
+                reply_contains=("ничего не сохранено",),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="vision-manage-edit-status-archive-restore-delete",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "money"),
+            ScenarioStep("text", "Создать финансовую подушку"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+            ScenarioStep("vision_callback", "status", reply_contains=("Статус",)),
+            ScenarioStep("vision_callback", "status", reply_contains=("Статус",)),
+            ScenarioStep("vision_callback", "edit", reply_contains=("Что изменить",)),
+            ScenarioStep("vision_callback", "editwish", reply_contains=("Пришли желание",)),
+            ScenarioStep("text", "Обновлённая финансовая цель"),
+            ScenarioStep("vision_callback", "archive", reply_contains=("архивирована",)),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "list:active", reply_contains=("пока нет",)),
+            ScenarioStep("vision_callback", "list:archived", reply_contains=("Архив",)),
+            ScenarioStep("vision_callback", "view", reply_contains=("в архиве",)),
+            ScenarioStep("vision_callback", "status", reply_contains=("Статус",)),
+            ScenarioStep("vision_callback", "deleteask", reply_contains=("Удалить",)),
+            ScenarioStep("vision_callback", "delete", reply_contains=("удалена",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="vision-identical-wishes-remain-owner-isolated",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "growth_creativity"),
+            ScenarioStep("text", "Научиться рисовать"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "vision_raw_callback",
+                "vision:view:1",
+                reply_contains=("недоступна",),
+            ),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "growth_creativity"),
+            ScenarioStep("voice", "Научиться рисовать"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState(
+                    "growth_creativity",
+                    "Научиться рисовать",
+                    "active",
+                ),
+                VisionState(
+                    "growth_creativity",
+                    "Научиться рисовать",
+                    "active",
+                ),
+            )
+        ),
+    ),
+)
+
 
 SCENARIOS = (
     *CORE_SCENARIOS,
@@ -1073,4 +1213,5 @@ SCENARIOS = (
     *HEALTH_SCENARIOS,
     *DOCTOR_PREP_SCENARIOS,
     *DOCTOR_SEARCH_SCENARIOS,
+    *VISION_SCENARIOS,
 )

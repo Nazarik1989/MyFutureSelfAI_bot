@@ -30,8 +30,11 @@ from future_self.models import (
     HealthReminderPreference,
     InboxItem,
     TaskReminder,
+    VisionDraft,
+    VisionItem,
 )
 from future_self.schemas import IntentResult
+from future_self.vision import CATEGORY_META
 
 from .fakes import (
     FakeBot,
@@ -55,6 +58,8 @@ StepKind = Literal[
     "health_answer",
     "switch_user",
     "setup_clear_focus",
+    "vision_callback",
+    "vision_raw_callback",
 ]
 
 
@@ -91,6 +96,14 @@ class InboxState:
     source: str
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class VisionState:
+    category: str
+    wish_text: str
+    status: str
+    linked_task: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class ExpectedState:
     drafts: tuple[DraftState, ...] = ()
@@ -103,6 +116,8 @@ class ExpectedState:
     health_reminder_removals: int = 0
     doctor_prep_count: int = 0
     task_reminder_count: int = 0
+    vision_items: tuple[VisionState, ...] = ()
+    vision_draft_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +286,8 @@ class BotAutotester:
             health_preference = await session.scalar(select(HealthReminderPreference))
             doctor_preps = list((await session.scalars(select(DoctorVisitPrep))).all())
             task_reminders = list((await session.scalars(select(TaskReminder))).all())
+            vision_items = list((await session.scalars(select(VisionItem))).all())
+            vision_drafts = list((await session.scalars(select(VisionDraft))).all())
         return ExpectedState(
             drafts=tuple(
                 sorted(
@@ -291,6 +308,18 @@ class BotAutotester:
             health_reminder_removals=len(self.bot.scheduler.removed_users),
             doctor_prep_count=len(doctor_preps),
             task_reminder_count=len(task_reminders),
+            vision_items=tuple(
+                sorted(
+                    VisionState(
+                        item.category,
+                        item.wish_text,
+                        item.status,
+                        item.linked_task_id is not None,
+                    )
+                    for item in vision_items
+                )
+            ),
+            vision_draft_count=len(vision_drafts),
         )
 
     async def _run_step(self, step: ScenarioStep) -> StepResult:
@@ -301,6 +330,10 @@ class BotAutotester:
             return StepResult(step.kind, step.value, ())
         if step.kind == "callback":
             return await self._run_callback(step.value)
+        if step.kind == "vision_callback":
+            return await self._run_vision_callback(step.value)
+        if step.kind == "vision_raw_callback":
+            return await self._run_raw_vision_callback(step.value)
         if step.kind == "command":
             return await self._run_command(step.value)
         if step.kind == "health_answer":
@@ -328,6 +361,7 @@ class BotAutotester:
         self.messages.append(message)
         update = self._update_for(message)
         handlers = {
+            "vision": self.bot.vision_command,
             "location": self.bot.location_command,
             "health": self.bot.health_command,
             "checkin": self.bot.health_checkin_start,
@@ -345,7 +379,11 @@ class BotAutotester:
             "doctor_find": self.bot.doctor_find,
             "doctor_find_task": self.bot.doctor_find_task,
         }
-        if command == "cancel" and self.doctor_state in {
+        current_user = await self.bot._user(self.telegram_user_id)
+        vision_draft = await self.bot.vision_service.draft(current_user.id, self.chat_id)
+        if command == "cancel" and vision_draft is not None:
+            result = await self.bot.cancel_draft_edit(update, self.context)
+        elif command == "cancel" and self.doctor_state in {
             DOCTOR_REASON,
             DOCTOR_DURATION,
             DOCTOR_SYMPTOMS,
@@ -429,6 +467,60 @@ class BotAutotester:
             answer for answer, _show_alert in query.answers if answer is not None
         )
         return StepResult("callback", action, outputs)
+
+    async def _run_vision_callback(self, action: str) -> StepResult:
+        data, message = self._latest_vision_callback(action)
+        return await self._dispatch_vision_callback("vision_callback", action, data, message)
+
+    async def _run_raw_vision_callback(self, data: str) -> StepResult:
+        message = FakeMessage()
+        self.messages.append(message)
+        return await self._dispatch_vision_callback("vision_raw_callback", data, data, message)
+
+    async def _dispatch_vision_callback(
+        self,
+        kind: StepKind,
+        value: str,
+        data: str,
+        message: FakeMessage,
+    ) -> StepResult:
+        previous_replies = len(message.replies)
+        query = FakeCallbackQuery(data, message)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+            effective_chat=SimpleNamespace(id=self.chat_id),
+        )
+        await self.bot.vision_action(update, self.context)
+        outputs = (
+            tuple(query.edits)
+            + tuple(answer for answer, _show_alert in query.answers if answer is not None)
+            + tuple(str(reply["text"]) for reply in message.replies[previous_replies:])
+        )
+        return StepResult(kind, value, outputs)
+
+    def _latest_vision_callback(self, action: str) -> tuple[str, FakeMessage]:
+        for message in reversed(self.messages):
+            for reply in reversed(message.replies):
+                markup = reply.get("reply_markup")
+                if markup is None:
+                    continue
+                for row in markup.inline_keyboard:
+                    for button in row:
+                        data = button.callback_data
+                        if data is None:
+                            continue
+                        if action in CATEGORY_META:
+                            matches = data.startswith("vision:cat:") and data.endswith(f":{action}")
+                        elif action == "editwish":
+                            matches = data.startswith("vision:editfield:") and data.endswith(
+                                ":wish"
+                            )
+                        else:
+                            matches = data.startswith(f"vision:{action}")
+                        if matches:
+                            return data, message
+        raise AssertionError(f"No vision callback found for {action!r}")
 
     def _latest_preview_callback(self, action: str) -> tuple[str, FakeMessage]:
         prefix = f"inbox:{action}:"

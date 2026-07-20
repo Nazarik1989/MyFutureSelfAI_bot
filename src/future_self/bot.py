@@ -66,6 +66,8 @@ from .scheduler import JobQueueScheduler
 from .schemas import IntentResult, ParsedThought, TemporalResolution, VisionSummary
 from .system_actions import SystemActionRoute, SystemActionRouter
 from .transcription import TranscriptionError, TranscriptionService
+from .vision import VisionService
+from .vision_handlers import VisionHandlers
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,7 @@ def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | No
         logger.error("%s error_type=%s user_id=%s", event, error_type, user_id)
 
 
-class FutureSelfBot:
+class FutureSelfBot(VisionHandlers):
     def __init__(
         self,
         settings: Settings,
@@ -139,6 +141,7 @@ class FutureSelfBot:
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
         self.location_service = LocationService(db)
+        self.vision_service = VisionService(db)
         self.doctor_prep_service = DoctorVisitPrepService(
             db,
             task_date_event_hour=settings.task_date_event_hour,
@@ -166,7 +169,24 @@ class FutureSelfBot:
         # This assistant handles profiles, health notes and reminders. Telegram
         # group/channel replies would disclose that data to other chat members,
         # so stop every non-private update before any feature handler sees it.
-        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-1)
+        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-2)
+        # Vision drafts must keep receiving text/voice even while another PTB
+        # ConversationHandler is paused. Group -1 routes only an active owner/chat
+        # draft and then stops the lower feature group.
+        app.add_handler(CommandHandler("vision", self.vision_command_gate), group=-1)
+        app.add_handler(
+            CallbackQueryHandler(self.vision_callback_gate, pattern=r"^vision:"),
+            group=-1,
+        )
+        app.add_handler(CommandHandler("cancel", self.vision_cancel_gate), group=-1)
+        app.add_handler(
+            MessageHandler(filters.VOICE | filters.AUDIO, self.vision_voice_gate),
+            group=-1,
+        )
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.vision_text_gate),
+            group=-1,
+        )
         # Profile callbacks belong to the per-user/per-chat conversation, not to
         # individual message IDs. PTB warns about this intentional configuration.
         with warnings.catch_warnings():
@@ -782,6 +802,8 @@ class FutureSelfBot:
         )
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._handle_vision_input(update, update.effective_message.text):
+            return
         goal_id = context.user_data.pop("rename_goal_id", None)
         if goal_id is not None:
             user = await self._user(update.effective_user.id)
@@ -831,6 +853,9 @@ class FutureSelfBot:
             await progress.edit_text(
                 "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
             )
+            return
+        if await self._handle_vision_input(update, text):
+            await progress.edit_text("Голос распознан и добавлен в карточку.")
             return
         await progress.edit_text(f"Я услышал: «{text}»")
         await self._route_message(update, context, text, "voice")
@@ -2279,6 +2304,12 @@ class FutureSelfBot:
             pass
 
     async def cancel_draft_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._user(update.effective_user.id)
+        if await self.vision_service.cancel(user.id, update.effective_chat.id):
+            await update.effective_message.reply_text(
+                "Создание или редактирование карточки отменено, ничего не сохранено."
+            )
+            return
         await self.conversation.clear_focus(update.effective_user.id, update.effective_chat.id)
         await self.conversation.clear_system_action(
             update.effective_user.id, update.effective_chat.id
@@ -3064,6 +3095,7 @@ class FutureSelfBot:
             "/health — состояние и динамика, /checkin — health check-in, "
             "/doctor_prepare — подготовка к визиту к врачу, "
             "/location — личный город или маршрут, "
+            "/vision — персональная карта желаний, "
             "/doctor_find — официальный поиск терапевта по твоей локации."
         )
 
