@@ -5,9 +5,10 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import case, delete, func, select, update
+from sqlalchemy.orm import selectinload
 
 from .db import Database
-from .models import InboxItem, User, VisionDraft, VisionItem
+from .models import InboxItem, User, VisionDraft, VisionItem, VisionItemImage
 
 CATEGORY_META: dict[str, tuple[str, str]] = {
     "health_energy": ("🌿", "Здоровье и энергия"),
@@ -277,6 +278,7 @@ class VisionService:
                 (
                     await session.scalars(
                         select(VisionItem)
+                        .options(selectinload(VisionItem.image))
                         .where(*conditions)
                         .order_by(
                             category_order,
@@ -375,6 +377,12 @@ class VisionService:
             await session.delete(draft)
             if item is None:
                 return DraftAdvance("stale")
+            await session.execute(
+                delete(VisionItemImage).where(
+                    VisionItemImage.owner_id == owner_id,
+                    VisionItemImage.vision_item_id == item_id,
+                )
+            )
             await session.delete(item)
             return DraftAdvance("deleted", item=item)
 
@@ -404,6 +412,12 @@ class VisionService:
 
     async def delete_item(self, owner_id: int, item_id: int) -> bool:
         async with self.db.session() as session:
+            await session.execute(
+                delete(VisionItemImage).where(
+                    VisionItemImage.owner_id == owner_id,
+                    VisionItemImage.vision_item_id == item_id,
+                )
+            )
             result = await session.execute(
                 delete(VisionItem).where(
                     VisionItem.id == item_id,

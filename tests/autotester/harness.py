@@ -1,9 +1,11 @@
 import re
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
+from PIL import Image
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from telegram.ext import ApplicationHandlerStop
@@ -33,14 +35,17 @@ from future_self.models import (
     TaskReminder,
     VisionDraft,
     VisionItem,
+    VisionItemImage,
 )
 from future_self.repositories import OnboardingRepository
 from future_self.schemas import IntentResult
 from future_self.vision import CATEGORY_META
+from future_self.vision_images import MAX_IMAGE_INPUT_BYTES, MAX_IMAGE_PIXELS
 
 from .fakes import (
     FakeBot,
     FakeCallbackQuery,
+    FakeImageMedia,
     FakeMessage,
     FakeVoice,
     ScriptedTranscription,
@@ -66,6 +71,8 @@ StepKind = Literal[
     "vision_replay_callback",
     "vision_hold_render",
     "vision_release_render",
+    "vision_photo",
+    "vision_document",
     "restart",
     "group_command",
     "timezone_onboarding",
@@ -111,6 +118,7 @@ class VisionState:
     wish_text: str
     status: str
     linked_task: bool = False
+    has_image: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +135,7 @@ class ExpectedState:
     task_reminder_count: int = 0
     vision_items: tuple[VisionState, ...] = ()
     vision_draft_count: int = 0
+    vision_image_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +220,7 @@ class BotAutotester:
         self,
         *,
         database: Database,
+        database_path: Path,
         bot: FutureSelfBot,
         ai: StrictAI,
         transcription: ScriptedTranscription,
@@ -219,6 +229,7 @@ class BotAutotester:
         chat_id: int = 910_001,
     ):
         self.database = database
+        self.database_path = database_path
         self.bot = bot
         self.ai = ai
         self.transcription = transcription
@@ -251,6 +262,7 @@ class BotAutotester:
         bot.scheduler = scheduler
         return cls(
             database=database,
+            database_path=database_path,
             bot=bot,
             ai=ai,
             transcription=transcription,
@@ -259,6 +271,8 @@ class BotAutotester:
 
     async def close(self) -> None:
         await self.database.dispose()
+        for suffix in ("", "-wal", "-shm"):
+            self.database_path.with_name(self.database_path.name + suffix).unlink(missing_ok=True)
 
     async def run(self, scenario: Scenario) -> ScenarioResult:
         results: list[StepResult] = []
@@ -297,7 +311,9 @@ class BotAutotester:
             doctor_preps = list((await session.scalars(select(DoctorVisitPrep))).all())
             task_reminders = list((await session.scalars(select(TaskReminder))).all())
             vision_items = list((await session.scalars(select(VisionItem))).all())
+            vision_images = list((await session.scalars(select(VisionItemImage))).all())
             vision_drafts = list((await session.scalars(select(VisionDraft))).all())
+        image_item_ids = {image.vision_item_id for image in vision_images}
         return ExpectedState(
             drafts=tuple(
                 sorted(
@@ -325,11 +341,13 @@ class BotAutotester:
                         item.wish_text,
                         item.status,
                         item.linked_task_id is not None,
+                        item.id in image_item_ids,
                     )
                     for item in vision_items
                 )
             ),
             vision_draft_count=len(vision_drafts),
+            vision_image_count=len(vision_images),
         )
 
     async def _run_step(self, step: ScenarioStep) -> StepResult:
@@ -363,6 +381,8 @@ class BotAutotester:
             user = await self.bot._user(self.telegram_user_id)
             await self.bot.vision_render_limiter.release(user.id)
             return StepResult(step.kind, step.value, ("render slot released",))
+        if step.kind in {"vision_photo", "vision_document"}:
+            return await self._run_vision_media(step.kind, step.value)
         if step.kind == "restart":
             scheduler = self.bot.scheduler
             self.bot = FutureSelfBot(
@@ -417,6 +437,96 @@ class BotAutotester:
             value,
             tuple(str(reply["text"]) for reply in message.replies),
         )
+
+    async def _run_vision_media(self, kind: StepKind, value: str) -> StepResult:
+        payload, mime_type, width, height, declared_size = self._vision_media_fixture(value)
+        media = FakeImageMedia(
+            payload,
+            mime_type=mime_type if kind == "vision_document" else None,
+            width=width if kind == "vision_photo" else None,
+            height=height if kind == "vision_photo" else None,
+            file_size=declared_size,
+        )
+        message = FakeMessage(
+            photo=[media] if kind == "vision_photo" else None,
+            document=media if kind == "vision_document" else None,
+        )
+        self.messages.append(message)
+        try:
+            await self.bot.vision_image_gate(self._update_for(message), self.context)
+        except ApplicationHandlerStop:
+            pass
+        outputs = tuple(str(reply["text"]) for reply in message.replies)
+        return StepResult(kind, value, outputs)
+
+    @staticmethod
+    def _vision_media_fixture(
+        value: str,
+    ) -> tuple[bytes, str, int, int, int | None]:
+        presets = {
+            "jpeg": ("JPEG", "red"),
+            "jpeg-second": ("JPEG", "blue"),
+            "png": ("PNG", "green"),
+            "webp": ("WEBP", "orange"),
+        }
+        if value in presets:
+            image_format, color = presets[value]
+            mime_type = {
+                "JPEG": "image/jpeg",
+                "PNG": "image/png",
+                "WEBP": "image/webp",
+            }[image_format]
+            return (
+                BotAutotester._encoded_image(image_format, color),
+                mime_type,
+                120,
+                80,
+                None,
+            )
+        if value == "pdf":
+            return b"%PDF-1.4\n% autotest only", "application/pdf", 0, 0, None
+        if value == "corrupt":
+            return b"corrupt-autotest-image", "image/jpeg", 10, 10, None
+        if value == "mismatch":
+            payload = BotAutotester._encoded_image("PNG", "purple")
+            return payload, "image/jpeg", 120, 80, None
+        if value == "oversize-meta":
+            payload = BotAutotester._encoded_image("JPEG", "red")
+            return payload, "image/jpeg", 120, 80, MAX_IMAGE_INPUT_BYTES + 1
+        if value == "multipixel-meta":
+            payload = BotAutotester._encoded_image("JPEG", "red")
+            return payload, "image/jpeg", MAX_IMAGE_PIXELS, 2, None
+        if value == "animated-gif":
+            first = Image.new("RGB", (20, 20), "red")
+            second = Image.new("RGB", (20, 20), "blue")
+            output = BytesIO()
+            first.save(
+                output,
+                format="GIF",
+                save_all=True,
+                append_images=[second],
+                duration=100,
+                loop=0,
+            )
+            first.close()
+            second.close()
+            return output.getvalue(), "image/gif", 20, 20, None
+        image_format, color = value.split(":", maxsplit=1)
+        format_name = image_format.upper()
+        mime_type = {
+            "JPEG": "image/jpeg",
+            "PNG": "image/png",
+            "WEBP": "image/webp",
+        }[format_name]
+        return BotAutotester._encoded_image(format_name, color), mime_type, 120, 80, None
+
+    @staticmethod
+    def _encoded_image(image_format: str, color: str) -> bytes:
+        image = Image.new("RGB", (120, 80), color)
+        output = BytesIO()
+        image.save(output, format=image_format)
+        image.close()
+        return output.getvalue()
 
     async def _run_timezone_onboarding(self, value: str) -> StepResult:
         answer, expected = value.split("=>", maxsplit=1)

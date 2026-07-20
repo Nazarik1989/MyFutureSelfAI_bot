@@ -128,6 +128,15 @@ DATABASE_URL=postgresql+asyncpg://future_self:future_self@localhost:5432/future_
 устанавливает Debian-пакет `fonts-dejavu-core`; его лицензия и copyright доступны внутри
 образа в `/usr/share/doc/fonts-dejavu-core/copyright`.
 
+К карточке можно прикрепить одну личную фотографию из Telegram photo или image-document.
+Поддерживаются статические JPEG, PNG и WebP: до 8 МиБ, 24 мегапикселей и 20 000 пикселей
+по стороне. До DB-транзакции файл локально проверяется по фактическому формату, EXIF
+orientation применяется, а EXIF/GPS/ICC/comments/filename удаляются. В SQLite сохраняется
+только RGB JPEG display-копия: максимум 1600 пикселей по стороне и 768 КиБ. Оригинал,
+временные файлы и публичные ссылки не создаются; LLM, внешние хранилища и renderer-сервисы
+не вызываются. Preview требует явного подтверждения, а замена и удаление защищены
+owner/chat/item/version capability.
+
 ## Разработка
 
 ```bash

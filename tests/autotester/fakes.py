@@ -58,8 +58,11 @@ class ScriptedTranscription:
 
 
 class FakeFile:
+    def __init__(self, data: bytes = b"autotest-voice") -> None:
+        self.data = data
+
     async def download_as_bytearray(self) -> bytearray:
-        return bytearray(b"autotest-voice")
+        return bytearray(self.data)
 
 
 class FakeVoice:
@@ -72,13 +75,42 @@ class FakeVoice:
         return FakeFile()
 
 
+class FakeImageMedia:
+    def __init__(
+        self,
+        data: bytes,
+        *,
+        mime_type: str | None,
+        width: int | None = None,
+        height: int | None = None,
+        file_size: int | None = None,
+    ) -> None:
+        self.data = data
+        self.mime_type = mime_type
+        self.width = width
+        self.height = height
+        self.file_size = len(data) if file_size is None else file_size
+
+    async def get_file(self) -> FakeFile:
+        return FakeFile(self.data)
+
+
 class FakeMessage:
     _ids = count(10_000)
 
-    def __init__(self, text: str | None = None, *, voice: FakeVoice | None = None):
+    def __init__(
+        self,
+        text: str | None = None,
+        *,
+        voice: FakeVoice | None = None,
+        photo: list[FakeImageMedia] | None = None,
+        document: FakeImageMedia | None = None,
+    ):
         self.text = text
         self.voice = voice
         self.audio = None
+        self.photo = photo or []
+        self.document = document
         self.reply_to_message = None
         self.replies: list[dict[str, Any]] = []
         self.edits: list[str] = []

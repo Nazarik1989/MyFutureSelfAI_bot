@@ -12,6 +12,15 @@ from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from .vision import CATEGORY_META, PAGE_SIZE
+from .vision_images import (
+    MAX_IMAGE_INPUT_BYTES,
+    MAX_IMAGE_OUTPUT_BYTES,
+    MAX_IMAGE_PIXELS,
+    TelegramImageMetadata,
+    VisionImageError,
+    normalize_vision_image,
+    validate_telegram_metadata,
+)
 from .vision_renderer import MAX_RENDER_ITEMS, VisionRenderItem
 
 logger = logging.getLogger(__name__)
@@ -21,6 +30,8 @@ class VisionHandlers:
     """Telegram presentation layer for the persistent owner-scoped vision service."""
 
     vision_service: Any
+    vision_image_service: Any
+    vision_image_sessions: Any
     vision_renderer: Any
     vision_render_sessions: Any
     vision_render_limiter: Any
@@ -44,6 +55,14 @@ class VisionHandlers:
         if await self.vision_service.draft(user.id, update.effective_chat.id) is None:
             return
         await self.voice(update, context)
+        raise ApplicationHandlerStop
+
+    async def vision_image_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        user = await self._user(update.effective_user.id)
+        if not await self.vision_image_sessions.has_upload(user.id, update.effective_chat.id):
+            return
+        await self._vision_image_input(update, user)
         raise ApplicationHandlerStop
 
     async def vision_cancel_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -338,6 +357,32 @@ class VisionHandlers:
             await query.answer()
             await query.edit_message_text("Визуализация отменена.")
             return
+        if action in {"imageadd", "imagereplace", "imagedeleteask"} and len(parts) == 3:
+            try:
+                item_id = int(parts[2])
+            except ValueError:
+                await self._vision_stale(query)
+                return
+            await self._vision_image_action(query, user.id, chat_id, action, item_id)
+            return
+        if (
+            action
+            in {
+                "imageconfirm",
+                "imagecancel",
+                "imagedelete",
+                "imagedeletecancel",
+            }
+            and len(parts) == 3
+        ):
+            await self._vision_image_capability_action(
+                query,
+                user.id,
+                chat_id,
+                action,
+                parts[2],
+            )
+            return
         if action == "list" and len(parts) == 4:
             try:
                 page = max(int(parts[3]), 0)
@@ -588,6 +633,7 @@ class VisionHandlers:
                     wish_text=item.wish_text,
                     target_date=item.target_date,
                     sort_id=item.id,
+                    image_bytes=item.image.image_bytes if item.image is not None else None,
                 )
                 for item in items
             ]
@@ -748,6 +794,264 @@ class VisionHandlers:
                 else "Задача создана без reminder. Напоминание можно назначить отдельно."
             )
 
+    async def _vision_image_action(
+        self,
+        query: Any,
+        owner_id: int,
+        chat_id: int,
+        action: str,
+        item_id: int,
+    ) -> None:
+        item = await self.vision_service.get_item(owner_id, item_id)
+        image = await self.vision_image_service.get(owner_id, item_id)
+        if item is None:
+            await self._vision_stale(query)
+            return
+        if action == "imageadd" and image is not None:
+            await self._vision_stale(query)
+            return
+        if action == "imagereplace" and image is None:
+            await self._vision_stale(query)
+            return
+        if action == "imagedeleteask":
+            if image is None:
+                await self._vision_stale(query)
+                return
+            token = await self.vision_image_sessions.issue_delete(
+                owner_id,
+                chat_id,
+                item_id,
+                expected_version=image.version,
+            )
+            if token is None:
+                await query.answer(
+                    "Сначала заверши или отмени текущую операцию с фото.",
+                    show_alert=True,
+                )
+                return
+            await query.answer()
+            await query.message.reply_text(
+                "Удалить личное фото из этой карточки? Карточка желания останется.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Удалить фото",
+                                callback_data=f"vision:imagedelete:{token}",
+                            ),
+                            InlineKeyboardButton(
+                                "Отмена",
+                                callback_data=f"vision:imagedeletecancel:{token}",
+                            ),
+                        ]
+                    ]
+                ),
+            )
+            return
+        token = await self.vision_image_sessions.issue_upload(
+            owner_id,
+            chat_id,
+            item_id,
+            mode="add" if action == "imageadd" else "replace",
+            expected_version=image.version if image is not None else None,
+        )
+        if token is None:
+            await query.answer(
+                "Сначала заверши или отмени текущую операцию с фото.",
+                show_alert=True,
+            )
+            return
+        await query.answer()
+        await query.message.reply_text(
+            "Отправь одно фото или image-document в JPEG, PNG или WebP. "
+            f"До {MAX_IMAGE_INPUT_BYTES // (1024 * 1024)} МБ и {MAX_IMAGE_PIXELS // 1_000_000} Мп. "
+            "Оригинал и его metadata сохраняться не будут.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Отмена",
+                            callback_data=f"vision:imagecancel:{token}",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+    async def _vision_image_capability_action(
+        self,
+        query: Any,
+        owner_id: int,
+        chat_id: int,
+        action: str,
+        token: str,
+    ) -> None:
+        if action in {"imagecancel", "imagedeletecancel"}:
+            if not await self.vision_image_sessions.cancel(token, owner_id, chat_id):
+                await self._vision_stale(query)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                "Добавление фото отменено."
+                if action == "imagecancel"
+                else "Удаление фото отменено."
+            )
+            return
+        if action == "imageconfirm":
+            capability = await self.vision_image_sessions.claim_confirm(
+                token,
+                owner_id,
+                chat_id,
+            )
+            if capability is None or capability.image is None:
+                await self._vision_stale(query)
+                return
+            result = await self.vision_image_service.save(
+                owner_id,
+                capability.item_id,
+                expected_version=capability.expected_version,
+                normalized=capability.image,
+            )
+            if result.status not in {"created", "replaced", "existing"}:
+                await self._vision_stale(query)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                "Фото уже было сохранено; дубль не создан."
+                if result.status == "existing"
+                else "Фото сохранено в карточке."
+            )
+            item = await self.vision_service.get_item(owner_id, capability.item_id)
+            if item is not None:
+                await self._vision_send_item(query.message, item)
+            return
+        capability = await self.vision_image_sessions.claim_delete(
+            token,
+            owner_id,
+            chat_id,
+        )
+        if capability is None or capability.expected_version is None:
+            await self._vision_stale(query)
+            return
+        result = await self.vision_image_service.delete(
+            owner_id,
+            capability.item_id,
+            expected_version=capability.expected_version,
+        )
+        if result.status != "deleted":
+            await self._vision_stale(query)
+            return
+        await query.answer()
+        await query.edit_message_text("Фото удалено. Карточка желания сохранена.")
+
+    async def _vision_image_input(self, update: Update, user: Any) -> None:
+        message = update.effective_message
+        capability = await self.vision_image_sessions.claim_upload(
+            user.id,
+            update.effective_chat.id,
+        )
+        if capability is None:
+            await message.reply_text("Фото уже обрабатывается. Дождись preview.")
+            return
+        try:
+            media, metadata = self._vision_telegram_image(message)
+            validate_telegram_metadata(metadata)
+            telegram_file = await media.get_file()
+            raw = bytes(await telegram_file.download_as_bytearray())
+            normalized = await asyncio.to_thread(
+                normalize_vision_image,
+                raw,
+                declared_mime=metadata.mime_type,
+            )
+            if not await self.vision_image_sessions.attach_preview(
+                capability.token,
+                user.id,
+                update.effective_chat.id,
+                normalized,
+            ):
+                await message.reply_text(
+                    "Не удалось подготовить preview: лимит временной памяти исчерпан."
+                )
+                return
+            stream = BytesIO(normalized.image_bytes)
+            stream.name = "vision-photo-preview.jpg"
+            try:
+                await message.reply_photo(
+                    photo=stream,
+                    caption=(
+                        f"Preview: {normalized.width}×{normalized.height}, "
+                        f"до {MAX_IMAGE_OUTPUT_BYTES // 1024} КБ. Сохранить это фото?"
+                    ),
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "Сохранить",
+                                    callback_data=f"vision:imageconfirm:{capability.token}",
+                                ),
+                                InlineKeyboardButton(
+                                    "Отмена",
+                                    callback_data=f"vision:imagecancel:{capability.token}",
+                                ),
+                            ]
+                        ]
+                    ),
+                )
+            finally:
+                stream.close()
+        except VisionImageError:
+            await self.vision_image_sessions.retry_upload(
+                capability.token,
+                user.id,
+                update.effective_chat.id,
+            )
+            await message.reply_text(
+                "Файл отклонён. Нужен статический JPEG, PNG или WebP без повреждений, "
+                f"не больше {MAX_IMAGE_INPUT_BYTES // (1024 * 1024)} МБ и "
+                f"{MAX_IMAGE_PIXELS // 1_000_000} Мп. GIF, SVG, PDF и HEIC не поддерживаются."
+            )
+        except TelegramError as exc:
+            await self.vision_image_sessions.cancel(
+                capability.token,
+                user.id,
+                update.effective_chat.id,
+            )
+            logger.error("Vision image transport failed error_type=%s", type(exc).__name__)
+            await message.reply_text(
+                "Не удалось безопасно загрузить фото. Открой карточку и попробуй ещё раз."
+            )
+        except Exception as exc:
+            await self.vision_image_sessions.cancel(
+                capability.token,
+                user.id,
+                update.effective_chat.id,
+            )
+            logger.error("Vision image processing failed error_type=%s", type(exc).__name__)
+            await message.reply_text(
+                "Не удалось обработать фото. Открой карточку и попробуй ещё раз."
+            )
+
+    @staticmethod
+    def _vision_telegram_image(message: Any) -> tuple[Any, TelegramImageMetadata]:
+        photos = list(message.photo or [])
+        if photos:
+            media = photos[-1]
+            return media, TelegramImageMetadata(
+                source="photo",
+                file_size=getattr(media, "file_size", None),
+                mime_type=getattr(media, "mime_type", None),
+                width=getattr(media, "width", None),
+                height=getattr(media, "height", None),
+            )
+        document = message.document
+        if document is None:
+            raise VisionImageError("unsupported_source")
+        return document, TelegramImageMetadata(
+            source="document",
+            file_size=getattr(document, "file_size", None),
+            mime_type=getattr(document, "mime_type", None),
+        )
+
     async def _vision_send_page(self, message: Any, owner_id: int, status: str, page: int) -> None:
         items, total = await self.vision_service.page(owner_id, status, page)
         counts = await self.vision_service.category_counts(owner_id, status)
@@ -809,6 +1113,40 @@ class VisionHandlers:
             "achieved": "достигнуто",
             "archived": "в архиве",
         }[item.status]
+        image = await self.vision_image_service.get(item.owner_id, item.id)
+        if image is not None:
+            stream = BytesIO(image.image_bytes)
+            stream.name = "vision-photo.jpg"
+            try:
+                await message.reply_photo(
+                    photo=stream,
+                    caption="Личное фото этой карточки.",
+                )
+            finally:
+                stream.close()
+        image_rows = (
+            [
+                [
+                    InlineKeyboardButton(
+                        "Заменить фото",
+                        callback_data=f"vision:imagereplace:{item.id}",
+                    ),
+                    InlineKeyboardButton(
+                        "Удалить фото",
+                        callback_data=f"vision:imagedeleteask:{item.id}",
+                    ),
+                ]
+            ]
+            if image is not None
+            else [
+                [
+                    InlineKeyboardButton(
+                        "Добавить фото",
+                        callback_data=f"vision:imageadd:{item.id}",
+                    )
+                ]
+            ]
+        )
         await message.reply_text(
             f"{emoji} #{item.id} · {category} · {status}\n\n"
             f"Желание: {item.wish_text}\n"
@@ -817,7 +1155,8 @@ class VisionHandlers:
             f"{item.target_date.strftime('%d.%m.%Y') if item.target_date else 'не указана'}\n"
             f"Первый шаг: {item.first_step or 'не указан'}",
             reply_markup=InlineKeyboardMarkup(
-                [
+                image_rows
+                + [
                     [
                         InlineKeyboardButton(
                             "Редактировать", callback_data=f"vision:edit:{item.id}"

@@ -68,6 +68,7 @@ from .system_actions import SystemActionRoute, SystemActionRouter
 from .transcription import TranscriptionError, TranscriptionService
 from .vision import VisionService
 from .vision_handlers import VisionHandlers
+from .vision_images import VisionImageService, VisionImageSessionStore
 from .vision_renderer import (
     VisionBoardRenderer,
     VisionRenderLimiter,
@@ -147,6 +148,8 @@ class FutureSelfBot(VisionHandlers):
         self.health_service = HealthService(db)
         self.location_service = LocationService(db)
         self.vision_service = VisionService(db)
+        self.vision_image_service = VisionImageService(db)
+        self.vision_image_sessions = VisionImageSessionStore()
         self.vision_renderer = VisionBoardRenderer()
         self.vision_render_sessions = VisionRenderSessionStore()
         self.vision_render_limiter = VisionRenderLimiter()
@@ -187,6 +190,10 @@ class FutureSelfBot(VisionHandlers):
             group=-1,
         )
         app.add_handler(CommandHandler("cancel", self.vision_cancel_gate), group=-1)
+        app.add_handler(
+            MessageHandler(filters.PHOTO | filters.Document.ALL, self.vision_image_gate),
+            group=-1,
+        )
         app.add_handler(
             MessageHandler(filters.VOICE | filters.AUDIO, self.vision_voice_gate),
             group=-1,

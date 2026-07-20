@@ -9,7 +9,7 @@ from io import BytesIO
 from pathlib import Path
 from time import monotonic
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from .vision import CATEGORY_META
 
@@ -53,6 +53,7 @@ class VisionRenderItem:
     wish_text: str
     target_date: date | None = None
     sort_id: int = 0
+    image_bytes: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,12 +306,28 @@ class VisionBoardRenderer:
                 font=category_font,
                 fill=accent,
             )
+            photo = self._card_photo(item.image_bytes)
+            photo_width = 0
+            if photo is not None:
+                photo_size = 148
+                photo_left = box.right - photo_size - 20
+                photo_top = box.top + 18
+                mask = Image.new("L", (photo_size, photo_size), 0)
+                ImageDraw.Draw(mask).rounded_rectangle(
+                    (0, 0, photo_size - 1, photo_size - 1),
+                    radius=18,
+                    fill=255,
+                )
+                image.paste(photo, (photo_left, photo_top), mask)
+                mask.close()
+                photo.close()
+                photo_width = photo_size + 24
             wish = clean_render_text(item.wish_text)
             lines = fit_text_lines(
                 draw,
                 wish,
                 wish_font,
-                max_width=box.right - box.left - 72,
+                max_width=box.right - box.left - 72 - photo_width,
                 max_lines=2 if item.target_date is not None else 3,
             )
             draw.multiline_text(
@@ -345,6 +362,33 @@ class VisionBoardRenderer:
         if len(png) > MAX_PNG_BYTES:
             raise VisionRenderError("too_large")
         return RenderedPage(png=png, card_boxes=tuple(boxes))
+
+    @staticmethod
+    def _card_photo(image_bytes: bytes | None) -> Image.Image | None:
+        if not image_bytes:
+            return None
+        try:
+            with Image.open(BytesIO(image_bytes)) as source:
+                source.load()
+                rgb = source.convert("RGB")
+            try:
+                return ImageOps.fit(
+                    rgb,
+                    (148, 148),
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5),
+                )
+            finally:
+                rgb.close()
+        except (
+            Image.DecompressionBombError,
+            Image.DecompressionBombWarning,
+            OSError,
+            SyntaxError,
+            UnidentifiedImageError,
+            ValueError,
+        ):
+            return None
 
     def _font(self, size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
         path = self.bold_font_path if bold else self.font_path

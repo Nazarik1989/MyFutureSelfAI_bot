@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     Time,
@@ -51,6 +52,7 @@ class User(TimestampMixin, Base):
     health_check_ins: Mapped[list[HealthCheckIn]] = relationship(back_populates="user")
     doctor_visit_preps: Mapped[list[DoctorVisitPrep]] = relationship(back_populates="user")
     vision_items: Mapped[list[VisionItem]] = relationship(back_populates="owner")
+    vision_item_images: Mapped[list[VisionItemImage]] = relationship(back_populates="owner")
 
 
 class DraftInboxItem(Base):
@@ -227,6 +229,37 @@ class VisionItem(TimestampMixin, Base):
     )
     owner: Mapped[User] = relationship(back_populates="vision_items")
     linked_task: Mapped[InboxItem | None] = relationship()
+    image: Mapped[VisionItemImage | None] = relationship(
+        back_populates="vision_item",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class VisionItemImage(TimestampMixin, Base):
+    __tablename__ = "vision_item_images"
+    __table_args__ = (
+        CheckConstraint("width > 0 AND height > 0", name="ck_vision_item_image_dimensions"),
+        CheckConstraint("version > 0", name="ck_vision_item_image_version"),
+        CheckConstraint(
+            "mime_type IN ('image/jpeg', 'image/png', 'image/webp')",
+            name="ck_vision_item_image_mime_type",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    vision_item_id: Mapped[int] = mapped_column(
+        ForeignKey("vision_items.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    image_bytes: Mapped[bytes] = mapped_column(LargeBinary)
+    mime_type: Mapped[str] = mapped_column(String(40))
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    vision_item: Mapped[VisionItem] = relationship(back_populates="image")
+    owner: Mapped[User] = relationship(back_populates="vision_item_images")
 
 
 class VisionDraft(TimestampMixin, Base):
