@@ -449,9 +449,9 @@ class FutureSelfBot:
             answers = OnboardingFlow.answer(answers, step, update.effective_message.text)
             question_key = ONBOARDING_QUESTIONS[step][0]
             if question_key == "timezone":
-                from .domain import validate_timezone
+                from .domain import canonical_timezone
 
-                validate_timezone(update.effective_message.text.strip())
+                answers["timezone"] = canonical_timezone(update.effective_message.text)
             elif question_key == "location":
                 parse_location(update.effective_message.text)
         except ValueError as exc:
@@ -550,7 +550,10 @@ class FutureSelfBot:
 
             await ProfileRepository(session).upsert(user, answers, summary)
             user.display_name = answers.get("display_name")
-            user.timezone = answers.get("timezone", user.timezone)
+            if timezone_value := answers.get("timezone"):
+                from .domain import canonical_timezone
+
+                user.timezone = canonical_timezone(timezone_value)
             if location_value := answers.get("location"):
                 location = parse_location(location_value)
                 user.location_city = location.city

@@ -14,7 +14,11 @@ from .schemas import AssistantAnswer, IntentResult, ParsedThought, TodayPlan
 
 ONBOARDING_QUESTIONS: tuple[tuple[str, str, bool], ...] = (
     ("display_name", "Как мне к тебе обращаться?", True),
-    ("timezone", "В каком часовом поясе ты живёшь? Например, Europe/Moscow.", True),
+    (
+        "timezone",
+        "В каком часовом поясе ты живёшь? Например: Москва, Moscow, GMT+4 или Europe/Saratov.",
+        True,
+    ),
     ("future_life", "Как выглядит твоя жизнь через три года?", True),
     ("residence", "Где ты живёшь в этом образе?", False),
     ("work_income", "Чем занимаешься и какой уровень дохода хочешь?", False),
@@ -163,8 +167,7 @@ class ProfileService:
             if user is None:
                 raise ValueError("User not found")
             if timezone := answers.get("timezone"):
-                validate_timezone(timezone)
-                user.timezone = timezone
+                user.timezone = canonical_timezone(timezone)
             user.display_name = answers.get("display_name")
             if location_value := answers.get("location"):
                 location = parse_location(location_value)
@@ -228,11 +231,46 @@ class FocusService:
         return await self.ai.make_today_plan(context)
 
 
-def validate_timezone(value: str) -> ZoneInfo:
+_TIMEZONE_ALIASES = {
+    "moscow": "Europe/Moscow",
+    "москва": "Europe/Moscow",
+    "мск": "Europe/Moscow",
+    "msk": "Europe/Moscow",
+    "europe/moscow": "Europe/Moscow",
+    "gmt+3": "Europe/Moscow",
+    "gmt+03": "Europe/Moscow",
+    "gmt+03:00": "Europe/Moscow",
+    "utc+3": "Europe/Moscow",
+    "utc+03": "Europe/Moscow",
+    "utc+03:00": "Europe/Moscow",
+    "saratov": "Europe/Saratov",
+    "саратов": "Europe/Saratov",
+    "europe/saratov": "Europe/Saratov",
+    "gmt+4": "Europe/Saratov",
+    "gmt+04": "Europe/Saratov",
+    "gmt+04:00": "Europe/Saratov",
+    "utc+4": "Europe/Saratov",
+    "utc+04": "Europe/Saratov",
+    "utc+04:00": "Europe/Saratov",
+}
+
+
+def canonical_timezone(value: str) -> str:
+    clean = value.strip()
+    alias_key = "".join(clean.casefold().split())
+    if alias := _TIMEZONE_ALIASES.get(alias_key):
+        return alias
     try:
-        return ZoneInfo(value)
+        return ZoneInfo(clean).key
     except ZoneInfoNotFoundError as exc:
-        raise ValueError("Неизвестный часовой пояс") from exc
+        raise ValueError(
+            "Неизвестный часовой пояс. Примеры: Москва, Moscow, GMT+4, "
+            "Europe/Moscow или Europe/Saratov."
+        ) from exc
+
+
+def validate_timezone(value: str) -> ZoneInfo:
+    return ZoneInfo(canonical_timezone(value))
 
 
 def next_notification_utc(
