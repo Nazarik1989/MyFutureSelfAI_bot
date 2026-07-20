@@ -1060,6 +1060,30 @@ DOCTOR_SEARCH_SCENARIOS = (
     ),
 )
 
+VISION_PAGINATION_ITEMS = (
+    ("money", "Денежная цель 1"),
+    ("money", "Денежная цель 2"),
+    ("money", "Денежная цель 3"),
+    ("travel", "Путешествие 1"),
+    ("travel", "Путешествие 2"),
+    ("travel", "Путешествие 3"),
+)
+
+VISION_PAGINATION_STEPS = tuple(
+    step
+    for category, wish in VISION_PAGINATION_ITEMS
+    for step in (
+        ScenarioStep("command", "/vision"),
+        ScenarioStep("vision_callback", "add"),
+        ScenarioStep("vision_callback", category),
+        ScenarioStep("text", wish),
+        ScenarioStep("vision_callback", "skip"),
+        ScenarioStep("vision_callback", "skip"),
+        ScenarioStep("vision_callback", "skip"),
+        ScenarioStep("vision_callback", "confirm"),
+    )
+)
+
 VISION_SCENARIOS = (
     Scenario(
         name="vision-full-voice-skip-confirm-task-idempotent-without-llm",
@@ -1130,6 +1154,66 @@ VISION_SCENARIOS = (
         expected=ExpectedState(),
     ),
     Scenario(
+        name="vision-persistent-draft-resumes-after-process-restart",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "home"),
+            ScenarioStep("text", "Дом у озера"),
+            ScenarioStep("restart"),
+            ScenarioStep(
+                "command",
+                "/vision",
+                reply_contains=("незавершённая", "Почему это важно"),
+            ),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("home", "Дом у озера", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-group-chat-is-blocked-before-private-content-handler",
+        steps=(
+            ScenarioStep(
+                "group_command",
+                "/vision",
+                reply_contains=("только в личном чате",),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="vision-category-groups-counts-and-pagination",
+        steps=(
+            *VISION_PAGINATION_STEPS,
+            ScenarioStep("command", "/vision"),
+            ScenarioStep(
+                "vision_callback",
+                "list:active",
+                reply_contains=("Моя карта — 6", "Деньги (3)", "Путешествия (3)"),
+            ),
+            ScenarioStep(
+                "vision_callback",
+                "list:active:1",
+                reply_contains=("Моя карта — 6", "Путешествия (3)"),
+            ),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState("money", "Денежная цель 1", "active"),
+                VisionState("money", "Денежная цель 2", "active"),
+                VisionState("money", "Денежная цель 3", "active"),
+                VisionState("travel", "Путешествие 1", "active"),
+                VisionState("travel", "Путешествие 2", "active"),
+                VisionState("travel", "Путешествие 3", "active"),
+            ),
+        ),
+    ),
+    Scenario(
         name="vision-manage-edit-status-archive-restore-delete",
         steps=(
             ScenarioStep("command", "/vision"),
@@ -1151,7 +1235,11 @@ VISION_SCENARIOS = (
             ScenarioStep("vision_callback", "list:archived", reply_contains=("Архив",)),
             ScenarioStep("vision_callback", "view", reply_contains=("в архиве",)),
             ScenarioStep("vision_callback", "status", reply_contains=("Статус",)),
-            ScenarioStep("vision_callback", "deleteask", reply_contains=("Удалить",)),
+            ScenarioStep(
+                "vision_callback",
+                "deleteask",
+                reply_contains=("подтверждения",),
+            ),
             ScenarioStep("vision_callback", "delete", reply_contains=("удалена",)),
         ),
         expected=ExpectedState(),
@@ -1171,6 +1259,21 @@ VISION_SCENARIOS = (
             ScenarioStep(
                 "vision_raw_callback",
                 "vision:view:1",
+                reply_contains=("недоступна",),
+            ),
+            ScenarioStep(
+                "vision_raw_callback",
+                "vision:status:1:achieved",
+                reply_contains=("недоступна",),
+            ),
+            ScenarioStep(
+                "vision_raw_callback",
+                "vision:task:1",
+                reply_contains=("недоступна",),
+            ),
+            ScenarioStep(
+                "vision_raw_callback",
+                "vision:delete:1:999999:1",
                 reply_contains=("недоступна",),
             ),
             ScenarioStep("command", "/vision"),
@@ -1199,6 +1302,28 @@ VISION_SCENARIOS = (
     ),
 )
 
+TIMEZONE_REGRESSION_SCENARIOS = tuple(
+    Scenario(
+        name=f"timezone-onboarding-{name}",
+        steps=(
+            ScenarioStep(
+                "timezone_onboarding",
+                f"{answer}=>{expected}",
+                reply_contains=(f"timezone={expected}",),
+            ),
+        ),
+        expected=ExpectedState(),
+    )
+    for name, answer, expected in (
+        ("moscow-en", "Moscow", "Europe/Moscow"),
+        ("moscow-ru", "Москва", "Europe/Moscow"),
+        ("moscow-short", "МСК", "Europe/Moscow"),
+        ("moscow-gmt3", "GMT+3", "Europe/Moscow"),
+        ("saratov-ru", "Саратов", "Europe/Saratov"),
+        ("saratov-gmt4", "GMT+4", "Europe/Saratov"),
+    )
+)
+
 
 SCENARIOS = (
     *CORE_SCENARIOS,
@@ -1213,5 +1338,6 @@ SCENARIOS = (
     *HEALTH_SCENARIOS,
     *DOCTOR_PREP_SCENARIOS,
     *DOCTOR_SEARCH_SCENARIOS,
+    *TIMEZONE_REGRESSION_SCENARIOS,
     *VISION_SCENARIOS,
 )

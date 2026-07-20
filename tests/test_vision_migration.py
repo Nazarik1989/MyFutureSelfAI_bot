@@ -20,7 +20,7 @@ def test_vision_migration_upgrades_from_pr13_and_preserves_existing_data(tmp_pat
     )
 
     connection = sqlite3.connect(database_path)
-    connection.execute(
+    cursor = connection.execute(
         """
         INSERT INTO users (
             telegram_id, display_name, timezone, location_city,
@@ -28,6 +28,21 @@ def test_vision_migration_upgrades_from_pr13_and_preserves_existing_data(tmp_pat
         ) VALUES (?, ?, ?, ?, ?, ?)
         """,
         (123456, "Сохранённый пользователь", "Europe/Moscow", "Москва", None, 0),
+    )
+    connection.execute(
+        """
+        INSERT INTO inbox_items (
+            user_id, kind, title, raw_text, source, status
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            cursor.lastrowid,
+            "task",
+            "Существующая задача",
+            "migration-sentinel",
+            "text",
+            "confirmed",
+        ),
     )
     connection.commit()
     connection.close()
@@ -44,6 +59,10 @@ def test_vision_migration_upgrades_from_pr13_and_preserves_existing_data(tmp_pat
     connection = sqlite3.connect(database_path)
     revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
     display_name = connection.execute("SELECT display_name FROM users").fetchone()[0]
+    existing_task = connection.execute(
+        "SELECT title FROM inbox_items WHERE raw_text = ?",
+        ("migration-sentinel",),
+    ).fetchone()[0]
     tables = {
         row[0]
         for row in connection.execute(
@@ -55,5 +74,6 @@ def test_vision_migration_upgrades_from_pr13_and_preserves_existing_data(tmp_pat
 
     assert revision == "20260720_0013"
     assert display_name == "Сохранённый пользователь"
+    assert existing_task == "Существующая задача"
     assert {"vision_items", "vision_drafts"} <= tables
     assert integrity == "ok"

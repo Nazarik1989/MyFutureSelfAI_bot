@@ -6,6 +6,7 @@ from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
+from telegram.ext import ApplicationHandlerStop
 
 from future_self.bot import (
     DOCTOR_DURATION,
@@ -33,6 +34,7 @@ from future_self.models import (
     VisionDraft,
     VisionItem,
 )
+from future_self.repositories import OnboardingRepository
 from future_self.schemas import IntentResult
 from future_self.vision import CATEGORY_META
 
@@ -60,6 +62,9 @@ StepKind = Literal[
     "setup_clear_focus",
     "vision_callback",
     "vision_raw_callback",
+    "restart",
+    "group_command",
+    "timezone_onboarding",
 ]
 
 
@@ -334,6 +339,20 @@ class BotAutotester:
             return await self._run_vision_callback(step.value)
         if step.kind == "vision_raw_callback":
             return await self._run_raw_vision_callback(step.value)
+        if step.kind == "restart":
+            scheduler = self.bot.scheduler
+            self.bot = FutureSelfBot(
+                self.bot.settings,
+                self.database,
+                self.ai,
+                self.transcription,
+            )
+            self.bot.scheduler = scheduler
+            return StepResult(step.kind, step.value, ("bot restarted",))
+        if step.kind == "group_command":
+            return await self._run_group_command(step.value)
+        if step.kind == "timezone_onboarding":
+            return await self._run_timezone_onboarding(step.value)
         if step.kind == "command":
             return await self._run_command(step.value)
         if step.kind == "health_answer":
@@ -352,6 +371,48 @@ class BotAutotester:
         await route(self._update_for(message), self.context)
         outputs = tuple(str(reply["text"]) for reply in message.replies) + tuple(message.edits)
         return StepResult(step.kind, step.value, outputs)
+
+    async def _run_group_command(self, value: str) -> StepResult:
+        message = FakeMessage(value)
+        self.messages.append(message)
+        update = SimpleNamespace(
+            effective_message=message,
+            message=message,
+            callback_query=None,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+            effective_chat=SimpleNamespace(id=self.chat_id, type="group"),
+        )
+        try:
+            await self.bot.private_chat_guard(update, self.context)
+        except ApplicationHandlerStop:
+            pass
+        else:
+            raise AssertionError("Group update was not stopped before feature handlers")
+        return StepResult(
+            "group_command",
+            value,
+            tuple(str(reply["text"]) for reply in message.replies),
+        )
+
+    async def _run_timezone_onboarding(self, value: str) -> StepResult:
+        answer, expected = value.split("=>", maxsplit=1)
+        user = await self.bot._user(self.telegram_user_id)
+        async with self.database.session() as session:
+            state = await OnboardingRepository(session).get_or_create(user.id)
+            state.current_step = 1
+            state.answers = {"display_name": "Автотест"}
+        message = FakeMessage(answer)
+        self.messages.append(message)
+        update = self._update_for(message)
+        context = SimpleNamespace(user_data={"onboarding_user_id": user.id})
+        await self.bot.onboarding_answer(update, context)
+        async with self.database.sessions() as session:
+            state = await OnboardingRepository(session).get_or_create(user.id)
+            saved = state.answers.get("timezone")
+        if saved != expected:
+            raise AssertionError(f"Timezone onboarding saved {saved!r}, expected {expected!r}")
+        outputs = tuple(str(reply["text"]) for reply in message.replies) + (f"timezone={saved}",)
+        return StepResult("timezone_onboarding", value, outputs)
 
     async def _run_command(self, value: str) -> StepResult:
         parts = value.split()
