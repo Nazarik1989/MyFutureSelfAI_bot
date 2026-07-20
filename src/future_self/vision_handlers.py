@@ -1,18 +1,29 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+from datetime import datetime
+from io import BytesIO
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from .vision import CATEGORY_META, PAGE_SIZE
+from .vision_renderer import MAX_RENDER_ITEMS, VisionRenderItem
+
+logger = logging.getLogger(__name__)
 
 
 class VisionHandlers:
     """Telegram presentation layer for the persistent owner-scoped vision service."""
 
     vision_service: Any
+    vision_renderer: Any
+    vision_render_sessions: Any
+    vision_render_limiter: Any
 
     async def vision_command_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.vision_command(update, context)
@@ -62,6 +73,12 @@ class VisionHandlers:
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")],
+                    [
+                        InlineKeyboardButton(
+                            "🖼 Создать визуализацию",
+                            callback_data="vision:render",
+                        )
+                    ],
                     [
                         InlineKeyboardButton("🗺 Моя карта", callback_data="vision:list:active:0"),
                         InlineKeyboardButton(
@@ -264,6 +281,63 @@ class VisionHandlers:
             await query.answer()
             await self._vision_menu(query.message)
             return
+        if action == "render" and len(parts) == 2:
+            await self._vision_render_menu(query, user.id, chat_id)
+            return
+        if action == "renderpick" and len(parts) == 4:
+            token, category = parts[2], parts[3]
+            selection = await self.vision_render_sessions.claim_selection(
+                token,
+                user.id,
+                chat_id,
+                category,
+            )
+            if selection is None:
+                await self._vision_render_stale(query)
+                return
+            await query.answer()
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await self._vision_render_and_send(
+                query.message,
+                user,
+                None if selection == "all" else selection,
+                token=token,
+                as_document=False,
+            )
+            return
+        if action == "renderdownload" and len(parts) == 3:
+            token = parts[2]
+            selection = await self.vision_render_sessions.claim_download(
+                token,
+                user.id,
+                chat_id,
+            )
+            if selection is None:
+                await self._vision_render_stale(query)
+                return
+            await query.answer()
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await self._vision_render_and_send(
+                query.message,
+                user,
+                None if selection == "all" else selection,
+                token=token,
+                as_document=True,
+            )
+            return
+        if action == "rendercancel" and len(parts) == 3:
+            if not await self.vision_render_sessions.cancel(parts[2], user.id, chat_id):
+                await self._vision_render_stale(query)
+                return
+            await query.answer()
+            await query.edit_message_text("Визуализация отменена.")
+            return
         if action == "list" and len(parts) == 4:
             try:
                 page = max(int(parts[3]), 0)
@@ -440,6 +514,153 @@ class VisionHandlers:
             await self._vision_prompt(query.message, outcome.draft)
             return
         await self._vision_stale(query)
+
+    async def _vision_render_menu(self, query: Any, owner_id: int, chat_id: int) -> None:
+        counts = await self.vision_service.category_counts(owner_id, "active")
+        available = {category for category, count in counts.items() if count > 0}
+        await query.answer()
+        if not available:
+            await query.message.reply_text(
+                "Активных желаний пока нет. Сначала добавь желание через /vision."
+            )
+            return
+        token = await self.vision_render_sessions.issue(owner_id, chat_id, available)
+        rows = [
+            [
+                InlineKeyboardButton(
+                    "🗺 Вся карта",
+                    callback_data=f"vision:renderpick:{token}:all",
+                )
+            ]
+        ]
+        entries = [(code, CATEGORY_META[code]) for code in CATEGORY_META if code in available]
+        for index in range(0, len(entries), 2):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{emoji} {label}",
+                        callback_data=f"vision:renderpick:{token}:{code}",
+                    )
+                    for code, (emoji, label) in entries[index : index + 2]
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Отмена",
+                    callback_data=f"vision:rendercancel:{token}",
+                )
+            ]
+        )
+        await query.message.reply_text(
+            "Что визуализировать? В изображение попадут только активные желания.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _vision_render_and_send(
+        self,
+        message: Any,
+        user: Any,
+        category: str | None,
+        *,
+        token: str,
+        as_document: bool,
+    ) -> None:
+        if not await self.vision_render_limiter.acquire(user.id):
+            await message.reply_text(
+                "Визуализация уже создаётся. Дождись завершения текущего запроса."
+            )
+            return
+        try:
+            items, total = await self.vision_service.active_for_render(
+                user.id,
+                category=category,
+                limit=MAX_RENDER_ITEMS,
+            )
+            if not items:
+                await message.reply_text(
+                    "Для этого выбора активных желаний нет. Открой /vision и добавь карточку."
+                )
+                return
+            snapshots = [
+                VisionRenderItem(
+                    category=item.category,
+                    wish_text=item.wish_text,
+                    target_date=item.target_date,
+                    sort_id=item.id,
+                )
+                for item in items
+            ]
+            try:
+                local_date = datetime.now(ZoneInfo(user.timezone)).date()
+            except (TypeError, ZoneInfoNotFoundError):
+                local_date = datetime.now(ZoneInfo("UTC")).date()
+            board = await asyncio.to_thread(
+                self.vision_renderer.render,
+                snapshots,
+                created_on=local_date,
+                category=category,
+                total_count=total,
+            )
+            category_label = "Вся карта" if category is None else CATEGORY_META[category][1]
+            for page_index, page in enumerate(board.pages, start=1):
+                stream = BytesIO(page.png)
+                filename = f"vision-board-{page_index}-of-{len(board.pages)}.png"
+                stream.name = filename
+                caption = (
+                    f"Активных желаний: {total} · {category_label} · "
+                    f"страница {page_index}/{len(board.pages)}"
+                )
+                if board.omitted_count and page_index == len(board.pages):
+                    caption += (
+                        f"\nПоказано {board.included_count}; ещё {board.omitted_count} "
+                        "доступны через /vision."
+                    )
+                try:
+                    if as_document:
+                        await message.reply_document(
+                            document=stream,
+                            filename=filename,
+                            caption=caption,
+                        )
+                    else:
+                        reply_markup = None
+                        if page_index == len(board.pages):
+                            reply_markup = InlineKeyboardMarkup(
+                                [
+                                    [
+                                        InlineKeyboardButton(
+                                            "Скачать PNG",
+                                            callback_data=f"vision:renderdownload:{token}",
+                                        )
+                                    ]
+                                ]
+                            )
+                        await message.reply_photo(
+                            photo=stream,
+                            caption=caption,
+                            reply_markup=reply_markup,
+                        )
+                finally:
+                    stream.close()
+        except Exception as exc:  # Telegram and Pillow adapters fail closed here.
+            logger.error("Vision render failed error_type=%s", type(exc).__name__)
+            await message.reply_text(
+                "Не удалось создать визуализацию. Попробуй ещё раз немного позже."
+            )
+        finally:
+            await self.vision_render_limiter.release(user.id)
+
+    @staticmethod
+    async def _vision_render_stale(query: Any) -> None:
+        await query.answer(
+            "Запрос визуализации недоступен или устарел. Открой /vision ещё раз.",
+            show_alert=True,
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
 
     async def _vision_item_action(
         self, query: Any, owner_id: int, chat_id: int, action: str, item_id: int

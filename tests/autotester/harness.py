@@ -62,6 +62,10 @@ StepKind = Literal[
     "setup_clear_focus",
     "vision_callback",
     "vision_raw_callback",
+    "vision_capture_callback",
+    "vision_replay_callback",
+    "vision_hold_render",
+    "vision_release_render",
     "restart",
     "group_command",
     "timezone_onboarding",
@@ -225,6 +229,7 @@ class BotAutotester:
         self.health_state: int | None = None
         self.doctor_state: int | None = None
         self.contexts = {telegram_user_id: context}
+        self.saved_vision_callbacks: dict[str, tuple[str, FakeMessage]] = {}
 
     @classmethod
     async def create(cls, sandbox: Path, stubs: tuple[LLMStub, ...]) -> "BotAutotester":
@@ -339,6 +344,25 @@ class BotAutotester:
             return await self._run_vision_callback(step.value)
         if step.kind == "vision_raw_callback":
             return await self._run_raw_vision_callback(step.value)
+        if step.kind == "vision_capture_callback":
+            data, message = self._latest_vision_callback(step.value)
+            self.saved_vision_callbacks[step.value] = (data, message)
+            return StepResult(step.kind, step.value, ("callback captured",))
+        if step.kind == "vision_replay_callback":
+            try:
+                data, message = self.saved_vision_callbacks[step.value]
+            except KeyError as exc:
+                raise AssertionError(f"No saved vision callback for {step.value!r}") from exc
+            return await self._dispatch_vision_callback(step.kind, step.value, data, message)
+        if step.kind == "vision_hold_render":
+            user = await self.bot._user(self.telegram_user_id)
+            if not await self.bot.vision_render_limiter.acquire(user.id):
+                raise AssertionError("Could not hold owner render slot")
+            return StepResult(step.kind, step.value, ("render slot held",))
+        if step.kind == "vision_release_render":
+            user = await self.bot._user(self.telegram_user_id)
+            await self.bot.vision_render_limiter.release(user.id)
+            return StepResult(step.kind, step.value, ("render slot released",))
         if step.kind == "restart":
             scheduler = self.bot.scheduler
             self.bot = FutureSelfBot(
@@ -577,6 +601,20 @@ class BotAutotester:
                             matches = data.startswith("vision:editfield:") and data.endswith(
                                 ":wish"
                             )
+                        elif action == "renderall":
+                            matches = data.startswith("vision:renderpick:") and data.endswith(
+                                ":all"
+                            )
+                        elif action == "rendertravel":
+                            matches = data.startswith("vision:renderpick:") and data.endswith(
+                                ":travel"
+                            )
+                        elif action == "rendermoney":
+                            matches = data.startswith("vision:renderpick:") and data.endswith(
+                                ":money"
+                            )
+                        elif action == "download":
+                            matches = data.startswith("vision:renderdownload:")
                         else:
                             matches = data.startswith(f"vision:{action}")
                         if matches:

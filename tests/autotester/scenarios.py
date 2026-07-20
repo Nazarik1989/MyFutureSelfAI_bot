@@ -1086,6 +1086,173 @@ VISION_PAGINATION_STEPS = tuple(
 
 VISION_SCENARIOS = (
     Scenario(
+        name="vision-render-empty-map-is-safe-and-read-only",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep(
+                "vision_callback",
+                "render",
+                reply_contains=("Сначала добавь желание",),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="vision-render-voice-photo-download-and-repeat-are-private",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "travel"),
+            ScenarioStep("voice", "Увидеть северное сияние ✨"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "render", reply_contains=("Что визуализировать",)),
+            ScenarioStep("vision_capture_callback", "renderall"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "renderall",
+                reply_contains=("Активных желаний: 1", "Вся карта"),
+            ),
+            ScenarioStep("vision_capture_callback", "download"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "download",
+                reply_contains=("Активных желаний: 1",),
+            ),
+            ScenarioStep(
+                "vision_replay_callback",
+                "download",
+                reply_contains=("устарел",),
+            ),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("travel", "Увидеть северное сияние ✨", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-render-category-callback-is-owner-bound",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "travel"),
+            ScenarioStep("text", "Побывать в Карелии"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "money"),
+            ScenarioStep("text", "Создать финансовую подушку"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "render"),
+            ScenarioStep("vision_capture_callback", "rendertravel"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "rendertravel",
+                reply_contains=("устарел",),
+            ),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "rendertravel",
+                reply_contains=("Активных желаний: 1", "Путешествия"),
+            ),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState("money", "Создать финансовую подушку", "active"),
+                VisionState("travel", "Побывать в Карелии", "active"),
+            ),
+        ),
+    ),
+    Scenario(
+        name="vision-render-multiple-pages-has-stable-page-captions",
+        steps=(
+            *VISION_PAGINATION_STEPS,
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "render"),
+            ScenarioStep(
+                "vision_callback",
+                "renderall",
+                reply_contains=("страница 1/2", "страница 2/2"),
+            ),
+        ),
+        expected=ExpectedState(
+            vision_items=(
+                VisionState("money", "Денежная цель 1", "active"),
+                VisionState("money", "Денежная цель 2", "active"),
+                VisionState("money", "Денежная цель 3", "active"),
+                VisionState("travel", "Путешествие 1", "active"),
+                VisionState("travel", "Путешествие 2", "active"),
+                VisionState("travel", "Путешествие 3", "active"),
+            ),
+        ),
+    ),
+    Scenario(
+        name="vision-render-concurrent-owner-request-is-rejected",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "home"),
+            ScenarioStep("text", "Создать спокойное пространство"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "render"),
+            ScenarioStep("vision_capture_callback", "renderall"),
+            ScenarioStep("vision_hold_render"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "renderall",
+                reply_contains=("уже создаётся",),
+            ),
+            ScenarioStep("vision_release_render"),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("home", "Создать спокойное пространство", "active"),),
+        ),
+    ),
+    Scenario(
+        name="vision-render-selection-cancel-is-single-use",
+        steps=(
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "add"),
+            ScenarioStep("vision_callback", "other"),
+            ScenarioStep("text", "Сохранить важную мечту"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "skip"),
+            ScenarioStep("vision_callback", "confirm"),
+            ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "render"),
+            ScenarioStep("vision_capture_callback", "rendercancel"),
+            ScenarioStep(
+                "vision_replay_callback",
+                "rendercancel",
+                reply_contains=("отменена",),
+            ),
+            ScenarioStep(
+                "vision_replay_callback",
+                "rendercancel",
+                reply_contains=("устарел",),
+            ),
+        ),
+        expected=ExpectedState(
+            vision_items=(VisionState("other", "Сохранить важную мечту", "active"),),
+        ),
+    ),
+    Scenario(
         name="vision-full-voice-skip-confirm-task-idempotent-without-llm",
         steps=(
             ScenarioStep("command", "/vision", reply_contains=("Карта желаний",)),
