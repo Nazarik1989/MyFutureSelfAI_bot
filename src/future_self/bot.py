@@ -8,14 +8,17 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram.constants import ChatType
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from telegram.warnings import PTBUserWarning
@@ -158,6 +161,10 @@ class FutureSelfBot:
             .post_init(self._post_init)
             .build()
         )
+        # This assistant handles profiles, health notes and reminders. Telegram
+        # group/channel replies would disclose that data to other chat members,
+        # so stop every non-private update before any feature handler sees it.
+        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-1)
         # Profile callbacks belong to the per-user/per-chat conversation, not to
         # individual message IDs. PTB warns about this intentional configuration.
         with warnings.catch_warnings():
@@ -304,6 +311,22 @@ class FutureSelfBot:
         app.add_error_handler(self.error_handler)
         return app
 
+    @staticmethod
+    async def private_chat_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        chat = update.effective_chat
+        if chat is None or chat.type == ChatType.PRIVATE:
+            return
+        message = (
+            "Из соображений приватности бот работает только в личном чате. "
+            "Открой диалог с ботом напрямую."
+        )
+        if update.callback_query is not None:
+            await update.callback_query.answer(message, show_alert=True)
+        elif update.effective_message is not None:
+            await update.effective_message.reply_text(message)
+        raise ApplicationHandlerStop
+
     async def _post_init(self, app: Application) -> None:
         async def send(telegram_id: int, text: str) -> int | None:
             message = await app.bot.send_message(chat_id=telegram_id, text=text)
@@ -341,7 +364,7 @@ class FutureSelfBot:
         for preference in await self.health_service.reminder_preferences():
             self.scheduler.schedule_health_reminder(
                 user_id=preference.user_id,
-                chat_id=preference.chat_id,
+                chat_id=preference.telegram_user_id,
                 timezone=preference.timezone,
                 local_time=preference.local_time,
             )
@@ -2618,7 +2641,7 @@ class FutureSelfBot:
         if self.scheduler:
             self.scheduler.schedule_health_reminder(
                 user_id=user.id,
-                chat_id=update.effective_chat.id,
+                chat_id=update.effective_user.id,
                 timezone=user.timezone,
                 local_time=local_time,
             )

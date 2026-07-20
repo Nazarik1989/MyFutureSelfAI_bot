@@ -8,7 +8,7 @@ from uuid import uuid4
 from sqlalchemy import select, update
 
 from .db import Database
-from .models import DraftInboxItem, InboxItem, TaskReminder
+from .models import DraftInboxItem, InboxItem, TaskReminder, User
 from .reminders import reminder_for_inbox_item
 from .schemas import ParsedThought
 
@@ -113,6 +113,14 @@ class DraftInboxService:
             version=1,
         )
         async with self.db.session() as session:
+            owner_exists = await session.scalar(
+                select(User.id).where(
+                    User.id == user_id,
+                    User.telegram_id == telegram_user_id,
+                )
+            )
+            if owner_exists is None:
+                raise ValueError("Telegram user does not own this draft")
             session.add(draft)
             await session.flush()
         log_transition(draft.id, telegram_user_id, "none", "preview", "create")
@@ -211,6 +219,9 @@ class DraftInboxService:
                 update(DraftInboxItem)
                 .where(
                     DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(
+                        select(User.id).where(User.telegram_id == telegram_user_id)
+                    ),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
                     DraftInboxItem.status == "preview",
@@ -482,6 +493,9 @@ class DraftInboxService:
                 update(DraftInboxItem)
                 .where(
                     DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(
+                        select(User.id).where(User.telegram_id == telegram_user_id)
+                    ),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
                     DraftInboxItem.status == "preview",
@@ -552,6 +566,9 @@ class DraftInboxService:
                 update(DraftInboxItem)
                 .where(
                     DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(
+                        select(User.id).where(User.telegram_id == telegram_user_id)
+                    ),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
                     DraftInboxItem.status == "preview",

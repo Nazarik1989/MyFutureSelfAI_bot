@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from .db import Database
-from .models import HealthCheckIn, HealthReminderPreference
+from .models import HealthCheckIn, HealthReminderPreference, User
 
 METRICS = ("energy", "sleep", "mood", "stress", "physical_wellbeing")
 METRIC_LABELS = {
@@ -238,22 +238,30 @@ class HealthService:
         enabled: bool,
     ) -> HealthReminderPreference:
         async with self.db.session() as session:
+            owner = await session.scalar(
+                select(User).where(
+                    User.id == user_id,
+                    User.telegram_id == telegram_user_id,
+                )
+            )
+            if owner is None:
+                raise ValueError("Telegram user does not own this health reminder")
             preference = await session.scalar(
                 select(HealthReminderPreference).where(HealthReminderPreference.user_id == user_id)
             )
             if preference is None:
                 preference = HealthReminderPreference(
                     user_id=user_id,
-                    telegram_user_id=telegram_user_id,
-                    chat_id=chat_id,
+                    telegram_user_id=owner.telegram_id,
+                    chat_id=owner.telegram_id,
                     timezone=timezone,
                     local_time=local_time,
                     enabled=enabled,
                 )
                 session.add(preference)
             else:
-                preference.telegram_user_id = telegram_user_id
-                preference.chat_id = chat_id
+                preference.telegram_user_id = owner.telegram_id
+                preference.chat_id = owner.telegram_id
                 preference.timezone = timezone
                 preference.local_time = local_time
                 preference.enabled = enabled
@@ -271,13 +279,19 @@ class HealthService:
             return True
 
     async def reminder_preferences(self) -> list[HealthReminderPreference]:
-        async with self.db.sessions() as session:
-            return list(
-                (
-                    await session.scalars(
-                        select(HealthReminderPreference).where(
-                            HealthReminderPreference.enabled.is_(True)
-                        )
-                    )
-                ).all()
-            )
+        async with self.db.session() as session:
+            rows = (
+                await session.execute(
+                    select(HealthReminderPreference, User)
+                    .join(User, User.id == HealthReminderPreference.user_id)
+                    .where(HealthReminderPreference.enabled.is_(True))
+                )
+            ).all()
+            preferences: list[HealthReminderPreference] = []
+            for preference, owner in rows:
+                # Never trust a persisted chat target for sensitive health data.
+                # A private Telegram chat is addressed by the user's Telegram ID.
+                preference.telegram_user_id = owner.telegram_id
+                preference.chat_id = owner.telegram_id
+                preferences.append(preference)
+            return preferences
