@@ -5,7 +5,9 @@ import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
+from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit, urlunsplit
 
 from alembic.config import Config
@@ -18,6 +20,7 @@ from sqlalchemy import text
 from .ai import create_ai_service
 from .config import ENV_FILE_PATH, Settings
 from .db import Database
+from .lab_media import TelegramLabMetadata, process_lab_upload
 from .transcription import create_transcription_service
 
 MINIMUM_PYTHON = (3, 12)
@@ -130,6 +133,39 @@ async def _check_database(report: DoctorReport, database_url: str) -> None:
         )
     finally:
         await database.dispose()
+
+
+def _check_pdf_renderer(report: DoctorReport) -> None:
+    try:
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=144, height=144)
+        output = BytesIO()
+        writer.write(output)
+        payload = output.getvalue()
+        with TemporaryDirectory(prefix="future-self-pdf-doctor-") as directory:
+            rendered = process_lab_upload(
+                payload,
+                TelegramLabMetadata("document", len(payload), "application/pdf"),
+                temp_root=Path(directory),
+            )
+        if len(rendered.pages) != 1 or not rendered.pages[0].image_bytes.startswith(
+            b"\xff\xd8\xff"
+        ):
+            raise RuntimeError("invalid_renderer_output")
+        report.add(
+            "pdf_renderer",
+            "OK",
+            f"Local PDFium render succeeded; pypdf {_package_version('pypdf')}; "
+            f"pypdfium2 {_package_version('pypdfium2')}",
+        )
+    except Exception as exc:
+        report.add(
+            "pdf_renderer",
+            "FAIL",
+            f"Local PDF renderer failed ({type(exc).__name__}); reinstall application dependencies",
+        )
 
 
 async def run_provider_check(
@@ -349,6 +385,7 @@ async def run_diagnostics(
         f"enable_voice={str(settings.enable_voice).lower()}; "
         f"key_configured={str(bool(settings.transcription_api_key)).lower()}",
     )
+    _check_pdf_renderer(report)
     await _check_database(report, settings.database_url)
     await _check_network(
         report,

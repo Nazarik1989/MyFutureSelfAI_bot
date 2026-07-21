@@ -87,7 +87,17 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
 def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_ai):
     validate_catalog()
     names = [item.command for item in PUBLIC_COMMANDS]
-    assert names == ["menu", "inbox", "vision", "health", "checkin", "doctor", "location", "help"]
+    assert names == [
+        "menu",
+        "inbox",
+        "vision",
+        "health",
+        "checkin",
+        "doctor",
+        "labs",
+        "location",
+        "help",
+    ]
     assert len(names) == len(set(names))
     assert len(ACTIONS) == len(set(ACTIONS))
     assert {action for section in SECTIONS.values() for action in section.actions} == set(ACTIONS)

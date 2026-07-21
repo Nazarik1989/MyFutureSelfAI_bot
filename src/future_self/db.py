@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .models import Base
@@ -12,7 +13,18 @@ class Database:
     def __init__(self, url: str, *, echo: bool = False):
         self.url = url
         self.engine = create_async_engine(url, echo=echo)
+        if self.engine.url.get_backend_name() == "sqlite":
+            event.listen(self.engine.sync_engine, "connect", self._enable_sqlite_foreign_keys)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+
+    @staticmethod
+    def _enable_sqlite_foreign_keys(dbapi_connection: object, connection_record: object) -> None:
+        del connection_record
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:

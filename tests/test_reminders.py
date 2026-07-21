@@ -566,7 +566,11 @@ async def test_bot_startup_delivers_persisted_due_reminder_via_telegram(db, fake
     await bot._post_init(SimpleNamespace(bot=TelegramBot(), job_queue=Queue()))
     assert len(sent) == 1
     assert sent[0][0] == 10
-    assert len(repeating) == 1
+    assert len(repeating) == 2
+    assert {item.get("name") for item in repeating} == {
+        "labs:cleanup",
+        "task-reminders:persistent-outbox",
+    }
     assert len(command_registrations) == 1
     assert len(menu_registrations) == 1
     async with db.sessions() as session:

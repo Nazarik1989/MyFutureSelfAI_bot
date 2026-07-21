@@ -59,6 +59,8 @@ from .health import (
     prolonged_weakness_message,
     urgent_safety_message,
 )
+from .lab_handlers import LabHandlers
+from .labs import LabDocumentService, LabUploadSessionStore
 from .location import LocationService, location_from_user, parse_location
 from .models import DraftInboxItem, Goal, InboxItem, Routine, User, VisionProfile
 from .natural_commands import NaturalAction, NaturalCommandRouter
@@ -133,7 +135,7 @@ def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | No
         logger.error("%s error_type=%s user_id=%s", event, error_type, user_id)
 
 
-class FutureSelfBot(VisionHandlers, NavigationHandlers):
+class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
     def __init__(
         self,
         settings: Settings,
@@ -171,6 +173,8 @@ class FutureSelfBot(VisionHandlers, NavigationHandlers):
         self.vision_service = VisionService(db)
         self.vision_image_service = VisionImageService(db)
         self.vision_image_sessions = VisionImageSessionStore()
+        self.lab_documents = LabDocumentService(db)
+        self.lab_uploads = LabUploadSessionStore()
         self.vision_renderer = VisionBoardRenderer()
         self.vision_render_sessions = VisionRenderSessionStore()
         self.vision_render_limiter = VisionRenderLimiter()
@@ -204,7 +208,7 @@ class FutureSelfBot(VisionHandlers, NavigationHandlers):
         app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-3)
         app.add_handler(
             CommandHandler(
-                ["inbox", "vision", "health", "checkin", "doctor", "location"],
+                ["inbox", "vision", "health", "checkin", "doctor", "location", "labs"],
                 self.navigation_public_command_gate,
             ),
             group=-2,
@@ -217,21 +221,26 @@ class FutureSelfBot(VisionHandlers, NavigationHandlers):
         # ConversationHandler is paused. Group -1 routes only an active owner/chat
         # draft and then stops the lower feature group.
         app.add_handler(CommandHandler("vision", self.vision_command_gate), group=-1)
+        app.add_handler(CommandHandler("labs", self.labs_command_gate), group=-1)
+        app.add_handler(
+            CallbackQueryHandler(self.labs_action, pattern=r"^labs:"),
+            group=-1,
+        )
         app.add_handler(
             CallbackQueryHandler(self.vision_callback_gate, pattern=r"^vision:"),
             group=-1,
         )
-        app.add_handler(CommandHandler("cancel", self.vision_cancel_gate), group=-1)
+        app.add_handler(CommandHandler("cancel", self.labs_cancel_gate), group=-1)
         app.add_handler(
-            MessageHandler(filters.PHOTO | filters.Document.ALL, self.vision_image_gate),
+            MessageHandler(filters.PHOTO | filters.Document.ALL, self.labs_media_gate),
             group=-1,
         )
         app.add_handler(
-            MessageHandler(filters.VOICE | filters.AUDIO, self.vision_voice_gate),
+            MessageHandler(filters.VOICE | filters.AUDIO, self.labs_voice_gate),
             group=-1,
         )
         app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.vision_text_gate),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.labs_text_gate),
             group=-1,
         )
         # Profile callbacks belong to the per-user/per-chat conversation, not to
@@ -423,6 +432,8 @@ class FutureSelfBot(VisionHandlers, NavigationHandlers):
         raise ApplicationHandlerStop
 
     async def _post_init(self, app: Application) -> None:
+        self.lab_uploads.cleanup_startup()
+        await self.lab_documents.cleanup_confirmations()
         await app.bot.set_my_commands(
             [BotCommand(item.command, item.description) for item in PUBLIC_COMMANDS],
             scope=BotCommandScopeAllPrivateChats(),
@@ -436,6 +447,12 @@ class FutureSelfBot(VisionHandlers, NavigationHandlers):
         if app.job_queue is None:
             logger.warning("JobQueue is unavailable; scheduled messages are disabled")
             return
+        app.job_queue.run_repeating(
+            self.labs_cleanup_job,
+            interval=300,
+            first=300,
+            name="labs:cleanup",
+        )
         self.scheduler = JobQueueScheduler(
             app.job_queue,
             send,

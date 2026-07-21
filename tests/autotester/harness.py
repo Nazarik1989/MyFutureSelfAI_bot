@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Literal
 
 from PIL import Image
+from pypdf import PdfWriter
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from telegram.ext import ApplicationHandlerStop, ConversationHandler
@@ -26,12 +27,15 @@ from future_self.bot import (
 )
 from future_self.config import Settings
 from future_self.db import Database
+from future_self.lab_media import MAX_LAB_INPUT_BYTES, MAX_PDF_PAGES
+from future_self.labs import LabUploadSessionStore
 from future_self.models import (
     DoctorVisitPrep,
     DraftInboxItem,
     HealthCheckIn,
     HealthReminderPreference,
     InboxItem,
+    LabDocument,
     TaskReminder,
     VisionDraft,
     VisionItem,
@@ -77,6 +81,13 @@ StepKind = Literal[
     "navigation_raw_callback",
     "navigation_capture_callback",
     "navigation_replay_callback",
+    "lab_callback",
+    "lab_raw_callback",
+    "lab_capture_callback",
+    "lab_replay_callback",
+    "lab_photo",
+    "lab_document",
+    "lab_text",
     "restart",
     "group_command",
     "timezone_onboarding",
@@ -125,6 +136,13 @@ class VisionState:
     has_image: bool = False
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class LabState:
+    title: str
+    document_date: str | None
+    page_count: int
+
+
 @dataclass(frozen=True, slots=True)
 class ExpectedState:
     drafts: tuple[DraftState, ...] = ()
@@ -140,6 +158,7 @@ class ExpectedState:
     vision_items: tuple[VisionState, ...] = ()
     vision_draft_count: int = 0
     vision_image_count: int = 0
+    lab_documents: tuple[LabState, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +265,7 @@ class BotAutotester:
         self.contexts = {telegram_user_id: context}
         self.saved_vision_callbacks: dict[str, tuple[str, FakeMessage]] = {}
         self.saved_navigation_callbacks: dict[str, tuple[str, FakeMessage]] = {}
+        self.saved_lab_callbacks: dict[str, tuple[str, FakeMessage]] = {}
 
     @classmethod
     async def create(cls, sandbox: Path, stubs: tuple[LLMStub, ...]) -> "BotAutotester":
@@ -263,6 +283,7 @@ class BotAutotester:
         transcription = ScriptedTranscription()
         context = SimpleNamespace(user_data={}, bot=FakeBot())
         bot = FutureSelfBot(settings, database, ai, transcription)
+        bot.lab_uploads = LabUploadSessionStore(root=sandbox / "lab-temp")
         scheduler = RecordingHealthScheduler()
         bot.scheduler = scheduler
         return cls(
@@ -318,6 +339,7 @@ class BotAutotester:
             vision_items = list((await session.scalars(select(VisionItem))).all())
             vision_images = list((await session.scalars(select(VisionItemImage))).all())
             vision_drafts = list((await session.scalars(select(VisionDraft))).all())
+            lab_documents = list((await session.scalars(select(LabDocument))).all())
         image_item_ids = {image.vision_item_id for image in vision_images}
         return ExpectedState(
             drafts=tuple(
@@ -353,6 +375,16 @@ class BotAutotester:
             ),
             vision_draft_count=len(vision_drafts),
             vision_image_count=len(vision_images),
+            lab_documents=tuple(
+                sorted(
+                    LabState(
+                        item.title,
+                        item.document_date.isoformat() if item.document_date else None,
+                        item.page_count,
+                    )
+                    for item in lab_documents
+                )
+            ),
         )
 
     async def _run_step(self, step: ScenarioStep) -> StepResult:
@@ -395,6 +427,22 @@ class BotAutotester:
             except KeyError as exc:
                 raise AssertionError(f"No saved navigation callback for {step.value!r}") from exc
             return await self._dispatch_navigation_callback(step.kind, step.value, data, message)
+        if step.kind == "lab_callback":
+            return await self._run_lab_callback(step.value)
+        if step.kind == "lab_raw_callback":
+            message = FakeMessage()
+            self.messages.append(message)
+            return await self._dispatch_lab_callback(step.kind, step.value, step.value, message)
+        if step.kind == "lab_capture_callback":
+            data, message = self._latest_lab_callback(step.value)
+            self.saved_lab_callbacks[step.value] = (data, message)
+            return StepResult(step.kind, step.value, ("callback captured",))
+        if step.kind == "lab_replay_callback":
+            try:
+                data, message = self.saved_lab_callbacks[step.value]
+            except KeyError as exc:
+                raise AssertionError(f"No saved lab callback for {step.value!r}") from exc
+            return await self._dispatch_lab_callback(step.kind, step.value, data, message)
         if step.kind == "vision_hold_render":
             user = await self.bot._user(self.telegram_user_id)
             if not await self.bot.vision_render_limiter.acquire(user.id):
@@ -406,14 +454,20 @@ class BotAutotester:
             return StepResult(step.kind, step.value, ("render slot released",))
         if step.kind in {"vision_photo", "vision_document"}:
             return await self._run_vision_media(step.kind, step.value)
+        if step.kind in {"lab_photo", "lab_document"}:
+            return await self._run_lab_media(step.kind, step.value)
+        if step.kind == "lab_text":
+            return await self._run_lab_text(step.value)
         if step.kind == "restart":
             scheduler = self.bot.scheduler
+            lab_root = self.bot.lab_uploads.root
             self.bot = FutureSelfBot(
                 self.bot.settings,
                 self.database,
                 self.ai,
                 self.transcription,
             )
+            self.bot.lab_uploads = LabUploadSessionStore(root=lab_root)
             self.bot.scheduler = scheduler
             return StepResult(step.kind, step.value, ("bot restarted",))
         if step.kind == "group_command":
@@ -481,6 +535,86 @@ class BotAutotester:
             pass
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult(kind, value, outputs)
+
+    async def _run_lab_media(self, kind: StepKind, value: str) -> StepResult:
+        payload, mime_type, width, height, declared_size = self._lab_media_fixture(value)
+        media = FakeImageMedia(
+            payload,
+            mime_type=mime_type if kind == "lab_document" else None,
+            width=width if kind == "lab_photo" else None,
+            height=height if kind == "lab_photo" else None,
+            file_size=declared_size,
+        )
+        message = FakeMessage(
+            photo=[media] if kind == "lab_photo" else None,
+            document=media if kind == "lab_document" else None,
+        )
+        self.messages.append(message)
+        try:
+            await self.bot.labs_media_gate(self._update_for(message), self.context)
+        except ApplicationHandlerStop:
+            pass
+        return StepResult(kind, value, tuple(str(reply["text"]) for reply in message.replies))
+
+    async def _run_lab_text(self, value: str) -> StepResult:
+        message = FakeMessage(value)
+        self.messages.append(message)
+        try:
+            await self.bot.labs_text_gate(self._update_for(message), self.context)
+        except ApplicationHandlerStop:
+            pass
+        return StepResult(
+            "lab_text",
+            value,
+            tuple(str(reply["text"]) for reply in message.replies) + tuple(message.edits),
+        )
+
+    @staticmethod
+    def _lab_media_fixture(
+        value: str,
+    ) -> tuple[bytes, str, int, int, int | None]:
+        if value in {"jpeg", "png", "webp"}:
+            image_format = value.upper()
+            mime_type = {
+                "JPEG": "image/jpeg",
+                "PNG": "image/png",
+                "WEBP": "image/webp",
+            }[image_format]
+            return BotAutotester._encoded_image(image_format, "teal"), mime_type, 120, 80, None
+        if value.startswith("pdf"):
+            encrypted = value == "pdf-encrypted"
+            javascript = value == "pdf-js"
+            attachment = value == "pdf-attachment"
+            page_count = {
+                "pdf1": 1,
+                "pdf3": 3,
+                "pdf-too-many": MAX_PDF_PAGES + 1,
+            }.get(value, 1)
+            writer = PdfWriter()
+            for _ in range(page_count):
+                writer.add_blank_page(width=612, height=792)
+            if encrypted:
+                writer.encrypt("password")
+            if javascript:
+                writer.add_js("app.alert('blocked')")
+            if attachment:
+                writer.add_attachment("blocked.txt", b"blocked")
+            output = BytesIO()
+            writer.write(output)
+            return output.getvalue(), "application/pdf", 0, 0, None
+        if value == "corrupt":
+            return b"corrupt-lab-document", "image/jpeg", 10, 10, None
+        if value == "mismatch":
+            return BotAutotester._encoded_image("PNG", "purple"), "image/jpeg", 120, 80, None
+        if value == "oversize-meta":
+            return (
+                BotAutotester._encoded_image("JPEG", "red"),
+                "image/jpeg",
+                120,
+                80,
+                MAX_LAB_INPUT_BYTES + 1,
+            )
+        raise AssertionError(f"Unknown lab media fixture {value!r}")
 
     @staticmethod
     def _vision_media_fixture(
@@ -601,6 +735,7 @@ class BotAutotester:
             "doctor_prepare_task": self.bot.doctor_prepare_task,
             "doctor_find": self.bot.doctor_find,
             "doctor_find_task": self.bot.doctor_find_task,
+            "labs": self.bot.labs_command,
         }
         current_user = await self.bot._user(self.telegram_user_id)
         vision_draft = await self.bot.vision_service.draft(current_user.id, self.chat_id)
@@ -622,6 +757,71 @@ class BotAutotester:
             self.doctor_state = result
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult("command", value, outputs)
+
+    async def _run_lab_callback(self, action: str) -> StepResult:
+        data, message = self._latest_lab_callback(action)
+        return await self._dispatch_lab_callback("lab_callback", action, data, message)
+
+    async def _dispatch_lab_callback(
+        self,
+        kind: StepKind,
+        value: str,
+        data: str,
+        message: FakeMessage,
+    ) -> StepResult:
+        previous_replies = len(message.replies)
+        query = FakeCallbackQuery(data, message)
+        update = SimpleNamespace(
+            effective_message=message,
+            message=message,
+            callback_query=query,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+            effective_chat=SimpleNamespace(id=self.chat_id, type="private"),
+        )
+        await self.bot.labs_action(update, self.context)
+        outputs = (
+            tuple(query.edits)
+            + tuple(answer for answer, _show_alert in query.answers if answer is not None)
+            + tuple(str(reply["text"]) for reply in message.replies[previous_replies:])
+        )
+        return StepResult(kind, value, outputs)
+
+    def _latest_lab_callback(self, action: str) -> tuple[str, FakeMessage]:
+        exact = {
+            "menu": "labs:menu",
+            "add": "labs:add",
+            "help": "labs:help",
+            "list": "labs:list:0",
+        }.get(action)
+        prefixes = {
+            "cancel": "labs:cancel:",
+            "draft-title": "labs:draft:title:",
+            "draft-date": "labs:draft:date:",
+            "draft-save": "labs:draft:save:",
+            "open": "labs:open:",
+            "view": "labs:view:",
+            "rename": "labs:rename:",
+            "date": "labs:date:",
+            "delete": "labs:delete:",
+            "delete-confirm": "labs:deleteconfirm:",
+            "list-next": "labs:list:",
+        }
+        prefix = prefixes.get(action)
+        for message in reversed(self.messages):
+            for reply in reversed(message.replies):
+                markup = reply.get("reply_markup")
+                if markup is None:
+                    continue
+                for row in markup.inline_keyboard:
+                    for button in row:
+                        data = button.callback_data
+                        if data is None:
+                            continue
+                        if exact is not None and data == exact:
+                            return data, message
+                        if prefix is not None and data.startswith(prefix):
+                            return data, message
+        raise AssertionError(f"No lab callback found for {action!r}")
 
     async def _run_navigation_callback(self, action: str) -> StepResult:
         data, message = self._latest_navigation_callback(action)
