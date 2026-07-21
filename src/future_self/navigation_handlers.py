@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+from typing import Any
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
+from telegram.ext import ApplicationHandlerStop, ContextTypes, ConversationHandler
+
+from .navigation import ACTIONS, HELP_TOPICS, SECTIONS
+
+FLOW_LABELS = {
+    "onboarding": "настройка профиля",
+    "evening": "вечерняя рефлексия",
+    "health": "health check-in",
+    "doctor": "подготовка к приёму",
+    "vision": "создание карточки желания",
+    "vision_image": "добавление личного фото",
+    "rename_goal": "переименование цели",
+}
+
+
+class NavigationHandlers:
+    navigation_flow_sessions: Any
+
+    async def navigation_public_command_gate(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is None:
+            return
+        await self._prompt_navigation_flow(update.effective_message, update, flow)
+        raise ApplicationHandlerStop
+
+    async def navigation_text_gate(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        command = self.natural_command_router.route(update.effective_message.text or "")
+        if command is None or command.action not in {"menu", "help"}:
+            return
+        if command.action == "menu":
+            await self.menu_command(update, context)
+        else:
+            await self.help_command(update, context)
+        raise ApplicationHandlerStop
+
+    async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None:
+            await self._prompt_navigation_flow(update.effective_message, update, flow)
+            return
+        await self._send_navigation_root(update.effective_message)
+
+    async def doctor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None:
+            await self._prompt_navigation_flow(update.effective_message, update, flow)
+            return
+        await self._send_navigation_section(update.effective_message, "doctor")
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        await update.effective_message.reply_text(
+            "Помощь\n\nВыбери короткий раздел — без длинной стены текста.",
+            reply_markup=self._help_keyboard(),
+        )
+
+    async def navigation_action(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int | None:
+        query = update.callback_query
+        data = query.data or ""
+        if data.startswith("nav:flow:"):
+            return await self._navigation_flow_action(update, context)
+
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None and not data.startswith("nav:help:"):
+            await query.answer()
+            await self._prompt_navigation_flow(query.message, update, flow)
+            return None
+
+        if data == "nav:root":
+            await query.answer()
+            await self._edit_or_send(
+                query,
+                "Главное меню\n\nВыбери раздел — команды помнить не обязательно.",
+                self._root_keyboard(),
+            )
+            return None
+        if data == "nav:help":
+            await query.answer()
+            await self._edit_or_send(
+                query,
+                "Помощь\n\nВыбери короткий раздел — без длинной стены текста.",
+                self._help_keyboard(),
+            )
+            return None
+        if data.startswith("nav:section:"):
+            section_key = data.removeprefix("nav:section:")
+            if section_key not in SECTIONS:
+                await self._navigation_stale(query)
+                return None
+            await query.answer()
+            section = SECTIONS[section_key]
+            await self._edit_or_send(
+                query,
+                f"{section.emoji} {section.label}\n\n{section.description}",
+                self._section_keyboard(section_key),
+            )
+            return None
+        if data.startswith("nav:help:"):
+            topic_key = data.removeprefix("nav:help:")
+            topic = HELP_TOPICS.get(topic_key)
+            if topic is None:
+                await self._navigation_stale(query)
+                return None
+            await query.answer()
+            await self._edit_or_send(
+                query,
+                f"{topic[0]}\n\n{topic[1]}",
+                self._back_keyboard("nav:help"),
+            )
+            return None
+        if data.startswith("nav:action:"):
+            action_key = data.removeprefix("nav:action:")
+            action = ACTIONS.get(action_key)
+            if action is None or action.handler in {
+                "health_checkin_start",
+                "doctor_prepare_start",
+                "start",
+            }:
+                await self._navigation_stale(query)
+                return None
+            await query.answer()
+            if action.handler is None:
+                text = action.description
+                if action.example:
+                    text += f"\n\nПример: {action.example}"
+                await query.message.reply_text(
+                    text,
+                    reply_markup=self._back_keyboard(self._section_for_action(action_key)),
+                )
+                return None
+            original_args = getattr(context, "args", None)
+            context.args = []
+            try:
+                await getattr(self, action.handler)(update, context)
+            finally:
+                context.args = original_args or []
+            await query.message.reply_text(
+                "Навигация",
+                reply_markup=self._back_keyboard(self._section_for_action(action_key)),
+            )
+            return None
+        await self._navigation_stale(query)
+        return None
+
+    async def navigation_health_entry(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int | None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None:
+            await update.callback_query.answer()
+            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            return None
+        await update.callback_query.answer()
+        return await self.health_checkin_start(update, context)
+
+    async def navigation_doctor_entry(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int | None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None:
+            await update.callback_query.answer()
+            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            return None
+        await update.callback_query.answer()
+        return await self.doctor_prepare_start(update, context)
+
+    async def navigation_onboarding_entry(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int | None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None:
+            await update.callback_query.answer()
+            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            return None
+        await update.callback_query.answer()
+        return await self.start(update, context)
+
+    async def _navigation_flow_action(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int | None:
+        query = update.callback_query
+        parts = (query.data or "").split(":")
+        if len(parts) != 4 or parts[2] not in {"continue", "exit"}:
+            await self._navigation_stale(query)
+            return None
+        capability = await self.navigation_flow_sessions.claim(
+            parts[3], update.effective_user.id, update.effective_chat.id
+        )
+        if capability is None:
+            await self._navigation_stale(query)
+            return None
+        current = await self._active_navigation_flow(update, context)
+        if current != capability.flow:
+            await self._navigation_stale(query)
+            return None
+        await query.answer()
+        if parts[2] == "continue":
+            instruction = (
+                "Отправь выбранное фото или нажми «Отмена» в сообщении загрузки."
+                if current == "vision_image"
+                else "Ответь на текущий вопрос."
+            )
+            await self._edit_or_send(
+                query,
+                f"Продолжаем: {FLOW_LABELS[current]}. {instruction}",
+                None,
+            )
+            if current == "vision":
+                user = await self._user(update.effective_user.id)
+                draft = await self.vision_service.draft(user.id, update.effective_chat.id)
+                if draft is not None:
+                    await self._vision_prompt(query.message, draft)
+            return None
+
+        await self._clear_navigation_flow(update, context, current)
+        await self._edit_or_send(
+            query,
+            f"Сценарий «{FLOW_LABELS[current]}» остановлен. Остальные данные не изменены.",
+            None,
+        )
+        await self._send_navigation_root(query.message)
+        return ConversationHandler.END
+
+    async def _active_navigation_flow(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> str | None:
+        for key, name in (
+            ("health_checkin", "health"),
+            ("doctor_prepare", "doctor"),
+            ("evening", "evening"),
+            ("rename_goal_id", "rename_goal"),
+        ):
+            if key in context.user_data:
+                return name
+        user = await self._user(update.effective_user.id)
+        if "onboarding_user_id" in context.user_data and not user.onboarding_completed:
+            return "onboarding"
+        if await self.vision_image_sessions.has_active(user.id, update.effective_chat.id):
+            return "vision_image"
+        if await self.vision_service.draft(user.id, update.effective_chat.id) is not None:
+            return "vision"
+        return None
+
+    async def _clear_navigation_flow(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        flow: str,
+    ) -> None:
+        if flow == "health":
+            context.user_data.pop("health_checkin", None)
+        elif flow == "doctor":
+            context.user_data.pop("doctor_prepare", None)
+        elif flow == "evening":
+            context.user_data.pop("evening", None)
+        elif flow == "rename_goal":
+            context.user_data.pop("rename_goal_id", None)
+        elif flow == "onboarding":
+            context.user_data.pop("onboarding_user_id", None)
+            context.user_data.pop("vision_summary", None)
+        else:
+            user = await self._user(update.effective_user.id)
+            if flow == "vision_image":
+                await self.vision_image_sessions.cancel_active(user.id, update.effective_chat.id)
+            elif flow == "vision":
+                await self.vision_service.cancel(user.id, update.effective_chat.id)
+
+    async def _prompt_navigation_flow(self, message: Any, update: Update, flow: str) -> None:
+        token = await self.navigation_flow_sessions.issue(
+            update.effective_user.id, update.effective_chat.id, flow
+        )
+        await message.reply_text(
+            f"Сейчас не завершён сценарий: {FLOW_LABELS[flow]}. Что сделать?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Продолжить", callback_data=f"nav:flow:continue:{token}"
+                        ),
+                        InlineKeyboardButton(
+                            "Выйти в меню", callback_data=f"nav:flow:exit:{token}"
+                        ),
+                    ]
+                ]
+            ),
+        )
+
+    @staticmethod
+    async def _navigation_stale(query: Any) -> None:
+        await query.answer("Эта кнопка устарела или недоступна.", show_alert=True)
+
+    @staticmethod
+    async def _edit_or_send(
+        query: Any, text: str, reply_markup: InlineKeyboardMarkup | None
+    ) -> None:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+        except (TelegramError, TypeError):
+            await query.message.reply_text(text, reply_markup=reply_markup)
+
+    async def _send_navigation_root(self, message: Any) -> None:
+        await message.reply_text(
+            "Главное меню\n\nВыбери раздел — команды помнить не обязательно.",
+            reply_markup=self._root_keyboard(),
+        )
+
+    async def _send_navigation_section(self, message: Any, section_key: str) -> None:
+        section = SECTIONS[section_key]
+        await message.reply_text(
+            f"{section.emoji} {section.label}\n\n{section.description}",
+            reply_markup=self._section_keyboard(section_key),
+        )
+
+    @staticmethod
+    def _root_keyboard() -> InlineKeyboardMarkup:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    f"{section.emoji} {section.label}",
+                    callback_data=f"nav:section:{section.key}",
+                )
+            ]
+            for section in SECTIONS.values()
+        ]
+        rows.append([InlineKeyboardButton("❓ Помощь", callback_data="nav:help")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _section_keyboard(section_key: str) -> InlineKeyboardMarkup:
+        section = SECTIONS[section_key]
+        rows = [
+            [
+                InlineKeyboardButton(
+                    ACTIONS[action].label,
+                    callback_data=f"nav:action:{action}",
+                )
+            ]
+            for action in section.actions
+        ]
+        rows.extend(
+            [
+                [InlineKeyboardButton("← Назад", callback_data="nav:root")],
+                [
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root"),
+                    InlineKeyboardButton("❓ Помощь", callback_data="nav:help"),
+                ],
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _help_keyboard() -> InlineKeyboardMarkup:
+        labels = {
+            "quick": "Быстрый старт",
+            "features": "Что умеет бот",
+            "examples": "Примеры сообщений",
+            "commands": "Команды",
+            "privacy": "Конфиденциальность",
+            "safety": "Здоровье и безопасность",
+        }
+        rows = [
+            [InlineKeyboardButton(labels[key], callback_data=f"nav:help:{key}")]
+            for key in HELP_TOPICS
+        ]
+        rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _back_keyboard(target: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("← Назад", callback_data=target)],
+                [
+                    InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root"),
+                    InlineKeyboardButton("❓ Помощь", callback_data="nav:help"),
+                ],
+            ]
+        )
+
+    @staticmethod
+    def _section_for_action(action_key: str) -> str:
+        for section in SECTIONS.values():
+            if action_key in section.actions:
+                return f"nav:section:{section.key}"
+        return "nav:root"

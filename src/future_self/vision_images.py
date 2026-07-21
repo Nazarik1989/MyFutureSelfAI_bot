@@ -179,6 +179,26 @@ class VisionImageSessionStore:
                 for session in self._sessions.values()
             )
 
+    async def has_active(self, owner_id: int, chat_id: int) -> bool:
+        async with self._lock:
+            self._prune()
+            return any(
+                session.owner_id == owner_id and session.chat_id == chat_id
+                for session in self._sessions.values()
+            )
+
+    async def cancel_active(self, owner_id: int, chat_id: int) -> bool:
+        async with self._lock:
+            self._prune()
+            tokens = [
+                token
+                for token, session in self._sessions.items()
+                if session.owner_id == owner_id and session.chat_id == chat_id
+            ]
+            for token in tokens:
+                self._sessions.pop(token, None)
+            return bool(tokens)
+
     async def claim_upload(self, owner_id: int, chat_id: int) -> VisionImageCapability | None:
         async with self._lock:
             self._prune()

@@ -158,7 +158,10 @@ def fake_ai() -> FakeAI:
 
 @pytest_asyncio.fixture
 async def db(tmp_path) -> AsyncIterator[Database]:
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    database_path = tmp_path / "test.db"
+    database = Database(f"sqlite+aiosqlite:///{database_path}")
     await database.create_all_for_tests()
     yield database
     await database.dispose()
+    for suffix in ("", "-wal", "-shm"):
+        database_path.with_name(database_path.name + suffix).unlink(missing_ok=True)

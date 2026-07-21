@@ -64,6 +64,7 @@ def is_discard_inbox_command(text: str) -> bool:
 
 
 NaturalAction = Literal[
+    "menu",
     "show_drafts",
     "show_inbox",
     "show_last_saved",
@@ -82,6 +83,12 @@ class NaturalCommandRouter:
     """Deterministic read-only commands routed before all content processing."""
 
     PATTERNS: dict[NaturalAction, tuple[str, ...]] = {
+        "menu": (
+            "меню",
+            "главное меню",
+            "открой меню",
+            "покажи меню",
+        ),
         "show_drafts": (
             "выполни команду drafts",
             "покажи что в drafts",
@@ -117,12 +124,14 @@ class NaturalCommandRouter:
             "мой план на сегодня",
         ),
         "help": (
+            "помощь",
             "покажи помощь",
             "какие есть команды",
             "какие у тебя есть команды",
             "какие у тебя команды",
             "какие команды у тебя есть",
             "что ты умеешь",
+            "как пользоваться ботом",
         ),
     }
     WRITE_INBOX = ("добавь в inbox", "добавь в инбокс", "запиши в inbox", "запиши в инбокс")
@@ -134,7 +143,12 @@ class NaturalCommandRouter:
         ):
             return None
         for action, patterns in self.PATTERNS.items():
-            if any(pattern in normalized for pattern in patterns):
+            matches = (
+                normalized in patterns
+                if action in {"menu", "help"}
+                else any(pattern in normalized for pattern in patterns)
+            )
+            if matches:
                 return NaturalCommand(action)
         return None
 
