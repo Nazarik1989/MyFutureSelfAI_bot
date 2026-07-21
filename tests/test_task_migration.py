@@ -101,7 +101,7 @@ def test_task_hub_migration_reconciles_existing_database_and_downgrades(tmp_path
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260720_0016"
+        "20260720_0017"
     )
     states = connection.execute(
         "SELECT inbox_item_id, owner_id, status, event_at, timezone, version "

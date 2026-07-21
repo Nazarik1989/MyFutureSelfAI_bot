@@ -65,6 +65,10 @@ class TaskHandlers:
         del context
         query = update.callback_query
         data = query.data or ""
+        if hasattr(self, "collection_service"):
+            user = await self._user(update.effective_user.id)
+            await self.collection_service.clear_context(user.id, update.effective_chat.id)
+            await self.collection_service.cancel_input(user.id, update.effective_chat.id)
         if data == "task:hub":
             await query.answer()
             await self._task_edit_or_send(

@@ -7,7 +7,7 @@ from typing import Literal
 
 from PIL import Image
 from pypdf import PdfWriter
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 from telegram.ext import ApplicationHandlerStop, ConversationHandler
 
@@ -36,6 +36,9 @@ from future_self.models import (
     HealthReminderPreference,
     InboxItem,
     LabDocument,
+    LifeCollection,
+    LifeCollectionLink,
+    LifeCollectionPreference,
     TaskReminder,
     VisionDraft,
     VisionItem,
@@ -92,6 +95,10 @@ StepKind = Literal[
     "task_raw_callback",
     "task_capture_callback",
     "task_replay_callback",
+    "collection_callback",
+    "collection_raw_callback",
+    "collection_capture_callback",
+    "collection_replay_callback",
     "restart",
     "group_command",
     "timezone_onboarding",
@@ -147,6 +154,14 @@ class LabState:
     page_count: int
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class CollectionState:
+    name: str
+    kind: str
+    status: str
+    item_count: int
+
+
 @dataclass(frozen=True, slots=True)
 class ExpectedState:
     drafts: tuple[DraftState, ...] = ()
@@ -163,6 +178,9 @@ class ExpectedState:
     vision_draft_count: int = 0
     vision_image_count: int = 0
     lab_documents: tuple[LabState, ...] = ()
+    collections: tuple[CollectionState, ...] = ()
+    collection_link_count: int = 0
+    collection_onboarded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +289,7 @@ class BotAutotester:
         self.saved_navigation_callbacks: dict[str, tuple[str, FakeMessage]] = {}
         self.saved_lab_callbacks: dict[str, tuple[str, FakeMessage]] = {}
         self.saved_task_callbacks: dict[str, tuple[str, FakeMessage]] = {}
+        self.saved_collection_callbacks: dict[str, tuple[str, FakeMessage]] = {}
 
     @classmethod
     async def create(cls, sandbox: Path, stubs: tuple[LLMStub, ...]) -> "BotAutotester":
@@ -345,6 +364,26 @@ class BotAutotester:
             vision_images = list((await session.scalars(select(VisionItemImage))).all())
             vision_drafts = list((await session.scalars(select(VisionDraft))).all())
             lab_documents = list((await session.scalars(select(LabDocument))).all())
+            collection_rows = (
+                await session.execute(
+                    select(LifeCollection, func.count(LifeCollectionLink.id))
+                    .outerjoin(
+                        LifeCollectionLink,
+                        LifeCollectionLink.collection_id == LifeCollection.id,
+                    )
+                    .group_by(LifeCollection.id)
+                )
+            ).all()
+            collection_link_count = int(
+                await session.scalar(select(func.count(LifeCollectionLink.id))) or 0
+            )
+            collection_onboarded = bool(
+                await session.scalar(
+                    select(func.count(LifeCollectionPreference.owner_id)).where(
+                        LifeCollectionPreference.onboarding_completed.is_(True)
+                    )
+                )
+            )
         image_item_ids = {image.vision_item_id for image in vision_images}
         return ExpectedState(
             drafts=tuple(
@@ -390,6 +429,19 @@ class BotAutotester:
                     for item in lab_documents
                 )
             ),
+            collections=tuple(
+                sorted(
+                    CollectionState(
+                        collection.name,
+                        collection.kind,
+                        collection.status,
+                        int(item_count or 0),
+                    )
+                    for collection, item_count in collection_rows
+                )
+            ),
+            collection_link_count=collection_link_count,
+            collection_onboarded=collection_onboarded,
         )
 
     async def _run_step(self, step: ScenarioStep) -> StepResult:
@@ -464,6 +516,24 @@ class BotAutotester:
             except KeyError as exc:
                 raise AssertionError(f"No saved task callback for {step.value!r}") from exc
             return await self._dispatch_task_callback(step.kind, step.value, data, message)
+        if step.kind == "collection_callback":
+            return await self._run_collection_callback(step.value)
+        if step.kind == "collection_raw_callback":
+            message = FakeMessage()
+            self.messages.append(message)
+            return await self._dispatch_collection_callback(
+                step.kind, step.value, step.value, message
+            )
+        if step.kind == "collection_capture_callback":
+            data, message = self._latest_collection_callback(step.value)
+            self.saved_collection_callbacks[step.value] = (data, message)
+            return StepResult(step.kind, step.value, ("callback captured",))
+        if step.kind == "collection_replay_callback":
+            try:
+                data, message = self.saved_collection_callbacks[step.value]
+            except KeyError as exc:
+                raise AssertionError(f"No saved collection callback for {step.value!r}") from exc
+            return await self._dispatch_collection_callback(step.kind, step.value, data, message)
         if step.kind == "vision_hold_render":
             user = await self.bot._user(self.telegram_user_id)
             if not await self.bot.vision_render_limiter.acquire(user.id):
@@ -739,6 +809,7 @@ class BotAutotester:
             "doctor": self.bot.doctor_command,
             "inbox": self.bot.inbox,
             "tasks": self.bot.tasks_command,
+            "collections": self.bot.collections_command,
             "drafts": self.bot.drafts_command,
             "vision": self.bot.vision_command,
             "location": self.bot.location_command,
@@ -833,6 +904,7 @@ class BotAutotester:
             "delete": "Удалить",
             "delete-confirm": "Да, удалить",
             "cancel": "Отмена",
+            "collection-view": "Открыть в Task Hub",
         }
         label = labels.get(action)
         for message in reversed(self.messages):
@@ -852,6 +924,98 @@ class BotAutotester:
                         ):
                             return data, message
         raise AssertionError(f"No task callback found for {action!r}")
+
+    async def _run_collection_callback(self, action: str) -> StepResult:
+        data, message = self._latest_collection_callback(action)
+        return await self._dispatch_collection_callback(
+            "collection_callback", action, data, message
+        )
+
+    async def _dispatch_collection_callback(
+        self,
+        kind: StepKind,
+        value: str,
+        data: str,
+        message: FakeMessage,
+    ) -> StepResult:
+        previous_replies = len(message.replies)
+        query = FakeCallbackQuery(data, message)
+        update = SimpleNamespace(
+            effective_message=message,
+            message=message,
+            callback_query=query,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+            effective_chat=SimpleNamespace(id=self.chat_id, type="private"),
+        )
+        await self.bot.collection_callback(update, self.context)
+        outputs = (
+            tuple(query.edits)
+            + tuple(answer for answer, _show_alert in query.answers if answer is not None)
+            + tuple(str(reply["text"]) for reply in message.replies[previous_replies:])
+        )
+        return StepResult(kind, value, outputs)
+
+    def _latest_collection_callback(self, action: str) -> tuple[str, FakeMessage]:
+        labels = {
+            "onboard-all": "Создать все",
+            "onboard-select": "Выбрать разделы",
+            "onboard-empty": "Начать с пустого",
+            "onboard-custom": "Создать свой",
+            "confirm-create": "Создать",
+            "starter-shopping": "Покупки",
+            "starter-travel": "Отдых и путешествия",
+            "starter-confirm": "Создать выбранные",
+            "all": "Все активные",
+            "topics": "Темы",
+            "projects": "Проекты",
+            "lists": "Списки",
+            "archived-list": "Архив",
+            "create-topic": "+ Тема",
+            "create-project": "+ Проект",
+            "create-list": "+ Список",
+            "open": "Открыть",
+            "content": "Открыть содержимое",
+            "add": "Добавить запись",
+            "rename": "Переименовать",
+            "alias": "Добавить alias",
+            "archive": "Архивировать",
+            "restore": "Восстановить",
+            "delete": "Удалить",
+            "delete-links": "Удалить только связи",
+            "item-open": "Открыть 1",
+            "task-hub": "Открыть в Task Hub",
+            "move": "Переместить",
+            "link": "Связать ещё",
+            "unlink": "Убрать из раздела",
+            "delete-item": "Удалить запись",
+            "save": "Сохранить",
+        }
+        target_label = action.removeprefix("target:") if action.startswith("target:") else None
+        collection_label = (
+            action.removeprefix("collection:") if action.startswith("collection:") else None
+        )
+        expected_label = labels.get(action)
+        for message in reversed(self.messages):
+            for reply in reversed(message.replies):
+                markup = reply.get("reply_markup")
+                if markup is None:
+                    continue
+                for row in markup.inline_keyboard:
+                    for button in row:
+                        data = button.callback_data
+                        if data is None or not data.startswith("collection:"):
+                            continue
+                        if target_label is not None and button.text == target_label:
+                            return data, message
+                        if collection_label is not None and button.text.startswith(
+                            collection_label
+                        ):
+                            return data, message
+                        if expected_label is not None and (
+                            button.text == expected_label or button.text.startswith(expected_label)
+                        ):
+                            return data, message
+        raise AssertionError(f"No collection callback found for {action!r}")
 
     async def _run_lab_callback(self, action: str) -> StepResult:
         data, message = self._latest_lab_callback(action)

@@ -1,7 +1,7 @@
 import logging
 import re
 import warnings
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from html import escape
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -39,6 +39,9 @@ from .actions import (
     DraftActionService,
 )
 from .ai import AIService
+from .collection_commands import CollectionCommandRouter
+from .collection_handlers import CollectionHandlers
+from .collections_service import LifeCollectionService
 from .config import Settings
 from .conversation import ConversationContextService, ConversationSnapshot
 from .dates import DateResolver
@@ -137,7 +140,9 @@ def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | No
         logger.error("%s error_type=%s user_id=%s", event, error_type, user_id)
 
 
-class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandlers):
+class FutureSelfBot(
+    LabHandlers, VisionHandlers, TaskHandlers, CollectionHandlers, NavigationHandlers
+):
     def __init__(
         self,
         settings: Settings,
@@ -173,6 +178,14 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
             date_event_hour=settings.task_date_event_hour,
             reminder_lead_minutes=settings.task_reminder_lead_minutes,
             date_resolver=self.date_resolver,
+        )
+        self.collection_command_router = CollectionCommandRouter()
+        self.collection_service = LifeCollectionService(
+            db,
+            action_ttl=timedelta(minutes=settings.collection_action_ttl_minutes),
+            input_ttl=timedelta(minutes=settings.collection_input_ttl_minutes),
+            context_ttl=timedelta(minutes=settings.collection_context_ttl_minutes),
+            task_date_event_hour=settings.task_date_event_hour,
         )
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
@@ -219,6 +232,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
                 [
                     "inbox",
                     "tasks",
+                    "collections",
                     "vision",
                     "health",
                     "checkin",
@@ -395,6 +409,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
         app.add_handler(doctor_prepare)
         app.add_handler(CommandHandler("menu", self.menu_command))
         app.add_handler(CommandHandler("tasks", self.tasks_command))
+        app.add_handler(CommandHandler("collections", self.collections_command))
         app.add_handler(CommandHandler("doctor", self.doctor_command))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
@@ -417,6 +432,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
         app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
         app.add_handler(CallbackQueryHandler(self.task_callback, pattern=r"^task:"))
+        app.add_handler(CallbackQueryHandler(self.collection_callback, pattern=r"^collection:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -455,6 +471,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
         await self.lab_documents.cleanup_confirmations()
         await self.task_service.cleanup_tokens()
         await self.task_service.reconcile()
+        await self.collection_service.cleanup()
         await app.bot.set_my_commands(
             [BotCommand(item.command, item.description) for item in PUBLIC_COMMANDS],
             scope=BotCommandScopeAllPrivateChats(),
@@ -921,6 +938,8 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
         )
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self.collection_pending_text(update, update.effective_message.text or "", "text"):
+            return
         if await self.task_pending_text(update):
             return
         if await self._handle_vision_input(update, update.effective_message.text):
@@ -975,6 +994,9 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
                 "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
             )
             return
+        if await self.collection_pending_text(update, text, "voice"):
+            await progress.edit_text("Голос распознан и обработан в разделе.")
+            return
         natural_command = self.natural_command_router.route(text)
         if natural_command is not None and natural_command.action in {"menu", "help"}:
             await progress.edit_text(f"Я услышал: «{text}»")
@@ -989,14 +1011,16 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
     async def _route_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, source: str
     ) -> None:
-        user = await self._user(update.effective_user.id)
-        chat_id = update.effective_chat.id
-        telegram_user_id = update.effective_user.id
-        snapshot = await self.conversation.get(telegram_user_id, chat_id)
         natural_command = self.natural_command_router.route(text)
         if natural_command is not None:
             await self._handle_natural_command(update, context, natural_command.action)
             return
+        if await self.handle_collection_natural(update, context, text, source):
+            return
+        user = await self._user(update.effective_user.id)
+        chat_id = update.effective_chat.id
+        telegram_user_id = update.effective_user.id
+        snapshot = await self.conversation.get(telegram_user_id, chat_id)
         system_route = self.system_action_router.route(
             text, pending_action=snapshot.system_pending_action
         )
@@ -1218,6 +1242,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
             "show_last_saved": self.last_saved_command,
             "show_profile": self.profile,
             "show_today": self.today,
+            "show_collections": self.collections_command,
             "help": self.help_command,
         }
         await handlers[action](update, context)
@@ -2431,6 +2456,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
             pass
 
     async def cancel_draft_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        collection_cancelled = await self.cancel_collection_state(update)
         if await self.cancel_task_input(update):
             return
         user = await self._user(update.effective_user.id)
@@ -2453,7 +2479,11 @@ class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandler
         await update.effective_message.reply_text(
             "Редактирование отменено, ничего не сохранено."
             if discarded
-            else "Текущий выбор и ожидающее действие отменены."
+            else (
+                "Операция с разделом отменена, активный раздел сброшен."
+                if collection_cancelled
+                else "Текущий выбор и ожидающее действие отменены."
+            )
         )
 
     async def drafts_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

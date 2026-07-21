@@ -1,6 +1,7 @@
 from future_self.schemas import IntentResult
 
 from .harness import (
+    CollectionState,
     DraftState,
     ExpectedState,
     InboxState,
@@ -26,6 +27,25 @@ def capture(text: str, *, intent: str, kind: str, title: str) -> LLMStub:
 
 def sorted_drafts(*drafts: DraftState) -> tuple[DraftState, ...]:
     return tuple(sorted(drafts))
+
+
+def starter_collection_states(*, shopping_items: int = 0) -> tuple[CollectionState, ...]:
+    return tuple(
+        sorted(
+            (
+                CollectionState("Работа и проекты", "topic", "active", 0),
+                CollectionState("Дом и быт", "topic", "active", 0),
+                CollectionState("Покупки", "list", "active", shopping_items),
+                CollectionState("Финансы", "topic", "active", 0),
+                CollectionState("Здоровье и самочувствие", "topic", "active", 0),
+                CollectionState("Семья и отношения", "topic", "active", 0),
+                CollectionState("Обучение и развитие", "topic", "active", 0),
+                CollectionState("Творчество и идеи", "topic", "active", 0),
+                CollectionState("Отдых и путешествия", "topic", "active", 0),
+                CollectionState("Личное", "topic", "active", 0),
+            )
+        )
+    )
 
 
 def doctor_steps(
@@ -2427,6 +2447,243 @@ TASK_HUB_SCENARIOS = (
 )
 
 
+COLLECTION_SCENARIOS = (
+    Scenario(
+        name="collections-onboarding-create-all-is-explicit-and-repeat-opens-hub",
+        steps=(
+            ScenarioStep(
+                "command",
+                "/collections",
+                reply_contains=("Ничего не создаётся автоматически",),
+            ),
+            ScenarioStep(
+                "collection_callback",
+                "onboard-all",
+                reply_contains=("Стартовые разделы созданы",),
+            ),
+            ScenarioStep(
+                "command",
+                "/collections",
+                reply_contains=("Темы, проекты и списки",),
+                reply_excludes=("Ничего не создаётся автоматически",),
+            ),
+        ),
+        expected=ExpectedState(
+            collections=starter_collection_states(),
+            collection_onboarded=True,
+        ),
+    ),
+    Scenario(
+        name="collections-selective-starters-survive-picker-and-empty-start-is-not-seeded",
+        steps=(
+            ScenarioStep("command", "/collections"),
+            ScenarioStep("collection_callback", "onboard-select"),
+            ScenarioStep("collection_callback", "starter-shopping"),
+            ScenarioStep("collection_callback", "starter-travel"),
+            ScenarioStep(
+                "collection_callback",
+                "starter-confirm",
+                reply_contains=("Создано разделов: 2",),
+            ),
+        ),
+        expected=ExpectedState(
+            collections=tuple(
+                sorted(
+                    (
+                        CollectionState("Покупки", "list", "active", 0),
+                        CollectionState("Отдых и путешествия", "topic", "active", 0),
+                    )
+                )
+            ),
+            collection_onboarded=True,
+        ),
+    ),
+    Scenario(
+        name="collections-empty-start-remains-empty-after-restart",
+        steps=(
+            ScenarioStep("command", "/collections"),
+            ScenarioStep("collection_callback", "onboard-empty"),
+            ScenarioStep("restart"),
+            ScenarioStep(
+                "command",
+                "/collections",
+                reply_contains=("Мои разделы",),
+                reply_excludes=("Создать все",),
+            ),
+        ),
+        expected=ExpectedState(collection_onboarded=True),
+    ),
+    Scenario(
+        name="collections-natural-list-splitting-and-voice-continuation-use-no-llm",
+        steps=(
+            ScenarioStep("command", "/collections"),
+            ScenarioStep("collection_callback", "onboard-all"),
+            ScenarioStep(
+                "text",
+                "Добавь в покупки чай, сахар, бетономешалку и остров в Индийском океане",
+                reply_contains=("Добавлено в «Покупки»: 4",),
+            ),
+            ScenarioStep(
+                "voice",
+                "Ещё добавь цемент",
+                reply_contains=("Добавлено в «Покупки»: 1",),
+            ),
+        ),
+        expected=ExpectedState(
+            inbox=tuple(
+                sorted(
+                    (
+                        InboxState("чай", "task", "collection_text"),
+                        InboxState("сахар", "task", "collection_text"),
+                        InboxState("бетономешалку", "task", "collection_text"),
+                        InboxState("остров в Индийском океане", "task", "collection_text"),
+                        InboxState("цемент", "task", "collection_voice"),
+                    )
+                )
+            ),
+            collections=starter_collection_states(shopping_items=5),
+            collection_link_count=5,
+            collection_onboarded=True,
+        ),
+    ),
+    Scenario(
+        name="collections-create-confirmation-survives-restart-and-replay-is-stale",
+        steps=(
+            ScenarioStep(
+                "text",
+                "Создай проект Наз и Войд",
+                reply_contains=("Создать проект",),
+            ),
+            ScenarioStep("collection_capture_callback", "confirm-create"),
+            ScenarioStep("restart"),
+            ScenarioStep(
+                "collection_replay_callback",
+                "confirm-create",
+                reply_contains=("создан",),
+            ),
+            ScenarioStep(
+                "collection_replay_callback",
+                "confirm-create",
+                reply_contains=("устарела",),
+            ),
+        ),
+        expected=ExpectedState(
+            collections=(CollectionState("Наз и Войд", "project", "active", 0),),
+            collection_onboarded=True,
+        ),
+    ),
+    Scenario(
+        name="collections-callbacks-are-owner-chat-bound-and-forged-safe",
+        steps=(
+            ScenarioStep("text", "Создай проект Ремонт"),
+            ScenarioStep("collection_capture_callback", "confirm-create"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "collection_replay_callback",
+                "confirm-create",
+                reply_contains=("устарела",),
+            ),
+            ScenarioStep(
+                "collection_raw_callback",
+                "collection:forged",
+                reply_contains=("устарела",),
+            ),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep(
+                "collection_replay_callback",
+                "confirm-create",
+                reply_contains=("создан",),
+            ),
+        ),
+        expected=ExpectedState(
+            collections=(CollectionState("Ремонт", "project", "active", 0),),
+            collection_onboarded=True,
+        ),
+    ),
+    Scenario(
+        name="collections-move-keeps-one-inbox-task-and-one-task-state",
+        steps=(
+            ScenarioStep("command", "/collections"),
+            ScenarioStep("collection_callback", "onboard-empty"),
+            ScenarioStep("text", "Создай проект Ремонт"),
+            ScenarioStep("collection_callback", "confirm-create"),
+            ScenarioStep("text", "Создай проект Дом"),
+            ScenarioStep("collection_callback", "confirm-create"),
+            ScenarioStep(
+                "text",
+                "Сохрани в проект Ремонт: исправить стену",
+                reply_contains=("Добавлено в «Ремонт»: 1",),
+            ),
+            ScenarioStep("text", "Покажи проект Ремонт"),
+            ScenarioStep("collection_callback", "item-open"),
+            ScenarioStep("collection_callback", "move"),
+            ScenarioStep(
+                "collection_callback",
+                "target:Дом",
+                reply_contains=("Запись перемещена",),
+            ),
+        ),
+        expected=ExpectedState(
+            inbox=(InboxState("исправить стену", "task", "collection_text"),),
+            collections=tuple(
+                sorted(
+                    (
+                        CollectionState("Дом", "project", "active", 1),
+                        CollectionState("Ремонт", "project", "active", 0),
+                    )
+                )
+            ),
+            collection_link_count=1,
+            collection_onboarded=True,
+        ),
+    ),
+    Scenario(
+        name="collections-task-item-opens-existing-task-hub-and-completes",
+        steps=(
+            ScenarioStep("command", "/collections"),
+            ScenarioStep("collection_callback", "onboard-all"),
+            ScenarioStep("text", "Добавь в покупки чай"),
+            ScenarioStep("text", "Что находится в покупках?"),
+            ScenarioStep("collection_callback", "item-open"),
+            ScenarioStep("task_callback", "collection-view", reply_contains=("Статус: активна",)),
+            ScenarioStep("task_callback", "complete", reply_contains=("выполнена",)),
+        ),
+        expected=ExpectedState(
+            inbox=(InboxState("чай", "task", "collection_text"),),
+            collections=starter_collection_states(shopping_items=1),
+            collection_link_count=1,
+            collection_onboarded=True,
+        ),
+    ),
+    Scenario(
+        name="collections-nonempty-delete-removes-links-not-content",
+        steps=(
+            ScenarioStep("command", "/collections"),
+            ScenarioStep("collection_callback", "onboard-all"),
+            ScenarioStep("text", "Добавь в покупки чай"),
+            ScenarioStep("command", "/collections"),
+            ScenarioStep("collection_callback", "lists"),
+            ScenarioStep("collection_callback", "collection:Покупки"),
+            ScenarioStep("collection_callback", "delete"),
+            ScenarioStep("collection_capture_callback", "delete-links"),
+            ScenarioStep("restart"),
+            ScenarioStep(
+                "collection_replay_callback",
+                "delete-links",
+                reply_contains=("Исходные записи",),
+            ),
+        ),
+        expected=ExpectedState(
+            inbox=(InboxState("чай", "task", "collection_text"),),
+            collections=tuple(
+                state for state in starter_collection_states() if state.name != "Покупки"
+            ),
+            collection_onboarded=True,
+        ),
+    ),
+)
+
+
 SCENARIOS = (
     *CORE_SCENARIOS,
     *GENERATED_SAVE_SCENARIOS,
@@ -2444,5 +2701,6 @@ SCENARIOS = (
     *VISION_SCENARIOS,
     *NAVIGATION_SCENARIOS,
     *TASK_HUB_SCENARIOS,
+    *COLLECTION_SCENARIOS,
     *LAB_SCENARIOS,
 )
