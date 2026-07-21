@@ -7,7 +7,15 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatType
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -54,6 +62,8 @@ from .health import (
 from .location import LocationService, location_from_user, parse_location
 from .models import DraftInboxItem, Goal, InboxItem, Routine, User, VisionProfile
 from .natural_commands import NaturalAction, NaturalCommandRouter
+from .navigation import PUBLIC_COMMANDS, NavigationFlowStore
+from .navigation_handlers import NavigationHandlers
 from .reminders import TaskReminderEngine
 from .repositories import (
     CheckInRepository,
@@ -104,6 +114,16 @@ ACTION_LABELS = {
 NAVIGATION = ReplyKeyboardMarkup([["Назад", "Пропустить"], ["Отменить"]], resize_keyboard=True)
 
 
+def _conversation_handler(**kwargs: object) -> ConversationHandler:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="If 'per_message=False', 'CallbackQueryHandler'.*",
+            category=PTBUserWarning,
+        )
+        return ConversationHandler(**kwargs)
+
+
 def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | None = None) -> None:
     """Log operational metadata without provider messages, prompts, audio, or secrets."""
     error_type = type(exc).__name__ if exc else "Unknown"
@@ -113,7 +133,7 @@ def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | No
         logger.error("%s error_type=%s user_id=%s", event, error_type, user_id)
 
 
-class FutureSelfBot(VisionHandlers):
+class FutureSelfBot(VisionHandlers, NavigationHandlers):
     def __init__(
         self,
         settings: Settings,
@@ -135,6 +155,7 @@ class FutureSelfBot(VisionHandlers):
         self.action_router = ActionCommandRouter()
         self.system_action_router = SystemActionRouter()
         self.natural_command_router = NaturalCommandRouter()
+        self.navigation_flow_sessions = NavigationFlowStore()
         self.conversation = ConversationContextService(
             db,
             settings.conversation_context_messages,
@@ -180,7 +201,18 @@ class FutureSelfBot(VisionHandlers):
         # This assistant handles profiles, health notes and reminders. Telegram
         # group/channel replies would disclose that data to other chat members,
         # so stop every non-private update before any feature handler sees it.
-        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-2)
+        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-3)
+        app.add_handler(
+            CommandHandler(
+                ["inbox", "vision", "health", "checkin", "doctor", "location"],
+                self.navigation_public_command_gate,
+            ),
+            group=-2,
+        )
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.navigation_text_gate),
+            group=-2,
+        )
         # Vision drafts must keep receiving text/voice even while another PTB
         # ConversationHandler is paused. Group -1 routes only an active owner/chat
         # draft and then stops the lower feature group.
@@ -214,6 +246,10 @@ class FutureSelfBot(VisionHandlers):
                 entry_points=[
                     CommandHandler("start", self.start),
                     CommandHandler("onboarding", self.start),
+                    CallbackQueryHandler(
+                        self.navigation_onboarding_entry,
+                        pattern=r"^nav:action:onboarding$",
+                    ),
                 ],
                 states={
                     ONBOARDING_INPUT: [
@@ -230,10 +266,11 @@ class FutureSelfBot(VisionHandlers):
                 fallbacks=[
                     CommandHandler("cancel", self.cancel_onboarding),
                     MessageHandler(filters.Regex("^Отменить$"), self.cancel_onboarding),
+                    CallbackQueryHandler(self.navigation_action, pattern=r"^nav:flow:"),
                 ],
                 allow_reentry=True,
             )
-        evening = ConversationHandler(
+        evening = _conversation_handler(
             entry_points=[CommandHandler("evening", self.evening_start)],
             states={
                 EVENING_WORKED: [
@@ -250,12 +287,19 @@ class FutureSelfBot(VisionHandlers):
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.evening_tomorrow)
                 ],
             },
-            fallbacks=[CommandHandler("cancel", self.cancel_evening)],
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_evening),
+                CallbackQueryHandler(self.navigation_action, pattern=r"^nav:flow:"),
+            ],
         )
-        health_checkin = ConversationHandler(
+        health_checkin = _conversation_handler(
             entry_points=[
                 CommandHandler("checkin", self.health_checkin_start),
                 CommandHandler("health_edit", self.health_checkin_start),
+                CallbackQueryHandler(
+                    self.navigation_health_entry,
+                    pattern=r"^nav:action:checkin$",
+                ),
             ],
             states={
                 HEALTH_ENERGY: [
@@ -282,12 +326,19 @@ class FutureSelfBot(VisionHandlers):
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.health_symptoms)
                 ],
             },
-            fallbacks=[CommandHandler("cancel", self.cancel_health_checkin)],
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_health_checkin),
+                CallbackQueryHandler(self.navigation_action, pattern=r"^nav:flow:"),
+            ],
         )
-        doctor_prepare = ConversationHandler(
+        doctor_prepare = _conversation_handler(
             entry_points=[
                 CommandHandler("doctor_prepare", self.doctor_prepare_start),
                 CommandHandler("doctor_prepare_edit", self.doctor_prepare_start),
+                CallbackQueryHandler(
+                    self.navigation_doctor_entry,
+                    pattern=r"^nav:action:doctor_prepare$",
+                ),
             ],
             states={
                 DOCTOR_REASON: [
@@ -306,13 +357,18 @@ class FutureSelfBot(VisionHandlers):
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.doctor_prepare_questions)
                 ],
             },
-            fallbacks=[CommandHandler("cancel", self.cancel_doctor_prepare)],
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_doctor_prepare),
+                CallbackQueryHandler(self.navigation_action, pattern=r"^nav:flow:"),
+            ],
             allow_reentry=True,
         )
         app.add_handler(onboarding)
         app.add_handler(evening)
         app.add_handler(health_checkin)
         app.add_handler(doctor_prepare)
+        app.add_handler(CommandHandler("menu", self.menu_command))
+        app.add_handler(CommandHandler("doctor", self.doctor_command))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
         app.add_handler(CommandHandler("location", self.location_command))
@@ -333,6 +389,7 @@ class FutureSelfBot(VisionHandlers):
         app.add_handler(CommandHandler("doctor_find", self.doctor_find))
         app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
+        app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
         app.add_handler(
@@ -366,6 +423,12 @@ class FutureSelfBot(VisionHandlers):
         raise ApplicationHandlerStop
 
     async def _post_init(self, app: Application) -> None:
+        await app.bot.set_my_commands(
+            [BotCommand(item.command, item.description) for item in PUBLIC_COMMANDS],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
         async def send(telegram_id: int, text: str) -> int | None:
             message = await app.bot.send_message(chat_id=telegram_id, text=text)
             return getattr(message, "message_id", None)
@@ -417,7 +480,10 @@ class FutureSelfBot(VisionHandlers):
         user = await self._user(update.effective_user.id)
         if user.onboarding_completed:
             await update.effective_message.reply_text(
-                f"С возвращением, {user.display_name or 'друг'}! Команды: /today, /evening, /profile."
+                f"С возвращением, {user.display_name or 'друг'}!",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Открыть главное меню", callback_data="nav:root")]]
+                ),
             )
             return ConversationHandler.END
         async with self.db.session() as session:
@@ -869,6 +935,11 @@ class FutureSelfBot(VisionHandlers):
                 "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
             )
             return
+        natural_command = self.natural_command_router.route(text)
+        if natural_command is not None and natural_command.action in {"menu", "help"}:
+            await progress.edit_text(f"Я услышал: «{text}»")
+            await self._handle_natural_command(update, context, natural_command.action)
+            return
         if await self._handle_vision_input(update, text):
             await progress.edit_text("Голос распознан и добавлен в карточку.")
             return
@@ -1101,6 +1172,7 @@ class FutureSelfBot(VisionHandlers):
         action: NaturalAction,
     ) -> None:
         handlers = {
+            "menu": self.menu_command,
             "show_drafts": self.drafts_command,
             "show_inbox": self.inbox,
             "show_last_saved": self.last_saved_command,
@@ -3102,7 +3174,7 @@ class FutureSelfBot(VisionHandlers):
             f"Reminder: {local_reminder.strftime('%d.%m.%Y %H:%M')} ({user.timezone})."
         )
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def legacy_help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             "/start — онбординг, /profile — профиль, /goals — обновить цели, /today — фокус дня, "
             "/evening — рефлексия, /inbox — сохранённые мысли, /drafts — активные черновики, "

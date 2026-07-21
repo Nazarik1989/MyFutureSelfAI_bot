@@ -539,8 +539,16 @@ async def test_bot_startup_delivers_persisted_due_reminder_via_telegram(db, fake
     )
     sent: list[tuple[int, str]] = []
     repeating: list[dict[str, object]] = []
+    command_registrations: list[tuple[object, object]] = []
+    menu_registrations: list[object] = []
 
     class TelegramBot:
+        async def set_my_commands(self, commands, *, scope):
+            command_registrations.append((commands, scope))
+
+        async def set_chat_menu_button(self, *, menu_button):
+            menu_registrations.append(menu_button)
+
         async def send_message(self, *, chat_id: int, text: str):
             sent.append((chat_id, text))
             return SimpleNamespace(message_id=900)
@@ -559,6 +567,8 @@ async def test_bot_startup_delivers_persisted_due_reminder_via_telegram(db, fake
     assert len(sent) == 1
     assert sent[0][0] == 10
     assert len(repeating) == 1
+    assert len(command_registrations) == 1
+    assert len(menu_registrations) == 1
     async with db.sessions() as session:
         saved = await session.get(TaskReminder, reminder.id)
     assert saved.status == "sent"

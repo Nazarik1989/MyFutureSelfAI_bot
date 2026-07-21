@@ -1872,6 +1872,177 @@ TIMEZONE_REGRESSION_SCENARIOS = tuple(
     )
 )
 
+NAVIGATION_SCENARIOS = (
+    Scenario(
+        name="navigation-menu-help-quick-start-and-back-have-no-dead-end",
+        steps=(
+            ScenarioStep("command", "/menu", reply_contains=("Главное меню",)),
+            ScenarioStep("navigation_callback", "help", reply_contains=("Помощь",)),
+            ScenarioStep("navigation_callback", "quick", reply_contains=("Быстрый старт",)),
+            ScenarioStep("navigation_callback", "help", reply_contains=("Помощь",)),
+            ScenarioStep("navigation_callback", "root", reply_contains=("Главное меню",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-every-main-section-has-real-back-path",
+        steps=(
+            ScenarioStep("command", "/menu"),
+            ScenarioStep("navigation_callback", "ideas", reply_contains=("Идеи и заметки",)),
+            ScenarioStep("navigation_callback", "root"),
+            ScenarioStep("navigation_callback", "tasks", reply_contains=("Задачи",)),
+            ScenarioStep("navigation_callback", "root"),
+            ScenarioStep("navigation_callback", "vision", reply_contains=("Карта желаний",)),
+            ScenarioStep("navigation_callback", "root"),
+            ScenarioStep("navigation_callback", "health", reply_contains=("Здоровье",)),
+            ScenarioStep("navigation_callback", "root"),
+            ScenarioStep("navigation_callback", "doctor", reply_contains=("Врач",)),
+            ScenarioStep("navigation_callback", "root"),
+            ScenarioStep("navigation_callback", "profile", reply_contains=("Профиль",)),
+            ScenarioStep("navigation_callback", "root"),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-natural-text-menu-is-deterministic-and-read-only",
+        steps=(ScenarioStep("text", "ГЛАВНОЕ МЕНЮ!!!", reply_contains=("Главное меню",)),),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-natural-voice-help-is-deterministic-and-read-only",
+        steps=(ScenarioStep("voice", "Как пользоваться ботом?", reply_contains=("Помощь",)),),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-unified-doctor-section-preserves-legacy-actions",
+        steps=(
+            ScenarioStep("command", "/doctor", reply_contains=("Врач",)),
+            ScenarioStep(
+                "navigation_callback",
+                "doctor_find",
+                reply_contains=("настрой локацию", "Навигация"),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-health-flow-can-continue-without-losing-answers",
+        steps=(
+            ScenarioStep("command", "/menu"),
+            ScenarioStep("navigation_callback", "health"),
+            ScenarioStep("navigation_callback", "checkin", reply_contains=("Энергия",)),
+            ScenarioStep("health_answer", "7", reply_contains=("Сон",)),
+            ScenarioStep("text", "Меню", reply_contains=("не завершён сценарий",)),
+            ScenarioStep("navigation_callback", "continue", reply_contains=("Продолжаем",)),
+            ScenarioStep("health_answer", "7"),
+            ScenarioStep("health_answer", "7"),
+            ScenarioStep("health_answer", "3"),
+            ScenarioStep("health_answer", "7"),
+            ScenarioStep("health_answer", "нет", reply_contains=("70/100",)),
+        ),
+        expected=ExpectedState(health_scores=(70,)),
+    ),
+    Scenario(
+        name="navigation-health-flow-explicit-exit-clears-only-current-state",
+        steps=(
+            ScenarioStep("command", "/menu"),
+            ScenarioStep("navigation_callback", "health"),
+            ScenarioStep("navigation_callback", "checkin"),
+            ScenarioStep("health_answer", "5"),
+            ScenarioStep("text", "Главное меню", reply_contains=("не завершён сценарий",)),
+            ScenarioStep(
+                "navigation_callback", "exit", reply_contains=("остановлен", "Главное меню")
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-flow-callback-is-owner-bound-stale-and-single-use",
+        steps=(
+            ScenarioStep("command", "/menu"),
+            ScenarioStep("navigation_callback", "health"),
+            ScenarioStep("navigation_callback", "checkin"),
+            ScenarioStep("text", "Меню"),
+            ScenarioStep("navigation_capture_callback", "exit"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep("navigation_replay_callback", "exit", reply_contains=("устарела",)),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep("navigation_replay_callback", "exit", reply_contains=("остановлен",)),
+            ScenarioStep("navigation_replay_callback", "exit", reply_contains=("устарела",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-doctor-preparation-entry-and-exit-save-no-medical-record",
+        steps=(
+            ScenarioStep("command", "/doctor"),
+            ScenarioStep(
+                "navigation_callback", "doctor_prepare", reply_contains=("причина обращения",)
+            ),
+            ScenarioStep("text", "Меню", reply_contains=("не завершён сценарий",)),
+            ScenarioStep("navigation_callback", "exit", reply_contains=("остановлен",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-ordinary-menu-word-is-content-not-command",
+        llm_stubs=(
+            capture(
+                "Добавь меню ужина в заметки",
+                intent="inbox_note",
+                kind="note",
+                title="Меню ужина",
+            ),
+        ),
+        steps=(
+            ScenarioStep(
+                "text",
+                "Добавь меню ужина в заметки",
+                reply_contains=("Меню ужина",),
+                reply_excludes=("Главное меню",),
+            ),
+        ),
+        expected=ExpectedState(
+            drafts=(DraftState("Меню ужина", "note", "preview", "text"),),
+            llm_inputs=("Добавь меню ужина в заметки",),
+        ),
+    ),
+    Scenario(
+        name="navigation-forged-unknown-callback-fails-closed",
+        steps=(
+            ScenarioStep(
+                "navigation_raw_callback",
+                "nav:section:medical-private-record",
+                reply_contains=("устарела",),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-group-chat-is-blocked-before-menu-handler",
+        steps=(
+            ScenarioStep(
+                "group_command",
+                "/menu",
+                reply_contains=("только в личном чате",),
+                reply_excludes=("Главное меню",),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="navigation-identical-menus-remain-user-isolated",
+        steps=(
+            ScenarioStep("command", "/menu"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep("command", "/menu"),
+            ScenarioStep("navigation_callback", "ideas"),
+            ScenarioStep("navigation_callback", "inbox", reply_contains=("Inbox",)),
+        ),
+        expected=ExpectedState(),
+    ),
+)
+
 
 SCENARIOS = (
     *CORE_SCENARIOS,
@@ -1888,4 +2059,5 @@ SCENARIOS = (
     *DOCTOR_SEARCH_SCENARIOS,
     *TIMEZONE_REGRESSION_SCENARIOS,
     *VISION_SCENARIOS,
+    *NAVIGATION_SCENARIOS,
 )

@@ -8,7 +8,7 @@ from typing import Literal
 from PIL import Image
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
-from telegram.ext import ApplicationHandlerStop
+from telegram.ext import ApplicationHandlerStop, ConversationHandler
 
 from future_self.bot import (
     DOCTOR_DURATION,
@@ -73,6 +73,10 @@ StepKind = Literal[
     "vision_release_render",
     "vision_photo",
     "vision_document",
+    "navigation_callback",
+    "navigation_raw_callback",
+    "navigation_capture_callback",
+    "navigation_replay_callback",
     "restart",
     "group_command",
     "timezone_onboarding",
@@ -241,6 +245,7 @@ class BotAutotester:
         self.doctor_state: int | None = None
         self.contexts = {telegram_user_id: context}
         self.saved_vision_callbacks: dict[str, tuple[str, FakeMessage]] = {}
+        self.saved_navigation_callbacks: dict[str, tuple[str, FakeMessage]] = {}
 
     @classmethod
     async def create(cls, sandbox: Path, stubs: tuple[LLMStub, ...]) -> "BotAutotester":
@@ -372,6 +377,24 @@ class BotAutotester:
             except KeyError as exc:
                 raise AssertionError(f"No saved vision callback for {step.value!r}") from exc
             return await self._dispatch_vision_callback(step.kind, step.value, data, message)
+        if step.kind == "navigation_callback":
+            return await self._run_navigation_callback(step.value)
+        if step.kind == "navigation_raw_callback":
+            message = FakeMessage()
+            self.messages.append(message)
+            return await self._dispatch_navigation_callback(
+                step.kind, step.value, step.value, message
+            )
+        if step.kind == "navigation_capture_callback":
+            data, message = self._latest_navigation_callback(step.value)
+            self.saved_navigation_callbacks[step.value] = (data, message)
+            return StepResult(step.kind, step.value, ("callback captured",))
+        if step.kind == "navigation_replay_callback":
+            try:
+                data, message = self.saved_navigation_callbacks[step.value]
+            except KeyError as exc:
+                raise AssertionError(f"No saved navigation callback for {step.value!r}") from exc
+            return await self._dispatch_navigation_callback(step.kind, step.value, data, message)
         if step.kind == "vision_hold_render":
             user = await self.bot._user(self.telegram_user_id)
             if not await self.bot.vision_render_limiter.acquire(user.id):
@@ -556,6 +579,11 @@ class BotAutotester:
         self.messages.append(message)
         update = self._update_for(message)
         handlers = {
+            "menu": self.bot.menu_command,
+            "help": self.bot.help_command,
+            "doctor": self.bot.doctor_command,
+            "inbox": self.bot.inbox,
+            "drafts": self.bot.drafts_command,
             "vision": self.bot.vision_command,
             "location": self.bot.location_command,
             "health": self.bot.health_command,
@@ -594,6 +622,75 @@ class BotAutotester:
             self.doctor_state = result
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult("command", value, outputs)
+
+    async def _run_navigation_callback(self, action: str) -> StepResult:
+        data, message = self._latest_navigation_callback(action)
+        return await self._dispatch_navigation_callback(
+            "navigation_callback", action, data, message
+        )
+
+    async def _dispatch_navigation_callback(
+        self,
+        kind: StepKind,
+        value: str,
+        data: str,
+        message: FakeMessage,
+    ) -> StepResult:
+        previous_replies = len(message.replies)
+        query = FakeCallbackQuery(data, message)
+        update = SimpleNamespace(
+            effective_message=message,
+            message=message,
+            callback_query=query,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+            effective_chat=SimpleNamespace(id=self.chat_id, type="private"),
+        )
+        if data == "nav:action:checkin":
+            self.health_state = await self.bot.navigation_health_entry(update, self.context)
+        elif data == "nav:action:doctor_prepare":
+            self.doctor_state = await self.bot.navigation_doctor_entry(update, self.context)
+        elif data == "nav:action:onboarding":
+            await self.bot.navigation_onboarding_entry(update, self.context)
+        else:
+            result = await self.bot.navigation_action(update, self.context)
+            if result == ConversationHandler.END:
+                if "health_checkin" not in self.context.user_data:
+                    self.health_state = None
+                if "doctor_prepare" not in self.context.user_data:
+                    self.doctor_state = None
+        outputs = (
+            tuple(query.edits)
+            + tuple(answer for answer, _show_alert in query.answers if answer is not None)
+            + tuple(str(reply["text"]) for reply in message.replies[previous_replies:])
+        )
+        return StepResult(kind, value, outputs)
+
+    def _latest_navigation_callback(self, action: str) -> tuple[str, FakeMessage]:
+        expected = {
+            "root": "nav:root",
+            "help": "nav:help",
+        }.get(action)
+        for message in reversed(self.messages):
+            for reply in reversed(message.replies):
+                markup = reply.get("reply_markup")
+                if markup is None:
+                    continue
+                for row in markup.inline_keyboard:
+                    for button in row:
+                        data = button.callback_data
+                        if data is None:
+                            continue
+                        if expected is not None and data == expected:
+                            return data, message
+                        if data == f"nav:section:{action}":
+                            return data, message
+                        if data == f"nav:action:{action}":
+                            return data, message
+                        if data == f"nav:help:{action}":
+                            return data, message
+                        if data.startswith(f"nav:flow:{action}:"):
+                            return data, message
+        raise AssertionError(f"No navigation callback for action={action!r}")
 
     async def _run_health_answer(self, value: str) -> StepResult:
         handlers = {
