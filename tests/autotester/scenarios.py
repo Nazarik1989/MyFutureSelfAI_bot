@@ -2257,6 +2257,176 @@ LAB_SCENARIOS = (
 )
 
 
+TASK_HUB_SCENARIOS = (
+    Scenario(
+        name="task-hub-menu-create-guide-and-empty-lists-have-no-dead-buttons",
+        steps=(
+            ScenarioStep("command", "/tasks", reply_contains=("Задачи и напоминания",)),
+            ScenarioStep("task_callback", "today", reply_contains=("Сегодня", "пока нет")),
+            ScenarioStep("task_callback", "hub", reply_contains=("Задачи и напоминания",)),
+            ScenarioStep(
+                "navigation_callback",
+                "task_create",
+                reply_contains=("preview", "Завтра в 18:00"),
+            ),
+            ScenarioStep("task_callback", "hub"),
+            ScenarioStep(
+                "navigation_callback",
+                "task_reminder_guide",
+                reply_contains=("Срок задачи", "явно"),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="task-hub-complete-replay-reopen-and-delete-cancel",
+        llm_stubs=(
+            capture(
+                "Подготовить отчёт Task Hub",
+                intent="inbox_task",
+                kind="task",
+                title="Task Hub отчёт",
+            ),
+        ),
+        steps=(
+            ScenarioStep("text", "Подготовить отчёт Task Hub", reply_contains=("Заголовок",)),
+            ScenarioStep("text", "сохрани", reply_contains=("Сохранено",)),
+            ScenarioStep("command", "/tasks"),
+            ScenarioStep("task_callback", "no-due", reply_contains=("Task Hub отчёт",)),
+            ScenarioStep("task_callback", "open", reply_contains=("Статус: активна",)),
+            ScenarioStep("task_capture_callback", "complete"),
+            ScenarioStep("task_replay_callback", "complete", reply_contains=("выполнена",)),
+            ScenarioStep("task_replay_callback", "complete", reply_contains=("уже выполнена",)),
+            ScenarioStep("task_callback", "reopen", reply_contains=("Старое напоминание",)),
+            ScenarioStep("task_callback", "delete", reply_contains=("Удалить задачу",)),
+            ScenarioStep("task_callback", "cancel", reply_contains=("Удаление отменено",)),
+        ),
+        expected=ExpectedState(
+            drafts=(DraftState("Task Hub отчёт", "task", "confirmed", "text"),),
+            inbox=(InboxState("Task Hub отчёт", "task", "text"),),
+            llm_inputs=("Подготовить отчёт Task Hub",),
+        ),
+    ),
+    Scenario(
+        name="task-hub-custom-reschedule-and-reminder-input-survive-restart",
+        llm_stubs=(
+            capture(
+                "Сверить план Task Hub",
+                intent="inbox_task",
+                kind="task",
+                title="Сверить план",
+            ),
+        ),
+        steps=(
+            ScenarioStep("text", "Сверить план Task Hub"),
+            ScenarioStep("text", "сохрани"),
+            ScenarioStep("command", "/tasks"),
+            ScenarioStep("task_callback", "no-due"),
+            ScenarioStep("task_callback", "open"),
+            ScenarioStep("task_callback", "reschedule"),
+            ScenarioStep("task_callback", "custom", reply_contains=("новую дату",)),
+            ScenarioStep("restart"),
+            ScenarioStep("text", "завтра в 18:00", reply_contains=("Срок перенесён",)),
+            ScenarioStep("command", "/tasks"),
+            ScenarioStep("task_callback", "upcoming", reply_contains=("Сверить план",)),
+            ScenarioStep("task_callback", "open"),
+            ScenarioStep("task_callback", "reminder-edit", reply_contains=("новую дату",)),
+            ScenarioStep("restart"),
+            ScenarioStep("text", "через 1 час", reply_contains=("Напоминание обновлено",)),
+            ScenarioStep("task_callback", "complete", reply_contains=("выполнена",)),
+            ScenarioStep("task_callback", "reopen", reply_contains=("не включено",)),
+        ),
+        expected=ExpectedState(
+            drafts=(DraftState("Сверить план", "task", "confirmed", "text"),),
+            inbox=(InboxState("Сверить план", "task", "text"),),
+            llm_inputs=("Сверить план Task Hub",),
+            task_reminder_count=1,
+        ),
+    ),
+    Scenario(
+        name="task-hub-relative-reminder-reschedule-preserve-and-complete",
+        steps=(
+            ScenarioStep("text", "Напомни через 5 минут проверить гонку"),
+            ScenarioStep("text", "сохрани"),
+            ScenarioStep("command", "/tasks"),
+            ScenarioStep("task_callback", "today", reply_contains=("Проверить гонку",)),
+            ScenarioStep("task_callback", "open"),
+            ScenarioStep("task_callback", "reschedule"),
+            ScenarioStep("task_callback", "30m", reply_contains=("Что сделать",)),
+            ScenarioStep("task_callback", "preserve", reply_contains=("интервал",)),
+            ScenarioStep("task_callback", "complete", reply_contains=("выполнена",)),
+        ),
+        expected=ExpectedState(
+            drafts=(DraftState("Проверить гонку", "task", "confirmed", "text"),),
+            inbox=(InboxState("Проверить гонку", "task", "text"),),
+            task_reminder_count=1,
+        ),
+    ),
+    Scenario(
+        name="task-hub-persistent-delete-removes-task-but-keeps-draft-history",
+        llm_stubs=(
+            capture(
+                "Удаляемая задача Task Hub",
+                intent="inbox_task",
+                kind="task",
+                title="Удаляемая задача",
+            ),
+        ),
+        steps=(
+            ScenarioStep("text", "Удаляемая задача Task Hub"),
+            ScenarioStep("text", "сохрани"),
+            ScenarioStep("command", "/tasks"),
+            ScenarioStep("task_callback", "no-due"),
+            ScenarioStep("task_callback", "open"),
+            ScenarioStep("task_callback", "delete"),
+            ScenarioStep("restart"),
+            ScenarioStep("task_callback", "delete-confirm", reply_contains=("Задача удалена",)),
+        ),
+        expected=ExpectedState(
+            drafts=(DraftState("Удаляемая задача", "task", "confirmed", "text"),),
+            llm_inputs=("Удаляемая задача Task Hub",),
+        ),
+    ),
+    Scenario(
+        name="task-hub-callback-is-owner-chat-bound-forged-and-replay-safe",
+        llm_stubs=(
+            capture(
+                "Изолированная задача Task Hub",
+                intent="inbox_task",
+                kind="task",
+                title="Изолированная задача",
+            ),
+        ),
+        steps=(
+            ScenarioStep("text", "Изолированная задача Task Hub"),
+            ScenarioStep("text", "сохрани"),
+            ScenarioStep("command", "/tasks"),
+            ScenarioStep("task_callback", "no-due"),
+            ScenarioStep("task_callback", "open"),
+            ScenarioStep("task_capture_callback", "complete"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep(
+                "task_replay_callback",
+                "complete",
+                reply_contains=("устарела",),
+            ),
+            ScenarioStep(
+                "task_raw_callback",
+                "task:forged",
+                reply_contains=("устарела",),
+            ),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep("task_replay_callback", "complete", reply_contains=("выполнена",)),
+        ),
+        expected=ExpectedState(
+            drafts=(DraftState("Изолированная задача", "task", "confirmed", "text"),),
+            inbox=(InboxState("Изолированная задача", "task", "text"),),
+            llm_inputs=("Изолированная задача Task Hub",),
+        ),
+    ),
+)
+
+
 SCENARIOS = (
     *CORE_SCENARIOS,
     *GENERATED_SAVE_SCENARIOS,
@@ -2273,5 +2443,6 @@ SCENARIOS = (
     *TIMEZONE_REGRESSION_SCENARIOS,
     *VISION_SCENARIOS,
     *NAVIGATION_SCENARIOS,
+    *TASK_HUB_SCENARIOS,
     *LAB_SCENARIOS,
 )

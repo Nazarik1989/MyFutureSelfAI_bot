@@ -8,9 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import Database
 from .health import METRIC_LABELS, HealthService
-from .models import DoctorVisitPrep, InboxItem, TaskReminder
+from .models import DoctorVisitPrep, InboxItem, TaskReminder, User
 from .reminders import reminder_for_inbox_item
 from .schemas import TemporalResolution
+from .tasks import add_task_state
 
 EMPTY_ANSWERS = {"нет", "не принимаю", "нет лекарств", "нет вопросов", "-"}
 
@@ -160,6 +161,14 @@ class DoctorVisitPrepService:
                 )
                 if reminder is not None:
                     session.add(reminder)
+                owner = await session.get(User, user_id)
+                await add_task_state(
+                    session,
+                    item,
+                    owner_timezone=owner.timezone,
+                    reminder=reminder,
+                    date_event_hour=self.task_date_event_hour,
+                )
                 claimed = await session.execute(
                     update(DoctorVisitPrep)
                     .where(

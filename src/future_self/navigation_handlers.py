@@ -147,6 +147,8 @@ class NavigationHandlers:
                 await getattr(self, action.handler)(update, context)
             finally:
                 context.args = original_args or []
+            if action.handler.startswith("task_"):
+                return None
             await query.message.reply_text(
                 "Навигация",
                 reply_markup=self._back_keyboard(self._section_for_action(action_key)),

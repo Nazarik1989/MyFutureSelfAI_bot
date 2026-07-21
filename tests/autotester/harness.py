@@ -88,6 +88,10 @@ StepKind = Literal[
     "lab_photo",
     "lab_document",
     "lab_text",
+    "task_callback",
+    "task_raw_callback",
+    "task_capture_callback",
+    "task_replay_callback",
     "restart",
     "group_command",
     "timezone_onboarding",
@@ -266,6 +270,7 @@ class BotAutotester:
         self.saved_vision_callbacks: dict[str, tuple[str, FakeMessage]] = {}
         self.saved_navigation_callbacks: dict[str, tuple[str, FakeMessage]] = {}
         self.saved_lab_callbacks: dict[str, tuple[str, FakeMessage]] = {}
+        self.saved_task_callbacks: dict[str, tuple[str, FakeMessage]] = {}
 
     @classmethod
     async def create(cls, sandbox: Path, stubs: tuple[LLMStub, ...]) -> "BotAutotester":
@@ -443,6 +448,22 @@ class BotAutotester:
             except KeyError as exc:
                 raise AssertionError(f"No saved lab callback for {step.value!r}") from exc
             return await self._dispatch_lab_callback(step.kind, step.value, data, message)
+        if step.kind == "task_callback":
+            return await self._run_task_callback(step.value)
+        if step.kind == "task_raw_callback":
+            message = FakeMessage()
+            self.messages.append(message)
+            return await self._dispatch_task_callback(step.kind, step.value, step.value, message)
+        if step.kind == "task_capture_callback":
+            data, message = self._latest_task_callback(step.value)
+            self.saved_task_callbacks[step.value] = (data, message)
+            return StepResult(step.kind, step.value, ("callback captured",))
+        if step.kind == "task_replay_callback":
+            try:
+                data, message = self.saved_task_callbacks[step.value]
+            except KeyError as exc:
+                raise AssertionError(f"No saved task callback for {step.value!r}") from exc
+            return await self._dispatch_task_callback(step.kind, step.value, data, message)
         if step.kind == "vision_hold_render":
             user = await self.bot._user(self.telegram_user_id)
             if not await self.bot.vision_render_limiter.acquire(user.id):
@@ -717,6 +738,7 @@ class BotAutotester:
             "help": self.bot.help_command,
             "doctor": self.bot.doctor_command,
             "inbox": self.bot.inbox,
+            "tasks": self.bot.tasks_command,
             "drafts": self.bot.drafts_command,
             "vision": self.bot.vision_command,
             "location": self.bot.location_command,
@@ -757,6 +779,79 @@ class BotAutotester:
             self.doctor_state = result
         outputs = tuple(str(reply["text"]) for reply in message.replies)
         return StepResult("command", value, outputs)
+
+    async def _run_task_callback(self, action: str) -> StepResult:
+        data, message = self._latest_task_callback(action)
+        return await self._dispatch_task_callback("task_callback", action, data, message)
+
+    async def _dispatch_task_callback(
+        self,
+        kind: StepKind,
+        value: str,
+        data: str,
+        message: FakeMessage,
+    ) -> StepResult:
+        previous_replies = len(message.replies)
+        query = FakeCallbackQuery(data, message)
+        update = SimpleNamespace(
+            effective_message=message,
+            message=message,
+            callback_query=query,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+            effective_chat=SimpleNamespace(id=self.chat_id, type="private"),
+        )
+        await self.bot.task_callback(update, self.context)
+        outputs = (
+            tuple(query.edits)
+            + tuple(answer for answer, _show_alert in query.answers if answer is not None)
+            + tuple(str(reply["text"]) for reply in message.replies[previous_replies:])
+        )
+        return StepResult(kind, value, outputs)
+
+    def _latest_task_callback(self, action: str) -> tuple[str, FakeMessage]:
+        exact = {
+            "hub": "task:hub",
+            "today": "task:list:today:0",
+            "upcoming": "task:list:upcoming:0",
+            "overdue": "task:list:overdue:0",
+            "no-due": "task:list:no_due:0",
+            "completed": "task:list:completed:0",
+        }.get(action)
+        labels = {
+            "open": "Открыть",
+            "complete": "Выполнено",
+            "reopen": "Вернуть в активные",
+            "reschedule": "Перенести",
+            "30m": "Через 30 минут",
+            "1h": "Через 1 час",
+            "tomorrow": "Завтра в 09:00",
+            "custom": "Другая дата и время",
+            "preserve": "Сохранить прежний интервал",
+            "new-reminder": "Выбрать новое напоминание",
+            "reminder-edit": "Изменить напоминание",
+            "reminder-off": "Отключить напоминание",
+            "delete": "Удалить",
+            "delete-confirm": "Да, удалить",
+            "cancel": "Отмена",
+        }
+        label = labels.get(action)
+        for message in reversed(self.messages):
+            for reply in reversed(message.replies):
+                markup = reply.get("reply_markup")
+                if markup is None:
+                    continue
+                for row in markup.inline_keyboard:
+                    for button in row:
+                        data = button.callback_data
+                        if data is None:
+                            continue
+                        if exact is not None and data == exact:
+                            return data, message
+                        if label is not None and (
+                            button.text == label or button.text.startswith(label)
+                        ):
+                            return data, message
+        raise AssertionError(f"No task callback found for {action!r}")
 
     async def _run_lab_callback(self, action: str) -> StepResult:
         data, message = self._latest_lab_callback(action)

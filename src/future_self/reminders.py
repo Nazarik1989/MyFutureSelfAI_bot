@@ -7,10 +7,10 @@ from datetime import UTC, datetime, time, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, exists, or_, select, update
 
 from .db import Database
-from .models import DraftInboxItem, InboxItem, TaskReminder, User
+from .models import DraftInboxItem, InboxItem, TaskReminder, TaskState, User
 from .schemas import TemporalResolution
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ class ReminderSchedule:
 class ClaimedReminder:
     id: int
     claim_token: str
+    inbox_item_id: int
+    owner_id: int
+    task_version: int
     chat_id: int
     title: str
     description: str | None
@@ -100,6 +103,7 @@ def reminder_for_inbox_item(
         remind_at=schedule.remind_at,
         timezone=schedule.timezone,
         delivery_key=f"inbox:{item.id}:task-reminder:v1",
+        task_version=1,
         status="pending",
     )
 
@@ -130,8 +134,9 @@ class TaskReminderEngine:
         async with self.db.session() as session:
             rows = (
                 await session.execute(
-                    select(InboxItem, DraftInboxItem)
+                    select(InboxItem, DraftInboxItem, TaskState)
                     .join(DraftInboxItem, DraftInboxItem.id == InboxItem.draft_id)
+                    .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
                     .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
                     .where(
                         InboxItem.kind == "task",
@@ -142,7 +147,7 @@ class TaskReminderEngine:
                 )
             ).all()
             created = 0
-            for item, draft in rows:
+            for item, draft, state in rows:
                 try:
                     reminder = reminder_for_inbox_item(
                         item,
@@ -160,6 +165,8 @@ class TaskReminderEngine:
                     continue
                 if reminder is None or as_utc(reminder.event_at) <= current:
                     continue
+                reminder.task_version = state.version
+                reminder.delivery_key = f"task:{item.id}:reminder:v{state.version}"
                 session.add(reminder)
                 created += 1
             if created:
@@ -170,6 +177,9 @@ class TaskReminderEngine:
         current = as_utc(now or datetime.now(UTC))
         delivered = 0
         for reminder in await self._claim_due(current):
+            if not await self._still_current(reminder):
+                await self._cancel_claim(reminder)
+                continue
             try:
                 message_id = await self.send(
                     reminder.chat_id,
@@ -208,7 +218,15 @@ class TaskReminderEngine:
                 (
                     await session.scalars(
                         select(TaskReminder.id)
+                        .join(TaskState, TaskState.inbox_item_id == TaskReminder.inbox_item_id)
+                        .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
                         .where(or_(due_pending, stale_processing))
+                        .where(
+                            TaskState.status == "active",
+                            TaskState.version == TaskReminder.task_version,
+                            TaskState.owner_id == InboxItem.user_id,
+                            InboxItem.kind == "task",
+                        )
                         .order_by(TaskReminder.remind_at, TaskReminder.id)
                         .limit(self.batch_size)
                     )
@@ -238,15 +256,42 @@ class TaskReminderEngine:
                     continue
                 reminder = await session.get(TaskReminder, reminder_id)
                 row = await session.execute(
-                    select(InboxItem, User)
+                    select(InboxItem, User, TaskState)
                     .join(User, User.id == InboxItem.user_id)
-                    .where(InboxItem.id == reminder.inbox_item_id)
+                    .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
+                    .where(
+                        InboxItem.id == reminder.inbox_item_id,
+                        InboxItem.kind == "task",
+                        TaskState.owner_id == InboxItem.user_id,
+                        TaskState.status == "active",
+                        TaskState.version == reminder.task_version,
+                    )
                 )
-                item, owner = row.one()
+                current_row = row.one_or_none()
+                if current_row is None:
+                    await session.execute(
+                        update(TaskReminder)
+                        .where(
+                            TaskReminder.id == reminder_id,
+                            TaskReminder.status == "processing",
+                            TaskReminder.claim_token == token,
+                        )
+                        .values(
+                            status="cancelled",
+                            claim_token=None,
+                            claimed_at=None,
+                            next_attempt_at=None,
+                        )
+                    )
+                    continue
+                item, owner, state = current_row
                 claimed.append(
                     ClaimedReminder(
                         id=reminder.id,
                         claim_token=token,
+                        inbox_item_id=item.id,
+                        owner_id=owner.id,
+                        task_version=state.version,
                         # The owner row is authoritative. Persisted reminder chat
                         # metadata may predate the private-chat-only policy.
                         chat_id=owner.telegram_id,
@@ -272,6 +317,15 @@ class TaskReminderEngine:
                     TaskReminder.id == reminder.id,
                     TaskReminder.status == "processing",
                     TaskReminder.claim_token == reminder.claim_token,
+                    TaskReminder.task_version == reminder.task_version,
+                    exists(
+                        select(TaskState.id).where(
+                            TaskState.inbox_item_id == reminder.inbox_item_id,
+                            TaskState.owner_id == reminder.owner_id,
+                            TaskState.status == "active",
+                            TaskState.version == reminder.task_version,
+                        )
+                    ),
                 )
                 .values(
                     status="sent",
@@ -285,6 +339,46 @@ class TaskReminderEngine:
                 .returning(TaskReminder.id)
             )
             return changed.scalar_one_or_none() is not None
+
+    async def _still_current(self, reminder: ClaimedReminder) -> bool:
+        """Final owner/state/version/claim check immediately before Telegram I/O."""
+        async with self.db.sessions() as session:
+            return (
+                await session.scalar(
+                    select(TaskReminder.id)
+                    .join(TaskState, TaskState.inbox_item_id == TaskReminder.inbox_item_id)
+                    .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
+                    .where(
+                        TaskReminder.id == reminder.id,
+                        TaskReminder.status == "processing",
+                        TaskReminder.claim_token == reminder.claim_token,
+                        TaskReminder.task_version == reminder.task_version,
+                        TaskState.inbox_item_id == reminder.inbox_item_id,
+                        TaskState.owner_id == reminder.owner_id,
+                        TaskState.status == "active",
+                        TaskState.version == reminder.task_version,
+                        InboxItem.user_id == reminder.owner_id,
+                        InboxItem.kind == "task",
+                    )
+                )
+            ) is not None
+
+    async def _cancel_claim(self, reminder: ClaimedReminder) -> None:
+        async with self.db.session() as session:
+            await session.execute(
+                update(TaskReminder)
+                .where(
+                    TaskReminder.id == reminder.id,
+                    TaskReminder.status == "processing",
+                    TaskReminder.claim_token == reminder.claim_token,
+                )
+                .values(
+                    status="cancelled",
+                    claim_token=None,
+                    claimed_at=None,
+                    next_attempt_at=None,
+                )
+            )
 
     async def _release_after_failure(
         self,

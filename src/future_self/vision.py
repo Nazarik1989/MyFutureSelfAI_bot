@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from .db import Database
 from .models import InboxItem, User, VisionDraft, VisionItem, VisionItemImage
+from .tasks import add_task_state
 
 CATEGORY_META: dict[str, tuple[str, str]] = {
     "health_energy": ("🌿", "Здоровье и энергия"),
@@ -462,6 +463,12 @@ class VisionService:
             )
             session.add(task)
             await session.flush()
+            owner = await session.get(User, owner_id)
+            await add_task_state(
+                session,
+                task,
+                owner_timezone=owner.timezone,
+            )
             item.linked_task_id = task.id
             return TaskLinkResult("created", item, task)
 
