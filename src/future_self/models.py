@@ -11,6 +11,8 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -53,6 +55,7 @@ class User(TimestampMixin, Base):
     doctor_visit_preps: Mapped[list[DoctorVisitPrep]] = relationship(back_populates="user")
     vision_items: Mapped[list[VisionItem]] = relationship(back_populates="owner")
     vision_item_images: Mapped[list[VisionItemImage]] = relationship(back_populates="owner")
+    lab_documents: Mapped[list[LabDocument]] = relationship(back_populates="owner")
 
 
 class DraftInboxItem(Base):
@@ -260,6 +263,95 @@ class VisionItemImage(TimestampMixin, Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     vision_item: Mapped[VisionItem] = relationship(back_populates="image")
     owner: Mapped[User] = relationship(back_populates="vision_item_images")
+
+
+class LabDocument(TimestampMixin, Base):
+    __tablename__ = "lab_documents"
+    __table_args__ = (
+        UniqueConstraint("id", "owner_id", name="uq_lab_document_id_owner"),
+        CheckConstraint("page_count > 0", name="ck_lab_document_page_count"),
+        CheckConstraint(
+            "length(title) BETWEEN 1 AND 200",
+            name="ck_lab_document_title_length",
+        ),
+        CheckConstraint("version > 0", name="ck_lab_document_version"),
+        CheckConstraint(
+            "source_type IN ('image', 'pdf')",
+            name="ck_lab_document_source_type",
+        ),
+        CheckConstraint(
+            "status IN ('saved')",
+            name="ck_lab_document_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    document_date: Mapped[date | None] = mapped_column(Date, index=True)
+    source_type: Mapped[str] = mapped_column(String(20))
+    page_count: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="saved", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    owner: Mapped[User] = relationship(back_populates="lab_documents")
+    pages: Mapped[list[LabDocumentPage]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="LabDocumentPage.page_index",
+    )
+
+
+class LabDocumentPage(Base):
+    __tablename__ = "lab_document_pages"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["document_id", "owner_id"],
+            ["lab_documents.id", "lab_documents.owner_id"],
+            ondelete="CASCADE",
+            name="fk_lab_page_document_owner",
+        ),
+        UniqueConstraint("document_id", "page_index", name="uq_lab_page_document_index"),
+        Index("ix_lab_document_pages_owner_document", "owner_id", "document_id"),
+        CheckConstraint("page_index >= 0", name="ck_lab_page_index"),
+        CheckConstraint("width > 0 AND height > 0", name="ck_lab_page_dimensions"),
+        CheckConstraint("length(image_bytes) > 0", name="ck_lab_page_has_bytes"),
+        CheckConstraint("mime_type = 'image/jpeg'", name="ck_lab_page_mime_type"),
+        CheckConstraint("length(sha256) = 64", name="ck_lab_page_sha256_length"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    page_index: Mapped[int] = mapped_column(Integer)
+    image_bytes: Mapped[bytes] = mapped_column(LargeBinary)
+    mime_type: Mapped[str] = mapped_column(String(40))
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    document: Mapped[LabDocument] = relationship(back_populates="pages")
+
+
+class LabDeleteConfirmation(Base):
+    __tablename__ = "lab_delete_confirmations"
+    __table_args__ = (
+        CheckConstraint("document_version > 0", name="ck_lab_delete_version"),
+        CheckConstraint(
+            "status IN ('pending', 'consumed')",
+            name="ck_lab_delete_status",
+        ),
+    )
+
+    token: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    document_id: Mapped[int] = mapped_column(Integer, index=True)
+    document_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class VisionDraft(TimestampMixin, Base):

@@ -15,6 +15,7 @@ FLOW_LABELS = {
     "doctor": "подготовка к приёму",
     "vision": "создание карточки желания",
     "vision_image": "добавление личного фото",
+    "labs": "загрузка результатов анализов",
     "rename_goal": "переименование цели",
 }
 
@@ -210,7 +211,11 @@ class NavigationHandlers:
             instruction = (
                 "Отправь выбранное фото или нажми «Отмена» в сообщении загрузки."
                 if current == "vision_image"
-                else "Ответь на текущий вопрос."
+                else (
+                    "Отправь фото/PDF или используй кнопки preview."
+                    if current == "labs"
+                    else "Ответь на текущий вопрос."
+                )
             )
             await self._edit_or_send(
                 query,
@@ -245,6 +250,15 @@ class NavigationHandlers:
             if key in context.user_data:
                 return name
         user = await self._user(update.effective_user.id)
+        if await self.lab_uploads.has_active(user.id, update.effective_chat.id):
+            return "labs"
+        edit = context.user_data.get("lab_document_edit")
+        if (
+            edit is not None
+            and edit.get("owner_id") == user.id
+            and edit.get("chat_id") == update.effective_chat.id
+        ):
+            return "labs"
         if "onboarding_user_id" in context.user_data and not user.onboarding_completed:
             return "onboarding"
         if await self.vision_image_sessions.has_active(user.id, update.effective_chat.id):
@@ -272,7 +286,10 @@ class NavigationHandlers:
             context.user_data.pop("vision_summary", None)
         else:
             user = await self._user(update.effective_user.id)
-            if flow == "vision_image":
+            if flow == "labs":
+                await self.lab_uploads.cancel_active(user.id, update.effective_chat.id)
+                context.user_data.pop("lab_document_edit", None)
+            elif flow == "vision_image":
                 await self.vision_image_sessions.cancel_active(user.id, update.effective_chat.id)
             elif flow == "vision":
                 await self.vision_service.cancel(user.id, update.effective_chat.id)

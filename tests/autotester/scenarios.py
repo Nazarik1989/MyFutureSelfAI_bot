@@ -4,6 +4,7 @@ from .harness import (
     DraftState,
     ExpectedState,
     InboxState,
+    LabState,
     LLMStub,
     Scenario,
     ScenarioStep,
@@ -2044,6 +2045,218 @@ NAVIGATION_SCENARIOS = (
 )
 
 
+LAB_SCENARIOS = (
+    Scenario(
+        name="labs-photo-preview-confirm-is-explicit-and-local",
+        steps=(
+            ScenarioStep("command", "/labs", reply_contains=("Анализы",)),
+            ScenarioStep("lab_callback", "add", reply_contains=("не сохранится",)),
+            ScenarioStep("lab_photo", "jpeg", reply_contains=("Preview первой страницы",)),
+            ScenarioStep("lab_callback", "draft-title"),
+            ScenarioStep("lab_text", "Фото анализов"),
+            ScenarioStep("lab_callback", "draft-save", reply_contains=("Документ сохранён",)),
+        ),
+        expected=ExpectedState(lab_documents=(LabState("Фото анализов", None, 1),)),
+    ),
+    Scenario(
+        name="labs-image-document-png-title-and-date",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "png", reply_contains=("Preview",)),
+            ScenarioStep("lab_callback", "draft-title", reply_contains=("название",)),
+            ScenarioStep("lab_text", "Общий анализ крови", reply_contains=("Название",)),
+            ScenarioStep("lab_callback", "draft-date", reply_contains=("ДД.ММ.ГГГГ",)),
+            ScenarioStep("lab_text", "20.07.2026", reply_contains=("20.07.2026",)),
+            ScenarioStep("lab_callback", "draft-save", reply_contains=("сохранён",)),
+        ),
+        expected=ExpectedState(lab_documents=(LabState("Общий анализ крови", "2026-07-20", 1),)),
+    ),
+    Scenario(
+        name="labs-static-webp-preview-cancel-leaves-no-record",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "webp", reply_contains=("Preview",)),
+            ScenarioStep("lab_callback", "cancel", reply_contains=("Временные файлы удалены",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="labs-single-page-pdf-save-list-open-view-delete",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "pdf1", reply_contains=("1 стр.",)),
+            ScenarioStep("lab_callback", "draft-save", reply_contains=("сохранён",)),
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "list", reply_contains=("Мои документы",)),
+            ScenarioStep("lab_callback", "open", reply_contains=("Страниц: 1",)),
+            ScenarioStep("lab_callback", "view", reply_contains=("страница 1/1",)),
+            ScenarioStep("lab_callback", "delete", reply_contains=("необратимо",)),
+            ScenarioStep("lab_callback", "delete-confirm", reply_contains=("удалён",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="labs-multipage-pdf-renders-all-pages",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "pdf3", reply_contains=("3 стр.",)),
+            ScenarioStep("lab_callback", "draft-title"),
+            ScenarioStep("lab_text", "Многостраничный PDF"),
+            ScenarioStep("lab_callback", "draft-save", reply_contains=("3 стр.",)),
+        ),
+        expected=ExpectedState(lab_documents=(LabState("Многостраничный PDF", None, 3),)),
+    ),
+    Scenario(
+        name="labs-saved-document-rename-and-date-edit-use-version",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "jpeg"),
+            ScenarioStep("lab_callback", "draft-save"),
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "list"),
+            ScenarioStep("lab_callback", "open"),
+            ScenarioStep("lab_callback", "rename", reply_contains=("новое название",)),
+            ScenarioStep("lab_text", "Биохимия", reply_contains=("Изменение сохранено",)),
+            ScenarioStep("lab_callback", "date", reply_contains=("ДД.ММ.ГГГГ",)),
+            ScenarioStep("lab_text", "19.07.2026", reply_contains=("Изменение сохранено",)),
+        ),
+        expected=ExpectedState(lab_documents=(LabState("Биохимия", "2026-07-19", 1),)),
+    ),
+    *(
+        Scenario(
+            name=f"labs-rejects-{name}-fail-closed",
+            steps=(
+                ScenarioStep("command", "/labs"),
+                ScenarioStep("lab_callback", "add"),
+                ScenarioStep("lab_document", fixture, reply_contains=("отклонён и удалён",)),
+            ),
+            expected=ExpectedState(),
+        )
+        for name, fixture in (
+            ("corrupt-image", "corrupt"),
+            ("mime-mismatch", "mismatch"),
+            ("encrypted-pdf", "pdf-encrypted"),
+            ("javascript-pdf", "pdf-js"),
+            ("attachment-pdf", "pdf-attachment"),
+            ("pdf-page-overflow", "pdf-too-many"),
+            ("declared-size-overflow", "oversize-meta"),
+        )
+    ),
+    Scenario(
+        name="labs-direct-file-outside-flow-is-not-saved",
+        steps=(ScenarioStep("lab_document", "jpeg", reply_excludes=("Preview",)),),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="labs-restart-invalidates-preview-confirm",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "jpeg"),
+            ScenarioStep("lab_capture_callback", "draft-save"),
+            ScenarioStep("restart"),
+            ScenarioStep("lab_replay_callback", "draft-save", reply_contains=("устарела",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="labs-delete-confirmation-is-owner-chat-bound-and-single-use",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "jpeg"),
+            ScenarioStep("lab_callback", "draft-save"),
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "list"),
+            ScenarioStep("lab_callback", "open"),
+            ScenarioStep("lab_callback", "delete"),
+            ScenarioStep("lab_capture_callback", "delete-confirm"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep("lab_replay_callback", "delete-confirm", reply_contains=("устарела",)),
+            ScenarioStep("switch_user", "900001:910001"),
+            ScenarioStep("lab_replay_callback", "delete-confirm", reply_contains=("удалён",)),
+            ScenarioStep("lab_replay_callback", "delete-confirm", reply_contains=("устарела",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="labs-identical-documents-remain-owner-isolated",
+        steps=(
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "jpeg"),
+            ScenarioStep("lab_callback", "draft-title"),
+            ScenarioStep("lab_text", "Одинаковый документ"),
+            ScenarioStep("lab_callback", "draft-save"),
+            ScenarioStep("switch_user", "900002:910002"),
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "add"),
+            ScenarioStep("lab_document", "jpeg"),
+            ScenarioStep("lab_callback", "draft-title"),
+            ScenarioStep("lab_text", "Одинаковый документ"),
+            ScenarioStep("lab_callback", "draft-save"),
+        ),
+        expected=ExpectedState(
+            lab_documents=(
+                LabState("Одинаковый документ", None, 1),
+                LabState("Одинаковый документ", None, 1),
+            )
+        ),
+    ),
+    Scenario(
+        name="labs-navigation-doctor-entry-help-back-and-root",
+        steps=(
+            ScenarioStep("command", "/doctor"),
+            ScenarioStep("navigation_callback", "labs", reply_contains=("Анализы",)),
+            ScenarioStep("lab_callback", "help", reply_contains=("OCR", "до 8 МБ")),
+            ScenarioStep("lab_callback", "menu", reply_contains=("Анализы",)),
+            ScenarioStep("navigation_callback", "root", reply_contains=("Главное меню",)),
+        ),
+        expected=ExpectedState(),
+    ),
+    Scenario(
+        name="labs-list-pagination-reaches-second-page",
+        steps=tuple(
+            step
+            for index in range(7)
+            for step in (
+                ScenarioStep("command", "/labs"),
+                ScenarioStep("lab_callback", "add"),
+                ScenarioStep("lab_document", "jpeg"),
+                ScenarioStep("lab_callback", "draft-title"),
+                ScenarioStep("lab_text", f"Пакет {index}"),
+                ScenarioStep("lab_callback", "draft-save"),
+            )
+        )
+        + (
+            ScenarioStep("command", "/labs"),
+            ScenarioStep("lab_callback", "list", reply_contains=("Мои документы",)),
+            ScenarioStep("lab_callback", "list-next", reply_contains=("Пакет 0",)),
+        ),
+        expected=ExpectedState(
+            lab_documents=tuple(LabState(f"Пакет {index}", None, 1) for index in range(7))
+        ),
+    ),
+    Scenario(
+        name="labs-group-chat-is-blocked-before-upload",
+        steps=(
+            ScenarioStep(
+                "group_command",
+                "/labs",
+                reply_contains=("только в личном чате",),
+                reply_excludes=("Храни фото",),
+            ),
+        ),
+        expected=ExpectedState(),
+    ),
+)
+
+
 SCENARIOS = (
     *CORE_SCENARIOS,
     *GENERATED_SAVE_SCENARIOS,
@@ -2060,4 +2273,5 @@ SCENARIOS = (
     *TIMEZONE_REGRESSION_SCENARIOS,
     *VISION_SCENARIOS,
     *NAVIGATION_SCENARIOS,
+    *LAB_SCENARIOS,
 )

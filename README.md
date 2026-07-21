@@ -92,6 +92,7 @@ DATABASE_URL=postgresql+asyncpg://future_self:future_self@localhost:5432/future_
 
 - `/menu` — открыть кнопочное главное меню;
 - `/doctor` — единый раздел поиска врача и подготовки к приёму;
+- `/labs` — безопасно загрузить и управлять фото/PDF результатов анализов;
 - `/start` или `/onboarding` — начать или продолжить онбординг;
 - `/profile` — показать Vision Profile и личную локацию;
 - `/location Саратов` — сохранить свой город; запасной маршрут можно задать как
@@ -141,10 +142,34 @@ orientation применяется, а EXIF/GPS/ICC/comments/filename удаля
 не вызываются. Preview требует явного подтверждения, а замена и удаление защищены
 owner/chat/item/version capability.
 
+Раздел `/labs` принимает Telegram photo, image-document (статические JPEG, PNG, WebP)
+и обычные незашифрованные PDF. Фактические лимиты: входной файл до 8 МиБ; PDF до
+10 страниц и 2000 PDF points по каждой стороне страницы; исходное изображение до
+24 мегапикселей и 20 000 пикселей по стороне; обработка PDF до 30 секунд; готовая
+PDF-страница до 3000 пикселей по стороне и 12 мегапикселей; JPEG-копия до 768 КиБ
+на страницу и до 8 МиБ на документ. Не более 16 upload-сессий и 32 МиБ временных
+нормализованных данных держатся одновременно; TTL preview — 20 минут.
+
+Изображения проходят тот же локальный EXIF orientation и безопасное RGB JPEG
+перекодирование, что и личные фото Vision. PDF предварительно строго разбирается и
+fail-closed отклоняется при пароле, повреждении, JavaScript, вложениях, actions,
+формах или мультимедиа. Затем отдельный локальный PDFium subprocess без shell и сети,
+с timeout и лимитами CPU/RAM/выхода, растрирует каждую страницу. Исходник удаляется
+сразу; до подтверждения остаются только случайно именованные файлы mode `600` в
+каталоге mode `700`, без symlink/path traversal, после confirm/cancel/error/TTL они
+удаляются. В SQLite BLOB сохраняются только нормализованные JPEG-страницы после кнопки
+«Сохранить». OCR, LLM, внешние renderer-сервисы, публичные URL, извлечение показателей
+и медицинская интерпретация не используются.
+
+PDF pipeline использует `pypdf` (BSD-3-Clause) для локальной проверки и `pypdfium2`
+с PDFium (BSD-3-Clause/Apache-2.0 и лицензии зависимостей) для локального raster render;
+системный PDF-пакет в Docker не устанавливается. Точные license metadata доступны через
+`python -m pip show pypdf pypdfium2` внутри образа.
+
 Навигация строится из единого декларативного каталога: те же названия и описания
 используются в главном меню, справке и native Telegram-командах. В native-меню
 показываются только `/menu`, `/inbox`, `/vision`, `/health`, `/checkin`, `/doctor`,
-`/location` и `/help`; расширенные legacy-команды продолжают работать. Если открыт
+`/labs`, `/location` и `/help`; расширенные legacy-команды продолжают работать. Если открыт
 check-in, подготовка к врачу, карточка желания или другой пошаговый сценарий, `/menu`
 предлагает явно продолжить его либо выйти, очищая только текущее состояние.
 
@@ -266,6 +291,10 @@ src/future_self/
   scheduler.py       изолированный JobQueue adapter
   reminders.py       persistent outbox задач и Telegram-доставка напоминаний
   vision_renderer.py локальный owner-safe PNG renderer карты желаний
+  lab_media.py       локальная проверка и нормализация image/PDF
+  lab_pdf_worker.py  изолированный PDFium raster subprocess
+  labs.py            owner-isolated документы, BLOB-страницы и capabilities
+  lab_handlers.py    Telegram preview/confirm/list/view/edit/delete flow
   config.py          personality, schedule и feature flags
   prompts.py         системные промпты
 alembic/              миграции схемы
