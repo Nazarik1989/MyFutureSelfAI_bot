@@ -400,11 +400,12 @@ class TaskState(TimestampMixin, Base):
         ),
         CheckConstraint("version > 0", name="ck_task_state_version"),
         UniqueConstraint("owner_id", "inbox_item_id", name="uq_task_state_owner_item"),
+        Index("ix_task_states_inbox_item_id", "inbox_item_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    inbox_item_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    inbox_item_id: Mapped[int] = mapped_column(Integer, unique=True)
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     timezone: Mapped[str] = mapped_column(String(64))
@@ -471,6 +472,163 @@ class TaskReminder(TimestampMixin, Base):
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
     last_error_type: Mapped[str | None] = mapped_column(String(120))
     inbox_item: Mapped[InboxItem] = relationship(back_populates="reminder")
+
+
+class LifeCollection(TimestampMixin, Base):
+    __tablename__ = "life_collections"
+    __table_args__ = (
+        UniqueConstraint("id", "owner_id", name="uq_life_collection_id_owner"),
+        UniqueConstraint(
+            "owner_id", "normalized_name", name="uq_life_collection_owner_normalized_name"
+        ),
+        CheckConstraint("kind IN ('topic', 'project', 'list')", name="ck_life_collection_kind"),
+        CheckConstraint("status IN ('active', 'archived')", name="ck_life_collection_status"),
+        CheckConstraint("version > 0", name="ck_life_collection_version"),
+        CheckConstraint("length(name) BETWEEN 1 AND 100", name="ck_life_collection_name_length"),
+        CheckConstraint(
+            "length(normalized_name) BETWEEN 1 AND 100",
+            name="ck_life_collection_normalized_name_length",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    normalized_name: Mapped[str] = mapped_column(String(100))
+    starter_key: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class LifeCollectionAlias(Base):
+    __tablename__ = "life_collection_aliases"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["collection_id", "owner_id"],
+            ["life_collections.id", "life_collections.owner_id"],
+            ondelete="CASCADE",
+            name="fk_life_collection_alias_owner",
+        ),
+        UniqueConstraint(
+            "owner_id", "normalized_alias", name="uq_life_collection_alias_owner_name"
+        ),
+        CheckConstraint("length(alias) BETWEEN 1 AND 100", name="ck_life_collection_alias_length"),
+        CheckConstraint(
+            "length(normalized_alias) BETWEEN 1 AND 100",
+            name="ck_life_collection_normalized_alias_length",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    collection_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    alias: Mapped[str] = mapped_column(String(100))
+    normalized_alias: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LifeCollectionLink(Base):
+    __tablename__ = "life_collection_links"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["collection_id", "owner_id"],
+            ["life_collections.id", "life_collections.owner_id"],
+            ondelete="CASCADE",
+            name="fk_life_collection_link_collection_owner",
+        ),
+        ForeignKeyConstraint(
+            ["inbox_item_id", "owner_id"],
+            ["inbox_items.id", "inbox_items.user_id"],
+            ondelete="CASCADE",
+            name="fk_life_collection_link_inbox_owner",
+        ),
+        UniqueConstraint("collection_id", "inbox_item_id", name="uq_life_collection_link_item"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    collection_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    inbox_item_id: Mapped[int] = mapped_column(Integer, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LifeCollectionPreference(TimestampMixin, Base):
+    __tablename__ = "life_collection_preferences"
+    __table_args__ = (CheckConstraint("version > 0", name="ck_life_collection_preference_version"),)
+
+    owner_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class LifeCollectionContext(TimestampMixin, Base):
+    __tablename__ = "life_collection_contexts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["collection_id", "owner_id"],
+            ["life_collections.id", "life_collections.owner_id"],
+            ondelete="CASCADE",
+            name="fk_life_collection_context_collection_owner",
+        ),
+        ForeignKeyConstraint(
+            ["last_inbox_item_id", "owner_id"],
+            ["inbox_items.id", "inbox_items.user_id"],
+            ondelete="CASCADE",
+            name="fk_life_collection_context_inbox_owner",
+        ),
+        UniqueConstraint("owner_id", "chat_id", name="uq_life_collection_context_owner_chat"),
+        CheckConstraint("version > 0", name="ck_life_collection_context_version"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    collection_id: Mapped[int] = mapped_column(Integer, index=True)
+    last_inbox_item_id: Mapped[int | None] = mapped_column(Integer)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class LifeCollectionActionToken(Base):
+    __tablename__ = "life_collection_action_tokens"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["collection_id", "owner_id"],
+            ["life_collections.id", "life_collections.owner_id"],
+            ondelete="CASCADE",
+            name="fk_life_collection_action_collection_owner",
+        ),
+        ForeignKeyConstraint(
+            ["inbox_item_id", "owner_id"],
+            ["inbox_items.id", "inbox_items.user_id"],
+            ondelete="CASCADE",
+            name="fk_life_collection_action_inbox_owner",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'awaiting_input', 'consumed')",
+            name="ck_life_collection_action_status",
+        ),
+        CheckConstraint(
+            "collection_version IS NULL OR collection_version > 0",
+            name="ck_life_collection_action_version",
+        ),
+    )
+
+    token: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    collection_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    collection_version: Mapped[int | None] = mapped_column(Integer)
+    inbox_item_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    action: Mapped[str] = mapped_column(String(48), index=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DailyCheckIn(TimestampMixin, Base):

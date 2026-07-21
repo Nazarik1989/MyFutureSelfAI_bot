@@ -70,6 +70,7 @@ NaturalAction = Literal[
     "show_last_saved",
     "show_profile",
     "show_today",
+    "show_collections",
     "help",
 ]
 
@@ -122,6 +123,11 @@ class NaturalCommandRouter:
             "покажи фокус дня",
             "что у меня сегодня",
             "мой план на сегодня",
+        ),
+        "show_collections": (
+            "покажи мои разделы",
+            "открой мои разделы",
+            "покажи разделы",
         ),
         "help": (
             "помощь",

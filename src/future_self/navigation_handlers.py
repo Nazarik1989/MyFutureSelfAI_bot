@@ -28,6 +28,10 @@ class NavigationHandlers:
     ) -> None:
         flow = await self._active_navigation_flow(update, context)
         if flow is None:
+            if hasattr(self, "collection_service"):
+                user = await self._user(update.effective_user.id)
+                await self.collection_service.clear_context(user.id, update.effective_chat.id)
+                await self.collection_service.cancel_input(user.id, update.effective_chat.id)
             return
         await self._prompt_navigation_flow(update.effective_message, update, flow)
         raise ApplicationHandlerStop
@@ -49,6 +53,10 @@ class NavigationHandlers:
         if flow is not None:
             await self._prompt_navigation_flow(update.effective_message, update, flow)
             return
+        if hasattr(self, "collection_service"):
+            user = await self._user(update.effective_user.id)
+            await self.collection_service.clear_context(user.id, update.effective_chat.id)
+            await self.collection_service.cancel_input(user.id, update.effective_chat.id)
         await self._send_navigation_root(update.effective_message)
 
     async def doctor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -78,6 +86,11 @@ class NavigationHandlers:
             await query.answer()
             await self._prompt_navigation_flow(query.message, update, flow)
             return None
+
+        if hasattr(self, "collection_service"):
+            user = await self._user(update.effective_user.id)
+            await self.collection_service.clear_context(user.id, update.effective_chat.id)
+            await self.collection_service.cancel_input(user.id, update.effective_chat.id)
 
         if data == "nav:root":
             await query.answer()
@@ -147,7 +160,7 @@ class NavigationHandlers:
                 await getattr(self, action.handler)(update, context)
             finally:
                 context.args = original_args or []
-            if action.handler.startswith("task_"):
+            if action.handler.startswith("task_") or action.handler == "collections_command":
                 return None
             await query.message.reply_text(
                 "Навигация",
