@@ -11,6 +11,7 @@ from .db import Database
 from .models import DraftInboxItem, InboxItem, TaskReminder, User
 from .reminders import reminder_for_inbox_item
 from .schemas import ParsedThought
+from .tasks import add_task_state
 
 logger = logging.getLogger(__name__)
 
@@ -606,6 +607,14 @@ class DraftInboxService:
             if reminder is not None:
                 session.add(reminder)
                 await session.flush()
+            owner = await session.get(User, draft.user_id)
+            await add_task_state(
+                session,
+                inbox_item,
+                owner_timezone=owner.timezone,
+                reminder=reminder,
+                date_event_hour=self.task_date_event_hour,
+            )
         log_transition(
             draft_id,
             telegram_user_id,

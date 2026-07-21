@@ -17,7 +17,7 @@ from future_self.bot import (
 from future_self.config import Settings
 from future_self.doctor_prep import DoctorVisitPrepService
 from future_self.health import subjective_score
-from future_self.models import DoctorVisitPrep, HealthCheckIn, InboxItem, TaskReminder
+from future_self.models import DoctorVisitPrep, HealthCheckIn, InboxItem, TaskReminder, TaskState
 from future_self.repositories import UserRepository
 
 
@@ -272,6 +272,7 @@ async def test_doctor_task_uses_existing_reminder_engine_and_is_idempotent(db, f
     async with db.sessions() as session:
         assert await session.scalar(select(func.count(InboxItem.id))) == 1
         assert await session.scalar(select(func.count(TaskReminder.id))) == 1
+        assert await session.scalar(select(func.count(TaskState.id))) == 1
 
     foreign_update, foreign_message = prep_update(
         f"/doctor_prepare_task {record.id} через 2 часа",

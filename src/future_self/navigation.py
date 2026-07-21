@@ -33,6 +33,7 @@ class NavigationSection:
 PUBLIC_COMMANDS = (
     CommandSpec("menu", "Главное меню"),
     CommandSpec("inbox", "Сохранённые идеи и заметки"),
+    CommandSpec("tasks", "Задачи и напоминания"),
     CommandSpec("vision", "Карта желаний"),
     CommandSpec("health", "Состояние и динамика"),
     CommandSpec("checkin", "Новый health check-in"),
@@ -83,12 +84,28 @@ ACTIONS = {
         NavigationAction(
             "last_saved", "Последнее сохранённое", "Последняя запись inbox.", "last_saved_command"
         ),
-        NavigationAction("today", "Фокус дня", "Короткий план на сегодня.", "today"),
         NavigationAction(
-            "reminder_guide",
-            "Как создать напоминание",
-            "Напиши задачу и время естественной фразой.",
-            example="Напомни через 30 минут позвонить в клинику",
+            "task_today", "Сегодня", "Задачи на локальную календарную дату.", "task_today"
+        ),
+        NavigationAction(
+            "task_upcoming", "Предстоящие", "Задачи после сегодняшнего дня.", "task_upcoming"
+        ),
+        NavigationAction(
+            "task_overdue", "Просроченные", "Активные задачи с прошедшим сроком.", "task_overdue"
+        ),
+        NavigationAction("task_no_due", "Без срока", "Активные задачи без срока.", "task_no_due"),
+        NavigationAction("task_completed", "Выполненные", "Завершённые задачи.", "task_completed"),
+        NavigationAction(
+            "task_create",
+            "Создать задачу",
+            "Создание через общий preview и confirm.",
+            "task_create",
+        ),
+        NavigationAction(
+            "task_reminder_guide",
+            "Как работают напоминания",
+            "Срок, напоминание, перенос и безопасная отмена доставки.",
+            "task_reminder_guide",
         ),
         NavigationAction(
             "vision", "Открыть карту", "Желания, визуализация и личные фото.", "vision_command"
@@ -154,7 +171,15 @@ SECTIONS = {
             "✅",
             "Задачи и напоминания",
             "Задачи с раздельными временем события и напоминания.",
-            ("today", "reminder_guide"),
+            (
+                "task_today",
+                "task_upcoming",
+                "task_overdue",
+                "task_no_due",
+                "task_completed",
+                "task_create",
+                "task_reminder_guide",
+            ),
         ),
         NavigationSection(
             "vision",

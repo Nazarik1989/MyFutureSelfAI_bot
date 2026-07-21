@@ -90,6 +90,7 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
     assert names == [
         "menu",
         "inbox",
+        "tasks",
         "vision",
         "health",
         "checkin",

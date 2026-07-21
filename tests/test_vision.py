@@ -14,7 +14,7 @@ from telegram.ext import ApplicationHandlerStop
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
-from future_self.models import InboxItem, TaskReminder, VisionDraft, VisionItem
+from future_self.models import InboxItem, TaskReminder, TaskState, VisionDraft, VisionItem
 from future_self.vision import CATEGORY_META
 
 
@@ -449,6 +449,7 @@ async def test_create_task_is_atomic_idempotent_and_never_creates_reminder(db, f
         assert tasks[0].source == "vision"
         assert tasks[0].next_step == "Написать план"
         assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(TaskState.id))) == 1
 
 
 async def test_missing_first_step_does_not_create_task(db, fake_ai):

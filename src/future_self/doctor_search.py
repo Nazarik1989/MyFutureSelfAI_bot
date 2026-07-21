@@ -10,6 +10,7 @@ from .location import UserLocation, location_from_user
 from .models import InboxItem, TaskReminder, User
 from .reminders import reminder_for_inbox_item
 from .schemas import TemporalResolution
+from .tasks import add_task_state
 
 BOOKING_PHONE = "122"
 GOSUSLUGI_BOOKING_URL = "https://www.gosuslugi.ru/"
@@ -185,6 +186,13 @@ class DoctorSearchService:
             if reminder is not None:
                 session.add(reminder)
                 await session.flush()
+            await add_task_state(
+                session,
+                item,
+                owner_timezone=owner.timezone,
+                reminder=reminder,
+                date_event_hour=self.task_date_event_hour,
+            )
             return SearchTaskResult("created", item, reminder)
 
     @staticmethod

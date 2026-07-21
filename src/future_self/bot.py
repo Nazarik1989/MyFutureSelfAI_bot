@@ -77,6 +77,8 @@ from .repositories import (
 from .scheduler import JobQueueScheduler
 from .schemas import IntentResult, ParsedThought, TemporalResolution, VisionSummary
 from .system_actions import SystemActionRoute, SystemActionRouter
+from .task_handlers import TaskHandlers
+from .tasks import TaskService
 from .transcription import TranscriptionError, TranscriptionService
 from .vision import VisionService
 from .vision_handlers import VisionHandlers
@@ -135,7 +137,7 @@ def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | No
         logger.error("%s error_type=%s user_id=%s", event, error_type, user_id)
 
 
-class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
+class FutureSelfBot(LabHandlers, VisionHandlers, TaskHandlers, NavigationHandlers):
     def __init__(
         self,
         settings: Settings,
@@ -166,6 +168,12 @@ class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
             settings.system_action_ttl_minutes,
         )
         self.date_resolver = DateResolver()
+        self.task_service = TaskService(
+            db,
+            date_event_hour=settings.task_date_event_hour,
+            reminder_lead_minutes=settings.task_reminder_lead_minutes,
+            date_resolver=self.date_resolver,
+        )
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
@@ -208,7 +216,16 @@ class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
         app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-3)
         app.add_handler(
             CommandHandler(
-                ["inbox", "vision", "health", "checkin", "doctor", "location", "labs"],
+                [
+                    "inbox",
+                    "tasks",
+                    "vision",
+                    "health",
+                    "checkin",
+                    "doctor",
+                    "location",
+                    "labs",
+                ],
                 self.navigation_public_command_gate,
             ),
             group=-2,
@@ -377,6 +394,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
         app.add_handler(health_checkin)
         app.add_handler(doctor_prepare)
         app.add_handler(CommandHandler("menu", self.menu_command))
+        app.add_handler(CommandHandler("tasks", self.tasks_command))
         app.add_handler(CommandHandler("doctor", self.doctor_command))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
@@ -398,6 +416,7 @@ class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
         app.add_handler(CommandHandler("doctor_find", self.doctor_find))
         app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
+        app.add_handler(CallbackQueryHandler(self.task_callback, pattern=r"^task:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -434,6 +453,8 @@ class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
     async def _post_init(self, app: Application) -> None:
         self.lab_uploads.cleanup_startup()
         await self.lab_documents.cleanup_confirmations()
+        await self.task_service.cleanup_tokens()
+        await self.task_service.reconcile()
         await app.bot.set_my_commands(
             [BotCommand(item.command, item.description) for item in PUBLIC_COMMANDS],
             scope=BotCommandScopeAllPrivateChats(),
@@ -900,6 +921,8 @@ class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
         )
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self.task_pending_text(update):
+            return
         if await self._handle_vision_input(update, update.effective_message.text):
             return
         goal_id = context.user_data.pop("rename_goal_id", None)
@@ -2408,6 +2431,8 @@ class FutureSelfBot(LabHandlers, VisionHandlers, NavigationHandlers):
             pass
 
     async def cancel_draft_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self.cancel_task_input(update):
+            return
         user = await self._user(update.effective_user.id)
         if await self.vision_service.cancel(user.id, update.effective_chat.id):
             await update.effective_message.reply_text(

@@ -56,6 +56,9 @@ class User(TimestampMixin, Base):
     vision_items: Mapped[list[VisionItem]] = relationship(back_populates="owner")
     vision_item_images: Mapped[list[VisionItemImage]] = relationship(back_populates="owner")
     lab_documents: Mapped[list[LabDocument]] = relationship(back_populates="owner")
+    task_states: Mapped[list[TaskState]] = relationship(
+        back_populates="owner", overlaps="inbox_item,task_state"
+    )
 
 
 class DraftInboxItem(Base):
@@ -184,6 +187,7 @@ class Routine(TimestampMixin, Base):
 
 class InboxItem(TimestampMixin, Base):
     __tablename__ = "inbox_items"
+    __table_args__ = (UniqueConstraint("id", "user_id", name="uq_inbox_item_id_user"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     draft_id: Mapped[str | None] = mapped_column(
@@ -202,6 +206,12 @@ class InboxItem(TimestampMixin, Base):
     user: Mapped[User] = relationship(back_populates="inbox_items")
     reminder: Mapped[TaskReminder | None] = relationship(
         back_populates="inbox_item", uselist=False, cascade="all, delete-orphan"
+    )
+    task_state: Mapped[TaskState | None] = relationship(
+        back_populates="inbox_item",
+        uselist=False,
+        cascade="all, delete-orphan",
+        overlaps="owner,task_states",
     )
 
 
@@ -375,6 +385,69 @@ class VisionDraft(TimestampMixin, Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class TaskState(TimestampMixin, Base):
+    __tablename__ = "task_states"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["inbox_item_id", "owner_id"],
+            ["inbox_items.id", "inbox_items.user_id"],
+            ondelete="CASCADE",
+            name="fk_task_state_inbox_owner",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'completed', 'cancelled')",
+            name="ck_task_state_status",
+        ),
+        CheckConstraint("version > 0", name="ck_task_state_version"),
+        UniqueConstraint("owner_id", "inbox_item_id", name="uq_task_state_owner_item"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    inbox_item_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    timezone: Mapped[str] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    owner: Mapped[User] = relationship(
+        back_populates="task_states", overlaps="inbox_item,task_state"
+    )
+    inbox_item: Mapped[InboxItem] = relationship(
+        back_populates="task_state", overlaps="owner,task_states"
+    )
+
+
+class TaskActionToken(Base):
+    __tablename__ = "task_action_tokens"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["owner_id", "inbox_item_id"],
+            ["task_states.owner_id", "task_states.inbox_item_id"],
+            ondelete="CASCADE",
+            name="fk_task_action_state_owner",
+        ),
+        CheckConstraint("task_version > 0", name="ck_task_action_version"),
+        CheckConstraint(
+            "status IN ('pending', 'awaiting_input', 'consumed')",
+            name="ck_task_action_status",
+        ),
+    )
+
+    token: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    inbox_item_id: Mapped[int] = mapped_column(Integer, index=True)
+    task_version: Mapped[int] = mapped_column(Integer)
+    action: Mapped[str] = mapped_column(String(40), index=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class TaskReminder(TimestampMixin, Base):
     __tablename__ = "task_reminders"
 
@@ -388,6 +461,7 @@ class TaskReminder(TimestampMixin, Base):
     remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     timezone: Mapped[str] = mapped_column(String(64))
     delivery_key: Mapped[str] = mapped_column(String(80), unique=True)
+    task_version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     claim_token: Mapped[str | None] = mapped_column(String(36))
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

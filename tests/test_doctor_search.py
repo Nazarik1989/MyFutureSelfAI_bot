@@ -13,7 +13,7 @@ from future_self.doctor_search import (
     DoctorSearchService,
 )
 from future_self.location import UserLocation
-from future_self.models import DraftInboxItem, InboxItem, TaskReminder
+from future_self.models import DraftInboxItem, InboxItem, TaskReminder, TaskState
 
 
 class NoopTranscription:
@@ -140,6 +140,7 @@ async def test_doctor_find_task_creates_private_location_task_idempotently(db, f
     async with db.sessions() as session:
         assert await session.scalar(select(func.count(InboxItem.id))) == 1
         assert await session.scalar(select(func.count(TaskReminder.id))) == 1
+        assert await session.scalar(select(func.count(TaskState.id))) == 1
         assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
 
 
