@@ -44,6 +44,8 @@ PUBLIC_COMMANDS = (
     CommandSpec("help", "Помощь и примеры"),
 )
 
+WORKSPACE_PUBLIC_COMMANDS = (CommandSpec("spaces", "Совместные пространства"),)
+
 # Existing commands remain supported, but intentionally stay outside Telegram's
 # compact native menu. Keeping this explicit lets tests detect catalog drift.
 ADVANCED_COMMANDS = frozenset(
@@ -74,6 +76,8 @@ ADVANCED_COMMANDS = frozenset(
         "doctor_find_task",
     }
 )
+
+WORKSPACE_ADVANCED_COMMANDS = frozenset({"workspaces"})
 
 ACTIONS = {
     action.key: action
@@ -163,6 +167,15 @@ ACTIONS = {
     )
 }
 
+WORKSPACE_ACTIONS = {
+    "spaces": NavigationAction(
+        "spaces",
+        "Открыть пространства",
+        "Участники, приглашения и проекты в защищённом общем контуре.",
+        "spaces_command",
+    )
+}
+
 SECTIONS = {
     section.key: section
     for section in (
@@ -233,6 +246,14 @@ SECTIONS = {
     )
 }
 
+WORKSPACE_SECTION = NavigationSection(
+    "spaces",
+    "🤝",
+    "Совместные пространства",
+    "Отдельный защищённый контур с участниками, ролями, приглашениями и проектами.",
+    ("spaces",),
+)
+
 HELP_TOPICS = {
     "quick": (
         "Быстрый старт",
@@ -272,6 +293,69 @@ HELP_TOPICS = {
         "помощью.",
     ),
 }
+
+
+def public_commands(enable_workspace_access: bool = False) -> tuple[CommandSpec, ...]:
+    """Return the native command catalog without exposing disabled features."""
+
+    if not enable_workspace_access:
+        return PUBLIC_COMMANDS
+    result: list[CommandSpec] = []
+    for item in PUBLIC_COMMANDS:
+        result.append(item)
+        if item.command == "collections":
+            result.extend(WORKSPACE_PUBLIC_COMMANDS)
+    return tuple(result)
+
+
+def advanced_commands(enable_workspace_access: bool = False) -> frozenset[str]:
+    return (
+        ADVANCED_COMMANDS | WORKSPACE_ADVANCED_COMMANDS
+        if enable_workspace_access
+        else ADVANCED_COMMANDS
+    )
+
+
+def navigation_actions(enable_workspace_access: bool = False) -> dict[str, NavigationAction]:
+    if not enable_workspace_access:
+        return ACTIONS
+    return {**ACTIONS, **WORKSPACE_ACTIONS}
+
+
+def navigation_sections(enable_workspace_access: bool = False) -> dict[str, NavigationSection]:
+    if not enable_workspace_access:
+        return SECTIONS
+    result: dict[str, NavigationSection] = {}
+    for key, section in SECTIONS.items():
+        result[key] = section
+        if key == "collections":
+            result[WORKSPACE_SECTION.key] = WORKSPACE_SECTION
+    return result
+
+
+def help_topics(enable_workspace_access: bool = False) -> dict[str, tuple[str, str]]:
+    """Build flag-aware help text while keeping the PR #22 constants stable."""
+
+    if not enable_workspace_access:
+        return HELP_TOPICS
+    topics = dict(HELP_TOPICS)
+    sections = navigation_sections(True)
+    topics["features"] = (
+        "Что умеет бот",
+        "\n".join(f"{item.emoji} {item.label} — {item.description}" for item in sections.values()),
+    )
+    topics["commands"] = (
+        "Основные команды",
+        "\n".join(f"/{item.command} — {item.description}" for item in public_commands(True)),
+    )
+    topics["privacy"] = (
+        "Конфиденциальность",
+        "Бот работает только в личном чате. Личные карточки, анализы, health-данные "
+        "и личные разделы не становятся общими автоматически. Пространства открывают "
+        "только свои данные участникам с действующим доступом. Telegram ID не включаются "
+        "в диагностические логи. Явные команды разделов обрабатываются без LLM.",
+    )
+    return topics
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,19 +418,22 @@ class NavigationFlowStore:
             self._sessions.pop(token, None)
 
 
-def validate_catalog() -> None:
-    command_names = [item.command for item in PUBLIC_COMMANDS]
+def validate_catalog(enable_workspace_access: bool = False) -> None:
+    commands = public_commands(enable_workspace_access)
+    actions = navigation_actions(enable_workspace_access)
+    sections = navigation_sections(enable_workspace_access)
+    command_names = [item.command for item in commands]
     if len(command_names) != len(set(command_names)):
         raise ValueError("Duplicate public navigation commands")
     used_actions: set[str] = set()
-    for section in SECTIONS.values():
+    for section in sections.values():
         if not section.actions:
             raise ValueError(f"Empty navigation section: {section.key}")
         for action in section.actions:
-            if action not in ACTIONS:
+            if action not in actions:
                 raise ValueError(f"Unknown navigation action: {action}")
             used_actions.add(action)
-    if used_actions != set(ACTIONS):
+    if used_actions != set(actions):
         raise ValueError("Unreachable navigation action")
 
 

@@ -67,7 +67,7 @@ from .labs import LabDocumentService, LabUploadSessionStore
 from .location import LocationService, location_from_user, parse_location
 from .models import DraftInboxItem, Goal, InboxItem, Routine, User, VisionProfile
 from .natural_commands import NaturalAction, NaturalCommandRouter
-from .navigation import PUBLIC_COMMANDS, NavigationFlowStore
+from .navigation import NavigationFlowStore, public_commands
 from .navigation_handlers import NavigationHandlers
 from .reminders import TaskReminderEngine
 from .repositories import (
@@ -91,6 +91,8 @@ from .vision_renderer import (
     VisionRenderLimiter,
     VisionRenderSessionStore,
 )
+from .workspace_access import WorkspaceAccessService
+from .workspace_handlers import WorkspaceHandlers
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +143,12 @@ def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | No
 
 
 class FutureSelfBot(
-    LabHandlers, VisionHandlers, TaskHandlers, CollectionHandlers, NavigationHandlers
+    LabHandlers,
+    VisionHandlers,
+    TaskHandlers,
+    CollectionHandlers,
+    WorkspaceHandlers,
+    NavigationHandlers,
 ):
     def __init__(
         self,
@@ -163,7 +170,9 @@ class FutureSelfBot(
         self.action_service = DraftActionService(self.draft_service)
         self.action_router = ActionCommandRouter()
         self.system_action_router = SystemActionRouter()
-        self.natural_command_router = NaturalCommandRouter()
+        self.natural_command_router = NaturalCommandRouter(
+            enable_workspace_access=getattr(settings, "enable_workspace_access", False)
+        )
         self.navigation_flow_sessions = NavigationFlowStore()
         self.conversation = ConversationContextService(
             db,
@@ -187,6 +196,7 @@ class FutureSelfBot(
             context_ttl=timedelta(minutes=settings.collection_context_ttl_minutes),
             task_date_event_hour=settings.task_date_event_hour,
         )
+        self.workspace_service = WorkspaceAccessService(db)
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
@@ -227,25 +237,32 @@ class FutureSelfBot(
         # group/channel replies would disclose that data to other chat members,
         # so stop every non-private update before any feature handler sees it.
         app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-3)
+        gated_public_commands = [
+            "inbox",
+            "tasks",
+            "collections",
+            "vision",
+            "health",
+            "checkin",
+            "doctor",
+            "location",
+            "labs",
+        ]
+        if getattr(self.settings, "enable_workspace_access", False):
+            gated_public_commands.extend(("spaces", "workspaces"))
         app.add_handler(
             CommandHandler(
-                [
-                    "inbox",
-                    "tasks",
-                    "collections",
-                    "vision",
-                    "health",
-                    "checkin",
-                    "doctor",
-                    "location",
-                    "labs",
-                ],
+                gated_public_commands,
                 self.navigation_public_command_gate,
             ),
             group=-2,
         )
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.navigation_text_gate),
+            group=-2,
+        )
+        app.add_handler(
+            CallbackQueryHandler(self.workspace_other_callback_gate),
             group=-2,
         )
         # Vision drafts must keep receiving text/voice even while another PTB
@@ -410,6 +427,8 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("menu", self.menu_command))
         app.add_handler(CommandHandler("tasks", self.tasks_command))
         app.add_handler(CommandHandler("collections", self.collections_command))
+        if getattr(self.settings, "enable_workspace_access", False):
+            app.add_handler(CommandHandler(["spaces", "workspaces"], self.spaces_command))
         app.add_handler(CommandHandler("doctor", self.doctor_command))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
@@ -433,6 +452,8 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
         app.add_handler(CallbackQueryHandler(self.task_callback, pattern=r"^task:"))
         app.add_handler(CallbackQueryHandler(self.collection_callback, pattern=r"^collection:"))
+        if getattr(self.settings, "enable_workspace_access", False):
+            app.add_handler(CallbackQueryHandler(self.workspace_callback, pattern=r"^spacei?:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -472,8 +493,11 @@ class FutureSelfBot(
         await self.task_service.cleanup_tokens()
         await self.task_service.reconcile()
         await self.collection_service.cleanup()
+        if getattr(self.settings, "enable_workspace_access", False):
+            await self.workspace_service.cleanup()
+        commands = public_commands(getattr(self.settings, "enable_workspace_access", False))
         await app.bot.set_my_commands(
-            [BotCommand(item.command, item.description) for item in PUBLIC_COMMANDS],
+            [BotCommand(item.command, item.description) for item in commands],
             scope=BotCommandScopeAllPrivateChats(),
         )
         await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -532,6 +556,8 @@ class FutureSelfBot(
             )
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        if await self.workspace_start_invitation(update, context):
+            return ConversationHandler.END
         user = await self._user(update.effective_user.id)
         if user.onboarding_completed:
             await update.effective_message.reply_text(
@@ -938,6 +964,8 @@ class FutureSelfBot(
         )
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self.workspace_pending_text(update, update.effective_message.text or "", "text"):
+            return
         if await self.collection_pending_text(update, update.effective_message.text or "", "text"):
             return
         if await self.task_pending_text(update):
@@ -993,6 +1021,9 @@ class FutureSelfBot(
             await progress.edit_text(
                 "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
             )
+            return
+        if await self.workspace_pending_text(update, text, "voice"):
+            await progress.edit_text("Голос распознан и обработан в пространстве.")
             return
         if await self.collection_pending_text(update, text, "voice"):
             await progress.edit_text("Голос распознан и обработан в разделе.")
@@ -1245,6 +1276,15 @@ class FutureSelfBot(
             "show_collections": self.collections_command,
             "help": self.help_command,
         }
+        if action in {
+            "show_spaces",
+            "create_space",
+            "invite_space_member",
+            "show_space_invitations",
+            "show_space_members",
+        }:
+            await self.handle_workspace_natural(update, context, action)
+            return
         await handlers[action](update, context)
 
     async def _confirm_pending_date(
@@ -2456,6 +2496,11 @@ class FutureSelfBot(
             pass
 
     async def cancel_draft_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self.cancel_workspace_state(update):
+            await update.effective_message.reply_text(
+                "Операция с пространством отменена. Выбранный контекст не изменён."
+            )
+            return
         collection_cancelled = await self.cancel_collection_state(update)
         if await self.cancel_task_input(update):
             return

@@ -18,6 +18,8 @@ MVP Telegram-ассистента, который связывает образ 
   IANA timezone, восстановление после рестарта, lease и защита от повторной отправки;
 - Life Areas & Smart Collections: пользовательские темы, проекты и списки связывают
   существующие записи Inbox и Task Hub без копирования содержимого или состояния задач;
+- совместные пространства с отдельным ACL-контуром: роли owner/editor/viewer,
+  одноразовые приглашения, проекты, немедленный revoke и перезапускоустойчивые действия;
 - private-chat-only transport: любые сообщения и callback в группах/каналах блокируются до
   feature handlers, а reminder доставляется по Telegram ID владельца, не по сохранённому chat ID;
 - Health Track MVP: приватные пошаговые check-in, субъективная шкала 0–100, недельная
@@ -110,6 +112,8 @@ credentials нельзя использовать для публичного и
 - `/inbox` — последние подтверждённые мысли;
 - `/tasks` — Task Hub: активные, предстоящие, просроченные и выполненные задачи;
 - `/collections` — «Мои разделы»: темы, проекты, списки и стартовые сферы по явному выбору;
+- `/spaces` — совместные пространства, участники, приглашения и workspace-проекты;
+  `/workspaces` остаётся расширенным алиасом;
 - `/drafts` — активные preview-карточки с действиями «Открыть», «Сохранить» и «Удалить»;
 - `/last_saved` — последняя подтверждённая запись inbox;
 - `/cleanup_drafts` — открыть подтверждение очистки активных drafts, ничего не удаляя сразу;
@@ -181,10 +185,22 @@ PDF pipeline использует `pypdf` (BSD-3-Clause) для локально
 Навигация строится из единого декларативного каталога: те же названия и описания
 используются в главном меню, справке и native Telegram-командах. В native-меню
 показываются только `/menu`, `/inbox`, `/tasks`, `/collections`, `/vision`, `/health`,
-`/checkin`, `/doctor`, `/labs`, `/location` и `/help`; расширенные legacy-команды продолжают
-работать. Если открыт
+`/checkin`, `/doctor`, `/labs`, `/location` и `/help`; при явном включении Access
+foundation к ним добавляется `/spaces`. Расширенные legacy-команды продолжают работать.
+Если открыт
 check-in, подготовка к врачу, карточка желания или другой пошаговый сценарий, `/menu`
 предлагает явно продолжить его либо выйти, очищая только текущее состояние.
+
+`/collections` и `/spaces` не взаимозаменяемы. «Мои разделы» организуют только личные
+записи владельца, а workspace является отдельной границей доступа. Создатель получает
+роль owner; owner управляет участниками и приглашениями, owner/editor — проектами,
+viewer — только чтением. Последнего owner нельзя удалить, понизить или вывести без
+предварительной передачи владения. Отзыв membership атомарно инвалидирует активный
+контекст и старые кнопки. Telegram-имя и произвольный `@username` не используются для
+поиска получателя: direct invite возможен только для уже однозначно известного боту
+внутреннего пользователя, иначе создаётся одноразовая deep link с TTL. В БД хранится
+только hash токена; принятие всегда требует явного подтверждения. Личные Vision,
+Inbox, Tasks, Collections, Health, Doctor и Labs автоматически не публикуются.
 
 ## Разработка
 
@@ -241,6 +257,7 @@ ENABLE_TASK_REMINDERS=true
 COLLECTION_ACTION_TTL_MINUTES=15
 COLLECTION_INPUT_TTL_MINUTES=20
 COLLECTION_CONTEXT_TTL_MINUTES=20
+ENABLE_WORKSPACE_ACCESS=false
 ```
 
 Pending-доставка переживает рестарт процесса. Worker атомарно захватывает запись по lease,
@@ -288,11 +305,14 @@ TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 
 Помимо провайдеров можно настроить строку БД, часовой пояс, имя и тон ассистента, расписание, ограничения аудио и feature flags.
 
-Knowledge Hub и Council пока не реализованы. PR #22 добавляет только принятые
-архитектурные решения, выключенные feature flags, bounded quotas и общую fail-closed
-границу `safe_media`. Ни один новый Telegram handler, worker или доменная таблица не
-активируется. Текущие решения и hardened production profile описаны в
+PR #23 добавляет только Access/Workspace foundation. Его UI включается независимо через
+`ENABLE_WORKSPACE_ACCESS`; по умолчанию флаг выключен и команда/кнопки отсутствуют.
+Capture, ingestion runner, retrieval, embeddings, OCR, Knowledge media, Council,
+scheduling и export всё ещё не реализованы и не активируются этим флагом. Workspace CRUD,
+ACL и навигация детерминированы и не вызывают LLM или внешние провайдеры. Текущие решения
+и hardened production profile описаны в
 [ADR-0001](docs/adr/0001-knowledge-hub-council-foundation.md) и
+[ADR-0002](docs/adr/0002-access-workspace-foundation.md), а также в
 [production hardening runbook](docs/operations/production-hardening.md).
 
 ## Структура
@@ -319,6 +339,7 @@ src/future_self/
   lab_pdf_worker.py  совместимый entrypoint общего PDFium worker
   labs.py            owner-isolated документы, BLOB-страницы и capabilities
   lab_handlers.py    Telegram preview/confirm/list/view/edit/delete flow
+  workspace_access.py ACL, invitations, contexts и restart-safe capabilities
   config.py          personality, schedule и feature flags
   prompts.py         системные промпты
 alembic/              миграции схемы

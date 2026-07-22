@@ -20,6 +20,7 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -623,6 +624,357 @@ class LifeCollectionActionToken(Base):
     collection_id: Mapped[int | None] = mapped_column(Integer, index=True)
     collection_version: Mapped[int | None] = mapped_column(Integer)
     inbox_item_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    action: Mapped[str] = mapped_column(String(48), index=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Workspace(TimestampMixin, Base):
+    """A collaboration boundary, distinct from owner-only LifeCollection rows."""
+
+    __tablename__ = "workspaces"
+    __table_args__ = (
+        UniqueConstraint("id", "created_by_user_id", name="uq_workspace_id_creator"),
+        UniqueConstraint(
+            "created_by_user_id",
+            "normalized_name",
+            name="uq_workspace_creator_normalized_name",
+        ),
+        CheckConstraint(
+            "character IN ('pair', 'friends', 'family', 'team', 'custom')",
+            name="ck_workspace_character",
+        ),
+        CheckConstraint("status IN ('active', 'archived')", name="ck_workspace_status"),
+        CheckConstraint("access_epoch > 0", name="ck_workspace_access_epoch"),
+        CheckConstraint("version > 0", name="ck_workspace_version"),
+        CheckConstraint("length(name) BETWEEN 1 AND 100", name="ck_workspace_name_length"),
+        CheckConstraint(
+            "length(normalized_name) BETWEEN 1 AND 100",
+            name="ck_workspace_normalized_name_length",
+        ),
+        CheckConstraint(
+            "description IS NULL OR length(description) BETWEEN 1 AND 500",
+            name="ck_workspace_description_length",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    normalized_name: Mapped[str] = mapped_column(String(100))
+    character: Mapped[str] = mapped_column(String(20), index=True)
+    description: Mapped[str | None] = mapped_column(String(500))
+    created_by_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    access_epoch: Mapped[int] = mapped_column(Integer, default=1)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class WorkspaceMember(TimestampMixin, Base):
+    __tablename__ = "workspace_members"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "user_id", name="uq_workspace_member_user"),
+        CheckConstraint("role IN ('owner', 'editor', 'viewer')", name="ck_workspace_member_role"),
+        CheckConstraint(
+            "status IN ('active', 'revoked', 'left')",
+            name="ck_workspace_member_status",
+        ),
+        CheckConstraint("version > 0", name="ck_workspace_member_version"),
+        CheckConstraint(
+            "(status = 'active' AND revoked_at IS NULL) OR "
+            "(status IN ('revoked', 'left') AND revoked_at IS NOT NULL)",
+            name="ck_workspace_member_revocation_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    role: Mapped[str] = mapped_column(String(20), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    invited_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class WorkspaceInvitation(TimestampMixin, Base):
+    __tablename__ = "workspace_invitations"
+    __table_args__ = (
+        UniqueConstraint("id", "workspace_id", name="uq_workspace_invitation_id_workspace"),
+        UniqueConstraint("token_hash", name="uq_workspace_invitation_token_hash"),
+        CheckConstraint("role IN ('editor', 'viewer')", name="ck_workspace_invitation_role"),
+        CheckConstraint(
+            "delivery_mode IN ('direct', 'share')",
+            name="ck_workspace_invitation_delivery_mode",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'accepted', 'declined', 'revoked', 'expired')",
+            name="ck_workspace_invitation_status",
+        ),
+        CheckConstraint("version > 0", name="ck_workspace_invitation_version"),
+        CheckConstraint("length(token_hash) = 64", name="ck_workspace_invitation_hash_length"),
+        CheckConstraint(
+            "length(template_key) BETWEEN 1 AND 64",
+            name="ck_workspace_invitation_template_length",
+        ),
+        CheckConstraint(
+            "custom_text IS NULL OR length(custom_text) BETWEEN 1 AND 1000",
+            name="ck_workspace_invitation_custom_text_length",
+        ),
+        CheckConstraint(
+            "(delivery_mode = 'direct' AND intended_user_id IS NOT NULL) OR "
+            "(delivery_mode = 'share' AND intended_user_id IS NULL)",
+            name="ck_workspace_invitation_recipient",
+        ),
+        CheckConstraint(
+            "intended_user_id IS NULL OR intended_user_id != inviter_user_id",
+            name="ck_workspace_invitation_not_self",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND consumed_at IS NULL AND revoked_at IS NULL) OR "
+            "(status IN ('accepted', 'declined') AND consumed_at IS NOT NULL "
+            "AND revoked_at IS NULL) OR "
+            "(status = 'revoked' AND consumed_at IS NULL AND revoked_at IS NOT NULL) OR "
+            "(status = 'expired' AND consumed_at IS NULL AND revoked_at IS NULL)",
+            name="ck_workspace_invitation_terminal_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    inviter_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    intended_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(20))
+    delivery_mode: Mapped[str] = mapped_column(String(20))
+    template_key: Mapped[str] = mapped_column(String(64))
+    custom_text: Mapped[str | None] = mapped_column(String(1000))
+    token_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class WorkspaceProject(TimestampMixin, Base):
+    """A shared-space project; never aliases LifeCollection(kind='project')."""
+
+    __tablename__ = "workspace_projects"
+    __table_args__ = (
+        UniqueConstraint("id", "workspace_id", name="uq_workspace_project_id_workspace"),
+        UniqueConstraint(
+            "workspace_id", "normalized_name", name="uq_workspace_project_normalized_name"
+        ),
+        CheckConstraint("status IN ('active', 'archived')", name="ck_workspace_project_status"),
+        CheckConstraint("version > 0", name="ck_workspace_project_version"),
+        CheckConstraint("length(name) BETWEEN 1 AND 100", name="ck_workspace_project_name_length"),
+        CheckConstraint(
+            "length(normalized_name) BETWEEN 1 AND 100",
+            name="ck_workspace_project_normalized_name_length",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(100))
+    normalized_name: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class KnowledgeSpace(TimestampMixin, Base):
+    __tablename__ = "knowledge_spaces"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_project_id", "workspace_id"],
+            ["workspace_projects.id", "workspace_projects.workspace_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_space_project_workspace",
+        ),
+        CheckConstraint(
+            "kind IN ('personal', 'workspace', 'project')", name="ck_knowledge_space_kind"
+        ),
+        CheckConstraint("status IN ('active', 'archived')", name="ck_knowledge_space_status"),
+        CheckConstraint("version > 0", name="ck_knowledge_space_version"),
+        CheckConstraint(
+            "(kind = 'personal' AND personal_owner_user_id IS NOT NULL "
+            "AND workspace_id IS NULL AND workspace_project_id IS NULL) OR "
+            "(kind = 'workspace' AND personal_owner_user_id IS NULL "
+            "AND workspace_id IS NOT NULL AND workspace_project_id IS NULL) OR "
+            "(kind = 'project' AND personal_owner_user_id IS NULL "
+            "AND workspace_id IS NOT NULL AND workspace_project_id IS NOT NULL)",
+            name="ck_knowledge_space_scope",
+        ),
+        Index(
+            "uq_knowledge_space_personal_owner",
+            "personal_owner_user_id",
+            unique=True,
+            sqlite_where=text("kind = 'personal'"),
+            postgresql_where=text("kind = 'personal'"),
+        ),
+        Index(
+            "uq_knowledge_space_workspace",
+            "workspace_id",
+            unique=True,
+            sqlite_where=text("kind = 'workspace'"),
+            postgresql_where=text("kind = 'workspace'"),
+        ),
+        Index(
+            "uq_knowledge_space_project",
+            "workspace_project_id",
+            unique=True,
+            sqlite_where=text("kind = 'project'"),
+            postgresql_where=text("kind = 'project'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    personal_owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    workspace_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    workspace_project_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class WorkspaceContext(TimestampMixin, Base):
+    __tablename__ = "workspace_contexts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "actor_user_id"],
+            ["workspace_members.workspace_id", "workspace_members.user_id"],
+            ondelete="CASCADE",
+            name="fk_workspace_context_member",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_project_id", "workspace_id"],
+            ["workspace_projects.id", "workspace_projects.workspace_id"],
+            ondelete="CASCADE",
+            name="fk_workspace_context_project",
+        ),
+        UniqueConstraint("actor_user_id", "chat_id", name="uq_workspace_context_actor_chat"),
+        CheckConstraint("workspace_access_epoch > 0", name="ck_workspace_context_access_epoch"),
+        CheckConstraint("version > 0", name="ck_workspace_context_version"),
+        CheckConstraint(
+            "(workspace_project_id IS NULL AND workspace_project_version IS NULL) OR "
+            "(workspace_project_id IS NOT NULL AND workspace_project_version IS NOT NULL "
+            "AND workspace_project_version > 0)",
+            name="ck_workspace_context_project_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    workspace_id: Mapped[int] = mapped_column(Integer, index=True)
+    workspace_access_epoch: Mapped[int] = mapped_column(Integer)
+    workspace_project_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    workspace_project_version: Mapped[int | None] = mapped_column(Integer)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class WorkspaceActionToken(Base):
+    __tablename__ = "workspace_action_tokens"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_project_id", "workspace_id"],
+            ["workspace_projects.id", "workspace_projects.workspace_id"],
+            ondelete="CASCADE",
+            name="fk_workspace_action_project",
+        ),
+        ForeignKeyConstraint(
+            ["invitation_id", "workspace_id"],
+            ["workspace_invitations.id", "workspace_invitations.workspace_id"],
+            ondelete="CASCADE",
+            name="fk_workspace_action_invitation",
+        ),
+        CheckConstraint(
+            "scope_kind IN ('wizard', 'workspace', 'invitation')",
+            name="ck_workspace_action_scope_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'awaiting_input', 'consumed')",
+            name="ck_workspace_action_status",
+        ),
+        CheckConstraint(
+            "(status IN ('pending', 'awaiting_input') AND consumed_at IS NULL) OR "
+            "(status = 'consumed' AND consumed_at IS NOT NULL)",
+            name="ck_workspace_action_consumed_time",
+        ),
+        CheckConstraint("length(token_hash) = 64", name="ck_workspace_action_hash_length"),
+        CheckConstraint("length(action) BETWEEN 1 AND 48", name="ck_workspace_action_length"),
+        CheckConstraint(
+            "(scope_kind = 'wizard' AND workspace_id IS NULL "
+            "AND workspace_access_epoch IS NULL AND workspace_version IS NULL "
+            "AND workspace_status_snapshot IS NULL "
+            "AND workspace_project_id IS NULL AND workspace_project_version IS NULL "
+            "AND workspace_project_status_snapshot IS NULL "
+            "AND invitation_id IS NULL AND invitation_version IS NULL) OR "
+            "(scope_kind = 'workspace' AND workspace_id IS NOT NULL "
+            "AND workspace_access_epoch IS NOT NULL AND workspace_access_epoch > 0 "
+            "AND workspace_version IS NOT NULL AND workspace_version > 0 "
+            "AND workspace_status_snapshot IN ('active', 'archived') "
+            "AND invitation_id IS NULL AND invitation_version IS NULL) OR "
+            "(scope_kind = 'invitation' AND workspace_id IS NOT NULL "
+            "AND workspace_access_epoch IS NULL AND workspace_version IS NULL "
+            "AND workspace_status_snapshot IS NULL "
+            "AND workspace_project_id IS NULL AND workspace_project_version IS NULL "
+            "AND workspace_project_status_snapshot IS NULL "
+            "AND invitation_id IS NOT NULL AND invitation_version IS NOT NULL "
+            "AND invitation_version > 0)",
+            name="ck_workspace_action_scope",
+        ),
+        CheckConstraint(
+            "(workspace_project_id IS NULL AND workspace_project_version IS NULL "
+            "AND workspace_project_status_snapshot IS NULL) OR "
+            "(scope_kind = 'workspace' AND workspace_project_id IS NOT NULL "
+            "AND workspace_project_version IS NOT NULL AND workspace_project_version > 0 "
+            "AND workspace_project_status_snapshot IN ('active', 'archived'))",
+            name="ck_workspace_action_project_version",
+        ),
+    )
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    scope_kind: Mapped[str] = mapped_column(String(20))
+    workspace_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    workspace_access_epoch: Mapped[int | None] = mapped_column(Integer)
+    workspace_version: Mapped[int | None] = mapped_column(Integer)
+    workspace_status_snapshot: Mapped[str | None] = mapped_column(String(20))
+    workspace_project_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    workspace_project_version: Mapped[int | None] = mapped_column(Integer)
+    workspace_project_status_snapshot: Mapped[str | None] = mapped_column(String(20))
+    invitation_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    invitation_version: Mapped[int | None] = mapped_column(Integer)
     action: Mapped[str] = mapped_column(String(48), index=True)
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)

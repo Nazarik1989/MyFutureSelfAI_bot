@@ -72,7 +72,7 @@ def test_lab_migration_upgrades_copy_preserves_data_enforces_constraints_and_dow
     connection = sqlite3.connect(migrated)
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260720_0017"
+        "20260722_0018"
     )
     assert (
         connection.execute(

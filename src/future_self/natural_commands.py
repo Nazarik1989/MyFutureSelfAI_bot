@@ -71,6 +71,11 @@ NaturalAction = Literal[
     "show_profile",
     "show_today",
     "show_collections",
+    "show_spaces",
+    "create_space",
+    "invite_space_member",
+    "show_space_invitations",
+    "show_space_members",
     "help",
 ]
 
@@ -82,6 +87,16 @@ class NaturalCommand:
 
 class NaturalCommandRouter:
     """Deterministic read-only commands routed before all content processing."""
+
+    WORKSPACE_ACTIONS = frozenset(
+        {
+            "show_spaces",
+            "create_space",
+            "invite_space_member",
+            "show_space_invitations",
+            "show_space_members",
+        }
+    )
 
     PATTERNS: dict[NaturalAction, tuple[str, ...]] = {
         "menu": (
@@ -129,6 +144,27 @@ class NaturalCommandRouter:
             "открой мои разделы",
             "покажи разделы",
         ),
+        "show_spaces": (
+            "покажи мои пространства",
+            "открой мои пространства",
+            "покажи совместные пространства",
+        ),
+        "create_space": (
+            "создай совместное пространство",
+            "создать совместное пространство",
+        ),
+        "invite_space_member": (
+            "пригласить участника",
+            "пригласи участника",
+        ),
+        "show_space_invitations": (
+            "покажи приглашения",
+            "покажи приглашения в пространство",
+        ),
+        "show_space_members": (
+            "покажи участников",
+            "покажи участников пространства",
+        ),
         "help": (
             "помощь",
             "покажи помощь",
@@ -142,6 +178,9 @@ class NaturalCommandRouter:
     }
     WRITE_INBOX = ("добавь в inbox", "добавь в инбокс", "запиши в inbox", "запиши в инбокс")
 
+    def __init__(self, *, enable_workspace_access: bool = False):
+        self.enable_workspace_access = enable_workspace_access
+
     def route(self, text: str) -> NaturalCommand | None:
         normalized = self._normalize(text)
         if is_save_inbox_command(text) or any(
@@ -149,9 +188,20 @@ class NaturalCommandRouter:
         ):
             return None
         for action, patterns in self.PATTERNS.items():
+            if action in self.WORKSPACE_ACTIONS and not self.enable_workspace_access:
+                continue
+            exact_actions = {
+                "menu",
+                "help",
+                "show_spaces",
+                "create_space",
+                "invite_space_member",
+                "show_space_invitations",
+                "show_space_members",
+            }
             matches = (
                 normalized in patterns
-                if action in {"menu", "help"}
+                if action in exact_actions
                 else any(pattern in normalized for pattern in patterns)
             )
             if matches:
