@@ -46,7 +46,11 @@ def run(
     transcription: TranscriptionService | None = None,
     application_runner: ApplicationRunner | None = None,
 ) -> None:
-    db = Database(settings.database_url)
+    db = Database(
+        settings.database_url,
+        sqlite_busy_timeout_ms=settings.sqlite_busy_timeout_ms,
+        sqlite_wal_enabled=settings.sqlite_wal_enabled,
+    )
     ai_service = ai or create_ai_service(settings)
     transcription_service = transcription or create_transcription_service(settings)
     try:

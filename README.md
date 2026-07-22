@@ -33,7 +33,8 @@ MVP Telegram-ассистента, который связывает образ 
   owner-safe выход из незавершённых сценариев и компактное native Telegram-меню;
 - текстовый и голосовой inbox с проверкой расшифровки и отдельным callback до сохранения;
 - персональный `/today` и пятишаговая неосуждающая рефлексия `/evening`;
-- async SQLAlchemy, Alembic, SQLite локально и PostgreSQL в production;
+- async SQLAlchemy и Alembic; текущий production использует SQLite, PostgreSQL остаётся
+  поддерживаемым целевым backend;
 - независимые OpenRouter/OpenAI-compatible text AI и Speech-to-Text клиенты;
 - конфигурируемые имя, тон, расписание, лимиты аудио и продуктовые флаги.
 
@@ -89,6 +90,9 @@ DATABASE_URL=postgresql+asyncpg://future_self:future_self@localhost:5432/future_
 ```
 
 И выполните `alembic upgrade head`. `docker compose` поднимает только локальную БД; самого бота удобно запускать из виртуального окружения. Docker-образ приложения также доступен через `docker build -t future-self-bot .`.
+
+Compose публикует демонстрационный PostgreSQL только на loopback `127.0.0.1`; его
+credentials нельзя использовать для публичного или production-развёртывания.
 
 ## Команды
 
@@ -284,6 +288,13 @@ TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 
 Помимо провайдеров можно настроить строку БД, часовой пояс, имя и тон ассистента, расписание, ограничения аудио и feature flags.
 
+Knowledge Hub и Council пока не реализованы. PR #22 добавляет только принятые
+архитектурные решения, выключенные feature flags, bounded quotas и общую fail-closed
+границу `safe_media`. Ни один новый Telegram handler, worker или доменная таблица не
+активируется. Текущие решения и hardened production profile описаны в
+[ADR-0001](docs/adr/0001-knowledge-hub-council-foundation.md) и
+[production hardening runbook](docs/operations/production-hardening.md).
+
 ## Структура
 
 ```text
@@ -303,8 +314,9 @@ src/future_self/
   scheduler.py       изолированный JobQueue adapter
   reminders.py       persistent outbox задач и Telegram-доставка напоминаний
   vision_renderer.py локальный owner-safe PNG renderer карты желаний
-  lab_media.py       локальная проверка и нормализация image/PDF
-  lab_pdf_worker.py  изолированный PDFium raster subprocess
+  safe_media/        недоменные fail-closed image/PDF/subprocess primitives
+  lab_media.py       Labs-adapter поверх общей safe_media boundary
+  lab_pdf_worker.py  совместимый entrypoint общего PDFium worker
   labs.py            owner-isolated документы, BLOB-страницы и capabilities
   lab_handlers.py    Telegram preview/confirm/list/view/edit/delete flow
   config.py          personality, schedule и feature flags

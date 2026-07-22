@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import os
 import re
 import sys
 from collections.abc import Awaitable, Callable
@@ -98,12 +99,37 @@ def _package_version(name: str) -> str:
         return "not installed"
 
 
-async def _check_database(report: DoctorReport, database_url: str) -> None:
-    database = Database(database_url)
+async def _check_database(
+    report: DoctorReport,
+    database_url: str,
+    *,
+    sqlite_busy_timeout_ms: int,
+    sqlite_wal_enabled: bool,
+) -> None:
+    database = Database(
+        database_url,
+        sqlite_busy_timeout_ms=sqlite_busy_timeout_ms,
+        sqlite_wal_enabled=sqlite_wal_enabled,
+    )
     try:
         async with database.sessions() as session:
             await session.execute(text("SELECT 1"))
+            if database.engine.url.get_backend_name() == "sqlite":
+                busy_timeout = await session.scalar(text("PRAGMA busy_timeout"))
+                journal_mode = str(await session.scalar(text("PRAGMA journal_mode"))).casefold()
+            else:
+                busy_timeout = None
+                journal_mode = None
         report.add("database", "OK", "Async database connection is available")
+        if busy_timeout is not None:
+            runtime_ok = int(busy_timeout) == sqlite_busy_timeout_ms and (
+                not database.sqlite_wal_enabled or journal_mode == "wal"
+            )
+            report.add(
+                "sqlite_runtime",
+                "OK" if runtime_ok else "FAIL",
+                f"journal_mode={journal_mode}; busy_timeout_ms={busy_timeout}",
+            )
     except Exception as exc:
         report.add(
             "database",
@@ -165,6 +191,37 @@ def _check_pdf_renderer(report: DoctorReport) -> None:
             "pdf_renderer",
             "FAIL",
             f"Local PDF renderer failed ({type(exc).__name__}); reinstall application dependencies",
+        )
+
+
+def _check_storage_capacity(report: DoctorReport, settings: Settings) -> None:
+    asset_root = Path(settings.knowledge_asset_root)
+    data_root = asset_root if asset_root.exists() else asset_root.parent
+    if not data_root.exists():
+        report.add(
+            "storage_capacity",
+            "WARN",
+            "Configured data root is not present in this runtime",
+        )
+        return
+    try:
+        stats = os.statvfs(data_root)
+        free_bytes = stats.f_bavail * stats.f_frsize
+        free_inodes = stats.f_favail
+        sufficient = (
+            free_bytes >= settings.runtime_min_free_bytes
+            and free_inodes >= settings.runtime_min_free_inodes
+        )
+        report.add(
+            "storage_capacity",
+            "OK" if sufficient else "FAIL",
+            f"free_bytes={free_bytes}; free_inodes={free_inodes}; thresholds satisfied={sufficient}",
+        )
+    except (AttributeError, OSError) as exc:
+        report.add(
+            "storage_capacity",
+            "FAIL",
+            f"Storage capacity check failed ({type(exc).__name__})",
         )
 
 
@@ -386,7 +443,13 @@ async def run_diagnostics(
         f"key_configured={str(bool(settings.transcription_api_key)).lower()}",
     )
     _check_pdf_renderer(report)
-    await _check_database(report, settings.database_url)
+    _check_storage_capacity(report, settings)
+    await _check_database(
+        report,
+        settings.database_url,
+        sqlite_busy_timeout_ms=settings.sqlite_busy_timeout_ms,
+        sqlite_wal_enabled=settings.sqlite_wal_enabled,
+    )
     await _check_network(
         report,
         settings,
