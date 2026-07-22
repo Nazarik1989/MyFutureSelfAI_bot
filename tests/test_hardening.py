@@ -249,6 +249,8 @@ def test_container_and_build_context_are_hardened() -> None:
     assert "USER 10001:10001" in dockerfile
     assert "HEALTHCHECK" in dockerfile
     assert "--no-create-home" in dockerfile
+    assert "umask 077" in dockerfile
+    assert "exec future-self-bot" in dockerfile
     assert dockerignore[0] == "*"
     assert not any(
         line in {"!.env", "!data", "!data/**", "!.git", "!.git/**"} for line in dockerignore

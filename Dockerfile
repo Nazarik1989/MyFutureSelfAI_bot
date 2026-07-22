@@ -18,4 +18,4 @@ RUN pip install --no-cache-dir .
 USER 10001:10001
 HEALTHCHECK --interval=60s --timeout=20s --start-period=30s --retries=3 \
     CMD ["python", "-m", "future_self.doctor"]
-CMD ["sh", "-c", "alembic upgrade head && future-self-bot"]
+CMD ["sh", "-c", "umask 077 && alembic upgrade head && exec future-self-bot"]
