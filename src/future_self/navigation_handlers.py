@@ -6,7 +6,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes, ConversationHandler
 
-from .navigation import ACTIONS, HELP_TOPICS, SECTIONS
+from .navigation import help_topics, navigation_actions, navigation_sections
 
 FLOW_LABELS = {
     "onboarding": "настройка профиля",
@@ -16,6 +16,7 @@ FLOW_LABELS = {
     "vision": "создание карточки желания",
     "vision_image": "добавление личного фото",
     "labs": "загрузка результатов анализов",
+    "workspace": "операция с совместным пространством",
     "rename_goal": "переименование цели",
 }
 
@@ -32,6 +33,8 @@ class NavigationHandlers:
                 user = await self._user(update.effective_user.id)
                 await self.collection_service.clear_context(user.id, update.effective_chat.id)
                 await self.collection_service.cancel_input(user.id, update.effective_chat.id)
+                if self._workspace_enabled():
+                    await self.workspace_service.cancel_input(user.id, update.effective_chat.id)
             return
         await self._prompt_navigation_flow(update.effective_message, update, flow)
         raise ApplicationHandlerStop
@@ -108,13 +111,16 @@ class NavigationHandlers:
                 self._help_keyboard(),
             )
             return None
+        sections = navigation_sections(self._workspace_enabled())
+        actions = navigation_actions(self._workspace_enabled())
+        topics = help_topics(self._workspace_enabled())
         if data.startswith("nav:section:"):
             section_key = data.removeprefix("nav:section:")
-            if section_key not in SECTIONS:
+            if section_key not in sections:
                 await self._navigation_stale(query)
                 return None
             await query.answer()
-            section = SECTIONS[section_key]
+            section = sections[section_key]
             await self._edit_or_send(
                 query,
                 f"{section.emoji} {section.label}\n\n{section.description}",
@@ -123,7 +129,7 @@ class NavigationHandlers:
             return None
         if data.startswith("nav:help:"):
             topic_key = data.removeprefix("nav:help:")
-            topic = HELP_TOPICS.get(topic_key)
+            topic = topics.get(topic_key)
             if topic is None:
                 await self._navigation_stale(query)
                 return None
@@ -136,7 +142,7 @@ class NavigationHandlers:
             return None
         if data.startswith("nav:action:"):
             action_key = data.removeprefix("nav:action:")
-            action = ACTIONS.get(action_key)
+            action = actions.get(action_key)
             if action is None or action.handler in {
                 "health_checkin_start",
                 "doctor_prepare_start",
@@ -160,7 +166,10 @@ class NavigationHandlers:
                 await getattr(self, action.handler)(update, context)
             finally:
                 context.args = original_args or []
-            if action.handler.startswith("task_") or action.handler == "collections_command":
+            if action.handler.startswith("task_") or action.handler in {
+                "collections_command",
+                "spaces_command",
+            }:
                 return None
             await query.message.reply_text(
                 "Навигация",
@@ -229,7 +238,11 @@ class NavigationHandlers:
                 else (
                     "Отправь фото/PDF или используй кнопки preview."
                     if current == "labs"
-                    else "Ответь на текущий вопрос."
+                    else (
+                        "Пришли запрошенный текст или используй /cancel."
+                        if current == "workspace"
+                        else "Ответь на текущий вопрос."
+                    )
                 )
             )
             await self._edit_or_send(
@@ -265,6 +278,12 @@ class NavigationHandlers:
             if key in context.user_data:
                 return name
         user = await self._user(update.effective_user.id)
+        if (
+            self._workspace_enabled()
+            and await self.workspace_service.pending_input(user.id, update.effective_chat.id)
+            is not None
+        ):
+            return "workspace"
         if await self.lab_uploads.has_active(user.id, update.effective_chat.id):
             return "labs"
         edit = context.user_data.get("lab_document_edit")
@@ -301,7 +320,9 @@ class NavigationHandlers:
             context.user_data.pop("vision_summary", None)
         else:
             user = await self._user(update.effective_user.id)
-            if flow == "labs":
+            if flow == "workspace":
+                await self.workspace_service.cancel_input(user.id, update.effective_chat.id)
+            elif flow == "labs":
                 await self.lab_uploads.cancel_active(user.id, update.effective_chat.id)
                 context.user_data.pop("lab_document_edit", None)
             elif flow == "vision_image":
@@ -349,14 +370,14 @@ class NavigationHandlers:
         )
 
     async def _send_navigation_section(self, message: Any, section_key: str) -> None:
-        section = SECTIONS[section_key]
+        section = navigation_sections(self._workspace_enabled())[section_key]
         await message.reply_text(
             f"{section.emoji} {section.label}\n\n{section.description}",
             reply_markup=self._section_keyboard(section_key),
         )
 
-    @staticmethod
-    def _root_keyboard() -> InlineKeyboardMarkup:
+    def _root_keyboard(self) -> InlineKeyboardMarkup:
+        sections = navigation_sections(self._workspace_enabled())
         rows = [
             [
                 InlineKeyboardButton(
@@ -364,18 +385,19 @@ class NavigationHandlers:
                     callback_data=f"nav:section:{section.key}",
                 )
             ]
-            for section in SECTIONS.values()
+            for section in sections.values()
         ]
         rows.append([InlineKeyboardButton("❓ Помощь", callback_data="nav:help")])
         return InlineKeyboardMarkup(rows)
 
-    @staticmethod
-    def _section_keyboard(section_key: str) -> InlineKeyboardMarkup:
-        section = SECTIONS[section_key]
+    def _section_keyboard(self, section_key: str) -> InlineKeyboardMarkup:
+        sections = navigation_sections(self._workspace_enabled())
+        actions = navigation_actions(self._workspace_enabled())
+        section = sections[section_key]
         rows = [
             [
                 InlineKeyboardButton(
-                    ACTIONS[action].label,
+                    actions[action].label,
                     callback_data=f"nav:action:{action}",
                 )
             ]
@@ -392,8 +414,8 @@ class NavigationHandlers:
         )
         return InlineKeyboardMarkup(rows)
 
-    @staticmethod
-    def _help_keyboard() -> InlineKeyboardMarkup:
+    def _help_keyboard(self) -> InlineKeyboardMarkup:
+        topics = help_topics(self._workspace_enabled())
         labels = {
             "quick": "Быстрый старт",
             "features": "Что умеет бот",
@@ -403,8 +425,7 @@ class NavigationHandlers:
             "safety": "Здоровье и безопасность",
         }
         rows = [
-            [InlineKeyboardButton(labels[key], callback_data=f"nav:help:{key}")]
-            for key in HELP_TOPICS
+            [InlineKeyboardButton(labels[key], callback_data=f"nav:help:{key}")] for key in topics
         ]
         rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")])
         return InlineKeyboardMarkup(rows)
@@ -421,9 +442,11 @@ class NavigationHandlers:
             ]
         )
 
-    @staticmethod
-    def _section_for_action(action_key: str) -> str:
-        for section in SECTIONS.values():
+    def _section_for_action(self, action_key: str) -> str:
+        for section in navigation_sections(self._workspace_enabled()).values():
             if action_key in section.actions:
                 return f"nav:section:{section.key}"
         return "nav:root"
+
+    def _workspace_enabled(self) -> bool:
+        return bool(getattr(self.settings, "enable_workspace_access", False))

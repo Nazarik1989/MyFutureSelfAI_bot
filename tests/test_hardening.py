@@ -43,6 +43,7 @@ def pdf_bytes(*, javascript: bool = False) -> bytes:
 
 def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     configured = settings()
+    assert configured.enable_workspace_access is False
     flags = {
         name: value
         for name, value in configured.model_dump().items()
@@ -57,6 +58,14 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.knowledge_runner_concurrency == 1
     assert configured.knowledge_external_processing_requires_consent is True
     assert configured.knowledge_default_apply_mode == "brief_reminder"
+
+
+def test_workspace_foundation_flag_is_independent_from_future_knowledge_flags() -> None:
+    configured = settings(enable_workspace_access=True)
+    assert configured.enable_workspace_access is True
+    assert configured.enable_knowledge_hub is False
+    assert configured.enable_knowledge_capture is False
+    assert configured.enable_council is False
 
 
 @pytest.mark.parametrize(
@@ -267,14 +276,22 @@ def test_container_and_build_context_are_hardened() -> None:
         assert control in runbook
 
 
-def test_pr22_adds_no_schema_revision_or_future_domain_models() -> None:
+def test_pr23_adds_only_access_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260720_0017"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260722_0018"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
-    for future_model in (
+    for access_model in (
         "Workspace",
+        "WorkspaceMember",
+        "WorkspaceInvitation",
+        "WorkspaceProject",
         "KnowledgeSpace",
+        "WorkspaceContext",
+        "WorkspaceActionToken",
+    ):
+        assert f"class {access_model}" in model_source
+    for future_model in (
         "KnowledgeSource",
         "KnowledgeChunk",
         "KnowledgeEmbedding",

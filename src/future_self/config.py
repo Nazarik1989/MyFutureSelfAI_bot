@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     runtime_min_free_bytes: int = Field(default=1024 * 1024 * 1024, ge=100_000_000)
     runtime_min_free_inodes: int = Field(default=10_000, ge=1_000)
 
+    # PR #23 exposes the Access/Workspace foundation independently. It remains
+    # fail-closed unless the deployment explicitly enables its UI and ACL paths.
+    enable_workspace_access: bool = False
+
     # PR #22 reserves bounded, disabled-by-default policy for later Knowledge
     # stages. These flags do not register commands, handlers, workers, or models.
     enable_knowledge_hub: bool = False
