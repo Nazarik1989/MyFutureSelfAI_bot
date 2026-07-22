@@ -1,42 +1,31 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import secrets
-import warnings
 from dataclasses import dataclass
-from io import BytesIO
 from time import monotonic
 
-from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy import select, update
 
 from .db import Database
 from .models import User, VisionItem, VisionItemImage
+from .safe_media import images as safe_images
 
-MAX_IMAGE_INPUT_BYTES = 8 * 1024 * 1024
-MAX_IMAGE_PIXELS = 24_000_000
-MAX_IMAGE_SOURCE_DIMENSION = 20_000
-MAX_IMAGE_DISPLAY_DIMENSION = 1600
-MAX_IMAGE_OUTPUT_BYTES = 768 * 1024
+MIME_FORMATS = safe_images.MIME_FORMATS
+MAX_IMAGE_INPUT_BYTES = safe_images.MAX_IMAGE_INPUT_BYTES
+MAX_IMAGE_PIXELS = safe_images.MAX_IMAGE_PIXELS
+MAX_IMAGE_SOURCE_DIMENSION = safe_images.MAX_IMAGE_SOURCE_DIMENSION
+MAX_IMAGE_DISPLAY_DIMENSION = safe_images.MAX_IMAGE_DISPLAY_DIMENSION
+MAX_IMAGE_OUTPUT_BYTES = safe_images.MAX_IMAGE_OUTPUT_BYTES
+NormalizedVisionImage = safe_images.NormalizedImage
+VisionImageError = safe_images.SafeImageError
+normalize_vision_image = safe_images.normalize_image
+_bounded_jpeg = safe_images.bounded_jpeg
+_safe_rgb = safe_images.safe_rgb
+
 IMAGE_UPLOAD_TTL_SECONDS = 10 * 60
 MAX_PENDING_IMAGE_SESSIONS = 32
 MAX_PENDING_IMAGE_BYTES = 16 * 1024 * 1024
-
-ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
-MIME_FORMATS = {
-    "image/jpeg": "JPEG",
-    "image/png": "PNG",
-    "image/webp": "WEBP",
-}
-
-# Pillow checks this before allocating decoded pixel buffers. The renderer uses
-# much smaller generated canvases, so the process-wide bound is safe there too.
-Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-
-
-class VisionImageError(ValueError):
-    """A safe media-validation failure represented by a non-sensitive code."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,15 +35,6 @@ class TelegramImageMetadata:
     mime_type: str | None
     width: int | None = None
     height: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class NormalizedVisionImage:
-    image_bytes: bytes
-    mime_type: str
-    width: int
-    height: int
-    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,111 +406,3 @@ def validate_telegram_metadata(metadata: TelegramImageMetadata) -> None:
             or metadata.width * metadata.height > MAX_IMAGE_PIXELS
         ):
             raise VisionImageError("too_many_pixels")
-
-
-def normalize_vision_image(
-    data: bytes,
-    *,
-    declared_mime: str | None,
-) -> NormalizedVisionImage:
-    if not data or len(data) > MAX_IMAGE_INPUT_BYTES:
-        raise VisionImageError("invalid_input_size")
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(data)) as probe:
-                actual_format = probe.format
-                width, height = probe.size
-                animated = (
-                    bool(getattr(probe, "is_animated", False))
-                    or int(getattr(probe, "n_frames", 1)) != 1
-                )
-                if actual_format not in ALLOWED_FORMATS:
-                    raise VisionImageError("unsupported_format")
-                if declared_mime is not None and MIME_FORMATS.get(declared_mime) != actual_format:
-                    raise VisionImageError("mime_mismatch")
-                if animated:
-                    raise VisionImageError("animated")
-                if (
-                    width <= 0
-                    or height <= 0
-                    or width > MAX_IMAGE_SOURCE_DIMENSION
-                    or height > MAX_IMAGE_SOURCE_DIMENSION
-                    or width * height > MAX_IMAGE_PIXELS
-                ):
-                    raise VisionImageError("too_many_pixels")
-                probe.verify()
-
-            with Image.open(BytesIO(data)) as source:
-                source.load()
-                oriented = ImageOps.exif_transpose(source)
-                try:
-                    safe = _safe_rgb(oriented)
-                    try:
-                        safe.thumbnail(
-                            (MAX_IMAGE_DISPLAY_DIMENSION, MAX_IMAGE_DISPLAY_DIMENSION),
-                            Image.Resampling.LANCZOS,
-                        )
-                        encoded, final_width, final_height = _bounded_jpeg(safe)
-                    finally:
-                        safe.close()
-                finally:
-                    if oriented is not source:
-                        oriented.close()
-    except VisionImageError:
-        raise
-    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
-        raise VisionImageError("decompression_bomb") from None
-    except (OSError, SyntaxError, ValueError, UnidentifiedImageError):
-        raise VisionImageError("corrupt_image") from None
-    return NormalizedVisionImage(
-        image_bytes=encoded,
-        mime_type="image/jpeg",
-        width=final_width,
-        height=final_height,
-        sha256=hashlib.sha256(encoded).hexdigest(),
-    )
-
-
-def _safe_rgb(image: Image.Image) -> Image.Image:
-    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
-        rgba = image.convert("RGBA")
-        safe = Image.new("RGB", rgba.size, "white")
-        safe.paste(rgba, mask=rgba.getchannel("A"))
-        rgba.close()
-        return safe
-    return image.convert("RGB")
-
-
-def _bounded_jpeg(image: Image.Image) -> tuple[bytes, int, int]:
-    working = image
-    while True:
-        for quality in (85, 75, 65, 55):
-            output = BytesIO()
-            working.save(
-                output,
-                format="JPEG",
-                quality=quality,
-                optimize=False,
-                progressive=False,
-                subsampling=2,
-            )
-            encoded = output.getvalue()
-            output.close()
-            if len(encoded) <= MAX_IMAGE_OUTPUT_BYTES:
-                final_size = working.size
-                if working is not image:
-                    working.close()
-                return encoded, final_size[0], final_size[1]
-        width, height = working.size
-        if max(width, height) <= 480:
-            if working is not image:
-                working.close()
-            raise VisionImageError("normalized_too_large")
-        resized = working.resize(
-            (max(int(width * 0.8), 1), max(int(height * 0.8), 1)),
-            Image.Resampling.LANCZOS,
-        )
-        if working is not image:
-            working.close()
-        working = resized

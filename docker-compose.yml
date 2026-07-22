@@ -6,7 +6,8 @@ services:
       POSTGRES_USER: future_self
       POSTGRES_PASSWORD: future_self
     ports:
-      - "5432:5432"
+      # Local development only. Never expose demo credentials on a public interface.
+      - "127.0.0.1:5432:5432"
     volumes:
       - future_self_pgdata:/var/lib/postgresql/data
     healthcheck:

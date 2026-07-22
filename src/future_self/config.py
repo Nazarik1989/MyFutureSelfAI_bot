@@ -1,7 +1,7 @@
 import os
 import warnings
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -76,6 +76,48 @@ class Settings(BaseSettings):
     collection_action_ttl_minutes: int = Field(default=15, ge=1, le=60)
     collection_input_ttl_minutes: int = Field(default=20, ge=1, le=120)
     collection_context_ttl_minutes: int = Field(default=20, ge=1, le=1440)
+    sqlite_wal_enabled: bool = True
+    sqlite_busy_timeout_ms: int = Field(default=5_000, ge=1_000, le=60_000)
+    runtime_min_free_bytes: int = Field(default=1024 * 1024 * 1024, ge=100_000_000)
+    runtime_min_free_inodes: int = Field(default=10_000, ge=1_000)
+
+    # PR #22 reserves bounded, disabled-by-default policy for later Knowledge
+    # stages. These flags do not register commands, handlers, workers, or models.
+    enable_knowledge_hub: bool = False
+    enable_knowledge_capture: bool = False
+    enable_knowledge_runner: bool = False
+    enable_knowledge_retrieval: bool = False
+    enable_knowledge_embeddings: bool = False
+    enable_knowledge_ocr: bool = False
+    enable_knowledge_media: bool = False
+    enable_external_vision: bool = False
+    enable_council: bool = False
+    enable_scheduled_council: bool = False
+    enable_knowledge_export: bool = False
+
+    knowledge_asset_root: str = "/data/knowledge"
+    knowledge_runner_concurrency: int = Field(default=1, ge=1, le=8)
+    knowledge_max_source_bytes: int = Field(
+        default=25 * 1024 * 1024, ge=1_000_000, le=100 * 1024 * 1024
+    )
+    knowledge_daily_ingest_bytes_per_user: int = Field(
+        default=100 * 1024 * 1024, ge=1_000_000, le=1024 * 1024 * 1024
+    )
+    knowledge_storage_quota_bytes_per_user: int = Field(
+        default=1024 * 1024 * 1024, ge=10_000_000, le=50 * 1024 * 1024 * 1024
+    )
+    knowledge_daily_sources_per_user: int = Field(default=20, ge=1, le=1_000)
+    knowledge_max_pending_jobs_per_user: int = Field(default=4, ge=1, le=100)
+    knowledge_provider_daily_token_budget_per_user: int = Field(
+        default=100_000, ge=1_000, le=10_000_000
+    )
+    knowledge_external_processing_requires_consent: bool = True
+    knowledge_default_apply_mode: Literal["brief_reminder", "explain"] = "brief_reminder"
+    knowledge_max_quote_chars: int = Field(default=400, ge=50, le=2_000)
+    council_daily_sessions_per_user: int = Field(default=5, ge=1, le=100)
+    council_evidence_max_chunks: int = Field(default=12, ge=1, le=100)
+    council_evidence_max_chars: int = Field(default=40_000, ge=1_000, le=200_000)
+
     enable_task_reminders: bool = True
     enable_voice: bool = True
     enable_weekly_review: bool = True
@@ -107,6 +149,22 @@ class Settings(BaseSettings):
         if value.startswith("postgresql://"):
             return value.replace("postgresql://", "postgresql+asyncpg://", 1)
         return value
+
+    @field_validator("knowledge_asset_root")
+    @classmethod
+    def safe_knowledge_asset_root(cls, value: str) -> str:
+        clean = value.strip()
+        path = PurePosixPath(clean)
+        if (
+            not clean.startswith("/")
+            or clean.startswith("//")
+            or "\\" in clean
+            or ".." in path.parts
+            or path in {PurePosixPath("/"), PurePosixPath("/data")}
+            or len(path.parts) < 3
+        ):
+            raise ValueError("KNOWLEDGE_ASSET_ROOT must be a dedicated absolute POSIX path")
+        return str(path)
 
     @model_validator(mode="after")
     def resolve_providers_and_legacy_values(self) -> "Settings":
@@ -155,6 +213,47 @@ class Settings(BaseSettings):
             )
         if not self.transcription_base_url:
             self.transcription_base_url = "https://api.openai.com/v1"
+
+        knowledge_children = (
+            self.enable_knowledge_capture,
+            self.enable_knowledge_runner,
+            self.enable_knowledge_retrieval,
+            self.enable_knowledge_embeddings,
+            self.enable_knowledge_ocr,
+            self.enable_knowledge_media,
+            self.enable_external_vision,
+            self.enable_council,
+            self.enable_scheduled_council,
+            self.enable_knowledge_export,
+        )
+        if any(knowledge_children) and not self.enable_knowledge_hub:
+            raise ValueError("Knowledge child features require ENABLE_KNOWLEDGE_HUB")
+        if self.enable_knowledge_runner and not self.enable_knowledge_capture:
+            raise ValueError("Knowledge runner requires ENABLE_KNOWLEDGE_CAPTURE")
+        if (self.enable_knowledge_ocr or self.enable_knowledge_media) and not (
+            self.enable_knowledge_capture
+        ):
+            raise ValueError("Knowledge OCR/media require ENABLE_KNOWLEDGE_CAPTURE")
+        if self.enable_knowledge_embeddings and not self.enable_knowledge_retrieval:
+            raise ValueError("Knowledge embeddings require ENABLE_KNOWLEDGE_RETRIEVAL")
+        if self.enable_council and not self.enable_knowledge_retrieval:
+            raise ValueError("Council requires ENABLE_KNOWLEDGE_RETRIEVAL")
+        if self.enable_scheduled_council and not self.enable_council:
+            raise ValueError("Scheduled Council requires ENABLE_COUNCIL")
+        if self.enable_external_vision and not self.enable_knowledge_capture:
+            raise ValueError("External vision requires ENABLE_KNOWLEDGE_CAPTURE")
+        if self.enable_external_vision and not (
+            self.knowledge_external_processing_requires_consent
+        ):
+            raise ValueError("External vision requires explicit per-user consent policy")
+        if not self.knowledge_external_processing_requires_consent:
+            raise ValueError("External Knowledge processing consent cannot be disabled")
+        if self.knowledge_max_source_bytes > self.knowledge_daily_ingest_bytes_per_user:
+            raise ValueError("Knowledge source limit cannot exceed the daily ingest quota")
+        if self.knowledge_daily_ingest_bytes_per_user > self.knowledge_storage_quota_bytes_per_user:
+            raise ValueError("Knowledge daily ingest quota cannot exceed storage quota")
+        if self.database_url.startswith("sqlite") and self.knowledge_runner_concurrency != 1:
+            raise ValueError("SQLite Knowledge deployments require exactly one runner")
         return self
 
 

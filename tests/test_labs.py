@@ -219,7 +219,7 @@ def test_renderer_timeout_and_failure_fail_closed(tmp_path, monkeypatch):
         del args, kwargs
         raise __import__("subprocess").TimeoutExpired("worker", 1)
 
-    monkeypatch.setattr("future_self.lab_media.subprocess.run", timeout)
+    monkeypatch.setattr("future_self.safe_media.subprocess.subprocess.run", timeout)
     with pytest.raises(LabMediaError, match="renderer_timeout"):
         process_lab_upload(
             raw,
