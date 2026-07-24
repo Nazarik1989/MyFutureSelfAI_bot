@@ -15,6 +15,7 @@ from telegram import (
     InlineKeyboardMarkup,
     MenuButtonCommands,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatType
@@ -55,6 +56,7 @@ from .domain import (
     IntentRouter,
     OnboardingFlow,
     PendingIntent,
+    normalize_display_name,
 )
 from .drafts import DraftInboxService
 from .health import (
@@ -101,6 +103,8 @@ from .workspace_handlers import WorkspaceHandlers
 logger = logging.getLogger(__name__)
 
 ONBOARDING_INPUT, PROFILE_CONFIRM = range(2)
+_ONBOARDING_META_KEY = "__onboarding_flow__"
+_ACTIVE_ONBOARDING_STATUSES = frozenset({"in_progress", "awaiting_confirmation"})
 EVENING_WORKED, EVENING_FAILED, EVENING_ENERGY, EVENING_OBSTACLE, EVENING_TOMORROW = range(10, 15)
 (
     HEALTH_ENERGY,
@@ -125,6 +129,14 @@ ACTION_LABELS = {
     "note": "заметку",
 }
 NAVIGATION = ReplyKeyboardMarkup([["Назад", "Пропустить"], ["Отменить"]], resize_keyboard=True)
+
+
+def _truncate_utf16(value: str, max_units: int) -> str:
+    encoded = value.encode("utf-16-le")
+    if len(encoded) <= max_units * 2:
+        return value
+    clipped = encoded[: (max_units - 1) * 2].decode("utf-16-le", errors="ignore")
+    return clipped.rstrip() + "…"
 
 
 def _conversation_handler(**kwargs: object) -> ConversationHandler:
@@ -291,6 +303,12 @@ class FutureSelfBot(
             ),
             group=-2,
         )
+        # Commands that are not public navigation entries (for example /drafts)
+        # must not escape an unfinished, durably restored onboarding flow.
+        app.add_handler(
+            MessageHandler(filters.COMMAND, self.onboarding_command_gate),
+            group=-2,
+        )
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.navigation_text_gate),
             group=-2,
@@ -348,6 +366,7 @@ class FutureSelfBot(
                         CommandHandler("skip", self.onboarding_skip),
                         MessageHandler(filters.Regex("^Назад$"), self.onboarding_back),
                         MessageHandler(filters.Regex("^Пропустить$"), self.onboarding_skip),
+                        MessageHandler(filters.VOICE | filters.AUDIO, self.voice),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, self.onboarding_answer),
                     ],
                     PROFILE_CONFIRM: [
@@ -494,6 +513,9 @@ class FutureSelfBot(
             app.add_handler(CallbackQueryHandler(self.workspace_callback, pattern=r"^spacei?:"))
         if getattr(self.settings, "enable_knowledge_hub", False):
             app.add_handler(CallbackQueryHandler(self.knowledge_callback, pattern=r"^kh:"))
+        # Fallback for a confirmation button sent before a process restart. The
+        # ConversationHandler handles it normally while its in-memory state exists.
+        app.add_handler(CallbackQueryHandler(self.profile_action, pattern=r"^profile:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -509,6 +531,10 @@ class FutureSelfBot(
         if getattr(self.settings, "enable_knowledge_capture", False):
             app.add_handler(
                 MessageHandler(filters.PHOTO | filters.Document.ALL, self.knowledge_media_gate)
+            )
+        if getattr(self.settings, "enable_workspace_access", False):
+            app.add_handler(
+                MessageHandler(filters.StatusUpdate.USERS_SHARED, self.workspace_users_shared)
             )
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.voice))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text))
@@ -608,13 +634,167 @@ class FutureSelfBot(
                 telegram_id, self.settings.default_timezone
             )
 
+    @staticmethod
+    def _onboarding_public_answers(answers: dict[str, object]) -> dict[str, str]:
+        keys = {key for key, _question, _required in ONBOARDING_QUESTIONS}
+        result = {
+            key: value for key, value in answers.items() if key in keys and isinstance(value, str)
+        }
+        if display_name := result.get("display_name"):
+            result["display_name"] = normalize_display_name(display_name, clip_legacy=True)
+        return result
+
+    @staticmethod
+    def _bounded_vision_summary(summary: VisionSummary) -> VisionSummary:
+        return VisionSummary(
+            summary=_truncate_utf16(summary.summary, 1_600),
+            values=[_truncate_utf16(value, 100) for value in summary.values[:6]],
+            desired_identity=[
+                _truncate_utf16(value, 120) for value in summary.desired_identity[:6]
+            ],
+            constraints=[_truncate_utf16(value, 120) for value in summary.constraints[:6]],
+            motivation_style=(
+                _truncate_utf16(summary.motivation_style, 120) if summary.motivation_style else None
+            ),
+        )
+
+    @staticmethod
+    def _onboarding_meta(answers: dict[str, object]) -> dict[str, object]:
+        value = answers.get(_ONBOARDING_META_KEY)
+        return dict(value) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _onboarding_delivery_key(update: Update) -> str | None:
+        update_id = getattr(update, "update_id", None)
+        if update_id is not None:
+            return f"update:{update_id}"
+        message_id = getattr(update.effective_message, "message_id", None)
+        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+        if message_id is None or chat_id is None:
+            return None
+        return f"message:{chat_id}:{message_id}"
+
+    async def _restore_onboarding_context(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> tuple[int, int, str, dict[str, object]] | None:
+        user = await self._user(update.effective_user.id)
+        if user.onboarding_completed:
+            context.user_data.pop("onboarding_user_id", None)
+            context.user_data.pop("onboarding_detached", None)
+            context.user_data.pop("vision_summary", None)
+            return None
+        async with self.db.sessions() as session:
+            state = await OnboardingRepository(session).get(user.id)
+            if state is None or state.status not in _ACTIVE_ONBOARDING_STATUSES:
+                return None
+            snapshot = (user.id, state.current_step, state.status, dict(state.answers))
+        if context.user_data.get("onboarding_user_id") != user.id:
+            context.user_data["onboarding_user_id"] = user.id
+            context.user_data["onboarding_detached"] = True
+        return snapshot
+
+    async def onboarding_persistent_input(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        *,
+        force: bool = False,
+    ) -> tuple[int, str | None] | None:
+        """Resume DB-backed onboarding before generic routing after a restart."""
+        attached = context.user_data.get("onboarding_user_id") is not None
+        detached = bool(context.user_data.get("onboarding_detached"))
+        restored = await self._restore_onboarding_context(update, context)
+        if restored is None:
+            return None
+        _user_id, step, _status, _answers = restored
+        navigation = self.natural_command_router.route(text)
+        if navigation is not None and navigation.action in {"help", "menu"}:
+            if navigation.action == "help":
+                await self.help_command(update, context)
+            else:
+                await self._send_navigation_root(update.effective_message)
+            state = PROFILE_CONFIRM if step >= len(ONBOARDING_QUESTIONS) else ONBOARDING_INPUT
+            return state, navigation.action
+        if attached and not detached and step < len(ONBOARDING_QUESTIONS) and not force:
+            return None
+        if attached and not detached and step >= len(ONBOARDING_QUESTIONS):
+            # The group -2 gate, rather than ConversationHandler, now owns this
+            # update. Keep subsequent updates on the same durable path so stale
+            # in-memory PROFILE_CONFIRM state cannot leak text to generic routing.
+            context.user_data["onboarding_detached"] = True
+        navigation_answer = text.strip().casefold()
+        if navigation_answer == "назад":
+            return await self.onboarding_back(update, context), None
+        if navigation_answer == "пропустить":
+            if step >= len(ONBOARDING_QUESTIONS):
+                return await self._present_onboarding_summary(update, context), None
+            return await self.onboarding_skip(update, context), None
+        if navigation_answer == "отменить":
+            return await self.cancel_onboarding(update, context), None
+        if step >= len(ONBOARDING_QUESTIONS):
+            return await self._present_onboarding_summary(update, context), None
+        # Use the recognized text supplied by the caller. For ordinary text it
+        # is the Telegram body; voice can pass its STT result here too.
+        return await self._accept_onboarding_answer(update, context, text), None
+
+    async def onboarding_command_gate(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        command = (update.effective_message.text or "").split(maxsplit=1)[0]
+        command = command.split("@", maxsplit=1)[0].casefold()
+        if command in {"/start", "/onboarding"}:
+            return
+        attached = context.user_data.get("onboarding_user_id") is not None
+        detached = bool(context.user_data.get("onboarding_detached"))
+        restored = await self._restore_onboarding_context(update, context)
+        if restored is None:
+            return
+        if command == "/help":
+            await self.help_command(update, context)
+            raise ApplicationHandlerStop
+        if command == "/menu":
+            await self._send_navigation_root(update.effective_message)
+            raise ApplicationHandlerStop
+        if attached and not detached and restored[1] >= len(ONBOARDING_QUESTIONS):
+            context.user_data["onboarding_detached"] = True
+            detached = True
+        if (
+            attached
+            and not detached
+            and restored[1] < len(ONBOARDING_QUESTIONS)
+            and command in {"/back", "/skip", "/cancel"}
+        ):
+            # Let the active ConversationHandler update its own in-memory state.
+            return
+        if command == "/back":
+            await self.onboarding_back(update, context)
+        elif command == "/skip":
+            if restored[1] >= len(ONBOARDING_QUESTIONS):
+                await self._present_onboarding_summary(update, context)
+            else:
+                await self.onboarding_skip(update, context)
+        elif command == "/cancel":
+            await self.cancel_onboarding(update, context)
+        else:
+            await self._prompt_navigation_flow(update.effective_message, update, "onboarding")
+        raise ApplicationHandlerStop
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if await self.workspace_start_invitation(update, context):
             return ConversationHandler.END
         user = await self._user(update.effective_user.id)
         if user.onboarding_completed:
+            context.user_data.pop("onboarding_user_id", None)
+            context.user_data.pop("onboarding_detached", None)
+            context.user_data.pop("vision_summary", None)
+            display_name = (
+                normalize_display_name(user.display_name, clip_legacy=True)
+                if user.display_name
+                else "друг"
+            )
             await update.effective_message.reply_text(
-                f"С возвращением, {user.display_name or 'друг'}!",
+                f"С возвращением, {display_name}!",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("Открыть главное меню", callback_data="nav:root")]]
                 ),
@@ -624,8 +804,10 @@ class FutureSelfBot(
             state = await OnboardingRepository(session).get_or_create(user.id)
             if state.status == "cancelled":
                 state.status = "in_progress"
-            step = state.current_step
+            step = max(0, min(state.current_step, len(ONBOARDING_QUESTIONS)))
+            state.current_step = step
         context.user_data["onboarding_user_id"] = user.id
+        context.user_data.pop("onboarding_detached", None)
         intro = (
             "Все ответы сохранены. Восстанавливаю итоговый профиль."
             if step >= len(ONBOARDING_QUESTIONS)
@@ -636,72 +818,111 @@ class FutureSelfBot(
         )
         await update.effective_message.reply_text(intro)
         if step >= len(ONBOARDING_QUESTIONS):
-            try:
-                summary = await self.ai.summarize_vision(dict(state.answers))
-            except Exception as exc:
-                log_safe_failure("Vision resume failed", exc, user_id=user.id)
-                await update.effective_message.reply_text(
-                    "Ответы сохранены, но профиль сейчас не удалось собрать. Попробуй /start позже."
-                )
-                return ConversationHandler.END
-            context.user_data["vision_summary"] = summary.model_dump()
-            await update.effective_message.reply_text(
-                self._profile_text(
-                    summary,
-                    location_label=(
-                        parse_location(state.answers["location"]).label
-                        if state.answers.get("location")
-                        else None
-                    ),
-                ),
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton("Подтвердить", callback_data="profile:confirm"),
-                            InlineKeyboardButton("Редактировать", callback_data="profile:edit"),
-                        ]
-                    ]
-                ),
-            )
-            return PROFILE_CONFIRM
+            return await self._present_onboarding_summary(update, context)
         await self._ask_question(update, step)
         return ONBOARDING_INPUT
 
     async def _ask_question(self, update: Update, step: int) -> None:
         _, question, required = ONBOARDING_QUESTIONS[step]
         suffix = "" if required else " (можно пропустить)"
-        await update.effective_message.reply_text(question + suffix, reply_markup=NAVIGATION)
+        await update.effective_message.reply_text(
+            f"Шаг {step + 1} из {len(ONBOARDING_QUESTIONS)}\n{question}{suffix}",
+            reply_markup=NAVIGATION,
+        )
 
-    async def _state(self, context: ContextTypes.DEFAULT_TYPE) -> tuple[int, int, dict[str, str]]:
-        user_id = int(context.user_data["onboarding_user_id"])
+    async def _state(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> tuple[int, int, dict[str, object]]:
+        user_id = context.user_data.get("onboarding_user_id")
+        telegram_user = getattr(update, "effective_user", None)
+        if telegram_user is not None:
+            user = await self._user(telegram_user.id)
+            user_id = user.id
+            context.user_data["onboarding_user_id"] = user_id
+        if user_id is None:
+            raise ValueError("Регистрация не была начата. Запусти /start.")
         async with self.db.session() as session:
-            state = await OnboardingRepository(session).get_or_create(user_id)
-            return user_id, state.current_step, dict(state.answers)
+            state = await OnboardingRepository(session).get_or_create(int(user_id))
+            return int(user_id), state.current_step, dict(state.answers)
 
     async def onboarding_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        user_id, step, answers = await self._state(context)
+        return await self._accept_onboarding_answer(
+            update, context, update.effective_message.text or ""
+        )
+
+    async def _accept_onboarding_answer(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> int:
         try:
-            answers = OnboardingFlow.answer(answers, step, update.effective_message.text)
+            user_id, step, answers = await self._state(update, context)
+            if step >= len(ONBOARDING_QUESTIONS):
+                return await self._present_onboarding_summary(update, context)
+            delivery_key = self._onboarding_delivery_key(update)
+            metadata = self._onboarding_meta(answers)
+            if delivery_key is not None and metadata.get("last_delivery_key") == delivery_key:
+                await update.effective_message.reply_text(
+                    "Этот ответ уже сохранён — повторно его не учитываю."
+                )
+                await self._ask_question(update, step)
+                return ONBOARDING_INPUT
+            answers = OnboardingFlow.answer(answers, step, text)
             question_key = ONBOARDING_QUESTIONS[step][0]
             if question_key == "timezone":
                 from .domain import canonical_timezone
 
-                answers["timezone"] = canonical_timezone(update.effective_message.text)
+                answers["timezone"] = canonical_timezone(text)
             elif question_key == "location":
-                parse_location(update.effective_message.text)
+                parse_location(text)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return ONBOARDING_INPUT
-        return await self._advance_onboarding(update, context, user_id, step, answers)
+        except Exception as exc:
+            log_safe_failure("Onboarding answer read failed", exc)
+            await update.effective_message.reply_text(
+                "Не удалось сохранить ответ. Шаг не изменён — попробуй ещё раз или продолжи через /start."
+            )
+            return ONBOARDING_INPUT
+        try:
+            return await self._advance_onboarding(
+                update,
+                context,
+                user_id,
+                step,
+                answers,
+                delivery_key=delivery_key,
+            )
+        except Exception as exc:
+            log_safe_failure("Onboarding answer save failed", exc, user_id=user_id)
+            await update.effective_message.reply_text(
+                "Не удалось сохранить ответ. Шаг не изменён — попробуй ещё раз или продолжи через /start."
+            )
+            return ONBOARDING_INPUT
 
     async def onboarding_skip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        user_id, step, answers = await self._state(context)
+        user_id, step, answers = await self._state(update, context)
+        delivery_key = self._onboarding_delivery_key(update)
+        if (
+            delivery_key is not None
+            and self._onboarding_meta(answers).get("last_delivery_key") == delivery_key
+        ):
+            await update.effective_message.reply_text(
+                "Эта команда уже обработана — повторно шаг не меняю."
+            )
+            if step < len(ONBOARDING_QUESTIONS):
+                await self._ask_question(update, step)
+                return ONBOARDING_INPUT
+            return await self._present_onboarding_summary(update, context)
         try:
             answers = OnboardingFlow.answer(answers, step, None)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return ONBOARDING_INPUT
-        return await self._advance_onboarding(update, context, user_id, step, answers)
+        return await self._advance_onboarding(
+            update, context, user_id, step, answers, delivery_key=delivery_key
+        )
 
     async def _advance_onboarding(
         self,
@@ -709,37 +930,122 @@ class FutureSelfBot(
         context: ContextTypes.DEFAULT_TYPE,
         user_id: int,
         step: int,
-        answers: dict[str, str],
+        answers: dict[str, object],
+        *,
+        delivery_key: str | None = None,
     ) -> int:
         next_step = OnboardingFlow.next_step(step)
+        outcome = "advanced"
         async with self.db.session() as session:
             state = await OnboardingRepository(session).get_or_create(user_id)
-            state.answers, state.current_step = answers, next_step
+            current_metadata = self._onboarding_meta(dict(state.answers))
+            if (
+                delivery_key is not None
+                and current_metadata.get("last_delivery_key") == delivery_key
+            ):
+                outcome = "duplicate"
+                next_step = state.current_step
+            elif state.current_step != step:
+                outcome = "stale"
+                next_step = state.current_step
+            else:
+                metadata = self._onboarding_meta(answers)
+                metadata.pop("summary", None)
+                if delivery_key is not None:
+                    metadata["last_delivery_key"] = delivery_key
+                answers[_ONBOARDING_META_KEY] = metadata
+                state.answers = answers
+                state.current_step = next_step
+                state.status = (
+                    "awaiting_confirmation"
+                    if next_step >= len(ONBOARDING_QUESTIONS)
+                    else "in_progress"
+                )
+        if outcome == "duplicate":
+            await update.effective_message.reply_text(
+                "Этот ответ уже сохранён — повторно его не учитываю."
+            )
+        elif outcome == "stale":
+            await update.effective_message.reply_text(
+                "Предыдущий ответ уже перевёл регистрацию дальше. "
+                "Повтори ответ на показанный ниже текущий вопрос."
+            )
+        else:
+            await update.effective_message.reply_text("Ответ сохранён ✓")
         if next_step < len(ONBOARDING_QUESTIONS):
             await self._ask_question(update, next_step)
             return ONBOARDING_INPUT
-        await update.effective_message.reply_text("Собираю профиль без добавления фактов от себя…")
-        try:
+        return await self._present_onboarding_summary(update, context)
+
+    async def _resolve_onboarding_summary(
+        self, user_id: int, stored_answers: dict[str, object]
+    ) -> VisionSummary:
+        metadata = self._onboarding_meta(stored_answers)
+        cached = metadata.get("summary")
+        summary = None
+        if isinstance(cached, dict):
+            try:
+                summary = VisionSummary.model_validate(cached)
+            except ValueError:
+                pass
+        answers = self._onboarding_public_answers(stored_answers)
+        if summary is None:
             summary = await self.ai.summarize_vision(answers)
+        summary = self._bounded_vision_summary(summary)
+        bounded_payload = summary.model_dump(mode="json")
+        if cached == bounded_payload:
+            return summary
+        async with self.db.session() as session:
+            state = await OnboardingRepository(session).get_or_create(user_id)
+            latest = dict(state.answers)
+            if (
+                state.current_step < len(ONBOARDING_QUESTIONS)
+                or self._onboarding_public_answers(latest) != answers
+            ):
+                raise RuntimeError("Onboarding answers changed while summary was prepared")
+            latest_metadata = self._onboarding_meta(latest)
+            latest_metadata["summary"] = bounded_payload
+            latest[_ONBOARDING_META_KEY] = latest_metadata
+            state.answers = latest
+            state.status = "awaiting_confirmation"
+        return summary
+
+    async def _present_onboarding_summary(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        user_id, _step, stored_answers = await self._state(update, context)
+        answers = self._onboarding_public_answers(stored_answers)
+        await update.effective_message.reply_text(
+            "Вопросы регистрации закончились — старые кнопки ответа убраны.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        try:
+            summary = await self._resolve_onboarding_summary(user_id, stored_answers)
         except Exception as exc:
             log_safe_failure("Vision summary failed", exc, user_id=user_id)
+            context.user_data["onboarding_detached"] = True
             await update.effective_message.reply_text(
-                "Не удалось подготовить профиль. Ответы сохранены — запусти /start позже."
+                "Ответы сохранены, но итоговый профиль сейчас не удалось подготовить. "
+                "Регистрация не потеряна: попробуй /start позже."
             )
             return ConversationHandler.END
         context.user_data["vision_summary"] = summary.model_dump()
+        location_label = None
+        if location_value := answers.get("location"):
+            try:
+                location_label = parse_location(location_value).label
+            except ValueError:
+                location_label = None
         await update.effective_message.reply_text(
-            self._profile_text(
-                summary,
-                location_label=(
-                    parse_location(answers["location"]).label if answers.get("location") else None
-                ),
-            ),
+            "Все вопросы пройдены. Проверь итог перед завершением регистрации.\n\n"
+            + self._profile_text(summary, location_label=location_label),
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("Подтвердить", callback_data="profile:confirm"),
-                        InlineKeyboardButton("Редактировать", callback_data="profile:edit"),
+                        InlineKeyboardButton(
+                            "Завершить регистрацию", callback_data="profile:confirm"
+                        ),
+                        InlineKeyboardButton("Изменить ответы", callback_data="profile:edit"),
                     ]
                 ]
             ),
@@ -747,11 +1053,32 @@ class FutureSelfBot(
         return PROFILE_CONFIRM
 
     async def onboarding_back(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        user_id, step, _ = await self._state(context)
+        user_id, step, answers = await self._state(update, context)
         previous = OnboardingFlow.previous_step(step)
+        delivery_key = self._onboarding_delivery_key(update)
+        duplicate = False
         async with self.db.session() as session:
             state = await OnboardingRepository(session).get_or_create(user_id)
-            state.current_step = previous
+            metadata = self._onboarding_meta(dict(state.answers))
+            if delivery_key is not None and metadata.get("last_delivery_key") == delivery_key:
+                duplicate = True
+                previous = state.current_step
+            elif state.current_step == step:
+                metadata.pop("summary", None)
+                if delivery_key is not None:
+                    metadata["last_delivery_key"] = delivery_key
+                answers[_ONBOARDING_META_KEY] = metadata
+                state.answers = answers
+                state.current_step = previous
+                state.status = "in_progress"
+            else:
+                previous = state.current_step
+        if duplicate:
+            await update.effective_message.reply_text(
+                "Эта команда уже обработана — повторно шаг не меняю."
+            )
+        if previous >= len(ONBOARDING_QUESTIONS):
+            return await self._present_onboarding_summary(update, context)
         await self._ask_question(update, previous)
         return ONBOARDING_INPUT
 
@@ -761,44 +1088,124 @@ class FutureSelfBot(
             async with self.db.session() as session:
                 state = await OnboardingRepository(session).get_or_create(int(user_id))
                 state.status = "cancelled"
+        context.user_data.pop("onboarding_user_id", None)
+        context.user_data.pop("onboarding_detached", None)
+        context.user_data.pop("vision_summary", None)
         await update.effective_message.reply_text(
-            "Онбординг остановлен. Ответы сохранены; продолжить — /start."
+            "Онбординг остановлен. Ответы сохранены; продолжить — /start.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
 
     async def profile_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         query = update.callback_query
-        await query.answer()
+        user = await self._user(update.effective_user.id)
+        if user.onboarding_completed:
+            await query.answer("Регистрация уже завершена", show_alert=True)
+            await self._send_navigation_root(query.message)
+            return ConversationHandler.END
+        async with self.db.sessions() as session:
+            state = await OnboardingRepository(session).get(user.id)
+            if (
+                state is None
+                or state.status != "awaiting_confirmation"
+                or state.current_step < len(ONBOARDING_QUESTIONS)
+            ):
+                await query.answer("Эта кнопка больше не действует", show_alert=True)
+                return ConversationHandler.END
+            stored_answers = dict(state.answers)
+        was_attached = context.user_data.get("onboarding_user_id") == user.id
+        context.user_data["onboarding_user_id"] = user.id
+        if not was_attached:
+            context.user_data["onboarding_detached"] = True
         if query.data == "profile:edit":
-            user_id = int(context.user_data["onboarding_user_id"])
+            await query.answer()
             async with self.db.session() as session:
-                state = await OnboardingRepository(session).get_or_create(user_id)
+                state = await OnboardingRepository(session).get_or_create(user.id)
                 state.current_step = 0
+                state.status = "in_progress"
+                answers = dict(state.answers)
+                metadata = self._onboarding_meta(answers)
+                metadata.pop("summary", None)
+                answers[_ONBOARDING_META_KEY] = metadata
+                state.answers = answers
+            context.user_data.pop("vision_summary", None)
             await query.edit_message_text("Хорошо, пройдём ответы ещё раз.")
             await self._ask_question(update, 0)
             return ONBOARDING_INPUT
-        user_id, _, answers = await self._state(context)
-        summary = VisionSummary.model_validate(context.user_data["vision_summary"])
-        async with self.db.session() as session:
-            user = await session.get(User, user_id)
-            from .repositories import ProfileRepository
+        if query.data != "profile:confirm":
+            await query.answer("Эта кнопка больше не действует", show_alert=True)
+            return ConversationHandler.END
+        answers = self._onboarding_public_answers(stored_answers)
+        required_answers = {key for key, _question, required in ONBOARDING_QUESTIONS if required}
+        if any(not answers.get(key) for key in required_answers):
+            await query.answer("Ответы неполные — продолжи через /start", show_alert=True)
+            return ConversationHandler.END
+        await query.answer()
+        try:
+            cached_summary = context.user_data.get("vision_summary")
+            summary = (
+                VisionSummary.model_validate(cached_summary)
+                if isinstance(cached_summary, dict)
+                else await self._resolve_onboarding_summary(user.id, stored_answers)
+            )
+        except Exception as exc:
+            log_safe_failure("Vision confirmation resume failed", exc, user_id=user.id)
+            await query.message.reply_text(
+                "Ответы сохранены, но завершить регистрацию сейчас не удалось. "
+                "Попробуй эту кнопку ещё раз или продолжи через /start."
+            )
+            return PROFILE_CONFIRM
+        try:
+            async with self.db.session() as session:
+                stored_user = await session.get(User, user.id)
+                if stored_user is None:
+                    raise RuntimeError("Onboarding owner disappeared")
+                from .repositories import ProfileRepository
 
-            await ProfileRepository(session).upsert(user, answers, summary)
-            user.display_name = answers.get("display_name")
-            if timezone_value := answers.get("timezone"):
-                from .domain import canonical_timezone
+                await ProfileRepository(session).upsert(stored_user, answers, summary)
+                stored_user.display_name = (
+                    normalize_display_name(display_name, clip_legacy=True)
+                    if (display_name := answers.get("display_name"))
+                    else None
+                )
+                if timezone_value := answers.get("timezone"):
+                    from .domain import canonical_timezone
 
-                user.timezone = canonical_timezone(timezone_value)
-            if location_value := answers.get("location"):
-                location = parse_location(location_value)
-                user.location_city = location.city
-                user.location_fallback_city = location.fallback_city
-            state = await OnboardingRepository(session).get_or_create(user_id)
-            state.status = "completed"
+                    stored_user.timezone = canonical_timezone(timezone_value)
+                if location_value := answers.get("location"):
+                    location = parse_location(location_value)
+                    stored_user.location_city = location.city
+                    stored_user.location_fallback_city = location.fallback_city
+                state = await OnboardingRepository(session).get_or_create(user.id)
+                state.status = "completed"
+                telegram_id = stored_user.telegram_id
+                timezone_name = stored_user.timezone
+        except Exception as exc:
+            log_safe_failure("Profile confirmation failed", exc, user_id=user.id)
+            await query.message.reply_text(
+                "Не удалось завершить регистрацию. Ответы сохранены — "
+                "попробуй кнопку ещё раз или продолжи через /start."
+            )
+            return PROFILE_CONFIRM
         if self.scheduler:
-            self.scheduler.schedule_user(user.telegram_id, user.timezone)
-        await query.edit_message_text("Профиль сохранён. Теперь предложу цели.")
-        await self._propose_goals(query, user_id, summary)
+            try:
+                self.scheduler.schedule_user(telegram_id, timezone_name)
+            except Exception as exc:
+                log_safe_failure("Onboarding schedule refresh failed", exc, user_id=user.id)
+        context.user_data.pop("onboarding_user_id", None)
+        context.user_data.pop("onboarding_detached", None)
+        context.user_data.pop("vision_summary", None)
+        await query.edit_message_text(
+            "Регистрация завершена ✓ Профиль сохранён. "
+            "Главное меню уже доступно; цели можно принять, изменить или отложить."
+        )
+        await query.message.reply_text(
+            "Кнопки регистрации убраны — дальше можно пользоваться обычным меню.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await self._send_navigation_root(query.message)
+        await self._propose_goals(query, user.id, summary)
         return ConversationHandler.END
 
     async def _propose_goals(self, query: object, user_id: int, summary: VisionSummary) -> None:
@@ -979,7 +1386,8 @@ class FutureSelfBot(
 
     @staticmethod
     def _profile_text(profile: VisionSummary, *, location_label: str | None = None) -> str:
-        return (
+        profile = FutureSelfBot._bounded_vision_summary(profile)
+        rendered = (
             f"Твой Vision Profile:\n{profile.summary}\n\n"
             f"Ценности: {', '.join(profile.values) or 'не указаны'}\n"
             f"Желаемая идентичность: {', '.join(profile.desired_identity) or 'не указана'}\n"
@@ -987,6 +1395,7 @@ class FutureSelfBot(
             f"Стиль поддержки: {profile.motivation_style or 'не указан'}\n"
             f"Локация: {location_label or 'не настроена — используй /location'}"
         )
+        return _truncate_utf16(rendered, 3_400)
 
     async def location_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await self._user(update.effective_user.id)
@@ -1041,12 +1450,28 @@ class FutureSelfBot(
             return
         await self._route_message(update, context, update.effective_message.text, "text")
 
-    async def voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
         medical_flow = await self._knowledge_medical_flow(update, context)
         if medical_flow is not None:
             await update.effective_message.reply_text(
                 "В медицинском сценарии голос не отправляется на распознавание или в LLM. "
                 "Ответь текстом либо заверши сценарий через /cancel."
+            )
+            return
+        user_data = getattr(context, "user_data", {})
+        blocked_context_flow = any(
+            key in user_data
+            for key in (
+                "health_checkin",
+                "doctor_prepare",
+                "evening",
+                "rename_goal_id",
+            )
+        )
+        if blocked_context_flow:
+            await update.effective_message.reply_text(
+                "Сейчас активен другой сценарий. Продолжи его ожидаемым текстом или "
+                "используй /cancel — аудио не отправлено на распознавание."
             )
             return
         if getattr(self.settings, "enable_knowledge_capture", False):
@@ -1100,21 +1525,37 @@ class FutureSelfBot(
                 "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
             )
             return
+        onboarding_result = await self.onboarding_persistent_input(
+            update, context, text, force=True
+        )
+        if onboarding_result is not None:
+            onboarding_state, navigation_action = onboarding_result
+            if navigation_action == "help":
+                await progress.edit_text("Голос распознан — открываю подробную помощь.")
+            elif navigation_action == "menu":
+                await progress.edit_text("Голос распознан — открываю главное меню.")
+            else:
+                await progress.edit_text("Голос распознан и обработан в регистрации.")
+            return onboarding_state
         if await self.workspace_pending_text(update, text, "voice"):
             await progress.edit_text("Голос распознан и обработан в пространстве.")
             return
         if await self.collection_pending_text(update, text, "voice"):
             await progress.edit_text("Голос распознан и обработан в разделе.")
             return
+        if await self.task_pending_text(update, text):
+            await progress.edit_text("Голос распознан и применён к задаче.")
+            return
+        heard_text = _truncate_utf16(text, 4_000)
         natural_command = self.natural_command_router.route(text)
         if natural_command is not None and natural_command.action in {"menu", "help"}:
-            await progress.edit_text(f"Я услышал: «{text}»")
+            await progress.edit_text(f"Я услышал: «{heard_text}»")
             await self._handle_natural_command(update, context, natural_command.action)
             return
         if await self._handle_vision_input(update, text):
             await progress.edit_text("Голос распознан и добавлен в карточку.")
             return
-        await progress.edit_text(f"Я услышал: «{text}»")
+        await progress.edit_text(f"Я услышал: «{heard_text}»")
         await self._route_message(update, context, text, "voice")
 
     async def _route_message(
@@ -1351,6 +1792,8 @@ class FutureSelfBot(
             "show_last_saved": self.last_saved_command,
             "show_profile": self.profile,
             "show_today": self.today,
+            "show_tasks": self.tasks_command,
+            "show_overdue_tasks": self.task_overdue,
             "show_collections": self.collections_command,
             "help": self.help_command,
         }
@@ -1485,7 +1928,9 @@ class FutureSelfBot(
         if route.kind == "cancel":
             await self.conversation.clear_system_action(telegram_user_id, chat_id)
             await update.effective_message.reply_text(
-                "Удаление черновиков отменено. Ничего не изменено."
+                "Очистка просроченных задач отменена. Ничего не изменено."
+                if snapshot.system_pending_action == "archive_overdue_tasks"
+                else "Удаление черновиков отменено. Ничего не изменено."
             )
             return
         if route.kind == "confirm":
@@ -1497,11 +1942,28 @@ class FutureSelfBot(
                 snapshot,
             )
             return
+        if snapshot.system_pending_action and route.action in {
+            "archive_overdue_tasks",
+            "discard_all_active_drafts",
+            "discard_selected_drafts",
+        }:
+            # Explicitly retargeting a pending cleanup invalidates the old
+            # capability even when the newly requested target set is empty.
+            await self.conversation.clear_system_action(telegram_user_id, chat_id)
         if route.action == "list_drafts":
             await self.drafts_command(update, context)
             return
         if route.action == "show_last_saved":
             await self.last_saved_command(update, context)
+            return
+        if route.action == "archive_overdue_tasks":
+            task_snapshot = await self.task_service.overdue_snapshot(user.id)
+            await self._begin_overdue_task_cleanup(
+                update.effective_message,
+                telegram_user_id,
+                chat_id,
+                task_snapshot,
+            )
             return
         drafts = await self.draft_service.active_drafts(telegram_user_id, chat_id)
         if route.action == "discard_all_active_drafts":
@@ -1516,6 +1978,43 @@ class FutureSelfBot(
             chat_id,
             drafts,
             affected,
+        )
+
+    async def _begin_overdue_task_cleanup(
+        self,
+        message: object,
+        telegram_user_id: int,
+        chat_id: int,
+        snapshot: list[dict[str, object]],
+    ) -> None:
+        if not snapshot:
+            await message.reply_text(
+                "Неактуальных задач не найдено. Просроченные задачи можно проверить в /tasks."
+            )
+            return
+        version = await self.conversation.begin_system_action(
+            telegram_user_id,
+            chat_id,
+            "archive_overdue_tasks",
+            snapshot,
+        )
+        preview = "\n".join(f"• {item['title']}" for item in snapshot[:5])
+        extra = f"\n• …и ещё {len(snapshot) - 5}" if len(snapshot) > 5 else ""
+        await message.reply_text(
+            f"Нашёл просроченных задач: {len(snapshot)}.\n\n{preview}{extra}\n\n"
+            "Убрать их из активных и Inbox? История сохранится, ожидающие напоминания "
+            "получат статус «истекло». Ничего не изменится без подтверждения.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"Да, убрать {len(snapshot)}",
+                            callback_data=f"sysdraft:confirm:{version}",
+                        ),
+                        InlineKeyboardButton("Отмена", callback_data=f"sysdraft:cancel:{version}"),
+                    ]
+                ]
+            ),
         )
 
     async def _begin_system_cleanup(
@@ -1584,6 +2083,22 @@ class FutureSelfBot(
                 "Подтверждение удаления отсутствует или истекло. Запусти /cleanup_drafts снова."
             )
             return False
+        if snapshot.system_pending_action == "archive_overdue_tasks":
+            user = await self._user(telegram_user_id)
+            result = await self.task_service.cancel_overdue_snapshot(
+                user.id, snapshot.system_draft_snapshot
+            )
+            await self.conversation.clear_system_action(telegram_user_id, chat_id)
+            if result.status != "cancelled":
+                await message.reply_text(
+                    "Список просроченных задач изменился. Ничего не изменено; "
+                    "повтори команду очистки."
+                )
+                return False
+            await message.reply_text(
+                f"Убрано из активных: {result.count}. История задач и напоминаний сохранена."
+            )
+            return True
         result = await self.draft_service.discard_snapshot(
             telegram_user_id, chat_id, snapshot.system_draft_snapshot
         )
@@ -1621,7 +2136,11 @@ class FutureSelfBot(
                 update.effective_user.id, update.effective_chat.id
             )
             await query.answer()
-            await query.edit_message_text("Удаление черновиков отменено.")
+            await query.edit_message_text(
+                "Очистка просроченных задач отменена."
+                if snapshot.system_pending_action == "archive_overdue_tasks"
+                else "Удаление черновиков отменено."
+            )
             return
         await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
@@ -2576,7 +3095,8 @@ class FutureSelfBot(
     async def cancel_draft_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self.cancel_workspace_state(update):
             await update.effective_message.reply_text(
-                "Операция с пространством отменена. Выбранный контекст не изменён."
+                "Операция с пространством отменена. Выбранный контекст не изменён.",
+                reply_markup=ReplyKeyboardRemove(),
             )
             return
         collection_cancelled = await self.cancel_collection_state(update)
@@ -2762,10 +3282,14 @@ class FutureSelfBot(
                     .limit(10)
                 )
             ).all()
-        text = (
-            "\n".join(f"• [{LABELS[item.kind]}] {item.title}" for item in items)
-            or "Inbox пока пуст."
-        )
+        text = "\n".join(f"• [{LABELS[item.kind]}] {item.title}" for item in items)
+        if text:
+            text = (
+                "Последние сохранённые записи Inbox\n\n"
+                f"{text}\n\nАктивные и просроченные задачи: /tasks."
+            )
+        else:
+            text = "Inbox пока пуст. Активные задачи и напоминания: /tasks."
         await update.effective_message.reply_text(text)
 
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

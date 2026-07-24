@@ -10,6 +10,7 @@ from autotester.fakes import (
     FakeVoice,
     ScriptedTranscription,
 )
+from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
 
 from future_self.bot import FutureSelfBot
@@ -33,6 +34,22 @@ class WorkspaceFakeBot(FakeBot):
     username = "future_self_test_bot"
 
 
+class DirectDeliveryBot(WorkspaceFakeBot):
+    def __init__(self, *, fail: bool = False, ambiguous: bool = False) -> None:
+        super().__init__()
+        self.fail = fail
+        self.ambiguous = ambiguous
+        self.sent: list[dict[str, object]] = []
+
+    async def send_message(self, **kwargs: object) -> SimpleNamespace:
+        if self.fail:
+            raise TelegramError("delivery unavailable")
+        self.sent.append(dict(kwargs))
+        if self.ambiguous:
+            raise RuntimeError("ambiguous transport result")
+        return SimpleNamespace(message_id=99001)
+
+
 def settings(*, enabled: bool = True) -> Settings:
     return Settings(
         _env_file=None,
@@ -45,6 +62,10 @@ def settings(*, enabled: bool = True) -> Settings:
 
 def context(*, args: list[str] | None = None) -> SimpleNamespace:
     return SimpleNamespace(user_data={}, args=args or [], bot=WorkspaceFakeBot())
+
+
+def delivery_context(bot: DirectDeliveryBot) -> SimpleNamespace:
+    return SimpleNamespace(user_data={}, args=[], bot=bot)
 
 
 def update_for(
@@ -115,6 +136,36 @@ async def create_pair_workspace(
     description = FakeMessage("-")
     assert await bot.workspace_pending_text(update_for(description, user_id=user_id), "-", "text")
     return description
+
+
+async def open_direct_recipient_picker(
+    bot: FutureSelfBot,
+    delivery_bot: DirectDeliveryBot,
+    *,
+    card: FakeMessage | None = None,
+) -> tuple[FakeMessage, int]:
+    card = card or await create_pair_workspace(bot)
+    ctx = delivery_context(delivery_bot)
+    await click(bot, card, "Пригласить", ctx=ctx)
+    await click(bot, card, "Редактор", ctx=ctx)
+    await click(bot, card, "Вариант 1", ctx=ctx)
+    await click(bot, card, "Отправить через бота", ctx=ctx)
+    picker = card.replies[-1]["reply_markup"]
+    request = picker.keyboard[0][0].request_users
+    assert request is not None
+    assert request.request_name is None
+    assert request.request_username is None
+    assert request.request_photo is None
+    return card, request.request_id
+
+
+def users_shared_message(request_id: int, telegram_id: int) -> FakeMessage:
+    message = FakeMessage()
+    message.users_shared = SimpleNamespace(
+        request_id=request_id,
+        users=(SimpleNamespace(user_id=telegram_id),),
+    )
+    return message
 
 
 @pytest.mark.autotester
@@ -223,6 +274,271 @@ async def test_invite_preview_edit_confirm_and_deep_link_accept_survive_restart(
     await click(recipient, invitation, "Присоединиться", user_id=880002)
     assert "Ты присоединился" in invitation.replies[-1]["text"]
     assert fake_ai.route_calls == []
+
+
+@pytest.mark.autotester
+async def test_known_recipient_gets_in_bot_invitation_without_link_or_identity_leak(
+    db, fake_ai, monkeypatch, caplog
+):
+    owner = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await owner._user(880002)
+    transport = DirectDeliveryBot()
+    card, request_id = await open_direct_recipient_picker(owner, transport)
+
+    captured_tokens: list[str] = []
+    create_invitation = owner.workspace_service.create_invitation
+
+    async def capture_invitation(*args, **kwargs):
+        issued = await create_invitation(*args, **kwargs)
+        captured_tokens.append(issued.token)
+        return issued
+
+    monkeypatch.setattr(owner.workspace_service, "create_invitation", capture_invitation)
+    shared = users_shared_message(request_id, 880002)
+    await owner.workspace_users_shared(update_for(shared), delivery_context(transport))
+
+    assert len(transport.sent) == 1
+    delivered = transport.sent[0]
+    assert delivered["chat_id"] == 880002
+    assert "Приглашение в совместное пространство" in str(delivered["text"])
+    delivered_labels = {
+        button.text for row in delivered["reply_markup"].inline_keyboard for button in row
+    }
+    assert {"Присоединиться", "Отклонить", "Подробнее", "Не сейчас"} <= delivered_labels
+    assert "https://" not in str(delivered["text"])
+    assert "Готово — бот отправил приглашение" in shared.replies[-1]["text"]
+
+    visible_text = "\n".join(
+        [*(reply["text"] for reply in card.replies), *(reply["text"] for reply in shared.replies)]
+    )
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert captured_tokens
+    assert all(token not in visible_text and token not in log_text for token in captured_tokens)
+    assert "880002" not in visible_text
+    assert "880002" not in log_text
+
+    invitation_card = FakeMessage()
+    invitation_card.replies.append(delivered)
+    accept = FakeCallbackQuery(
+        callback_by_label(invitation_card, "Присоединиться"), invitation_card
+    )
+    restarted = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await restarted.workspace_callback(
+        update_for(invitation_card, user_id=880002, query=accept), context()
+    )
+    assert any("Ты присоединился" in reply["text"] for reply in invitation_card.replies)
+
+
+@pytest.mark.autotester
+async def test_unknown_recipient_gets_honest_fallback_without_global_user_directory(db, fake_ai):
+    owner = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    transport = DirectDeliveryBot()
+    _card, request_id = await open_direct_recipient_picker(owner, transport)
+    shared = users_shared_message(request_id, 999_999_123)
+
+    await owner.workspace_users_shared(update_for(shared), delivery_context(transport))
+
+    assert transport.sent == []
+    assert "Бот не смог отправить сообщение" in shared.replies[-1]["text"]
+    assert "ещё не запускал бота или запретил сообщения" in shared.replies[-1]["text"]
+    assert "999999123" not in "\n".join(reply["text"] for reply in shared.replies)
+    assert "https://" not in "\n".join(reply["text"] for reply in shared.replies)
+    assert callback_by_label(shared, "Создать ссылку для передачи").startswith("space:")
+    user = await owner._user(880001)
+    active = await owner.workspace_service.active_context(user.id, 880001)
+    assert active is not None
+    assert await owner.workspace_service.list_invitations(active.access_context) == ()
+
+
+@pytest.mark.autotester
+async def test_failed_direct_delivery_revokes_invitation_before_offering_link(db, fake_ai):
+    owner = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await owner._user(880002)
+    transport = DirectDeliveryBot(fail=True)
+    _card, request_id = await open_direct_recipient_picker(owner, transport)
+    shared = users_shared_message(request_id, 880002)
+
+    await owner.workspace_users_shared(update_for(shared), delivery_context(transport))
+
+    user = await owner._user(880001)
+    active = await owner.workspace_service.active_context(user.id, 880001)
+    assert active is not None
+    assert await owner.workspace_service.list_invitations(active.access_context) == ()
+    revoked = await owner.workspace_service.list_invitations(
+        active.access_context, status="revoked"
+    )
+    assert len(revoked) == 1
+    assert revoked[0].delivery_mode == "direct"
+    assert "Адресное приглашение не осталось активным" in shared.replies[-1]["text"]
+    assert callback_by_label(shared, "Создать ссылку для передачи").startswith("space:")
+
+
+@pytest.mark.autotester
+async def test_direct_invitation_management_requires_revoke_and_fresh_delivery(db, fake_ai):
+    owner = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    card = await create_pair_workspace(owner)
+    owner_user = await owner._user(880001)
+    recipient = await owner._user(880002)
+    active = await owner.workspace_service.active_context(owner_user.id, 880001)
+    assert active is not None
+    workspace = await owner.workspace_service.get_workspace(active.access_context)
+    direct = await owner.workspace_service.create_invitation(
+        active.access_context,
+        delivery_mode="direct",
+        intended_user_id=recipient.id,
+        role="editor",
+        template_key="pair_1",
+    )
+    preexisting_renew = await owner.workspace_service.issue_action(
+        owner_user.id,
+        880001,
+        "invite_renew",
+        payload={
+            "invitation_id": direct.invitation.id,
+            "invitation_version": direct.invitation.version,
+        },
+        context=active.access_context,
+        workspace_version=workspace.version,
+    )
+
+    await click(owner, card, "Приглашения")
+    await click(owner, card, "Приглашение 1", contains=True)
+    direct_view = card.replies[-1]
+    direct_labels = {
+        button.text for row in direct_view["reply_markup"].inline_keyboard for button in row
+    }
+    assert "Обновить" not in direct_labels
+    assert "Отозвать" in direct_labels
+    assert "отзови это и создай новое" in direct_view["text"]
+
+    stale_query = FakeCallbackQuery(preexisting_renew, card)
+    await owner.workspace_callback(update_for(card, query=stale_query), context())
+    assert any(show_alert for _text, show_alert in stale_query.answers)
+    pending = await owner.workspace_service.list_invitations(active.access_context)
+    assert [(item.id, item.version, item.delivery_mode) for item in pending] == [
+        (direct.invitation.id, direct.invitation.version, "direct")
+    ]
+
+    await owner.workspace_service.revoke_invitation(
+        active.access_context, direct.invitation.id, direct.invitation.version
+    )
+    await owner.workspace_service.create_invitation(
+        active.access_context,
+        delivery_mode="share",
+        role="editor",
+        template_key="pair_1",
+    )
+    fresh = FakeMessage("/spaces")
+    await owner.spaces_command(update_for(fresh), context())
+    await click(owner, fresh, "Наше будущее", contains=True)
+    await click(owner, fresh, "Приглашения")
+    await click(owner, fresh, "Приглашение 1", contains=True)
+    share_labels = {
+        button.text for row in fresh.replies[-1]["reply_markup"].inline_keyboard for button in row
+    }
+    assert "Обновить" in share_labels
+
+
+@pytest.mark.autotester
+async def test_ambiguous_delivery_revokes_invite_and_delivered_buttons_fail_closed(db, fake_ai):
+    owner = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await owner._user(880002)
+    transport = DirectDeliveryBot(ambiguous=True)
+    _card, request_id = await open_direct_recipient_picker(owner, transport)
+    shared = users_shared_message(request_id, 880002)
+
+    await owner.workspace_users_shared(update_for(shared), delivery_context(transport))
+
+    assert len(transport.sent) == 1
+    accidentally_delivered = FakeMessage()
+    accidentally_delivered.replies.append(transport.sent[0])
+    stale_accept = FakeCallbackQuery(
+        callback_by_label(accidentally_delivered, "Присоединиться"), accidentally_delivered
+    )
+    restarted = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await restarted.workspace_callback(
+        update_for(accidentally_delivered, user_id=880002, query=stale_accept), context()
+    )
+
+    assert any(show_alert for _text, show_alert in stale_accept.answers)
+    assert all("Наше будущее" not in (text or "") for text, _show_alert in stale_accept.answers)
+    owner_user = await owner._user(880001)
+    active = await owner.workspace_service.active_context(owner_user.id, 880001)
+    assert active is not None
+    assert await owner.workspace_service.list_invitations(active.access_context) == ()
+
+
+@pytest.mark.autotester
+async def test_recipient_picker_is_actor_chat_and_request_bound(db, fake_ai):
+    owner = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await owner._user(880002)
+    transport = DirectDeliveryBot()
+    _card, request_id = await open_direct_recipient_picker(owner, transport)
+
+    forged_actor = users_shared_message(request_id, 880002)
+    await owner.workspace_users_shared(
+        update_for(forged_actor, user_id=880099), delivery_context(transport)
+    )
+    forged_chat = users_shared_message(request_id, 880002)
+    await owner.workspace_users_shared(
+        update_for(forged_chat, chat_id=880099), delivery_context(transport)
+    )
+    forged_request = users_shared_message(request_id + 1, 880002)
+    await owner.workspace_users_shared(update_for(forged_request), delivery_context(transport))
+
+    assert transport.sent == []
+    assert all(
+        "Наше будущее" not in reply["text"]
+        for message in (forged_actor, forged_chat, forged_request)
+        for reply in message.replies
+    )
+    user = await owner._user(880001)
+    pending = await owner.workspace_service.pending_input(user.id, 880001)
+    assert pending is not None
+    assert pending.action == "input:invite_recipient"
+
+    valid = users_shared_message(request_id, 880002)
+    await owner.workspace_users_shared(update_for(valid), delivery_context(transport))
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.autotester
+async def test_self_and_existing_member_do_not_create_or_fallback_to_share_invites(db, fake_ai):
+    owner = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    transport = DirectDeliveryBot()
+    _card, request_id = await open_direct_recipient_picker(owner, transport)
+    self_selection = users_shared_message(request_id, 880001)
+    await owner.workspace_users_shared(update_for(self_selection), delivery_context(transport))
+    assert "Себя приглашать не нужно" in self_selection.replies[-1]["text"]
+    assert transport.sent == []
+
+    owner_user = await owner._user(880001)
+    member_user = await owner._user(880002)
+    active = await owner.workspace_service.active_context(owner_user.id, 880001)
+    assert active is not None
+    existing = await owner.workspace_service.create_invitation(
+        active.access_context,
+        delivery_mode="direct",
+        intended_user_id=member_user.id,
+        role="editor",
+        template_key="pair_1",
+    )
+    await owner.workspace_service.accept_invitation(member_user.id, existing.token)
+
+    fresh = FakeMessage("/spaces")
+    await owner.spaces_command(update_for(fresh), context())
+    await click(owner, fresh, "Наше будущее", contains=True)
+    _card, member_request_id = await open_direct_recipient_picker(owner, transport, card=fresh)
+    member_selection = users_shared_message(member_request_id, 880002)
+    await owner.workspace_users_shared(update_for(member_selection), delivery_context(transport))
+    assert "уже участвует" in member_selection.replies[-1]["text"]
+    assert all(
+        button.text != "Создать ссылку для передачи"
+        for reply in member_selection.replies
+        for row in getattr(reply.get("reply_markup"), "inline_keyboard", ())
+        for button in row
+    )
+    assert transport.sent == []
 
 
 @pytest.mark.autotester

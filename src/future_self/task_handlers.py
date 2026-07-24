@@ -294,7 +294,7 @@ class TaskHandlers:
             return
         await self._task_stale_message(query)
 
-    async def task_pending_text(self, update: Update) -> bool:
+    async def task_pending_text(self, update: Update, text: str | None = None) -> bool:
         user = await self._user(update.effective_user.id)
         pending = await self.task_service.pending_input(user.id, update.effective_chat.id)
         if pending is None:
@@ -307,7 +307,7 @@ class TaskHandlers:
             )
             return True
         parsed = self.task_service.parse_datetime(
-            update.effective_message.text or "",
+            text if text is not None else (update.effective_message.text or ""),
             record.state.timezone,
         )
         if parsed.status != "resolved":
@@ -520,6 +520,8 @@ class TaskHandlers:
                 reminder_text = local_reminder.strftime("%d.%m.%Y %H:%M")
             elif reminder.status == "sent":
                 reminder_text = f"отправлено {local_reminder.strftime('%d.%m.%Y %H:%M')}"
+            elif reminder.status == "expired":
+                reminder_text = f"истекло {local_reminder.strftime('%d.%m.%Y %H:%M')}"
             else:
                 reminder_text = "отключено"
         description = ""

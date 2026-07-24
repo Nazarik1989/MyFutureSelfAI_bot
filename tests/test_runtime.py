@@ -159,7 +159,11 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "doctor_find",
         "doctor_find_task",
     } <= commands
-    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 12
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 13
+    assert any(
+        isinstance(handler, CallbackQueryHandler) and handler.callback.__name__ == "profile_action"
+        for handler in handlers
+    )
     assert sum(isinstance(handler, MessageHandler) for handler in handlers) == 2
     gate_commands = {
         command

@@ -35,6 +35,10 @@ class ProfileRepository:
             select(VisionProfile).where(VisionProfile.user_id == user.id)
         )
         values = data.model_dump()
+        if motivation_style := values.get("motivation_style"):
+            # VisionProfile.motivation_style is VARCHAR(120). Keep this final DB
+            # boundary safe even for callers outside the Telegram onboarding flow.
+            values["motivation_style"] = str(motivation_style)[:120]
         if profile is None:
             profile = VisionProfile(user_id=user.id, raw_answers=answers, **values)
             self.session.add(profile)
@@ -124,11 +128,14 @@ class OnboardingRepository:
         self.session = session
 
     async def get_or_create(self, user_id: int) -> OnboardingState:
-        state = await self.session.scalar(
-            select(OnboardingState).where(OnboardingState.user_id == user_id)
-        )
+        state = await self.get(user_id)
         if state is None:
             state = OnboardingState(user_id=user_id)
             self.session.add(state)
             await self.session.flush()
         return state
+
+    async def get(self, user_id: int) -> OnboardingState | None:
+        return await self.session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == user_id)
+        )

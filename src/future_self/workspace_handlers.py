@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import logging
+import secrets
 from html import escape
 from typing import Any
 from urllib.parse import quote
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    KeyboardButtonRequestUsers,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 from telegram.helpers import create_deep_linked_url
@@ -24,6 +34,8 @@ from .workspace_access import (
     clean_workspace_description,
     clean_workspace_name,
 )
+
+logger = logging.getLogger(__name__)
 
 CHARACTER_LABELS = {
     "pair": "Для пары",
@@ -187,7 +199,6 @@ class WorkspaceHandlers:
             await self._workspace_edit_or_send(query, escape(str(exc)), None, parse_mode="HTML")
 
     async def workspace_pending_text(self, update: Update, text: str, source: str) -> bool:
-        del source
         if not self._workspace_enabled():
             return False
         user = await self._user(update.effective_user.id)
@@ -195,6 +206,20 @@ class WorkspaceHandlers:
         pending = None
         try:
             pending = await self.workspace_service.pending_input(user.id, chat_id)
+            if pending is not None and pending.action == "input:invite_recipient":
+                if source == "text" and text.strip().casefold() in {"отмена", "cancel"}:
+                    await self.workspace_service.cancel_input(user.id, chat_id)
+                    await update.effective_message.reply_text(
+                        "Выбор получателя отменён. Приглашение не создано.",
+                        reply_markup=ReplyKeyboardRemove(),
+                    )
+                else:
+                    await update.effective_message.reply_text(
+                        "Для адресного приглашения нажми «Выбрать человека» ниже. "
+                        "Бот не ищет людей по введённому имени и не открывает общий список пользователей. "
+                        "Для отмены нажми «Отмена» или используй /cancel.",
+                    )
+                return True
             claim = (
                 await self.workspace_service.claim_pending_input(user.id, chat_id, pending.action)
                 if pending is not None
@@ -226,6 +251,87 @@ class WorkspaceHandlers:
             await self._rearm_workspace_input(user.id, chat_id, claim)
             await update.effective_message.reply_text(str(exc))
         return True
+
+    async def workspace_users_shared(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Complete an address-bound invitation selected via Telegram's native picker."""
+
+        message = update.effective_message
+        if not self._workspace_enabled() or message is None:
+            return
+        user = await self._user(update.effective_user.id)
+        chat_id = update.effective_chat.id
+        pending = await self.workspace_service.pending_input(user.id, chat_id)
+        if pending is None or pending.action != "input:invite_recipient":
+            await message.reply_text(
+                "Этот выбор получателя больше не ожидается. Открой /spaces и начни приглашение заново.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        shared = getattr(message, "users_shared", None)
+        recipients = tuple(getattr(shared, "users", ()) or ())
+        request_id = getattr(shared, "request_id", None)
+        expected_request_id = (pending.payload or {}).get("request_id")
+        if (
+            isinstance(request_id, bool)
+            or not isinstance(request_id, int)
+            or request_id != expected_request_id
+            or len(recipients) != 1
+        ):
+            await message.reply_text(
+                "Не удалось подтвердить этот выбор. Нажми «Выбрать человека» ещё раз "
+                "или используй /cancel.",
+            )
+            return
+
+        claim = await self.workspace_service.claim_pending_input(user.id, chat_id, pending.action)
+        if claim is None or claim.access_context is None:
+            await message.reply_text(
+                "Время выбора истекло или доступ изменился. Открой /spaces и начни заново.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        recipient_telegram_id = getattr(recipients[0], "user_id", None)
+        if (
+            isinstance(recipient_telegram_id, bool)
+            or not isinstance(recipient_telegram_id, int)
+            or recipient_telegram_id <= 0
+        ):
+            await message.reply_text(
+                "Не удалось подтвердить выбранного человека. Приглашение не создано; "
+                "открой /spaces и попробуй ещё раз.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        if recipient_telegram_id == update.effective_user.id:
+            await message.reply_text(
+                "Себя приглашать не нужно — ты уже владелец этого пространства.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        recipient = await self.workspace_service.known_bot_user(recipient_telegram_id)
+        try:
+            if recipient is None:
+                await self._direct_invitation_fallback(message, user, chat_id, claim)
+                return
+            await self._deliver_direct_invitation(
+                message,
+                context,
+                user,
+                chat_id,
+                claim,
+                recipient.user_id,
+                recipient.telegram_id,
+            )
+        except WorkspaceAccessError:
+            await message.reply_text(
+                "Приглашение не создано: пространство или доступ уже изменились. "
+                "Открой /spaces и начни заново.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
 
     async def cancel_workspace_state(self, update: Update) -> bool:
         if not self._workspace_enabled():
@@ -438,6 +544,8 @@ class WorkspaceHandlers:
                 "будет добавлено автоматически. /cancel — отменить ввод.",
                 self._workspace_navigation_markup(),
             )
+        elif action == "invite_direct":
+            await self._begin_direct_invitation(query, user, chat_id, access, claim, payload)
         elif action == "invite_confirm":
             await self._confirm_share_invitation(query, context, user, chat_id, access, payload)
         elif action == "invitations":
@@ -1552,6 +1660,18 @@ class WorkspaceHandlers:
             access=access,
             workspace_version=workspace.version,
         )
+        direct = await self._workspace_action(
+            user.id,
+            chat_id,
+            "invite_direct",
+            payload={
+                "role": role,
+                "template_index": index,
+                "custom_text": custom_text,
+            },
+            access=access,
+            workspace_version=workspace.version,
+        )
         next_token = await self._workspace_action(
             user.id,
             chat_id,
@@ -1584,10 +1704,12 @@ class WorkspaceHandlers:
             f"{escape(invitation_text)}\n\n"
             f"<i>{escape(PRIVACY_FOOTER)}</i>\n\n"
             f"Будущая роль: {escape(ROLE_LABELS[role])}.\n"
-            "Ссылка будет одноразовой и действительна ограниченное время."
+            "Если человек уже общался с ботом, приглашение можно отправить ему прямо здесь. "
+            "Иначе бот честно предложит одноразовую ссылку для личной передачи."
         )
         return text, InlineKeyboardMarkup(
             [
+                [InlineKeyboardButton("Отправить через бота", callback_data=f"space:{direct}")],
                 [InlineKeyboardButton("Поделиться приглашением", callback_data=f"space:{confirm}")],
                 [
                     InlineKeyboardButton("Другой вариант", callback_data=f"space:{next_token}"),
@@ -1595,6 +1717,180 @@ class WorkspaceHandlers:
                 ],
                 [InlineKeyboardButton("Отмена", callback_data=f"space:{cancel}")],
             ]
+        )
+
+    async def _begin_direct_invitation(
+        self,
+        query: Any,
+        user: Any,
+        chat_id: int,
+        access: AccessContext,
+        claim: Any,
+        payload: dict[str, Any],
+    ) -> None:
+        role = str(payload.get("role", ""))
+        if role not in {"editor", "viewer"}:
+            raise WorkspaceStaleError("Роль приглашения недоступна.")
+        request_id = secrets.randbelow(2_147_483_647) + 1
+        await self._begin_workspace_input(
+            user.id,
+            chat_id,
+            "input_invite_recipient",
+            payload={
+                "request_id": request_id,
+                "role": role,
+                "template_index": int(payload.get("template_index", 0)),
+                "custom_text": payload.get("custom_text"),
+            },
+            access=access,
+            workspace_version=claim.workspace_version,
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except (TelegramError, TypeError):
+            pass
+        await query.message.reply_text(
+            "Кого пригласить? Нажми кнопку ниже и выбери одного человека. "
+            "Telegram передаст боту только выбранного пользователя — общего списка людей бот "
+            "не показывает. Если бот не сможет написать первым, предложу безопасную ссылку.",
+            reply_markup=ReplyKeyboardMarkup(
+                [
+                    [
+                        KeyboardButton(
+                            "Выбрать человека",
+                            request_users=KeyboardButtonRequestUsers(
+                                request_id=request_id,
+                                user_is_bot=False,
+                                max_quantity=1,
+                            ),
+                        )
+                    ],
+                    ["Отмена"],
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
+
+    async def _deliver_direct_invitation(
+        self,
+        message: Any,
+        context: Any,
+        user: Any,
+        chat_id: int,
+        claim: Any,
+        recipient_user_id: int,
+        recipient_telegram_id: int,
+    ) -> None:
+        access = claim.access_context
+        if access is None:
+            raise WorkspaceStaleError("Пространство недоступно.")
+        workspace = await self.workspace_service.get_workspace(access)
+        payload = claim.payload
+        role = str(payload.get("role", ""))
+        if role not in {"editor", "viewer"}:
+            raise WorkspaceStaleError("Роль приглашения недоступна.")
+        index = int(payload.get("template_index", 0)) % len(
+            INVITATION_TEMPLATES[workspace.character]
+        )
+        custom_text = payload.get("custom_text")
+        try:
+            issued = await self.workspace_service.create_invitation(
+                access,
+                delivery_mode="direct",
+                intended_user_id=recipient_user_id,
+                template_key=("custom" if custom_text else f"{workspace.character}_{index + 1}"),
+                role=role,
+                custom_text=str(custom_text) if custom_text is not None else None,
+            )
+        except WorkspaceAccessError:
+            await message.reply_text(
+                "Адресное приглашение не создано: этот человек уже участвует в пространстве "
+                "или сейчас недоступен. Открой /spaces, чтобы проверить участников.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        delivery_failed = False
+        try:
+            incoming = await self.workspace_service.issue_incoming_actions(
+                recipient_user_id, recipient_telegram_id, issued.token
+            )
+            sender = getattr(getattr(context, "bot", None), "send_message", None)
+            if not callable(sender):
+                delivery_failed = True
+            else:
+                await sender(
+                    chat_id=recipient_telegram_id,
+                    text=self._incoming_invitation_text(incoming.preview),
+                    reply_markup=self._incoming_keyboard(incoming.actions),
+                    parse_mode="HTML",
+                )
+        except Exception as exc:
+            # A transport may fail ambiguously after accepting the message. Revoke the
+            # address-bound invite below so any possibly delivered buttons fail closed.
+            logger.warning("Direct workspace invitation delivery failed (%s)", type(exc).__name__)
+            delivery_failed = True
+
+        if delivery_failed:
+            try:
+                await self.workspace_service.revoke_invitation(
+                    access, issued.invitation.id, issued.invitation.version
+                )
+            except WorkspaceAccessError:
+                await message.reply_text(
+                    "Не удалось подтвердить доставку. Новую ссылку не создаю, чтобы не оставить "
+                    "два приглашения. Проверь раздел «Приглашения» в /spaces.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+                return
+            await self._direct_invitation_fallback(message, user, chat_id, claim)
+            return
+
+        await message.reply_text(
+            "Готово — бот отправил приглашение в личный чат. Получатель увидит описание "
+            "пространства и кнопки «Присоединиться» и «Отклонить».",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    async def _direct_invitation_fallback(
+        self, message: Any, user: Any, chat_id: int, claim: Any
+    ) -> None:
+        access = claim.access_context
+        if access is None:
+            raise WorkspaceStaleError("Пространство недоступно.")
+        workspace = await self.workspace_service.get_workspace(access)
+        payload = claim.payload
+        role = str(payload.get("role", ""))
+        if role not in {"editor", "viewer"}:
+            raise WorkspaceStaleError("Роль приглашения недоступна.")
+        fallback = await self._workspace_action(
+            user.id,
+            chat_id,
+            "invite_confirm",
+            payload={
+                "role": role,
+                "template_index": int(payload.get("template_index", 0)),
+                "custom_text": payload.get("custom_text"),
+            },
+            access=access,
+            workspace_version=workspace.version,
+        )
+        await message.reply_text("Кнопка выбора закрыта.", reply_markup=ReplyKeyboardRemove())
+        await message.reply_text(
+            "Бот не смог отправить сообщение этому человеку. Обычно это значит, что человек "
+            "ещё не запускал бота или запретил сообщения. Адресное приглашение не осталось "
+            "активным. Можно создать одноразовую ссылку и передать её лично только нужному человеку.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Создать ссылку для передачи", callback_data=f"space:{fallback}"
+                        )
+                    ],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
+                ]
+            ),
         )
 
     async def _confirm_share_invitation(
@@ -1765,16 +2061,20 @@ class WorkspaceHandlers:
             access=access,
             workspace_version=workspace.version,
         )
-        renew = await self._workspace_action(
-            actor_id,
-            chat_id,
-            "invite_renew",
-            payload={
-                "invitation_id": invitation.id,
-                "invitation_version": invitation.version,
-            },
-            access=access,
-            workspace_version=workspace.version,
+        renew = (
+            await self._workspace_action(
+                actor_id,
+                chat_id,
+                "invite_renew",
+                payload={
+                    "invitation_id": invitation.id,
+                    "invitation_version": invitation.version,
+                },
+                access=access,
+                workspace_version=workspace.version,
+            )
+            if invitation.delivery_mode == "share"
+            else None
         )
         back = await self._workspace_action(
             actor_id,
@@ -1783,19 +2083,29 @@ class WorkspaceHandlers:
             access=access,
             workspace_version=workspace.version,
         )
+        rows: list[list[InlineKeyboardButton]] = []
+        if renew is not None:
+            rows.append([InlineKeyboardButton("Обновить", callback_data=f"space:{renew}")])
+        rows.extend(
+            (
+                [InlineKeyboardButton("Отозвать", callback_data=f"space:{revoke}")],
+                [InlineKeyboardButton("← Назад", callback_data=f"space:{back}")],
+            )
+        )
+        direct_notice = (
+            "\n\nЧтобы отправить адресное приглашение заново, отзови это и создай новое — "
+            "так бот сможет подтвердить доставку новых кнопок."
+            if invitation.delivery_mode == "direct"
+            else ""
+        )
         await self._workspace_edit_or_send(
             query,
             "<b>Активное приглашение</b>\n"
             f"Роль: {escape(ROLE_LABELS[invitation.role])}\n"
             f"Способ: {'одноразовая ссылка' if invitation.delivery_mode == 'share' else 'адресное'}\n"
-            f"Действует до: {escape(invitation.expires_at.strftime('%d.%m.%Y %H:%M UTC'))}",
-            InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("Обновить", callback_data=f"space:{renew}")],
-                    [InlineKeyboardButton("Отозвать", callback_data=f"space:{revoke}")],
-                    [InlineKeyboardButton("← Назад", callback_data=f"space:{back}")],
-                ]
-            ),
+            f"Действует до: {escape(invitation.expires_at.strftime('%d.%m.%Y %H:%M UTC'))}"
+            f"{direct_notice}",
+            InlineKeyboardMarkup(rows),
             parse_mode="HTML",
         )
 

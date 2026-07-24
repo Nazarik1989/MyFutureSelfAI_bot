@@ -34,6 +34,25 @@ ONBOARDING_QUESTIONS: tuple[tuple[str, str, bool], ...] = (
         True,
     ),
 )
+DISPLAY_NAME_MAX_CHARS = 120
+ONBOARDING_ANSWER_MAX_CHARS = 8_000
+ONBOARDING_TOTAL_MAX_CHARS = 30_000
+
+
+def normalize_display_name(value: str, *, clip_legacy: bool = False) -> str:
+    clean = " ".join(value.split())
+    if not clean:
+        if clip_legacy:
+            return "друг"
+        raise ValueError("Имя не должно быть пустым.")
+    if len(clean) > DISPLAY_NAME_MAX_CHARS:
+        if clip_legacy:
+            return clean[:DISPLAY_NAME_MAX_CHARS].rstrip()
+        raise ValueError(
+            f"Имя слишком длинное. Укажи не больше {DISPLAY_NAME_MAX_CHARS} символов; "
+            "длинный рассказ можно будет написать в следующих ответах."
+        )
+    return clean
 
 
 class OnboardingFlow:
@@ -47,6 +66,8 @@ class OnboardingFlow:
 
     @staticmethod
     def answer(answers: dict[str, Any], step: int, value: str | None) -> dict[str, Any]:
+        if not 0 <= step < len(ONBOARDING_QUESTIONS):
+            raise ValueError("Текущий шаг регистрации устарел. Запусти /start, чтобы продолжить.")
         result = dict(answers)
         key, _, required = ONBOARDING_QUESTIONS[step]
         if value is None and required:
@@ -54,7 +75,28 @@ class OnboardingFlow:
         if value is None:
             result.pop(key, None)
         else:
-            result[key] = value.strip()
+            clean = value.strip()
+            if not clean:
+                raise ValueError("Ответ получился пустым. Напиши ответ или используй /skip.")
+            if key == "display_name":
+                clean = normalize_display_name(clean)
+            elif len(clean) > ONBOARDING_ANSWER_MAX_CHARS:
+                raise ValueError(
+                    f"Ответ слишком длинный. Сократи его до {ONBOARDING_ANSWER_MAX_CHARS} "
+                    "символов; многоабзацный текст поддерживается."
+                )
+            result[key] = clean
+            answer_keys = {item[0] for item in ONBOARDING_QUESTIONS}
+            total_chars = sum(
+                len(answer)
+                for answer_key, answer in result.items()
+                if answer_key in answer_keys and isinstance(answer, str)
+            )
+            if total_chars > ONBOARDING_TOTAL_MAX_CHARS:
+                raise ValueError(
+                    "Ответы вместе получились слишком длинными. Сократи текущий ответ; "
+                    "предыдущие ответы сохранены и шаг не изменён."
+                )
         return result
 
 
@@ -168,7 +210,11 @@ class ProfileService:
                 raise ValueError("User not found")
             if timezone := answers.get("timezone"):
                 user.timezone = canonical_timezone(timezone)
-            user.display_name = answers.get("display_name")
+            user.display_name = (
+                normalize_display_name(display_name, clip_legacy=True)
+                if (display_name := answers.get("display_name"))
+                else None
+            )
             if location_value := answers.get("location"):
                 location = parse_location(location_value)
                 user.location_city = location.city

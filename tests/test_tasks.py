@@ -77,6 +77,79 @@ async def token(service, owner_id, item_id, action, *, chat_id=100):
     return (await service.issue_actions(owner_id, chat_id, item_id, 1, (action,)))[action]
 
 
+async def test_bulk_overdue_cleanup_is_optimistic_atomic_and_owner_scoped(db):
+    now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    owner_id, first_id, _ = await create_task(
+        db,
+        telegram_id=1901,
+        title="Старая первая",
+        event_at=now - timedelta(days=3),
+        remind_at=now - timedelta(days=3, minutes=30),
+    )
+    _, second_id, _ = await create_task(
+        db,
+        telegram_id=1901,
+        title="Старая вторая",
+        event_at=now - timedelta(days=2),
+        remind_at=now - timedelta(days=2, minutes=30),
+    )
+    _, future_id, _ = await create_task(
+        db,
+        telegram_id=1901,
+        title="Будущая",
+        event_at=now + timedelta(days=2),
+        remind_at=now + timedelta(days=2, minutes=-30),
+    )
+    foreign_owner, foreign_id, _ = await create_task(
+        db,
+        telegram_id=1902,
+        title="Чужая старая",
+        event_at=now - timedelta(days=4),
+        remind_at=now - timedelta(days=4, minutes=30),
+    )
+    service = TaskService(db)
+    snapshot = await service.overdue_snapshot(owner_id, now=now)
+    assert [row["id"] for row in snapshot] == [first_id, second_id]
+
+    async with db.session() as session:
+        changed = await session.scalar(
+            select(TaskState).where(TaskState.inbox_item_id == second_id)
+        )
+        changed.version += 1
+    result = await service.cancel_overdue_snapshot(owner_id, snapshot, now=now)
+    assert result.status == "changed"
+    async with db.sessions() as session:
+        states = list(
+            (
+                await session.scalars(
+                    select(TaskState).where(TaskState.inbox_item_id.in_({first_id, second_id}))
+                )
+            ).all()
+        )
+    assert {state.status for state in states} == {"active"}
+
+    fresh = await service.overdue_snapshot(owner_id, now=now)
+    result = await service.cancel_overdue_snapshot(owner_id, fresh, now=now)
+    assert (result.status, result.count) == ("cancelled", 2)
+    async with db.sessions() as session:
+        rows = (
+            await session.execute(
+                select(TaskState, InboxItem, TaskReminder)
+                .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+                .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                .where(TaskState.inbox_item_id.in_({first_id, second_id, future_id, foreign_id}))
+            )
+        ).all()
+    values = {
+        item.id: (state.status, item.status, reminder.status) for state, item, reminder in rows
+    }
+    assert values[first_id] == ("cancelled", "archived", "expired")
+    assert values[second_id] == ("cancelled", "archived", "expired")
+    assert values[future_id] == ("active", "confirmed", "pending")
+    assert values[foreign_id] == ("active", "confirmed", "pending")
+    assert foreign_owner != owner_id
+
+
 async def test_reconciliation_is_idempotent_and_uses_canonical_precedence(db):
     async with db.session() as session:
         owner = await UserRepository(session).get_or_create(200, "Europe/Moscow")
@@ -234,6 +307,33 @@ async def test_reschedule_preserves_interval_and_invalidates_competing_callback(
     assert as_utc(changed.record.reminder.remind_at) == now + timedelta(minutes=15)
     assert changed.record.reminder.task_version == 2
     assert (await service.complete(actions["complete"], owner_id, 100)).status == "stale"
+
+
+async def test_reschedule_makes_auto_archived_overdue_task_current_again(db):
+    now = datetime.now(UTC)
+    event = now - timedelta(days=7)
+    owner_id, item_id, _ = await create_task(
+        db,
+        event_at=event,
+        remind_at=event - timedelta(minutes=30),
+    )
+
+    async def send(chat_id: int, text: str) -> int:
+        raise AssertionError("stale reminder must not be delivered")
+
+    assert await TaskReminderEngine(db, send).expire_stale(now=now) == 1
+    service = TaskService(db)
+    menu_token = await token(service, owner_id, item_id, "reschedule_menu")
+    menu = await service.reschedule_menu(menu_token, owner_id, 100)
+    proposal = await service.choose_reschedule_preset(menu.tokens["1h"], owner_id, 100, now=now)
+    result = await service.apply_reschedule_choice(
+        proposal.tokens["reschedule_preserve"], owner_id, 100
+    )
+    assert result.status == "rescheduled"
+    assert result.record.item.status == "confirmed"
+    assert result.record.state.status == "active"
+    assert result.record.reminder.status == "pending"
+    assert as_utc(result.record.state.event_at) == now + timedelta(hours=1)
 
 
 async def test_custom_event_and_reminder_inputs_are_persistent_and_deterministic(db):

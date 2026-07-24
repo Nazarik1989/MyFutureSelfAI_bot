@@ -57,6 +57,12 @@ class TaskResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskBulkResult:
+    status: Literal["cancelled", "changed", "empty"]
+    count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedTaskDateTime:
     status: Literal["resolved", "none", "conflict", "nonexistent"]
     event_at: datetime | None = None
@@ -193,6 +199,99 @@ class TaskService:
                 delete(TaskActionToken).where(TaskActionToken.expires_at <= current)
             )
             return int(result.rowcount or 0)
+
+    async def overdue_snapshot(
+        self, owner_id: int, *, now: datetime | None = None
+    ) -> list[dict[str, object]]:
+        """Return an owner-scoped optimistic snapshot for bulk cleanup preview."""
+
+        current = as_utc(now or datetime.now(UTC))
+        async with self.db.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(TaskState, InboxItem)
+                    .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+                    .where(
+                        TaskState.owner_id == owner_id,
+                        TaskState.status == "active",
+                        TaskState.event_at.is_not(None),
+                        TaskState.event_at < current,
+                        InboxItem.user_id == owner_id,
+                        InboxItem.kind == "task",
+                    )
+                    .order_by(TaskState.event_at, TaskState.inbox_item_id)
+                )
+            ).all()
+        return [
+            {
+                "id": state.inbox_item_id,
+                "version": state.version,
+                "title": item.title,
+            }
+            for state, item in rows
+        ]
+
+    async def cancel_overdue_snapshot(
+        self,
+        owner_id: int,
+        snapshot: list[dict[str, object]],
+        *,
+        now: datetime | None = None,
+    ) -> TaskBulkResult:
+        """Cancel exactly the previewed overdue tasks, retaining rows as history.
+
+        The operation is all-or-nothing: a changed version, status, due date, owner,
+        or set aborts the whole cleanup. Pending reminder rows become ``expired`` so
+        their history remains available and can never be delivered later.
+        """
+
+        current = as_utc(now or datetime.now(UTC))
+        try:
+            expected = {
+                int(entry["id"]): int(entry["version"])
+                for entry in snapshot
+                if set(entry) <= {"id", "version", "title"}
+            }
+        except (KeyError, TypeError, ValueError):
+            return TaskBulkResult("changed")
+        if not expected or len(expected) != len(snapshot):
+            return TaskBulkResult("empty" if not snapshot else "changed")
+
+        async with self.db.session() as session:
+            await self._lock_owner(session, owner_id)
+            rows = (
+                await session.execute(
+                    select(TaskState, InboxItem, TaskReminder)
+                    .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+                    .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                    .where(
+                        TaskState.owner_id == owner_id,
+                        TaskState.status == "active",
+                        TaskState.event_at.is_not(None),
+                        TaskState.event_at < current,
+                        InboxItem.user_id == owner_id,
+                        InboxItem.kind == "task",
+                    )
+                    .order_by(TaskState.inbox_item_id)
+                )
+            ).all()
+            actual = {state.inbox_item_id: state.version for state, _item, _reminder in rows}
+            if actual != expected:
+                return TaskBulkResult("changed")
+
+            for state, item, reminder in rows:
+                state.status = "cancelled"
+                state.cancelled_at = current
+                state.completed_at = None
+                state.version += 1
+                item.status = "archived"
+                if reminder is not None and reminder.status in {"pending", "processing"}:
+                    reminder.status = "expired"
+                    reminder.claim_token = None
+                    reminder.claimed_at = None
+                    reminder.next_attempt_at = None
+            await session.flush()
+            return TaskBulkResult("cancelled", len(rows))
 
     async def list_page(
         self,
@@ -849,6 +948,7 @@ class TaskService:
         item = await session.get(InboxItem, state.inbox_item_id)
         if item is None:
             raise ValueError("Task inbox item disappeared")
+        item.status = "confirmed"
         local = event_at.astimezone(ZoneInfo(state.timezone))
         item.resolved_date = local.date()
         item.temporal_resolution = {
@@ -892,6 +992,7 @@ class TaskService:
         owner = await session.get(User, state.owner_id)
         if item is None or owner is None:
             raise ValueError("Task owner or inbox item disappeared")
+        item.status = "confirmed"
         if state.event_at is None:
             state.event_at = remind_at
             local = remind_at.astimezone(ZoneInfo(state.timezone))

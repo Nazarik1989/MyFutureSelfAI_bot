@@ -341,6 +341,31 @@ async def test_decline_revoke_renew_and_old_capabilities_fail_closed(db):
     assert joined.actor_user_id == second_recipient.id
 
 
+async def test_direct_invitation_cannot_be_renewed_without_redelivery(db):
+    owner = await create_user(db, 915_101)
+    recipient = await create_user(db, 915_102)
+    service = WorkspaceAccessService(db)
+    _workspace, context = await create_space(service, owner)
+    direct = await service.create_invitation(
+        context,
+        delivery_mode="direct",
+        intended_user_id=recipient.id,
+        role="viewer",
+        template_key="pair_1",
+    )
+
+    with pytest.raises(WorkspaceInvitationError, match="нельзя обновить"):
+        await service.renew_invitation(context, direct.invitation.id, direct.invitation.version)
+
+    assert await invitation_status(db, direct.token) == "pending"
+    preview = await service.invitation_preview(recipient.id, direct.token)
+    assert preview.role == "viewer"
+    pending = await service.list_invitations(context)
+    assert [(item.id, item.version, item.delivery_mode) for item in pending] == [
+        (direct.invitation.id, direct.invitation.version, "direct")
+    ]
+
+
 async def test_concurrent_double_accept_and_accept_vs_revoke_have_one_winner(db):
     owner = await create_user(db, 916_001)
     first = await create_user(db, 916_002)

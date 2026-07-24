@@ -6,7 +6,13 @@ from sqlalchemy import func, select
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
-from future_self.models import ConversationSession, DraftInboxItem, InboxItem
+from future_self.models import (
+    ConversationSession,
+    DraftInboxItem,
+    InboxItem,
+    TaskReminder,
+    TaskState,
+)
 from future_self.schemas import ParsedThought, TemporalResolution
 
 
@@ -158,6 +164,35 @@ async def make_named_preview(bot, user_id, chat_id, context, title, raw_text):
         ParsedThought(kind="idea", title=title),
     )
     return message
+
+
+async def make_overdue_task(bot, user_id: int, chat_id: int, title: str, event_at: datetime):
+    user = await bot._user(user_id)
+    temporal = TemporalResolution(
+        resolved_at=event_at,
+        remind_at=event_at - timedelta(minutes=30),
+        timezone="Europe/Moscow",
+        resolved_local_date=event_at.date(),
+        resolved_local_time=event_at.time().replace(tzinfo=None),
+        precision="datetime",
+        original_expression="на прошлой неделе",
+    )
+    draft = await bot.draft_service.create(
+        user_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=chat_id,
+        source="voice",
+        raw_text=title,
+        parsed=ParsedThought(
+            kind="task",
+            title=title,
+            resolved_date=event_at.date(),
+            temporal_resolution=temporal,
+        ),
+    )
+    result = await bot.draft_service.confirm(draft.id, draft.version, user_id, chat_id)
+    assert result.ok
+    return result.inbox_item
 
 
 @pytest.mark.parametrize(
@@ -603,6 +638,313 @@ async def test_cleanup_snapshot_change_aborts_without_partial_delete(db, fake_ai
     await bot.text(update_for(confirmation, 1203, 2203), context)
     assert "Набор черновиков изменился" in confirmation.replies[-1]["text"]
     assert await active_count(db, 1203, 2203) == 2
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Я имел в виду: удали все неактуальные черновики.",
+        "Я сейчас посмотрел черновики, там все не актуальны, удали, пожалуйста, все.",
+    ],
+)
+async def test_screenshot_draft_cleanup_phrases_are_control_intents_before_ai(
+    db, fake_ai, source, phrase
+):
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        PhraseTranscription(phrase) if source == "voice" else NoopTranscription(),
+    )
+    ctx = context_with_bot()
+    await make_named_preview(bot, 1215, 2215, ctx, "Первый черновик", "Первая мысль")
+    await make_named_preview(bot, 1215, 2215, ctx, "Второй черновик", "Вторая мысль")
+    routed_before = len(fake_ai.route_calls)
+    request = FakeMessage(phrase) if source == "text" else FakeMessage(voice=FakeVoice())
+
+    await (bot.text if source == "text" else bot.voice)(update_for(request, 1215, 2215), ctx)
+
+    assert request.replies[-1]["text"].startswith("Удалить 2 активных черновиков?")
+    assert await active_count(db, 1215, 2215) == 2
+    assert len(fake_ai.route_calls) == routed_before
+
+    confirmation = FakeMessage("да, удалить")
+    await bot.text(update_for(confirmation, 1215, 2215), ctx)
+    assert await active_count(db, 1215, 2215) == 0
+    assert len(fake_ai.route_calls) == routed_before
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Удали все неактуальные задачи",
+        "Удали все не актуальные задачи",
+        "Убери все просроченные задачи",
+    ],
+)
+async def test_screenshot_stale_task_cleanup_is_previewed_confirmed_and_owner_scoped(
+    db, fake_ai, source, phrase
+):
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        PhraseTranscription(phrase) if source == "voice" else NoopTranscription(),
+    )
+    ctx = context_with_bot()
+    now = datetime.now(UTC)
+    old_one = await make_overdue_task(
+        bot, 1216, 2216, "Напоминание с прошлой недели", now - timedelta(days=7)
+    )
+    old_two = await make_overdue_task(
+        bot, 1216, 2216, "Старая запись к врачу", now - timedelta(days=2)
+    )
+    future = await make_overdue_task(
+        bot, 1216, 2216, "Будущая важная задача", now + timedelta(days=2)
+    )
+    foreign = await make_overdue_task(
+        bot, 9996, 2216, "Чужая просроченная задача", now - timedelta(days=8)
+    )
+    routed_before = len(fake_ai.route_calls)
+    request = FakeMessage(phrase) if source == "text" else FakeMessage(voice=FakeVoice())
+
+    await (bot.text if source == "text" else bot.voice)(update_for(request, 1216, 2216), ctx)
+
+    assert request.replies[-1]["text"].startswith("Нашёл просроченных задач: 2.")
+    assert len(fake_ai.route_calls) == routed_before
+    async with db.sessions() as session:
+        before = list(
+            (
+                await session.scalars(
+                    select(TaskState).where(TaskState.inbox_item_id.in_({old_one.id, old_two.id}))
+                )
+            ).all()
+        )
+    assert {row.status for row in before} == {"active"}
+
+    confirmation = FakeMessage("да, удалить")
+    await bot.text(update_for(confirmation, 1216, 2216), ctx)
+    assert "Убрано из активных: 2" in confirmation.replies[-1]["text"]
+    assert len(fake_ai.route_calls) == routed_before
+
+    async with db.sessions() as session:
+        rows = (
+            await session.execute(
+                select(TaskState, InboxItem, TaskReminder)
+                .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+                .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                .where(TaskState.inbox_item_id.in_({old_one.id, old_two.id, future.id, foreign.id}))
+            )
+        ).all()
+    by_title = {item.title: (state, item, reminder) for state, item, reminder in rows}
+    for title in ("Напоминание с прошлой недели", "Старая запись к врачу"):
+        state, item, reminder = by_title[title]
+        assert (state.status, item.status, reminder.status) == (
+            "cancelled",
+            "archived",
+            "expired",
+        )
+    assert by_title["Будущая важная задача"][0].status == "active"
+    assert by_title["Будущая важная задача"][1].status == "confirmed"
+    assert by_title["Чужая просроченная задача"][0].status == "active"
+    assert by_title["Чужая просроченная задача"][1].status == "confirmed"
+
+    inbox_message = FakeMessage("/inbox")
+    await bot.inbox(update_for(inbox_message, 1216, 2216), ctx)
+    inbox_text = inbox_message.replies[-1]["text"]
+    assert "Будущая важная задача" in inbox_text
+    assert "Напоминание с прошлой недели" not in inbox_text
+    assert "Старая запись к врачу" not in inbox_text
+
+
+@pytest.mark.parametrize("correction_source", ["text", "voice"])
+async def test_screenshot_cleanup_correction_replaces_pending_target_without_mutation(
+    db, fake_ai, correction_source
+):
+    correction = "Я имел в виду: удали все неактуальные черновики"
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        PhraseTranscription(correction) if correction_source == "voice" else NoopTranscription(),
+    )
+    ctx = context_with_bot()
+    now = datetime.now(UTC)
+    first_task = await make_overdue_task(
+        bot, 1217, 2217, "Старая задача один", now - timedelta(days=5)
+    )
+    second_task = await make_overdue_task(
+        bot, 1217, 2217, "Старая задача два", now - timedelta(days=4)
+    )
+    await make_named_preview(bot, 1217, 2217, ctx, "Черновик один", "Первая сырая мысль")
+    await make_named_preview(bot, 1217, 2217, ctx, "Черновик два", "Вторая сырая мысль")
+    routed_before = len(fake_ai.route_calls)
+
+    initial = FakeMessage("Удали все неактуальные задачи")
+    await bot.text(update_for(initial, 1217, 2217), ctx)
+    assert initial.replies[-1]["text"].startswith("Нашёл просроченных задач: 2.")
+
+    message = (
+        FakeMessage(correction) if correction_source == "text" else FakeMessage(voice=FakeVoice())
+    )
+    await (bot.text if correction_source == "text" else bot.voice)(
+        update_for(message, 1217, 2217), ctx
+    )
+    assert message.replies[-1]["text"].startswith("Удалить 2 активных черновиков?")
+    assert await active_count(db, 1217, 2217) == 2
+    async with db.sessions() as session:
+        task_states = list(
+            (
+                await session.scalars(
+                    select(TaskState).where(
+                        TaskState.inbox_item_id.in_({first_task.id, second_task.id})
+                    )
+                )
+            ).all()
+        )
+    assert {state.status for state in task_states} == {"active"}
+    assert len(fake_ai.route_calls) == routed_before
+
+    confirmation = FakeMessage("да, удалить")
+    await bot.text(update_for(confirmation, 1217, 2217), ctx)
+    assert await active_count(db, 1217, 2217) == 0
+    async with db.sessions() as session:
+        task_states = list(
+            (
+                await session.scalars(
+                    select(TaskState).where(
+                        TaskState.inbox_item_id.in_({first_task.id, second_task.id})
+                    )
+                )
+            ).all()
+        )
+    assert {state.status for state in task_states} == {"active"}
+    assert len(fake_ai.route_calls) == routed_before
+
+
+async def test_voice_updates_persistent_task_input_before_generic_ai_routing(db, fake_ai):
+    phrase = "завтра в 18:00"
+    bot = FutureSelfBot(settings(), db, fake_ai, PhraseTranscription(phrase))
+    ctx = context_with_bot()
+    now = datetime.now(UTC)
+    item = await make_overdue_task(
+        bot, 1218, 2218, "Перенести существующую задачу", now + timedelta(days=2)
+    )
+    user = await bot._user(1218)
+    menu_token = (
+        await bot.task_service.issue_actions(user.id, 2218, item.id, 1, ("reschedule_menu",))
+    )["reschedule_menu"]
+    menu = await bot.task_service.reschedule_menu(menu_token, user.id, 2218)
+    pending = await bot.task_service.choose_reschedule_preset(
+        menu.tokens["custom"], user.id, 2218, now=now
+    )
+    assert pending.status == "await_event"
+    routed_before = len(fake_ai.route_calls)
+    message = FakeMessage(voice=FakeVoice())
+
+    await bot.voice(update_for(message, 1218, 2218), ctx)
+
+    assert "Новый срок выбран" in message.replies[-1]["text"]
+    assert len(fake_ai.route_calls) == routed_before
+    assert await bot.task_service.pending_input(user.id, 2218) is None
+
+
+async def test_long_voice_transcription_uses_bounded_ack_but_routes_full_text(db, fake_ai):
+    phrase = "Длинная голосовая мысль " + ("😀" * 3_000)
+    bot = FutureSelfBot(settings(), db, fake_ai, PhraseTranscription(phrase))
+    message = FakeMessage(voice=FakeVoice())
+
+    await bot.voice(update_for(message, 1222, 2222), context_with_bot())
+
+    acknowledgement = next(text for text in message.edits if text.startswith("Я услышал:"))
+    assert len(acknowledgement.encode("utf-16-le")) // 2 <= 4_096
+    assert "…»" in acknowledgement
+    assert fake_ai.route_calls[-1][0] == phrase
+
+
+async def test_retarget_from_tasks_to_empty_drafts_invalidates_old_confirmation(db, fake_ai):
+    correction = "Нет, я имел в виду: удали все неактуальные черновики"
+    bot = FutureSelfBot(settings(), db, fake_ai, PhraseTranscription(correction))
+    ctx = context_with_bot()
+    item = await make_overdue_task(
+        bot,
+        1219,
+        2219,
+        "Просроченная, но не подтверждённая к очистке",
+        datetime.now(UTC) - timedelta(days=4),
+    )
+    routed_before = len(fake_ai.route_calls)
+    initial = FakeMessage("Удали все неактуальные задачи")
+    await bot.text(update_for(initial, 1219, 2219), ctx)
+    assert initial.replies[-1]["text"].startswith("Нашёл просроченных задач: 1.")
+
+    correction_message = FakeMessage(voice=FakeVoice())
+    await bot.voice(update_for(correction_message, 1219, 2219), ctx)
+    assert correction_message.replies[-1]["text"] == "Нет активных черновиков для удаления."
+
+    confirmation = FakeMessage("да, удалить")
+    await bot.text(update_for(confirmation, 1219, 2219), ctx)
+    assert "Ожидаю отдельное подтверждение" in confirmation.replies[-1]["text"]
+    async with db.sessions() as session:
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item.id))
+    assert state.status == "active"
+    assert len(fake_ai.route_calls) == routed_before
+
+
+async def test_retarget_from_drafts_to_empty_tasks_invalidates_old_confirmation(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    ctx = context_with_bot()
+    await make_named_preview(bot, 1220, 2220, ctx, "Черновик остаётся", "Сырая мысль")
+    routed_before = len(fake_ai.route_calls)
+    initial = FakeMessage("удали все черновики")
+    await bot.text(update_for(initial, 1220, 2220), ctx)
+    assert initial.replies[-1]["text"].startswith("Удалить 1 активных черновиков?")
+
+    correction = FakeMessage("Нет, я имел в виду: удали все неактуальные задачи")
+    await bot.text(update_for(correction, 1220, 2220), ctx)
+    assert correction.replies[-1]["text"].startswith("Неактуальных задач не найдено.")
+
+    confirmation = FakeMessage("да, удалить")
+    await bot.text(update_for(confirmation, 1220, 2220), ctx)
+    assert "Ожидаю отдельное подтверждение" in confirmation.replies[-1]["text"]
+    assert await active_count(db, 1220, 2220) == 1
+    assert len(fake_ai.route_calls) == routed_before
+
+
+@pytest.mark.parametrize("pending_target", ["tasks", "drafts"])
+async def test_conflicting_named_target_never_confirms_pending_cleanup(db, fake_ai, pending_target):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    ctx = context_with_bot()
+    routed_before = len(fake_ai.route_calls)
+    if pending_target == "tasks":
+        item = await make_overdue_task(
+            bot,
+            1221,
+            2221,
+            "Просроченная задача остаётся",
+            datetime.now(UTC) - timedelta(days=4),
+        )
+        initial = FakeMessage("удали все неактуальные задачи")
+        await bot.text(update_for(initial, 1221, 2221), ctx)
+        conflicting = FakeMessage("да, удалить черновики")
+        await bot.text(update_for(conflicting, 1221, 2221), ctx)
+        assert "Очистка просроченных задач отменена" in conflicting.replies[-1]["text"]
+        async with db.sessions() as session:
+            state = await session.scalar(
+                select(TaskState).where(TaskState.inbox_item_id == item.id)
+            )
+        assert state.status == "active"
+    else:
+        await make_named_preview(bot, 1221, 2221, ctx, "Черновик остаётся", "Сырая мысль")
+        initial = FakeMessage("удали все черновики")
+        await bot.text(update_for(initial, 1221, 2221), ctx)
+        conflicting = FakeMessage("да, удалить задачи")
+        await bot.text(update_for(conflicting, 1221, 2221), ctx)
+        assert "Удаление черновиков отменено" in conflicting.replies[-1]["text"]
+        assert await active_count(db, 1221, 2221) == 1
+    assert len(fake_ai.route_calls) == routed_before
 
 
 async def test_drafts_pagination_groups_duplicates_and_isolates_user(db, fake_ai):

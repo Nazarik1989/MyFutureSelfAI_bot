@@ -98,6 +98,14 @@ class IssuedInvitation:
 
 
 @dataclass(frozen=True, slots=True)
+class KnownBotUser:
+    """Minimal recipient identity for an explicitly selected Telegram user."""
+
+    user_id: int
+    telegram_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class InvitationPreview:
     inviter_display_name: str
     workspace_name: str
@@ -434,6 +442,19 @@ class WorkspaceAccessService:
         async with self.db.sessions() as session:
             workspace, _ = await self._read_access(session, context, roles=_ALL_ROLES)
             return workspace
+
+    async def known_bot_user(self, telegram_id: int) -> KnownBotUser | None:
+        """Resolve only an existing bot user; never create a row from a shared contact."""
+
+        if isinstance(telegram_id, bool) or not 0 < telegram_id < 2**63:
+            return None
+        async with self.db.sessions() as session:
+            row = (
+                await session.execute(
+                    select(User.id, User.telegram_id).where(User.telegram_id == telegram_id)
+                )
+            ).one_or_none()
+        return KnownBotUser(int(row.id), int(row.telegram_id)) if row is not None else None
 
     async def rename_workspace(
         self,
@@ -843,12 +864,14 @@ class WorkspaceAccessService:
                 )
                 if old is None:
                     raise WorkspaceStaleError("Приглашение уже недействительно.")
-                if old.intended_user_id is not None:
-                    intended_exists = await session.scalar(
-                        select(User.id).where(User.id == old.intended_user_id)
+                # Renewing rotates the raw token. A share link can be presented to
+                # the owner immediately, while a direct token would have no safe
+                # delivery acknowledgement here. Keep the existing direct invite
+                # untouched and require a fresh address-selection flow instead.
+                if old.delivery_mode != "share":
+                    raise WorkspaceInvitationError(
+                        "Адресное приглашение нельзя обновить. Отзови его и создай новое."
                     )
-                    if intended_exists is None:
-                        raise WorkspaceInvitationError("Получатель приглашения недоступен.")
                 old.status = "revoked"
                 old.revoked_at = current
                 old.version += 1

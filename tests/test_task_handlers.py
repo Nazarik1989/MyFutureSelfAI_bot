@@ -44,20 +44,28 @@ def callback_by_label(message: FakeMessage, label: str) -> str:
     raise AssertionError(f"Missing button {label}")
 
 
-async def create_confirmed_task(bot, *, user_id=701, source="text", description="Описание"):
+async def create_confirmed_task(
+    bot,
+    *,
+    user_id=701,
+    source="text",
+    description="Описание",
+    same_local_day=False,
+):
     owner = await bot._user(user_id)
     now = datetime.now(UTC)
+    zone = __import__("zoneinfo").ZoneInfo(owner.timezone)
+    event_at = now + timedelta(hours=2)
+    if same_local_day:
+        event_at = (
+            now.astimezone(zone).replace(hour=12, minute=0, second=0, microsecond=0).astimezone(UTC)
+        )
     temporal = TemporalResolution(
-        resolved_at=now + timedelta(hours=2),
-        remind_at=now + timedelta(hours=1),
+        resolved_at=event_at,
+        remind_at=event_at - timedelta(hours=1),
         timezone=owner.timezone,
-        resolved_local_date=(now + timedelta(hours=2))
-        .astimezone(__import__("zoneinfo").ZoneInfo(owner.timezone))
-        .date(),
-        resolved_local_time=(now + timedelta(hours=2))
-        .astimezone(__import__("zoneinfo").ZoneInfo(owner.timezone))
-        .time()
-        .replace(tzinfo=None),
+        resolved_local_date=event_at.astimezone(zone).date(),
+        resolved_local_time=event_at.astimezone(zone).time().replace(tzinfo=None),
         precision="datetime",
         original_expression="через два часа",
     )
@@ -108,7 +116,7 @@ async def test_tasks_menu_has_required_buttons_and_creation_uses_existing_previe
 
 async def test_card_complete_replay_reopen_and_delete_navigation_are_deterministic(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
-    await create_confirmed_task(bot)
+    await create_confirmed_task(bot, same_local_day=True)
     listing = FakeMessage()
     await bot.task_today(update_for(listing), context())
     open_callback = callback_by_label(listing, "Открыть 1")
