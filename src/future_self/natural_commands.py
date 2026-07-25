@@ -70,6 +70,8 @@ NaturalAction = Literal[
     "show_last_saved",
     "show_profile",
     "show_today",
+    "show_tasks",
+    "show_overdue_tasks",
     "show_collections",
     "show_spaces",
     "create_space",
@@ -138,6 +140,17 @@ class NaturalCommandRouter:
             "покажи фокус дня",
             "что у меня сегодня",
             "мой план на сегодня",
+        ),
+        "show_tasks": (
+            "покажи мои задачи",
+            "открой мои задачи",
+            "покажи задачи и напоминания",
+            "открой задачи и напоминания",
+        ),
+        "show_overdue_tasks": (
+            "покажи просроченные задачи",
+            "какие задачи просрочены",
+            "что у меня просрочено",
         ),
         "show_collections": (
             "покажи мои разделы",

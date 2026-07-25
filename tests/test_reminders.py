@@ -9,11 +9,12 @@ from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.dates import DateResolver
 from future_self.drafts import DraftInboxService
-from future_self.models import DraftInboxItem, InboxItem, TaskReminder
+from future_self.models import DraftInboxItem, InboxItem, TaskReminder, TaskState
 from future_self.reminders import TaskReminderEngine, as_utc, schedule_from_temporal
 from future_self.repositories import UserRepository
 from future_self.scheduler import JobQueueScheduler
 from future_self.schemas import ParsedThought, TemporalResolution
+from future_self.tasks import TaskService
 
 
 class RouteMessage:
@@ -391,6 +392,190 @@ async def test_future_reminder_is_not_delivered(db):
     assert sent == []
 
 
+async def test_week_old_pending_reminder_expires_and_hides_inbox_but_keeps_overdue_task(db):
+    now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    item, reminder = await create_reminder(
+        db,
+        temporal_resolution=temporal(
+            resolved_at=now - timedelta(days=7),
+            local_date=date(2026, 7, 18),
+        ),
+    )
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 1
+
+    engine = TaskReminderEngine(db, send)
+    assert await engine.deliver_due(now=now) == 0
+    assert sent == []
+    async with db.sessions() as session:
+        stored_reminder = await session.get(TaskReminder, reminder.id)
+        stored_item = await session.get(InboxItem, item.id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item.id))
+    assert stored_reminder.status == "expired"
+    assert stored_item.status == "archived"
+    assert state.status == "active"
+
+    overdue = await TaskService(db).list_page(state.owner_id, "overdue", 0, now=now)
+    assert [record.item.id for record in overdue.records] == [item.id]
+
+
+async def test_week_old_sent_reminder_is_hidden_without_rewriting_delivery_history(db):
+    now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    item, reminder = await create_reminder(
+        db,
+        temporal_resolution=temporal(
+            resolved_at=now - timedelta(days=7),
+            local_date=date(2026, 7, 18),
+        ),
+    )
+    async with db.session() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+        stored.status = "sent"
+        stored.sent_at = now - timedelta(days=7)
+        stored.telegram_message_id = 777
+
+    async def send(chat_id: int, text: str) -> int:
+        raise AssertionError("sent history must not be delivered again")
+
+    engine = TaskReminderEngine(db, send)
+    assert await engine.expire_stale(now=now) == 1
+    assert await engine.expire_stale(now=now) == 0
+    async with db.sessions() as session:
+        stored_reminder = await session.get(TaskReminder, reminder.id)
+        stored_item = await session.get(InboxItem, item.id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item.id))
+    assert stored_reminder.status == "sent"
+    assert stored_reminder.telegram_message_id == 777
+    assert stored_item.status == "archived"
+    assert state.status == "active"
+
+
+@pytest.mark.parametrize("reminder_state", [None, "cancelled"])
+async def test_legacy_overdue_task_without_live_reminder_is_hidden_but_kept_in_task_hub(
+    db, reminder_state
+):
+    now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    item, reminder = await create_reminder(
+        db,
+        temporal_resolution=temporal(
+            resolved_at=now - timedelta(days=7),
+            local_date=date(2026, 7, 18),
+        ),
+    )
+    async with db.session() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+        if reminder_state is None:
+            await session.delete(stored)
+        else:
+            stored.status = reminder_state
+
+    async def send(chat_id: int, text: str) -> int:
+        raise AssertionError("legacy stale task must not trigger delivery")
+
+    engine = TaskReminderEngine(db, send)
+    assert await engine.expire_stale(now=now) == 1
+    assert await engine.expire_stale(now=now) == 0
+    async with db.sessions() as session:
+        stored_item = await session.get(InboxItem, item.id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item.id))
+    assert stored_item.status == "archived"
+    assert state.status == "active"
+    overdue = await TaskService(db).list_page(state.owner_id, "overdue", 0, now=now)
+    assert [record.item.id for record in overdue.records] == [item.id]
+
+
+async def test_due_reminder_within_expiration_grace_is_still_delivered(db):
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    await create_reminder(
+        db,
+        temporal_resolution=temporal(
+            resolved_at=now - timedelta(hours=1),
+            local_date=date(2026, 7, 20),
+        ),
+    )
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 1
+
+    assert await TaskReminderEngine(db, send).deliver_due(now=now) == 1
+    assert len(sent) == 1
+
+
+async def test_future_explicit_reminder_for_overdue_task_survives_stale_cleanup_and_delivers(db):
+    now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    future_reminder = now + timedelta(days=1)
+    item, reminder = await create_reminder(
+        db,
+        temporal_resolution=temporal(
+            resolved_at=now - timedelta(days=7),
+            local_date=date(2026, 7, 18),
+        ),
+    )
+    async with db.session() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+        stored.remind_at = future_reminder
+
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 909
+
+    engine = TaskReminderEngine(db, send)
+    assert await engine.expire_stale(now=now) == 0
+    assert await engine.deliver_due(now=future_reminder - timedelta(seconds=1)) == 0
+    assert await engine.deliver_due(now=future_reminder) == 1
+    assert len(sent) == 1
+    async with db.sessions() as session:
+        stored_reminder = await session.get(TaskReminder, reminder.id)
+        stored_item = await session.get(InboxItem, item.id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item.id))
+    assert stored_reminder.status == "sent"
+    assert stored_reminder.telegram_message_id == 909
+    assert stored_item.status == "confirmed"
+    assert state.status == "active"
+
+
+async def test_missed_old_reminder_for_future_task_expires_without_archiving_task(db):
+    now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    item, reminder = await create_reminder(
+        db,
+        temporal_resolution=temporal(
+            resolved_at=now + timedelta(days=7),
+            local_date=date(2026, 8, 1),
+        ),
+    )
+    async with db.session() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+        stored.remind_at = now - timedelta(days=2)
+
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 1
+
+    engine = TaskReminderEngine(db, send)
+    assert await engine.expire_stale(now=now) == 1
+    assert await engine.deliver_due(now=now) == 0
+    assert sent == []
+    async with db.sessions() as session:
+        stored_reminder = await session.get(TaskReminder, reminder.id)
+        stored_item = await session.get(InboxItem, item.id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item.id))
+    assert stored_reminder.status == "expired"
+    assert stored_item.status == "confirmed"
+    assert state.status == "active"
+
+    upcoming = await TaskService(db).list_page(state.owner_id, "upcoming", 0, now=now)
+    assert [record.item.id for record in upcoming.records] == [item.id]
+
+
 async def test_repeated_poll_does_not_duplicate_telegram_delivery(db):
     await create_reminder(
         db,
@@ -532,8 +717,8 @@ async def test_delivery_failure_is_retried_with_backoff_without_leaking_error(db
     assert as_utc(saved.next_attempt_at) == due + timedelta(seconds=5)
 
 
-async def test_bot_startup_delivers_persisted_due_reminder_via_telegram(db, fake_ai):
-    _, reminder = await create_reminder(
+async def test_bot_startup_expires_very_old_reminder_without_telegram_delivery(db, fake_ai):
+    item, reminder = await create_reminder(
         db,
         temporal_resolution=temporal(resolved_at=datetime(2020, 7, 20, 15, tzinfo=UTC)),
     )
@@ -564,8 +749,7 @@ async def test_bot_startup_delivers_persisted_due_reminder_via_telegram(db, fake
         PhraseTranscription(""),
     )
     await bot._post_init(SimpleNamespace(bot=TelegramBot(), job_queue=Queue()))
-    assert len(sent) == 1
-    assert sent[0][0] == 10
+    assert sent == []
     assert len(repeating) == 2
     assert {item.get("name") for item in repeating} == {
         "labs:cleanup",
@@ -575,8 +759,10 @@ async def test_bot_startup_delivers_persisted_due_reminder_via_telegram(db, fake
     assert len(menu_registrations) == 1
     async with db.sessions() as session:
         saved = await session.get(TaskReminder, reminder.id)
-    assert saved.status == "sent"
-    assert saved.telegram_message_id == 900
+        saved_item = await session.get(InboxItem, item.id)
+    assert saved.status == "expired"
+    assert saved.telegram_message_id is None
+    assert saved_item.status == "archived"
 
 
 def test_scheduler_registers_single_persistent_outbox_poller():

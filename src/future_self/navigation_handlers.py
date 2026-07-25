@@ -43,6 +43,11 @@ class NavigationHandlers:
     async def navigation_text_gate(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        onboarding_result = await self.onboarding_persistent_input(
+            update, context, update.effective_message.text or ""
+        )
+        if onboarding_result is not None:
+            raise ApplicationHandlerStop
         command = self.natural_command_router.route(update.effective_message.text or "")
         if command is None or command.action not in {"menu", "help"}:
             return
@@ -73,7 +78,8 @@ class NavigationHandlers:
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
         await update.effective_message.reply_text(
-            "Помощь\n\nВыбери короткий раздел — без длинной стены текста.",
+            "❓ Помощь\n\nЗдесь есть пошаговые инструкции, примеры фраз и пояснения "
+            "по каждой возможности. Выбери тему:",
             reply_markup=self._help_keyboard(),
         )
 
@@ -86,7 +92,8 @@ class NavigationHandlers:
             return await self._navigation_flow_action(update, context)
 
         flow = await self._active_navigation_flow(update, context)
-        if flow is not None and not data.startswith("nav:help:"):
+        help_navigation = data == "nav:help" or data.startswith("nav:help:")
+        if flow is not None and not help_navigation:
             await query.answer()
             await self._prompt_navigation_flow(query.message, update, flow)
             return None
@@ -108,7 +115,8 @@ class NavigationHandlers:
             await query.answer()
             await self._edit_or_send(
                 query,
-                "Помощь\n\nВыбери короткий раздел — без длинной стены текста.",
+                "❓ Помощь\n\nЗдесь есть пошаговые инструкции, примеры фраз и пояснения "
+                "по каждой возможности. Выбери тему:",
                 self._help_keyboard(),
             )
             return None
@@ -126,6 +134,8 @@ class NavigationHandlers:
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            self._voice_enabled(),
+            self._task_reminders_enabled(),
         )
         if data.startswith("nav:section:"):
             section_key = data.removeprefix("nav:section:")
@@ -277,9 +287,16 @@ class NavigationHandlers:
             return None
 
         await self._clear_navigation_flow(update, context, current)
+        if current == "onboarding":
+            message = (
+                "Регистрация приостановлена. Ответы и текущий шаг сохранены; "
+                "продолжить можно через /start."
+            )
+        else:
+            message = f"Сценарий «{FLOW_LABELS[current]}» остановлен. Остальные данные не изменены."
         await self._edit_or_send(
             query,
-            f"Сценарий «{FLOW_LABELS[current]}» остановлен. Остальные данные не изменены.",
+            message,
             None,
         )
         await self._send_navigation_root(query.message)
@@ -288,6 +305,20 @@ class NavigationHandlers:
     async def _active_navigation_flow(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> str | None:
+        user = await self._user(update.effective_user.id)
+        if not user.onboarding_completed:
+            from .repositories import OnboardingRepository
+
+            async with self.db.sessions() as session:
+                state = await OnboardingRepository(session).get(user.id)
+            if state is not None and state.status in {
+                "in_progress",
+                "awaiting_confirmation",
+            }:
+                if context.user_data.get("onboarding_user_id") != user.id:
+                    context.user_data["onboarding_user_id"] = user.id
+                    context.user_data["onboarding_detached"] = True
+                return "onboarding"
         for key, name in (
             ("health_checkin", "health"),
             ("doctor_prepare", "doctor"),
@@ -296,7 +327,6 @@ class NavigationHandlers:
         ):
             if key in context.user_data:
                 return name
-        user = await self._user(update.effective_user.id)
         if (
             self._workspace_enabled()
             and await self.workspace_service.pending_input(user.id, update.effective_chat.id)
@@ -339,7 +369,18 @@ class NavigationHandlers:
         elif flow == "rename_goal":
             context.user_data.pop("rename_goal_id", None)
         elif flow == "onboarding":
+            from .repositories import OnboardingRepository
+
+            user = await self._user(update.effective_user.id)
+            async with self.db.session() as session:
+                state = await OnboardingRepository(session).get(user.id)
+                if state is not None and state.status in {
+                    "in_progress",
+                    "awaiting_confirmation",
+                }:
+                    state.status = "cancelled"
             context.user_data.pop("onboarding_user_id", None)
+            context.user_data.pop("onboarding_detached", None)
             context.user_data.pop("vision_summary", None)
         else:
             user = await self._user(update.effective_user.id)
@@ -470,19 +511,32 @@ class NavigationHandlers:
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            self._voice_enabled(),
+            self._task_reminders_enabled(),
         )
         labels = {
-            "quick": "Быстрый старт",
-            "features": "Что умеет бот",
-            "examples": "Примеры сообщений",
-            "commands": "Команды",
-            "privacy": "Конфиденциальность",
-            "safety": "Здоровье и безопасность",
+            "quick": "🚀 Быстрый старт",
+            "features": "🧭 Что умеет бот",
+            "voice": "🎙 Голосом",
+            "drafts": "📝 Inbox и черновики",
+            "tasks": "✅ Задачи",
+            "collections": "🗂 Мои разделы",
+            "vision": "🎯 Карта желаний",
+            "health": "❤️ Здоровье",
+            "doctor": "🩺 Врач и анализы",
+            "registration": "👤 Регистрация",
+            "examples": "💬 Примеры",
+            "commands": "⌨️ Команды",
+            "privacy": "🔒 Конфиденциальность",
+            "safety": "🛟 Безопасность",
+            "troubleshooting": "🧰 Бот не понял",
+            "spaces": "🤝 Пространства",
             "knowledge": "📚 База знаний",
         }
-        rows = [
-            [InlineKeyboardButton(labels[key], callback_data=f"nav:help:{key}")] for key in topics
+        buttons = [
+            InlineKeyboardButton(labels[key], callback_data=f"nav:help:{key}") for key in topics
         ]
+        rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
         rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")])
         return InlineKeyboardMarkup(rows)
 
@@ -516,3 +570,9 @@ class NavigationHandlers:
 
     def _knowledge_capture_enabled(self) -> bool:
         return bool(getattr(self.settings, "enable_knowledge_capture", False))
+
+    def _voice_enabled(self) -> bool:
+        return bool(getattr(self.settings, "enable_voice", False))
+
+    def _task_reminders_enabled(self) -> bool:
+        return bool(getattr(self.settings, "enable_task_reminders", False))

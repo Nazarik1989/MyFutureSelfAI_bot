@@ -14,6 +14,7 @@ from future_self.navigation import (
     SECTIONS,
     NavigationFlowStore,
     advanced_commands,
+    help_topics,
     navigation_actions,
     navigation_sections,
     public_commands,
@@ -155,6 +156,35 @@ def test_knowledge_catalog_is_flag_aware_and_capture_stays_advanced():
     }
 
 
+def test_help_is_detailed_flag_aware_and_telegram_safe():
+    disabled = help_topics(
+        enable_workspace_access=False,
+        enable_knowledge_hub=False,
+        enable_knowledge_capture=False,
+        enable_voice=False,
+        enable_task_reminders=False,
+    )
+    assert {"quick", "drafts", "tasks", "health", "registration", "troubleshooting"} <= set(
+        disabled
+    )
+    assert {"voice", "spaces", "knowledge"}.isdisjoint(disabled)
+    disabled_text = "\n".join(text for _title, text in disabled.values())
+    assert "/capture" not in disabled_text
+    assert "/spaces" not in disabled_text
+    assert "Напомни через" not in disabled_text
+    assert "голос" not in disabled_text.casefold()
+    assert "скажи" not in disabled["quick"][1].casefold()
+
+    enabled = help_topics(True, True, True, True, True)
+    assert {"voice", "drafts", "tasks", "spaces", "knowledge", "health"} <= set(enabled)
+    assert "/capture" in enabled["knowledge"][1]
+    assert "отдельное подтверждение" in enabled["voice"][1]
+    assert "/inbox" in enabled["drafts"][1]
+    assert "/tasks" in enabled["drafts"][1]
+    assert all(len(f"{title}\n\n{text}") < 4096 for title, text in enabled.values())
+    assert all(len(f"nav:help:{key}".encode()) <= 64 for key in enabled)
+
+
 def test_every_registered_command_is_catalogued_or_explicitly_advanced(db, fake_ai):
     application = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription()).build()
 
@@ -200,6 +230,20 @@ def test_natural_navigation_is_exact_deterministic_and_punctuation_safe(
     assert bot.natural_command_router.route(phrase).action == action
     assert bot.natural_command_router.route("Добавь меню ужина в заметки") is None
     assert bot.natural_command_router.route("Мне нужна помощь с покупкой билетов") is None
+
+
+@pytest.mark.parametrize(
+    ("phrase", "action"),
+    [
+        ("Покажи мои задачи", "show_tasks"),
+        ("Открой задачи и напоминания", "show_tasks"),
+        ("Какие задачи просрочены?", "show_overdue_tasks"),
+        ("Покажи просроченные задачи", "show_overdue_tasks"),
+    ],
+)
+def test_task_read_intents_are_deterministic_before_ai(db, fake_ai, phrase, action):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    assert bot.natural_command_router.route(phrase).action == action
 
 
 async def test_health_flow_continue_exit_owner_binding_repeat_and_state_isolation(db, fake_ai):

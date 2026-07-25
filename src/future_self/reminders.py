@@ -111,6 +111,8 @@ def reminder_for_inbox_item(
 class TaskReminderEngine:
     """Persistent task reminder outbox with leases and idempotent state transitions."""
 
+    STALE_AFTER = timedelta(days=1)
+
     def __init__(
         self,
         db: Database,
@@ -175,6 +177,7 @@ class TaskReminderEngine:
 
     async def deliver_due(self, *, now: datetime | None = None) -> int:
         current = as_utc(now or datetime.now(UTC))
+        await self.expire_stale(now=current)
         delivered = 0
         for reminder in await self._claim_due(current):
             if not await self._still_current(reminder):
@@ -197,10 +200,73 @@ class TaskReminderEngine:
                 delivered += 1
         return delivered
 
+    async def expire_stale(self, *, now: datetime | None = None) -> int:
+        """Terminalize and hide stale reminders while retaining task history."""
+
+        current = as_utc(now or datetime.now(UTC))
+        event_cutoff = current - self.STALE_AFTER
+        stale_claim = current - self.lease
+        async with self.db.session() as session:
+            changed = await session.execute(
+                update(TaskReminder)
+                .where(
+                    TaskReminder.remind_at < event_cutoff,
+                    or_(
+                        TaskReminder.status == "pending",
+                        and_(
+                            TaskReminder.status == "processing",
+                            TaskReminder.claimed_at <= stale_claim,
+                        ),
+                    ),
+                )
+                .values(
+                    status="expired",
+                    claim_token=None,
+                    claimed_at=None,
+                    next_attempt_at=None,
+                )
+                .returning(TaskReminder.inbox_item_id)
+            )
+            transitioned = set(changed.scalars().all())
+            archive_ids = set(
+                (
+                    await session.scalars(
+                        select(InboxItem.id)
+                        .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
+                        .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                        .where(
+                            InboxItem.kind == "task",
+                            InboxItem.status == "confirmed",
+                            TaskState.owner_id == InboxItem.user_id,
+                            TaskState.status == "active",
+                            TaskState.event_at.is_not(None),
+                            TaskState.event_at < event_cutoff,
+                            or_(
+                                TaskReminder.id.is_(None),
+                                TaskReminder.status.in_({"cancelled", "sent", "expired"}),
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            if archive_ids:
+                await session.execute(
+                    update(InboxItem)
+                    .where(
+                        InboxItem.id.in_(archive_ids),
+                        InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
+                    )
+                    .values(status="archived")
+                )
+            return len(transitioned | archive_ids)
+
     async def _claim_due(self, now: datetime) -> list[ClaimedReminder]:
         stale_before = now - self.lease
+        event_cutoff = now - self.STALE_AFTER
         due_pending = and_(
             TaskReminder.status == "pending",
+            TaskReminder.remind_at >= event_cutoff,
             or_(
                 and_(
                     TaskReminder.next_attempt_at.is_(None),
@@ -212,6 +278,7 @@ class TaskReminderEngine:
         stale_processing = and_(
             TaskReminder.status == "processing",
             TaskReminder.claimed_at <= stale_before,
+            TaskReminder.remind_at >= event_cutoff,
         )
         async with self.db.session() as session:
             candidate_ids = list(
