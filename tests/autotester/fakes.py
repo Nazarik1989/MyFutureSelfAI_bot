@@ -167,8 +167,10 @@ class FakeCallbackQuery:
     async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
         self.answers.append((text, show_alert))
 
-    async def edit_message_text(self, text: str) -> None:
+    async def edit_message_text(self, text: str, **kwargs: Any) -> None:
         self.edits.append(text)
+        if kwargs:
+            self.message.replies.append({"text": text, **kwargs})
 
     async def edit_message_reply_markup(self, reply_markup: object = None) -> None:
         self.markup_removed += 1

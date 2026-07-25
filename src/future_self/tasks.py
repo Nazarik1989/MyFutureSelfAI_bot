@@ -138,7 +138,7 @@ async def add_task_state(
     date_event_hour: int = 9,
 ) -> TaskState | None:
     """Atomically attach TaskState to a newly-created task."""
-    if item.kind != "task":
+    if item.kind != "task" or item.status != "confirmed":
         return None
     state = task_state_for_inbox_item(
         item,
@@ -178,7 +178,11 @@ class TaskService:
                     .join(User, User.id == InboxItem.user_id)
                     .outerjoin(TaskState, TaskState.inbox_item_id == InboxItem.id)
                     .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
-                    .where(InboxItem.kind == "task", TaskState.id.is_(None))
+                    .where(
+                        InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
+                        TaskState.id.is_(None),
+                    )
                     .order_by(InboxItem.id)
                 )
             ).all()
@@ -218,6 +222,7 @@ class TaskService:
                         TaskState.event_at < current,
                         InboxItem.user_id == owner_id,
                         InboxItem.kind == "task",
+                        InboxItem.status.in_(("confirmed", "archived")),
                     )
                     .order_by(TaskState.event_at, TaskState.inbox_item_id)
                 )
@@ -271,6 +276,7 @@ class TaskService:
                         TaskState.event_at < current,
                         InboxItem.user_id == owner_id,
                         InboxItem.kind == "task",
+                        InboxItem.status.in_(("confirmed", "archived")),
                     )
                     .order_by(TaskState.inbox_item_id)
                 )
@@ -285,6 +291,7 @@ class TaskService:
                 state.completed_at = None
                 state.version += 1
                 item.status = "archived"
+                item.version += 1
                 if reminder is not None and reminder.status in {"pending", "processing"}:
                     reminder.status = "expired"
                     reminder.claim_token = None
@@ -314,6 +321,7 @@ class TaskService:
                         TaskState.owner_id == owner_id,
                         InboxItem.user_id == owner_id,
                         InboxItem.kind == "task",
+                        InboxItem.status.in_(("confirmed", "archived")),
                     )
                 )
             ).all()
@@ -360,12 +368,11 @@ class TaskService:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         async with self.db.session() as session:
-            state = await session.scalar(
-                select(TaskState).where(
-                    TaskState.owner_id == owner_id,
-                    TaskState.inbox_item_id == inbox_item_id,
-                    TaskState.version == version,
-                )
+            state = await self._live_state(
+                session,
+                owner_id,
+                inbox_item_id,
+                version=version,
             )
             if state is None:
                 return {}
@@ -402,6 +409,9 @@ class TaskService:
             capability = await self._token(session, token, owner_id, chat_id)
             if capability is None or as_utc(capability.expires_at) <= datetime.now(UTC):
                 return None
+            state = await self._live_state(session, owner_id, capability.inbox_item_id)
+            if state is None:
+                return None
             return capability.action
 
     async def complete(self, token: str, owner_id: int, chat_id: int) -> TaskResult:
@@ -409,11 +419,10 @@ class TaskService:
             await self._lock_owner(session, owner_id)
             capability = await self._token(session, token, owner_id, chat_id)
             if capability is not None and capability.status == "consumed":
-                state = await session.scalar(
-                    select(TaskState).where(
-                        TaskState.owner_id == owner_id,
-                        TaskState.inbox_item_id == capability.inbox_item_id,
-                    )
+                state = await self._live_state(
+                    session,
+                    owner_id,
+                    capability.inbox_item_id,
                 )
                 if (
                     capability.action == "complete"
@@ -530,15 +539,13 @@ class TaskService:
                 or as_utc(capability.expires_at) <= current
             ):
                 return TaskResult("stale")
-            state = await session.scalar(
-                select(TaskState).where(
-                    TaskState.owner_id == owner_id,
-                    TaskState.inbox_item_id == capability.inbox_item_id,
-                    TaskState.version == capability.task_version,
-                    TaskState.status == "active",
-                )
+            state = await self._live_state(
+                session,
+                owner_id,
+                capability.inbox_item_id,
+                version=capability.task_version,
             )
-            if state is None:
+            if state is None or state.status != "active":
                 return TaskResult("stale")
             preset = (capability.payload or {}).get("preset")
             if preset == "custom":
@@ -583,15 +590,13 @@ class TaskService:
                 or as_utc(capability.expires_at) <= current
             ):
                 return TaskResult("stale")
-            state = await session.scalar(
-                select(TaskState).where(
-                    TaskState.owner_id == owner_id,
-                    TaskState.inbox_item_id == capability.inbox_item_id,
-                    TaskState.version == capability.task_version,
-                    TaskState.status == "active",
-                )
+            state = await self._live_state(
+                session,
+                owner_id,
+                capability.inbox_item_id,
+                version=capability.task_version,
             )
-            if state is None:
+            if state is None or state.status != "active":
                 return TaskResult("stale")
             await self._replace_pending_input(session, owner_id, chat_id)
             capability.action = "reminder_input"
@@ -634,7 +639,12 @@ class TaskService:
                 return None
             pending.status = "consumed"
             pending.consumed_at = current
-            return await self._record(session, owner_id, pending.inbox_item_id)
+            record = await self._record(session, owner_id, pending.inbox_item_id)
+            return (
+                record
+                if record is not None and record.state.version == pending.task_version
+                else None
+            )
 
     async def submit_pending_input(
         self,
@@ -654,15 +664,13 @@ class TaskService:
                 or as_utc(capability.expires_at) <= datetime.now(UTC)
             ):
                 return TaskResult("stale")
-            state = await session.scalar(
-                select(TaskState).where(
-                    TaskState.owner_id == owner_id,
-                    TaskState.inbox_item_id == capability.inbox_item_id,
-                    TaskState.version == capability.task_version,
-                    TaskState.status == "active",
-                )
+            state = await self._live_state(
+                session,
+                owner_id,
+                capability.inbox_item_id,
+                version=capability.task_version,
             )
-            if state is None:
+            if state is None or state.status != "active":
                 return TaskResult("stale")
             capability.status = "consumed"
             capability.consumed_at = datetime.now(UTC)
@@ -699,13 +707,11 @@ class TaskService:
                 or as_utc(capability.expires_at) <= datetime.now(UTC)
             ):
                 return TaskResult("stale")
-            state = await session.scalar(
-                select(TaskState).where(
-                    TaskState.owner_id == owner_id,
-                    TaskState.inbox_item_id == capability.inbox_item_id,
-                    TaskState.version == capability.task_version,
-                    TaskState.status == "active",
-                )
+            state = await self._live_state(
+                session,
+                owner_id,
+                capability.inbox_item_id,
+                version=capability.task_version,
             )
             payload = capability.payload or {}
             event_at = _parsed_datetime(payload.get("event_at"))
@@ -777,49 +783,51 @@ class TaskService:
                 or as_utc(capability.expires_at) <= datetime.now(UTC)
             ):
                 return TaskResult("stale")
-            state = await session.scalar(
-                select(TaskState).where(
-                    TaskState.owner_id == owner_id,
-                    TaskState.inbox_item_id == capability.inbox_item_id,
-                    TaskState.version == capability.task_version,
-                )
+            state = await self._live_state(
+                session,
+                owner_id,
+                capability.inbox_item_id,
+                version=capability.task_version,
             )
             if state is None:
                 return TaskResult("stale")
             if capability.action == "delete_cancel":
-                capability.status = "consumed"
-                capability.consumed_at = datetime.now(UTC)
+                cancelled_at = datetime.now(UTC)
+                await session.execute(
+                    update(TaskActionToken)
+                    .where(
+                        TaskActionToken.owner_id == owner_id,
+                        TaskActionToken.chat_id == chat_id,
+                        TaskActionToken.inbox_item_id == state.inbox_item_id,
+                        TaskActionToken.task_version == state.version,
+                        TaskActionToken.action.in_({"delete_confirm", "delete_cancel"}),
+                        TaskActionToken.status == "pending",
+                    )
+                    .values(status="consumed", consumed_at=cancelled_at)
+                )
                 return TaskResult(
                     "delete_cancelled", await self._record(session, owner_id, state.inbox_item_id)
                 )
             item_id = state.inbox_item_id
-            await session.execute(
-                update(VisionItem)
-                .where(VisionItem.owner_id == owner_id, VisionItem.linked_task_id == item_id)
-                .values(linked_task_id=None)
-            )
-            await session.execute(
-                update(TaskReminder)
-                .where(TaskReminder.inbox_item_id == item_id)
-                .values(
-                    status="cancelled",
-                    claim_token=None,
-                    claimed_at=None,
-                    next_attempt_at=None,
-                )
-            )
             item = await session.scalar(
                 select(InboxItem).where(
                     InboxItem.id == item_id,
                     InboxItem.user_id == owner_id,
                     InboxItem.kind == "task",
+                    InboxItem.status.in_(("confirmed", "archived")),
                 )
             )
             if item is None:
                 return TaskResult("stale")
-            await session.delete(item)
+            trashed_at = datetime.now(UTC)
+            state.version += 1
+            item.pre_trash_status = item.status
+            item.status = "trashed"
+            item.trashed_at = trashed_at
+            item.version += 1
+            await self._cancel_live_reminder(session, item_id)
             await session.flush()
-            return TaskResult("deleted")
+            return TaskResult("trashed")
 
     def parse_datetime(
         self,
@@ -945,7 +953,14 @@ class TaskService:
         state.event_at = event_at
         state.timezone = _valid_timezone(timezone, state.timezone)
         state.version += 1
-        item = await session.get(InboxItem, state.inbox_item_id)
+        item = await session.scalar(
+            select(InboxItem).where(
+                InboxItem.id == state.inbox_item_id,
+                InboxItem.user_id == state.owner_id,
+                InboxItem.kind == "task",
+                InboxItem.status.in_(("confirmed", "archived")),
+            )
+        )
         if item is None:
             raise ValueError("Task inbox item disappeared")
         item.status = "confirmed"
@@ -988,7 +1003,14 @@ class TaskService:
     ) -> None:
         remind_at = as_utc(remind_at)
         state.version += 1
-        item = await session.get(InboxItem, state.inbox_item_id)
+        item = await session.scalar(
+            select(InboxItem).where(
+                InboxItem.id == state.inbox_item_id,
+                InboxItem.user_id == state.owner_id,
+                InboxItem.kind == "task",
+                InboxItem.status.in_(("confirmed", "archived")),
+            )
+        )
         owner = await session.get(User, state.owner_id)
         if item is None or owner is None:
             raise ValueError("Task owner or inbox item disappeared")
@@ -1059,6 +1081,29 @@ class TaskService:
         if reminder is not None:
             self._cancel_reminder(reminder)
 
+    @staticmethod
+    async def _live_state(
+        session: AsyncSession,
+        owner_id: int,
+        inbox_item_id: int,
+        *,
+        version: int | None = None,
+    ) -> TaskState | None:
+        statement = (
+            select(TaskState)
+            .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+            .where(
+                TaskState.owner_id == owner_id,
+                TaskState.inbox_item_id == inbox_item_id,
+                InboxItem.user_id == owner_id,
+                InboxItem.kind == "task",
+                InboxItem.status.in_(("confirmed", "archived")),
+            )
+        )
+        if version is not None:
+            statement = statement.where(TaskState.version == version)
+        return await session.scalar(statement)
+
     async def _record(
         self, session: AsyncSession, owner_id: int, inbox_item_id: int
     ) -> TaskRecord | None:
@@ -1072,6 +1117,7 @@ class TaskService:
                     TaskState.inbox_item_id == inbox_item_id,
                     InboxItem.user_id == owner_id,
                     InboxItem.kind == "task",
+                    InboxItem.status.in_(("confirmed", "archived")),
                 )
             )
         ).one_or_none()
@@ -1116,12 +1162,11 @@ class TaskService:
             or as_utc(capability.expires_at) <= current
         ):
             return None, None
-        state = await session.scalar(
-            select(TaskState).where(
-                TaskState.owner_id == owner_id,
-                TaskState.inbox_item_id == capability.inbox_item_id,
-                TaskState.version == capability.task_version,
-            )
+        state = await self._live_state(
+            session,
+            owner_id,
+            capability.inbox_item_id,
+            version=capability.task_version,
         )
         if state is None:
             return None, None

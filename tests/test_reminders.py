@@ -9,6 +9,7 @@ from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.dates import DateResolver
 from future_self.drafts import DraftInboxService
+from future_self.inbox import InboxLifecycleService
 from future_self.models import DraftInboxItem, InboxItem, TaskReminder, TaskState
 from future_self.reminders import TaskReminderEngine, as_utc, schedule_from_temporal
 from future_self.repositories import UserRepository
@@ -715,6 +716,38 @@ async def test_delivery_failure_is_retried_with_backoff_without_leaking_error(db
     assert saved.status == "pending"
     assert saved.last_error_type == "RuntimeError"
     assert as_utc(saved.next_attempt_at) == due + timedelta(seconds=5)
+
+
+async def test_delivery_race_with_trash_compensates_stale_telegram_message(db):
+    item, reminder = await create_reminder(
+        db,
+        telegram_user_id=77,
+        chat_id=707,
+        temporal_resolution=temporal(resolved_at=datetime(2026, 7, 20, 15, tzinfo=UTC)),
+    )
+    assert reminder is not None
+    lifecycle = InboxLifecycleService(db)
+    deleted: list[tuple[int, int]] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        del text
+        snapshot = await lifecycle.confirmed_snapshot(item.user_id, {item.id})
+        assert (await lifecycle.trash_snapshot(item.user_id, snapshot)).status == "trashed"
+        return 909
+
+    async def delete_sent(chat_id: int, message_id: int) -> None:
+        deleted.append((chat_id, message_id))
+
+    engine = TaskReminderEngine(db, send, delete_sent=delete_sent)
+    delivered = await engine.deliver_due(now=datetime(2026, 7, 20, 14, 30, tzinfo=UTC))
+
+    assert delivered == 0
+    assert deleted == [(77, 909)]
+    async with db.sessions() as session:
+        stored_item = await session.get(InboxItem, item.id)
+        stored_reminder = await session.get(TaskReminder, reminder.id)
+    assert stored_item.status == "trashed"
+    assert stored_reminder.status == "cancelled"
 
 
 async def test_bot_startup_expires_very_old_reminder_without_telegram_delivery(db, fake_ai):

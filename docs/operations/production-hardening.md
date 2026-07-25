@@ -57,7 +57,7 @@ offsite retention and secret rotation remain host-operator responsibilities.
    override it with a local process/SQLite check compatible with the retained revision:
 
    ```bash
-   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\"} else 1)'" \
+   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\"} else 1)'" \
    --health-interval=60s --health-timeout=20s --health-start-period=30s \
    --health-retries=3
    ```
@@ -139,8 +139,13 @@ files stay root-owned `0700/0600`.
   backup only when discarding all post-cutover Workspace/Knowledge changes is an explicit
   incident decision.
 - Do not `stamp` the live database backward to make an old image start. Use the
-  pre-created rollback command override above, keep revision `20260722_0019`, and retain
-  the failed PR #24 container under a separate stopped name for forensics.
+  pre-created rollback command override above, keep revision `20260725_0020`, and retain
+  any failed rollout container under a separate stopped name for forensics.
+- Before starting any image that predates Inbox lifecycle support, verify without printing
+  row contents that the Inbox trash is empty. Older collection/Vision consumers do not know
+  the `trashed` lifecycle. If it is non-empty, keep the lifecycle-aware image or restore the
+  rows explicitly before rollback; migration `20260725_0020` intentionally refuses to
+  downgrade while recoverable trash exists.
 
 ## PR #24 Knowledge rollout gate
 

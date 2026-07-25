@@ -309,7 +309,7 @@ async def test_reschedule_preserves_interval_and_invalidates_competing_callback(
     assert (await service.complete(actions["complete"], owner_id, 100)).status == "stale"
 
 
-async def test_reschedule_makes_auto_archived_overdue_task_current_again(db):
+async def test_auto_archived_overdue_task_stays_manageable_but_cannot_remind(db):
     now = datetime.now(UTC)
     event = now - timedelta(days=7)
     owner_id, item_id, _ = await create_task(
@@ -323,17 +323,16 @@ async def test_reschedule_makes_auto_archived_overdue_task_current_again(db):
 
     assert await TaskReminderEngine(db, send).expire_stale(now=now) == 1
     service = TaskService(db)
-    menu_token = await token(service, owner_id, item_id, "reschedule_menu")
-    menu = await service.reschedule_menu(menu_token, owner_id, 100)
-    proposal = await service.choose_reschedule_preset(menu.tokens["1h"], owner_id, 100, now=now)
-    result = await service.apply_reschedule_choice(
-        proposal.tokens["reschedule_preserve"], owner_id, 100
-    )
-    assert result.status == "rescheduled"
-    assert result.record.item.status == "confirmed"
-    assert result.record.state.status == "active"
-    assert result.record.reminder.status == "pending"
-    assert as_utc(result.record.state.event_at) == now + timedelta(hours=1)
+    assert (await service.record(owner_id, item_id)).item.id == item_id
+    actions = await service.issue_actions(owner_id, 100, item_id, 1, ("reschedule_menu",))
+    assert set(actions) == {"reschedule_menu"}
+    async with db.sessions() as session:
+        item = await session.get(InboxItem, item_id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item_id))
+        reminder = await session.scalar(
+            select(TaskReminder).where(TaskReminder.inbox_item_id == item_id)
+        )
+    assert (item.status, state.status, reminder.status) == ("archived", "active", "expired")
 
 
 async def test_custom_event_and_reminder_inputs_are_persistent_and_deterministic(db):
@@ -391,8 +390,13 @@ async def test_explicit_reminder_after_sent_gets_new_delivery_key_and_can_be_dis
     assert as_utc(disabled.record.state.event_at) == now + timedelta(days=1)
 
 
-async def test_delete_confirmation_is_owner_chat_version_bound_and_clears_vision_link(db):
-    owner_id, item_id, _ = await create_task(db)
+async def test_delete_confirmation_is_owner_chat_version_bound_and_moves_to_trash(db):
+    now = datetime.now(UTC)
+    owner_id, item_id, _ = await create_task(
+        db,
+        event_at=now + timedelta(days=1),
+        remind_at=now + timedelta(hours=23),
+    )
     async with db.session() as session:
         vision = VisionItem(
             owner_id=owner_id,
@@ -416,6 +420,9 @@ async def test_delete_confirmation_is_owner_chat_version_bound_and_clears_vision
     ).status == "stale"
     cancelled = await service.delete_or_cancel(confirm.tokens["delete_cancel"], owner_id, 100)
     assert cancelled.status == "delete_cancelled"
+    assert (
+        await service.delete_or_cancel(confirm.tokens["delete_confirm"], owner_id, 100)
+    ).status == "stale"
     expired_ask = (await service.issue_actions(owner_id, 100, item_id, 1, ("delete_ask",)))[
         "delete_ask"
     ]
@@ -430,10 +437,23 @@ async def test_delete_confirmation_is_owner_chat_version_bound_and_clears_vision
     confirm = await service.prepare_delete(ask, owner_id, 100)
     assert (
         await service.delete_or_cancel(confirm.tokens["delete_confirm"], owner_id, 100)
-    ).status == "deleted"
+    ).status == "trashed"
     async with db.sessions() as session:
-        assert await session.get(InboxItem, item_id) is None
-        assert (await session.get(VisionItem, vision_id)).linked_task_id is None
+        item = await session.get(InboxItem, item_id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item_id))
+        reminder = await session.scalar(
+            select(TaskReminder).where(TaskReminder.inbox_item_id == item_id)
+        )
+        linked_vision = await session.get(VisionItem, vision_id)
+    assert item.status == "trashed"
+    assert item.pre_trash_status == "confirmed"
+    assert item.trashed_at is not None
+    assert item.version == 2
+    assert state.status == "active"
+    assert state.version == 2
+    assert state.cancelled_at is None
+    assert reminder.status == "cancelled"
+    assert linked_vision.linked_task_id == item_id
 
 
 async def test_tokens_are_owner_isolated_forged_stale_and_single_use(db):
@@ -446,6 +466,36 @@ async def test_tokens_are_owner_isolated_forged_stale_and_single_use(db):
     assert (await service.complete(capability, owner_id, 401)).status == "stale"
     assert (await service.complete(capability, owner_id, 400)).status == "completed"
     assert (await service.complete(capability, owner_id, 400)).status == "already_completed"
+
+
+async def test_trashed_inbox_task_is_hidden_and_old_tokens_fail_closed(db):
+    now = datetime.now(UTC)
+    owner_id, item_id, _ = await create_task(
+        db,
+        event_at=now - timedelta(days=1),
+    )
+    service = TaskService(db)
+    actions = await service.issue_actions(
+        owner_id,
+        100,
+        item_id,
+        1,
+        ("view", "complete"),
+    )
+    async with db.session() as session:
+        item = await session.get(InboxItem, item_id)
+        item.pre_trash_status = item.status
+        item.status = "trashed"
+        item.trashed_at = now
+        item.version += 1
+
+    assert await service.record(owner_id, item_id) is None
+    assert (await service.list_page(owner_id, "overdue", 0, now=now)).total == 0
+    assert await service.overdue_snapshot(owner_id, now=now) == []
+    assert await service.capability_action(actions["view"], owner_id, 100) is None
+    assert (await service.open_from_token(actions["view"], owner_id, 100)).status == "stale"
+    assert (await service.complete(actions["complete"], owner_id, 100)).status == "stale"
+    assert await service.issue_actions(owner_id, 100, item_id, 1, ("view",)) == {}
 
 
 async def test_complete_reschedule_delete_race_has_single_winner(db):
@@ -480,13 +530,14 @@ async def test_complete_reschedule_delete_race_has_single_winner(db):
 
     results = await asyncio.gather(complete(), reschedule(), prepare_delete())
     winners = [
-        result for result in results if result.status in {"completed", "rescheduled", "deleted"}
+        result for result in results if result.status in {"completed", "rescheduled", "trashed"}
     ]
     assert len(winners) == 1
     async with db.sessions() as session:
         state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item_id))
-    if winners[0].status == "deleted":
-        assert state is None
+        item = await session.get(InboxItem, item_id)
+    if winners[0].status == "trashed":
+        assert (state.status, state.version, item.status) == ("active", 2, "trashed")
     else:
         assert state.version == 2
 

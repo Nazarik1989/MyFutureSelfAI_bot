@@ -136,6 +136,7 @@ class InboxState:
     title: str
     kind: str
     source: str
+    status: str = "confirmed"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -393,7 +394,10 @@ class BotAutotester:
                 )
             ),
             inbox=tuple(
-                sorted(InboxState(item.title, item.kind, item.source) for item in inbox_items)
+                sorted(
+                    InboxState(item.title, item.kind, item.source, item.status)
+                    for item in inbox_items
+                )
             ),
             llm_inputs=tuple(self.ai.route_calls),
             health_scores=tuple(sorted(record.state_score for record in health_records)),
@@ -902,7 +906,7 @@ class BotAutotester:
             "reminder-edit": "Изменить напоминание",
             "reminder-off": "Отключить напоминание",
             "delete": "Удалить",
-            "delete-confirm": "Да, удалить",
+            "delete-confirm": "Да, в корзину",
             "cancel": "Отмена",
             "collection-view": "Открыть в Task Hub",
         }

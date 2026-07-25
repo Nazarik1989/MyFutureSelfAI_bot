@@ -10,6 +10,7 @@ from future_self.models import (
     ConversationSession,
     DraftInboxItem,
     InboxItem,
+    OnboardingState,
     TaskReminder,
     TaskState,
 )
@@ -48,8 +49,10 @@ class FakeCallbackQuery:
     async def answer(self, text: str | None = None, show_alert: bool = False):
         self.answers.append((text, show_alert))
 
-    async def edit_message_text(self, text: str):
+    async def edit_message_text(self, text: str, **kwargs):
         self.edits.append(text)
+        if kwargs:
+            self.message.replies.append({"text": text, **kwargs})
 
     async def edit_message_reply_markup(self, reply_markup=None):
         self.markup_removed += 1
@@ -257,11 +260,17 @@ async def test_voice_and_callback_save_share_atomic_confirm(db, fake_ai, monkeyp
         ),
         context,
     )
+    saved_buttons = {
+        button.text for row in first.replies[-1]["reply_markup"].inline_keyboard for button in row
+    }
+    assert "🗑 В корзину" in saved_buttons
     await make_preview(bot, 1004, 2004, context)
     voice = FakeMessage(voice=FakeVoice())
     await bot.voice(update_for(voice, 1004, 2004), context)
     assert calls == 2
-    assert await counts(db) == (2, 2)
+    assert await counts(db) == (2, 1)
+    assert "повторную копию не создаю" in voice.replies[-1]["text"]
+    assert voice.replies[-1]["reply_markup"] is None
 
 
 async def test_repeated_voice_save_is_idempotent_and_removes_preview_keyboard(db, fake_ai):
@@ -682,6 +691,10 @@ async def test_screenshot_draft_cleanup_phrases_are_control_intents_before_ai(
         "Удали все неактуальные задачи",
         "Удали все не актуальные задачи",
         "Убери все просроченные задачи",
+        "Удалить все просроченные",
+        "Удали всё просроченное",
+        "Удали все неактуальные",
+        "Убрать все устаревшие",
     ],
 )
 async def test_screenshot_stale_task_cleanup_is_previewed_confirmed_and_owner_scoped(
@@ -715,6 +728,18 @@ async def test_screenshot_stale_task_cleanup_is_previewed_confirmed_and_owner_sc
     assert request.replies[-1]["text"].startswith("Нашёл просроченных задач: 2.")
     assert len(fake_ai.route_calls) == routed_before
     async with db.sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count(DraftInboxItem.id)).where(DraftInboxItem.raw_text == phrase)
+            )
+            == 0
+        )
+        assert (
+            await session.scalar(
+                select(func.count(InboxItem.id)).where(InboxItem.raw_text == phrase)
+            )
+            == 0
+        )
         before = list(
             (
                 await session.scalars(
@@ -726,7 +751,7 @@ async def test_screenshot_stale_task_cleanup_is_previewed_confirmed_and_owner_sc
 
     confirmation = FakeMessage("да, удалить")
     await bot.text(update_for(confirmation, 1216, 2216), ctx)
-    assert "Убрано из активных: 2" in confirmation.replies[-1]["text"]
+    assert "Перемещено в корзину просроченных задач: 2" in confirmation.replies[-1]["text"]
     assert len(fake_ai.route_calls) == routed_before
 
     async with db.sessions() as session:
@@ -742,9 +767,9 @@ async def test_screenshot_stale_task_cleanup_is_previewed_confirmed_and_owner_sc
     for title in ("Напоминание с прошлой недели", "Старая запись к врачу"):
         state, item, reminder = by_title[title]
         assert (state.status, item.status, reminder.status) == (
+            "active",
+            "trashed",
             "cancelled",
-            "archived",
-            "expired",
         )
     assert by_title["Будущая важная задача"][0].status == "active"
     assert by_title["Будущая важная задача"][1].status == "confirmed"
@@ -757,6 +782,140 @@ async def test_screenshot_stale_task_cleanup_is_previewed_confirmed_and_owner_sc
     assert "Будущая важная задача" in inbox_text
     assert "Напоминание с прошлой недели" not in inbox_text
     assert "Старая запись к врачу" not in inbox_text
+
+
+async def test_voice_cleanup_wins_over_active_onboarding_without_consuming_answer(db, fake_ai):
+    phrase = "Удали все просроченные"
+    bot = FutureSelfBot(settings(), db, fake_ai, PhraseTranscription(phrase))
+    owner = await bot._user(1277)
+    async with db.session() as session:
+        session.add(
+            OnboardingState(
+                user_id=owner.id,
+                current_step=1,
+                answers={"display_name": "Тест"},
+                status="in_progress",
+            )
+        )
+    await make_overdue_task(
+        bot,
+        1277,
+        2277,
+        "Просроченная задача",
+        datetime.now(UTC) - timedelta(days=2),
+    )
+    ctx = context_with_bot()
+    ctx.user_data["onboarding_user_id"] = owner.id
+    message = FakeMessage(voice=FakeVoice())
+
+    await bot.voice(update_for(message, 1277, 2277), ctx)
+
+    assert any(reply["text"].startswith("Нашёл просроченных задач: 1") for reply in message.replies)
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+    assert state.current_step == 1
+    assert state.answers == {"display_name": "Тест"}
+    assert fake_ai.route_calls == []
+
+
+async def test_long_voice_onboarding_answer_is_not_mistaken_for_cleanup(db, fake_ai):
+    narrative = "В будущем я хочу научиться удалять все неактуальные задачи вовремя"
+    bot = FutureSelfBot(settings(), db, fake_ai, PhraseTranscription(narrative))
+    owner = await bot._user(1280)
+    async with db.session() as session:
+        session.add(
+            OnboardingState(
+                user_id=owner.id,
+                current_step=2,
+                answers={"display_name": "Тест"},
+                status="in_progress",
+            )
+        )
+    message = FakeMessage(voice=FakeVoice())
+
+    await bot.voice(update_for(message, 1280, 2280), context_with_bot())
+
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+    assert state.current_step == 3
+    assert state.answers["future_life"] == narrative
+    assert any("Где ты живёшь в этом образе" in reply["text"] for reply in message.replies)
+    assert fake_ai.route_calls == []
+
+
+async def test_read_only_task_navigation_cancels_pending_cleanup_and_is_not_blocked(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    await bot.conversation.begin_system_action(
+        1278,
+        2278,
+        "archive_overdue_tasks",
+        [{"id": 1}],
+    )
+    message = FakeMessage("Открой задачи и напоминания")
+
+    await bot.text(update_for(message, 1278, 2278), context_with_bot())
+
+    assert message.replies[-1]["text"].startswith("✅ Задачи и напоминания")
+    assert (await bot.conversation.get(1278, 2278)).system_pending_action is None
+    assert fake_ai.route_calls == []
+
+
+async def test_text_cleanup_cancel_does_not_claim_success_after_confirm_wins_race(
+    db, fake_ai, monkeypatch
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    await bot.conversation.begin_system_action(
+        1279,
+        2279,
+        "archive_overdue_tasks",
+        [{"id": 1}],
+    )
+
+    async def confirm_already_claimed(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(bot.conversation, "clear_system_action", confirm_already_claimed)
+    message = FakeMessage("отмена")
+
+    await bot.text(update_for(message, 1279, 2279), context_with_bot())
+
+    reply = message.replies[-1]["text"]
+    assert "уже неактуально или операция уже выполняется" in reply
+    assert "Ничего не изменено" not in reply
+    assert fake_ai.route_calls == []
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "удали всё старое",
+        "очисти всё",
+        "не удаляй просроченные задачи",
+        "удали задачи и черновики",
+    ],
+)
+async def test_ambiguous_destructive_language_is_quarantined_before_ai(db, fake_ai, source, phrase):
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        PhraseTranscription(phrase) if source == "voice" else NoopTranscription(),
+    )
+    message = FakeMessage(phrase) if source == "text" else FakeMessage(voice=FakeVoice())
+
+    await (bot.text if source == "text" else bot.voice)(
+        update_for(message, 1288, 2288),
+        context_with_bot(),
+    )
+
+    assert "Ничего не удалено и новая запись не создана" in message.replies[-1]["text"]
+    assert await counts(db) == (0, 0)
+    assert fake_ai.route_calls == []
 
 
 @pytest.mark.parametrize("correction_source", ["text", "voice"])
@@ -1449,6 +1608,25 @@ async def test_natural_inbox_is_isolated_and_write_phrase_is_not_read_command(db
     await bot.text(update_for(write, 1302, 2302), context)
     assert "Inbox пока пуст" not in write.replies[-1]["text"]
     assert "Нет одной актуальной" in write.replies[-1]["text"]
+
+
+async def test_saved_duplicate_does_not_replace_last_saved_receipt(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, NoopTranscription())
+    ctx = context_with_bot()
+    await make_named_preview(bot, 1308, 2308, ctx, "Первая", "Первое содержание")
+    await bot.text(update_for(FakeMessage("сохрани"), 1308, 2308), ctx)
+    await make_named_preview(bot, 1308, 2308, ctx, "Вторая", "Второе содержание")
+    await bot.text(update_for(FakeMessage("сохрани"), 1308, 2308), ctx)
+    await make_named_preview(bot, 1308, 2308, ctx, "Первая", "Первое содержание")
+    duplicate = FakeMessage("сохрани")
+    await bot.text(update_for(duplicate, 1308, 2308), ctx)
+
+    assert "повторную копию не создаю" in duplicate.replies[-1]["text"]
+    assert await counts(db) == (3, 2)
+    last = FakeMessage("/last_saved")
+    await bot.last_saved_command(update_for(last, 1308, 2308), ctx)
+    assert "Вторая" in last.replies[-1]["text"]
+    assert "Первая" not in last.replies[-1]["text"]
 
 
 async def test_conflict_choice_regenerates_all_temporal_fields_and_survives_restart(db, fake_ai):

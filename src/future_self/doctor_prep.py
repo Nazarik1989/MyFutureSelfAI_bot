@@ -136,7 +136,11 @@ class DoctorVisitPrepService:
                 if record is None:
                     return DoctorTaskResult("missing")
                 if record.appointment_inbox_item_id is not None:
-                    return await self._existing_task(session, record.appointment_inbox_item_id)
+                    return await self._existing_task(
+                        session,
+                        user_id,
+                        record.appointment_inbox_item_id,
+                    )
 
                 item = InboxItem(
                     user_id=user_id,
@@ -193,11 +197,28 @@ class DoctorVisitPrepService:
                 )
                 if record is None or record.appointment_inbox_item_id is None:
                     return DoctorTaskResult("missing")
-                return await self._existing_task(session, record.appointment_inbox_item_id)
+                return await self._existing_task(
+                    session,
+                    user_id,
+                    record.appointment_inbox_item_id,
+                )
 
     @staticmethod
-    async def _existing_task(session: AsyncSession, inbox_item_id: int) -> DoctorTaskResult:
-        item = await session.get(InboxItem, inbox_item_id)
+    async def _existing_task(
+        session: AsyncSession,
+        user_id: int,
+        inbox_item_id: int,
+    ) -> DoctorTaskResult:
+        item = await session.scalar(
+            select(InboxItem).where(
+                InboxItem.id == inbox_item_id,
+                InboxItem.user_id == user_id,
+                InboxItem.kind == "task",
+                InboxItem.status.in_(("confirmed", "archived")),
+            )
+        )
+        if item is None:
+            return DoctorTaskResult("stale")
         reminder = await session.scalar(
             select(TaskReminder).where(TaskReminder.inbox_item_id == inbox_item_id)
         )

@@ -17,6 +17,7 @@ from future_self.bot import (
 from future_self.config import Settings
 from future_self.doctor_prep import DoctorVisitPrepService
 from future_self.health import subjective_score
+from future_self.inbox import InboxLifecycleService
 from future_self.models import DoctorVisitPrep, HealthCheckIn, InboxItem, TaskReminder, TaskState
 from future_self.repositories import UserRepository
 
@@ -313,3 +314,83 @@ async def test_concurrent_doctor_task_creation_is_atomic(db, fake_ai):
     async with db.sessions() as session:
         assert await session.scalar(select(func.count(InboxItem.id))) == 1
         assert await session.scalar(select(func.count(TaskReminder.id))) == 1
+
+
+async def test_trashed_doctor_task_pointer_is_stale_and_never_duplicated(db, fake_ai):
+    bot = FutureSelfBot(prep_settings(), db, fake_ai, NoopTranscription())
+    user = await bot._user(41)
+    record = await bot.doctor_prep_service.save(
+        user_id=user.id,
+        timezone=user.timezone,
+        answers=prep_answers(),
+    )
+    temporal = bot._doctor_task_temporal("через 2 часа", user.timezone)
+    created = await bot.doctor_prep_service.create_appointment_task(
+        user_id=user.id,
+        record_id=record.id,
+        telegram_user_id=41,
+        chat_id=401,
+        temporal=temporal,
+    )
+    lifecycle = InboxLifecycleService(db)
+    snapshot = await lifecycle.confirmed_snapshot(user.id, {created.inbox_item.id})
+    assert (await lifecycle.trash_snapshot(user.id, snapshot)).status == "trashed"
+
+    repeated = await bot.doctor_prep_service.create_appointment_task(
+        user_id=user.id,
+        record_id=record.id,
+        telegram_user_id=41,
+        chat_id=401,
+        temporal=temporal,
+    )
+
+    assert repeated.status == "stale"
+    assert repeated.inbox_item is None
+    async with db.sessions() as session:
+        stored = await session.get(DoctorVisitPrep, record.id)
+        assert stored.appointment_inbox_item_id == created.inbox_item.id
+        assert await session.scalar(select(func.count(InboxItem.id))) == 1
+
+
+async def test_foreign_doctor_task_pointer_is_stale_and_never_exposed(db, fake_ai):
+    bot = FutureSelfBot(prep_settings(), db, fake_ai, NoopTranscription())
+    user = await bot._user(42)
+    foreign_owner = await bot._user(43)
+    record = await bot.doctor_prep_service.save(
+        user_id=user.id,
+        timezone=user.timezone,
+        answers=prep_answers(),
+    )
+    async with db.session() as session:
+        foreign_task = InboxItem(
+            user_id=foreign_owner.id,
+            kind="task",
+            title="Чужая задача к врачу",
+            description=None,
+            raw_text="Чужая задача к врачу",
+            next_step="Чужие медицинские данные",
+            resolved_date=None,
+            temporal_resolution=None,
+            source="doctor_prepare",
+            status="confirmed",
+        )
+        session.add(foreign_task)
+        await session.flush()
+        stored = await session.get(DoctorVisitPrep, record.id)
+        stored.appointment_inbox_item_id = foreign_task.id
+        foreign_task_id = foreign_task.id
+    temporal = bot._doctor_task_temporal("через 2 часа", user.timezone)
+
+    result = await bot.doctor_prep_service.create_appointment_task(
+        user_id=user.id,
+        record_id=record.id,
+        telegram_user_id=42,
+        chat_id=402,
+        temporal=temporal,
+    )
+
+    assert result.status == "stale"
+    assert result.inbox_item is None
+    async with db.sessions() as session:
+        assert await session.get(InboxItem, foreign_task_id) is not None
+        assert await session.scalar(select(func.count(InboxItem.id))) == 1

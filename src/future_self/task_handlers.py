@@ -77,6 +77,17 @@ class TaskHandlers:
                 self._task_hub_keyboard(),
             )
             return
+        if data == "task:cleanup:overdue":
+            user = await self._user(update.effective_user.id)
+            snapshot = await self.inbox_lifecycle.overdue_snapshot(user.id)
+            await query.answer()
+            await self._begin_overdue_task_cleanup(
+                query.message,
+                update.effective_user.id,
+                update.effective_chat.id,
+                snapshot,
+            )
+            return
         if data.startswith("task:list:"):
             parts = data.split(":")
             if len(parts) != 4 or parts[2] not in BUCKET_LABELS or not parts[3].isdigit():
@@ -252,12 +263,13 @@ class TaskHandlers:
                 return
             await self._task_edit_or_send(
                 query,
-                "Удалить задачу? Напоминание будет отменено, а связанная карточка желания останется.",
+                "Перенести задачу в корзину? Напоминание будет отменено, а история и связанная "
+                "карточка желания сохранятся.",
                 InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
-                                "Да, удалить",
+                                "Да, в корзину",
                                 callback_data=f"task:{result.tokens['delete_confirm']}",
                             ),
                             InlineKeyboardButton(
@@ -273,10 +285,12 @@ class TaskHandlers:
             result = await self.task_service.delete_or_cancel(
                 token, user.id, update.effective_chat.id
             )
-            if result.status == "deleted":
+            if result.status == "trashed":
                 await self._task_edit_or_send(
                     query,
-                    "Задача удалена. Связанная карточка желания сохранена.",
+                    "Задача перенесена в корзину. История задачи и связь с карточкой желания "
+                    "сохранены; восстановить задачу можно через /inbox. Ожидающее напоминание "
+                    "отменено.",
                     self._task_hub_keyboard(),
                 )
             elif result.status == "delete_cancelled":
@@ -705,6 +719,12 @@ class TaskHandlers:
                     InlineKeyboardButton("Без срока", callback_data="task:list:no_due:0"),
                 ],
                 [InlineKeyboardButton("Выполненные", callback_data="task:list:completed:0")],
+                [
+                    InlineKeyboardButton(
+                        "🧹 Очистить просроченные",
+                        callback_data="task:cleanup:overdue",
+                    )
+                ],
                 [InlineKeyboardButton("Создать задачу", callback_data="nav:action:task_create")],
                 [
                     InlineKeyboardButton(

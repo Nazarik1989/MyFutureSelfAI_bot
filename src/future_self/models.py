@@ -189,7 +189,18 @@ class Routine(TimestampMixin, Base):
 
 class InboxItem(TimestampMixin, Base):
     __tablename__ = "inbox_items"
-    __table_args__ = (UniqueConstraint("id", "user_id", name="uq_inbox_item_id_user"),)
+    __table_args__ = (
+        UniqueConstraint("id", "user_id", name="uq_inbox_item_id_user"),
+        CheckConstraint("version > 0", name="ck_inbox_item_version"),
+        CheckConstraint(
+            "(status = 'trashed' AND trashed_at IS NOT NULL "
+            "AND pre_trash_status IN ('confirmed', 'archived')) OR "
+            "(status != 'trashed' AND trashed_at IS NULL "
+            "AND pre_trash_status IS NULL)",
+            name="ck_inbox_item_trash_state",
+        ),
+        Index("ix_inbox_items_user_status_id", "user_id", "status", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     draft_id: Mapped[str | None] = mapped_column(
@@ -205,6 +216,9 @@ class InboxItem(TimestampMixin, Base):
     temporal_resolution: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     source: Mapped[str] = mapped_column(String(20), default="text")
     status: Mapped[str] = mapped_column(String(20), default="confirmed", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    trashed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    pre_trash_status: Mapped[str | None] = mapped_column(String(20))
     user: Mapped[User] = relationship(back_populates="inbox_items")
     reminder: Mapped[TaskReminder | None] = relationship(
         back_populates="inbox_item", uselist=False, cascade="all, delete-orphan"

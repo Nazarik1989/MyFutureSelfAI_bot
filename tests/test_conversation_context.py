@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -108,6 +109,113 @@ async def test_context_ttl_excludes_expired_messages(db):
         conversation = await session.scalar(select(ConversationSession))
         conversation.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     assert not (await service.get(100, 200)).messages
+
+
+async def test_system_action_begin_uses_unique_atomic_versions(db):
+    service = ConversationContextService(db, 12, 24)
+    assert await service.begin_system_action(110, 210, "bootstrap", [{"id": 0}]) == 1
+
+    requests = (
+        ("discard_all_active_drafts", [{"id": "draft"}]),
+        ("archive_overdue_tasks", [{"id": 42}]),
+    )
+    versions = await asyncio.gather(
+        *(service.begin_system_action(110, 210, action, snapshot) for action, snapshot in requests)
+    )
+
+    assert sorted(versions) == [2, 3]
+    winning_action, winning_snapshot = requests[versions.index(3)]
+    current = await service.get(110, 210)
+    assert current.system_action_version == 3
+    assert current.system_pending_action == winning_action
+    assert current.system_draft_snapshot == winning_snapshot
+
+
+async def test_system_action_claim_and_clear_are_bound_to_expected_version(db):
+    service = ConversationContextService(db, 12, 24)
+    old_version = await service.begin_system_action(
+        120,
+        220,
+        "discard_all_active_drafts",
+        [{"id": "old"}],
+    )
+    new_snapshot = [{"id": 99, "version": 7}]
+    new_version = await service.begin_system_action(
+        120,
+        220,
+        "archive_overdue_tasks",
+        new_snapshot,
+    )
+
+    assert not await service.clear_system_action(
+        120,
+        220,
+        expected_version=old_version,
+    )
+    assert await service.claim_system_action(120, 220, expected_version=old_version) is None
+    still_current = await service.get(120, 220)
+    assert still_current.system_action_version == new_version
+    assert still_current.system_draft_snapshot == new_snapshot
+
+    competing_claims = await asyncio.gather(
+        service.claim_system_action(120, 220, expected_version=new_version),
+        service.claim_system_action(120, 220, expected_version=new_version),
+    )
+    claims = [claim for claim in competing_claims if claim is not None]
+    assert len(claims) == 1
+    assert claims[0].action == "archive_overdue_tasks"
+    assert claims[0].snapshot == new_snapshot
+    assert claims[0].version == new_version
+    assert (await service.get(120, 220)).system_pending_action is None
+
+    latest_version = await service.begin_system_action(
+        120,
+        220,
+        "trash_inbox_items",
+        [{"id": 100}],
+    )
+    assert not await service.clear_system_action(
+        120,
+        220,
+        expected_version=new_version,
+    )
+    latest = await service.get(120, 220)
+    assert latest.system_action_version == latest_version
+    assert latest.system_pending_action == "trash_inbox_items"
+    assert await service.clear_system_action(
+        120,
+        220,
+        expected_version=latest_version,
+    )
+    assert not await service.clear_system_action(
+        120,
+        220,
+        expected_version=latest_version,
+    )
+
+
+async def test_system_action_confirm_and_cancel_have_exactly_one_winner(db):
+    service = ConversationContextService(db, 12, 24)
+    version = await service.begin_system_action(
+        130,
+        230,
+        "trash_inbox_items",
+        [{"id": 1}],
+    )
+
+    claim, cancelled = await asyncio.gather(
+        service.claim_system_action(130, 230, expected_version=version),
+        service.clear_system_action(130, 230, expected_version=version),
+    )
+
+    assert (claim is not None) != cancelled
+    if claim is not None:
+        assert await service.finalize_system_action_claim(
+            130,
+            230,
+            expected_version=version,
+        )
+    assert (await service.get(130, 230)).system_pending_action is None
 
 
 async def test_recent_conversation_reaches_next_message_after_bot_recreation(db, fake_ai):
