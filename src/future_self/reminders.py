@@ -16,6 +16,7 @@ from .schemas import TemporalResolution
 logger = logging.getLogger(__name__)
 
 ReminderSendCallback = Callable[[int, str], Awaitable[int | None]]
+ReminderDeleteCallback = Callable[[int, int], Awaitable[None]]
 
 
 def as_utc(value: datetime) -> datetime:
@@ -118,6 +119,7 @@ class TaskReminderEngine:
         db: Database,
         send: ReminderSendCallback,
         *,
+        delete_sent: ReminderDeleteCallback | None = None,
         lease_seconds: int = 120,
         batch_size: int = 20,
         date_event_hour: int = 9,
@@ -125,6 +127,7 @@ class TaskReminderEngine:
     ):
         self.db = db
         self.send = send
+        self.delete_sent = delete_sent
         self.lease = timedelta(seconds=lease_seconds)
         self.batch_size = batch_size
         self.date_event_hour = date_event_hour
@@ -198,6 +201,19 @@ class TaskReminderEngine:
                 continue
             if await self._mark_sent(reminder, current, message_id):
                 delivered += 1
+            elif message_id is not None and self.delete_sent is not None:
+                # The task may have been trashed/rescheduled after the final
+                # pre-send check but before Telegram returned. Compensate by
+                # removing that now-stale delivery; lifecycle state remains the
+                # source of truth even if Telegram deletion itself fails.
+                try:
+                    await self.delete_sent(reminder.chat_id, message_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Stale task reminder compensation failed reminder_id=%s error_type=%s",
+                        reminder.id,
+                        type(exc).__name__,
+                    )
         return delivered
 
     async def expire_stale(self, *, now: datetime | None = None) -> int:
@@ -293,6 +309,7 @@ class TaskReminderEngine:
                             TaskState.version == TaskReminder.task_version,
                             TaskState.owner_id == InboxItem.user_id,
                             InboxItem.kind == "task",
+                            InboxItem.status == "confirmed",
                         )
                         .order_by(TaskReminder.remind_at, TaskReminder.id)
                         .limit(self.batch_size)
@@ -329,6 +346,7 @@ class TaskReminderEngine:
                     .where(
                         InboxItem.id == reminder.inbox_item_id,
                         InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
                         TaskState.owner_id == InboxItem.user_id,
                         TaskState.status == "active",
                         TaskState.version == reminder.task_version,
@@ -386,11 +404,16 @@ class TaskReminderEngine:
                     TaskReminder.claim_token == reminder.claim_token,
                     TaskReminder.task_version == reminder.task_version,
                     exists(
-                        select(TaskState.id).where(
+                        select(TaskState.id)
+                        .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+                        .where(
                             TaskState.inbox_item_id == reminder.inbox_item_id,
                             TaskState.owner_id == reminder.owner_id,
                             TaskState.status == "active",
                             TaskState.version == reminder.task_version,
+                            InboxItem.user_id == reminder.owner_id,
+                            InboxItem.kind == "task",
+                            InboxItem.status == "confirmed",
                         )
                     ),
                 )
@@ -426,6 +449,7 @@ class TaskReminderEngine:
                         TaskState.version == reminder.task_version,
                         InboxItem.user_id == reminder.owner_id,
                         InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
                     )
                 )
             ) is not None

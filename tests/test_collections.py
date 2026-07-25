@@ -12,6 +12,7 @@ from future_self.collections_service import (
     normalize_collection_name,
     split_list_items,
 )
+from future_self.inbox import InboxLifecycleService
 from future_self.models import (
     InboxItem,
     LifeCollection,
@@ -90,6 +91,54 @@ async def test_deleted_starter_does_not_reappear_and_inbox_content_survives(db):
     async with db.sessions() as session:
         assert await session.get(InboxItem, created.item_ids[0]) is not None
         assert await session.scalar(select(func.count(LifeCollection.id))) == 0
+
+
+async def test_delete_item_uses_reversible_trash_and_preserves_collection_link(db):
+    user, collection = await create_collection(db, kind="list", name="Покупки")
+    service = LifeCollectionService(db)
+    created = await service.create_items(
+        user.id,
+        700001,
+        collection.id,
+        collection.version,
+        ("Купить чай",),
+        source="text",
+    )
+    item_id = created.item_ids[0]
+    current = (await service.summary(user.id, collection.id)).collection
+
+    stale = await service.delete_item(
+        user.id,
+        collection.id,
+        current.version - 1,
+        item_id,
+    )
+    assert stale.status == "stale"
+    result = await service.delete_item(user.id, collection.id, current.version, item_id)
+    assert result.status == "item_deleted"
+
+    async with db.sessions() as session:
+        item = await session.get(InboxItem, item_id)
+        state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item_id))
+        link_count = await session.scalar(
+            select(func.count(LifeCollectionLink.id)).where(
+                LifeCollectionLink.owner_id == user.id,
+                LifeCollectionLink.collection_id == collection.id,
+                LifeCollectionLink.inbox_item_id == item_id,
+            )
+        )
+    assert item.status == "trashed"
+    assert item.pre_trash_status == "confirmed"
+    assert state.status == "active"
+    assert state.version == 2
+    assert link_count == 1
+    assert (await service.item_page(user.id, collection.id, 0)).total == 0
+
+    lifecycle = InboxLifecycleService(db)
+    snapshot = await lifecycle.trashed_snapshot(user.id, {item_id})
+    restored = await lifecycle.restore_snapshot(user.id, snapshot)
+    assert restored.status == "restored"
+    assert (await service.item_page(user.id, collection.id, 0)).total == 1
 
 
 async def test_crud_normalization_aliases_and_same_name_for_different_owners(db):

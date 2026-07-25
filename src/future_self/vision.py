@@ -436,17 +436,29 @@ class VisionService:
             if not item.first_step:
                 return TaskLinkResult("missing_step", item=item)
             if item.linked_task_id is not None:
-                task = await session.get(InboxItem, item.linked_task_id)
+                task = await session.scalar(
+                    select(InboxItem).where(
+                        InboxItem.id == item.linked_task_id,
+                        InboxItem.user_id == owner_id,
+                        InboxItem.kind == "task",
+                        InboxItem.status.in_(("confirmed", "archived")),
+                    )
+                )
+                if task is None:
+                    return TaskLinkResult("stale", item=item)
                 return TaskLinkResult("existing", item, task)
             key = f"vision:{item.id}:first-step:v1"
             existing = await session.scalar(
                 select(InboxItem).where(
                     InboxItem.user_id == owner_id,
+                    InboxItem.kind == "task",
                     InboxItem.source == "vision",
                     InboxItem.raw_text == key,
                 )
             )
             if existing is not None:
+                if existing.status not in {"confirmed", "archived"}:
+                    return TaskLinkResult("stale", item=item)
                 item.linked_task_id = existing.id
                 return TaskLinkResult("existing", item, existing)
             task = InboxItem(

@@ -2,12 +2,13 @@ import logging
 import re
 import warnings
 from datetime import UTC, date, datetime, time, timedelta
+from hashlib import blake2s
 from html import escape
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
@@ -65,6 +66,7 @@ from .health import (
     prolonged_weakness_message,
     urgent_safety_message,
 )
+from .inbox import InboxLifecycleService
 from .knowledge import KnowledgeQuotaPolicy, KnowledgeService
 from .knowledge_handlers import KnowledgeHandlers
 from .knowledge_storage import KnowledgeAssetStore
@@ -187,6 +189,7 @@ class FutureSelfBot(
         self.action_service = DraftActionService(self.draft_service)
         self.action_router = ActionCommandRouter()
         self.system_action_router = SystemActionRouter()
+        self.inbox_lifecycle = InboxLifecycleService(db)
         self.natural_command_router = NaturalCommandRouter(
             enable_workspace_access=getattr(settings, "enable_workspace_access", False)
         )
@@ -278,7 +281,15 @@ class FutureSelfBot(
         # This assistant handles profiles, health notes and reminders. Telegram
         # group/channel replies would disclose that data to other chat members,
         # so stop every non-private update before any feature handler sees it.
-        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-3)
+        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-4)
+        # Destructive natural-language controls must win over every stateful
+        # text flow (onboarding, Labs, Vision, health, doctor, and so on).
+        # Keeping this in its own group also means a non-matching phrase can
+        # continue to the normal flow without being consumed.
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.system_action_text_gate),
+            group=-3,
+        )
         gated_public_commands = [
             "inbox",
             "tasks",
@@ -526,6 +537,7 @@ class FutureSelfBot(
         app.add_handler(CallbackQueryHandler(self.drafts_action, pattern=r"^drafts:"))
         app.add_handler(CallbackQueryHandler(self.system_draft_action, pattern=r"^sysdraft:"))
         app.add_handler(CallbackQueryHandler(self.inbox_action, pattern=r"^inbox:"))
+        app.add_handler(CallbackQueryHandler(self.saved_inbox_action, pattern=r"^ibox:"))
         app.add_handler(CallbackQueryHandler(self.goals_action, pattern=r"^goals:"))
         app.add_handler(CallbackQueryHandler(self.routines_action, pattern=r"^routines:"))
         if getattr(self.settings, "enable_knowledge_capture", False):
@@ -585,6 +597,9 @@ class FutureSelfBot(
             message = await app.bot.send_message(chat_id=telegram_id, text=text)
             return getattr(message, "message_id", None)
 
+        async def delete_stale_reminder(telegram_id: int, message_id: int) -> None:
+            await app.bot.delete_message(chat_id=telegram_id, message_id=message_id)
+
         if app.job_queue is None:
             logger.warning("JobQueue is unavailable; scheduled messages are disabled")
             return
@@ -606,6 +621,7 @@ class FutureSelfBot(
             self.reminder_engine = TaskReminderEngine(
                 self.db,
                 send,
+                delete_sent=delete_stale_reminder,
                 lease_seconds=self.settings.task_reminder_lease_seconds,
                 date_event_hour=self.settings.task_date_event_hour,
                 lead_minutes=self.settings.task_reminder_lead_minutes,
@@ -1426,9 +1442,12 @@ class FutureSelfBot(
         )
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if await self.workspace_pending_text(update, update.effective_message.text or "", "text"):
+        text = update.effective_message.text or ""
+        if await self._try_system_action(update, context, text):
             return
-        if await self.collection_pending_text(update, update.effective_message.text or "", "text"):
+        if await self.workspace_pending_text(update, text, "text"):
+            return
+        if await self.collection_pending_text(update, text, "text"):
             return
         if await self.task_pending_text(update):
             return
@@ -1446,9 +1465,18 @@ class FutureSelfBot(
                 else:
                     await update.effective_message.reply_text("Не удалось переименовать эту цель.")
             return
-        if await self.knowledge_pending_text(update, update.effective_message.text or "", "text"):
+        if await self.knowledge_pending_text(update, text, "text"):
             return
-        await self._route_message(update, context, update.effective_message.text, "text")
+        await self._route_message(update, context, text, "text")
+
+    async def system_action_text_gate(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Route safe destructive controls before any stateful text handler."""
+
+        text = update.effective_message.text or ""
+        if await self._try_system_action(update, context, text):
+            raise ApplicationHandlerStop
 
     async def voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
         medical_flow = await self._knowledge_medical_flow(update, context)
@@ -1525,6 +1553,9 @@ class FutureSelfBot(
                 "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
             )
             return
+        if await self._try_system_action(update, context, text):
+            await progress.edit_text(f"Я услышал: «{_truncate_utf16(text, 4_000)}»")
+            return
         onboarding_result = await self.onboarding_persistent_input(
             update, context, text, force=True
         )
@@ -1557,6 +1588,56 @@ class FutureSelfBot(
             return
         await progress.edit_text(f"Я услышал: «{heard_text}»")
         await self._route_message(update, context, text, "voice")
+
+    async def _try_system_action(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> bool:
+        """Consume destructive control language before any content flow or LLM."""
+
+        user = await self._user(update.effective_user.id)
+        snapshot = await self.conversation.get(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        if snapshot.system_pending_action and self.natural_command_router.route(text) is not None:
+            # An explicit navigation/read action means the user moved on. Drop
+            # only the still-current preview and let normal natural routing run.
+            await self.conversation.clear_system_action(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_version=snapshot.system_action_version,
+            )
+            return False
+        route = self.system_action_router.route(
+            text,
+            pending_action=snapshot.system_pending_action,
+        )
+        if (
+            not user.onboarding_completed
+            and not snapshot.system_pending_action
+            and not self.system_action_router.is_explicit_cleanup_command(text)
+            and (
+                route.kind in {"clarify", "pending"}
+                or route.action
+                in {
+                    "archive_overdue_tasks",
+                    "discard_all_active_drafts",
+                    "discard_selected_drafts",
+                }
+            )
+        ):
+            # During registration, long free-form answers belong to the current
+            # question. Only an unmistakable cleanup command may interrupt that
+            # durable flow; narrative wishes such as "хочу научиться удалять..."
+            # must continue to onboarding instead of opening a delete preview.
+            return False
+        if route.kind == "none":
+            return False
+        await self._handle_system_action_route(update, context, user, snapshot, route)
+        return True
 
     async def _route_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, source: str
@@ -1920,18 +2001,38 @@ class FutureSelfBot(
     ) -> None:
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+        if route.kind == "clarify":
+            if snapshot.system_pending_action:
+                await self.conversation.clear_system_action(
+                    telegram_user_id,
+                    chat_id,
+                    expected_version=snapshot.system_action_version,
+                )
+            await update.effective_message.reply_text(
+                "Похоже на команду удаления, но безопасную цель определить нельзя. "
+                "Ничего не удалено и новая запись не создана. Уточни, например: "
+                "«удали все просроченные задачи» или «удали все черновики»."
+            )
+            return
         if route.kind == "pending":
             await update.effective_message.reply_text(
                 "Ожидаю отдельное подтверждение удаления: «да, удалить» или кнопка «Отмена»."
             )
             return
         if route.kind == "cancel":
-            await self.conversation.clear_system_action(telegram_user_id, chat_id)
-            await update.effective_message.reply_text(
-                "Очистка просроченных задач отменена. Ничего не изменено."
-                if snapshot.system_pending_action == "archive_overdue_tasks"
-                else "Удаление черновиков отменено. Ничего не изменено."
+            cleared = await self.conversation.clear_system_action(
+                telegram_user_id,
+                chat_id,
+                expected_version=snapshot.system_action_version,
             )
+            if not cleared:
+                await update.effective_message.reply_text(
+                    "Это подтверждение уже неактуально или операция уже выполняется. "
+                    "Проверь актуальное состояние через /inbox или /tasks."
+                )
+                return
+            cancelled = self._system_cleanup_cancelled(snapshot.system_pending_action)
+            await update.effective_message.reply_text(f"{cancelled}. Ничего не изменено.")
             return
         if route.kind == "confirm":
             await self._confirm_system_cleanup(
@@ -1949,7 +2050,11 @@ class FutureSelfBot(
         }:
             # Explicitly retargeting a pending cleanup invalidates the old
             # capability even when the newly requested target set is empty.
-            await self.conversation.clear_system_action(telegram_user_id, chat_id)
+            await self.conversation.clear_system_action(
+                telegram_user_id,
+                chat_id,
+                expected_version=snapshot.system_action_version,
+            )
         if route.action == "list_drafts":
             await self.drafts_command(update, context)
             return
@@ -1957,7 +2062,7 @@ class FutureSelfBot(
             await self.last_saved_command(update, context)
             return
         if route.action == "archive_overdue_tasks":
-            task_snapshot = await self.task_service.overdue_snapshot(user.id)
+            task_snapshot = await self.inbox_lifecycle.overdue_snapshot(user.id)
             await self._begin_overdue_task_cleanup(
                 update.effective_message,
                 telegram_user_id,
@@ -1979,6 +2084,14 @@ class FutureSelfBot(
             drafts,
             affected,
         )
+
+    @staticmethod
+    def _system_cleanup_cancelled(action: str | None) -> str:
+        if action == "archive_overdue_tasks":
+            return "Очистка просроченных задач отменена"
+        if action in {"trash_inbox_items", "trash_inbox_commands"}:
+            return "Перемещение записей Inbox в корзину отменено"
+        return "Удаление черновиков отменено"
 
     async def _begin_overdue_task_cleanup(
         self,
@@ -2002,8 +2115,9 @@ class FutureSelfBot(
         extra = f"\n• …и ещё {len(snapshot) - 5}" if len(snapshot) > 5 else ""
         await message.reply_text(
             f"Нашёл просроченных задач: {len(snapshot)}.\n\n{preview}{extra}\n\n"
-            "Убрать их из активных и Inbox? История сохранится, ожидающие напоминания "
-            "получат статус «истекло». Ничего не изменится без подтверждения.",
+            "Переместить их из активных и Inbox в корзину? Связи сохранятся, ожидающие "
+            "напоминания будут выключены, а записи можно будет восстановить. "
+            "Ничего не изменится без подтверждения.",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
@@ -2012,6 +2126,49 @@ class FutureSelfBot(
                             callback_data=f"sysdraft:confirm:{version}",
                         ),
                         InlineKeyboardButton("Отмена", callback_data=f"sysdraft:cancel:{version}"),
+                    ]
+                ]
+            ),
+        )
+
+    async def _begin_inbox_trash(
+        self,
+        message: object,
+        telegram_user_id: int,
+        chat_id: int,
+        snapshot: list[dict[str, object]],
+        *,
+        action: str = "trash_inbox_items",
+    ) -> None:
+        if not snapshot:
+            await message.reply_text("Подходящих сохранённых записей Inbox не найдено.")
+            return
+        version = await self.conversation.begin_system_action(
+            telegram_user_id,
+            chat_id,
+            action,
+            snapshot,
+        )
+        preview = "\n".join(
+            f"• [{LABELS.get(str(item['kind']), str(item['kind']))}] {item['title']}"
+            for item in snapshot[:6]
+        )
+        extra = f"\n• …и ещё {len(snapshot) - 6}" if len(snapshot) > 6 else ""
+        await message.reply_text(
+            f"Переместить в корзину записей: {len(snapshot)}?\n\n{preview}{extra}\n\n"
+            "Связанные ожидающие напоминания будут выключены. Записи можно восстановить "
+            "через Inbox; старые напоминания при восстановлении сами не включатся.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"Да, в корзину ({len(snapshot)})",
+                            callback_data=f"sysdraft:confirm:{version}",
+                        ),
+                        InlineKeyboardButton(
+                            "Отмена",
+                            callback_data=f"sysdraft:cancel:{version}",
+                        ),
                     ]
                 ]
             ),
@@ -2080,41 +2237,95 @@ class FutureSelfBot(
             or not snapshot.system_draft_snapshot
         ):
             await message.reply_text(
-                "Подтверждение удаления отсутствует или истекло. Запусти /cleanup_drafts снова."
+                "Подтверждение отсутствует или истекло. Открой нужный раздел и повтори действие."
             )
             return False
-        if snapshot.system_pending_action == "archive_overdue_tasks":
-            user = await self._user(telegram_user_id)
-            result = await self.task_service.cancel_overdue_snapshot(
-                user.id, snapshot.system_draft_snapshot
+        claim = await self.conversation.claim_system_action(
+            telegram_user_id,
+            chat_id,
+            expected_version=snapshot.system_action_version,
+        )
+        if claim is None:
+            await message.reply_text(
+                "Это подтверждение уже использовано, истекло или заменено новым preview. "
+                "Ничего не изменено."
             )
-            await self.conversation.clear_system_action(telegram_user_id, chat_id)
-            if result.status != "cancelled":
+            return False
+        try:
+            if claim.action in {"trash_inbox_items", "trash_inbox_commands"}:
+                user = await self._user(telegram_user_id)
+                if claim.action == "trash_inbox_commands":
+                    result = await self.inbox_lifecycle.trash_command_garbage_snapshot(
+                        user.id,
+                        claim.snapshot,
+                    )
+                else:
+                    result = await self.inbox_lifecycle.trash_snapshot(user.id, claim.snapshot)
+                if result.status != "trashed":
+                    await message.reply_text(
+                        "Список Inbox или ошибочно сохранённых команд изменился. "
+                        "Ничего не перемещено; открой /inbox и повтори."
+                    )
+                    return False
                 await message.reply_text(
-                    "Список просроченных задач изменился. Ничего не изменено; "
-                    "повтори команду очистки."
+                    f"Перемещено в корзину: {result.count}. Восстановление доступно в /inbox.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🗑 Открыть корзину",
+                                    callback_data="ibox:trashlist:0",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                return True
+            if claim.action == "archive_overdue_tasks":
+                user = await self._user(telegram_user_id)
+                result = await self.inbox_lifecycle.trash_snapshot(user.id, claim.snapshot)
+                if result.status != "trashed":
+                    await message.reply_text(
+                        "Список просроченных задач изменился. Ничего не изменено; "
+                        "повтори команду очистки."
+                    )
+                    return False
+                await message.reply_text(
+                    f"Перемещено в корзину просроченных задач: {result.count}. "
+                    "Их можно восстановить через /inbox.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🗑 Открыть корзину",
+                                    callback_data="ibox:trashlist:0",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                return True
+            result = await self.draft_service.discard_snapshot(
+                telegram_user_id, chat_id, claim.snapshot
+            )
+            if not result.ok:
+                await message.reply_text(
+                    "Набор черновиков изменился. Ничего не удалено; повтори /cleanup_drafts."
                 )
                 return False
+            await self.conversation.clear_focus(telegram_user_id, chat_id)
+            for message_id in result.preview_message_ids or []:
+                await self._deactivate_preview_keyboard(context, chat_id, message_id)
             await message.reply_text(
-                f"Убрано из активных: {result.count}. История задач и напоминаний сохранена."
+                f"Удалено {result.count} черновиков. Сохранённые записи не затронуты"
             )
             return True
-        result = await self.draft_service.discard_snapshot(
-            telegram_user_id, chat_id, snapshot.system_draft_snapshot
-        )
-        await self.conversation.clear_system_action(telegram_user_id, chat_id)
-        if not result.ok:
-            await message.reply_text(
-                "Набор черновиков изменился. Ничего не удалено; повтори /cleanup_drafts."
+        finally:
+            await self.conversation.finalize_system_action_claim(
+                telegram_user_id,
+                chat_id,
+                expected_version=claim.version,
             )
-            return False
-        await self.conversation.clear_focus(telegram_user_id, chat_id)
-        for message_id in result.preview_message_ids or []:
-            await self._deactivate_preview_keyboard(context, chat_id, message_id)
-        await message.reply_text(
-            f"Удалено {result.count} черновиков. Сохранённые записи не затронуты"
-        )
-        return True
 
     async def system_draft_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -2132,14 +2343,17 @@ class FutureSelfBot(
             await query.answer("Это подтверждение уже неактуально", show_alert=True)
             return
         if parts[1] == "cancel":
-            await self.conversation.clear_system_action(
-                update.effective_user.id, update.effective_chat.id
+            cleared = await self.conversation.clear_system_action(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_version=expected_version,
             )
+            if not cleared:
+                await query.answer("Это подтверждение уже неактуально", show_alert=True)
+                return
             await query.answer()
             await query.edit_message_text(
-                "Очистка просроченных задач отменена."
-                if snapshot.system_pending_action == "archive_overdue_tasks"
-                else "Удаление черновиков отменено."
+                f"{self._system_cleanup_cancelled(snapshot.system_pending_action)}."
             )
             return
         await query.answer()
@@ -2439,7 +2653,8 @@ class FutureSelfBot(
             channel = "голосовой" if source == "voice" else "текстовой"
             receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
             await update.effective_message.reply_text(
-                f"Сохранено в inbox по {channel} команде.\n{receipt}"
+                f"Сохранено в inbox по {channel} команде.\n{receipt}",
+                reply_markup=self._saved_receipt_markup(outcome),
             )
         elif action in {"discard", "cancel"}:
             await self.conversation.clear_focus(telegram_user_id, chat_id)
@@ -2888,7 +3103,10 @@ class FutureSelfBot(
         receipt = await self._record_saved_receipt(
             update.effective_user.id, update.effective_chat.id, outcome
         )
-        await query.edit_message_text(receipt)
+        await query.edit_message_text(
+            receipt,
+            reply_markup=self._saved_receipt_markup(outcome),
+        )
         await self.conversation.set_active_draft(
             update.effective_user.id, update.effective_chat.id, None
         )
@@ -3018,7 +3236,10 @@ class FutureSelfBot(
         await query.answer()
         if action == "save":
             receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
-            await query.edit_message_text(receipt)
+            await query.edit_message_text(
+                receipt,
+                reply_markup=self._saved_receipt_markup(outcome),
+            )
         else:
             await query.edit_message_text("Черновик удалён.")
         await self.conversation.clear_focus(telegram_user_id, chat_id)
@@ -3081,7 +3302,10 @@ class FutureSelfBot(
                 return
             await query.answer()
             receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
-            await query.edit_message_text(receipt)
+            await query.edit_message_text(
+                receipt,
+                reply_markup=self._saved_receipt_markup(outcome),
+            )
             await self.conversation.set_active_draft(telegram_user_id, chat_id, None)
 
     @staticmethod
@@ -3224,6 +3448,11 @@ class FutureSelfBot(
         item = outcome.result.inbox_item if outcome.result else None
         if item is None:
             return "Сохранено в inbox."
+        if outcome.result and outcome.result.duplicate:
+            return (
+                "Такая запись уже есть в Inbox — повторную копию не создаю:\n"
+                f"{LABELS[item.kind]} — {item.title}"
+            )
         await self.conversation.record_saved(telegram_user_id, chat_id, item.id)
         receipt = f"Сохранено в inbox:\n{LABELS[item.kind]} — {item.title}"
         if item.kind == "task":
@@ -3240,6 +3469,26 @@ class FutureSelfBot(
                     f"{local_reminder.strftime('%d.%m.%Y %H:%M')} ({reminder.timezone})"
                 )
         return receipt
+
+    @staticmethod
+    def _saved_receipt_markup(outcome: ActionOutcome) -> InlineKeyboardMarkup | None:
+        """Offer a safe, immediately discoverable trash action after saving."""
+
+        result = outcome.result
+        item = result.inbox_item if result else None
+        if item is None or result.duplicate:
+            return None
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🗑 В корзину",
+                        callback_data=f"ibox:trash:{item.id}",
+                    )
+                ],
+                [InlineKeyboardButton("Открыть Inbox", callback_data="ibox:page:0")],
+            ]
+        )
 
     async def last_saved_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await self._user(update.effective_user.id)
@@ -3268,29 +3517,368 @@ class FutureSelfBot(
             await update.effective_message.reply_text("В inbox пока нет сохранённых записей.")
             return
         await update.effective_message.reply_text(
-            f"Последняя сохранённая запись:\n{LABELS[item.kind]} — {item.title}"
+            f"Последняя сохранённая запись:\n{LABELS[item.kind]} — {item.title}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Открыть",
+                            callback_data=f"ibox:view:{item.id}",
+                        ),
+                        InlineKeyboardButton(
+                            "🗑 В корзину",
+                            callback_data=f"ibox:trash:{item.id}",
+                        ),
+                    ],
+                    [InlineKeyboardButton("Все записи Inbox", callback_data="ibox:page:0")],
+                ]
+            ),
         )
 
     async def inbox(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await self._user(update.effective_user.id)
+        await self._send_saved_inbox_page(
+            update.effective_message,
+            user.id,
+            0,
+            trashed=False,
+            edit=False,
+        )
+
+    async def saved_inbox_action(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        query = update.callback_query
+        parts = (query.data or "").split(":")
+        if len(parts) != 3 or parts[0] != "ibox":
+            await self._stale_callback(query)
+            return
+        action, raw_value = parts[1], parts[2]
+        user = await self._user(update.effective_user.id)
+        chat_id = update.effective_chat.id
+        if action in {"page", "trashlist"}:
+            try:
+                page = max(0, int(raw_value))
+            except ValueError:
+                await self._stale_callback(query)
+                return
+            await query.answer()
+            await self._send_saved_inbox_page(
+                query,
+                user.id,
+                page,
+                trashed=action == "trashlist",
+                edit=True,
+            )
+            return
+        if action == "cleanup" and raw_value == "commands":
+            snapshot = await self.inbox_lifecycle.command_garbage_snapshot(user.id)
+            await query.answer()
+            await self._begin_inbox_trash(
+                query.message,
+                update.effective_user.id,
+                chat_id,
+                snapshot,
+                action="trash_inbox_commands",
+            )
+            return
+        if action == "trashpage":
+            try:
+                raw_page, signature = raw_value.split(".", maxsplit=1)
+                page = max(0, int(raw_page))
+            except (ValueError, AttributeError):
+                await self._stale_callback(query)
+                return
+            if not re.fullmatch(r"[0-9a-f]{12}", signature):
+                await self._stale_callback(query)
+                return
+            page_size = 6
+            async with self.db.sessions() as session:
+                ordered_item_ids = list(
+                    await session.scalars(
+                        select(InboxItem.id)
+                        .where(
+                            InboxItem.user_id == user.id,
+                            InboxItem.status == "confirmed",
+                        )
+                        .order_by(InboxItem.id.desc())
+                        .offset(page * page_size)
+                        .limit(page_size)
+                    )
+                )
+            if self._inbox_page_signature(ordered_item_ids) != signature:
+                await query.answer(
+                    "Страница Inbox изменилась — обнови список перед массовым действием",
+                    show_alert=True,
+                )
+                return
+            item_ids = set(ordered_item_ids)
+            snapshot = await self.inbox_lifecycle.confirmed_snapshot(user.id, item_ids)
+            await query.answer()
+            await self._begin_inbox_trash(
+                query.message,
+                update.effective_user.id,
+                chat_id,
+                snapshot,
+            )
+            return
+        try:
+            item_id = int(raw_value)
+        except ValueError:
+            await self._stale_callback(query)
+            return
+        if item_id <= 0:
+            await self._stale_callback(query)
+            return
+        if action == "trash":
+            snapshot = await self.inbox_lifecycle.confirmed_snapshot(user.id, {item_id})
+            if not snapshot:
+                await query.answer("Запись уже изменилась", show_alert=True)
+                return
+            await query.answer()
+            await self._begin_inbox_trash(
+                query.message,
+                update.effective_user.id,
+                chat_id,
+                snapshot,
+            )
+            return
+        if action == "restore":
+            snapshot = await self.inbox_lifecycle.trashed_snapshot(user.id, {item_id})
+            if not snapshot:
+                await query.answer("Запись уже изменилась", show_alert=True)
+                return
+            result = await self.inbox_lifecycle.restore_snapshot(user.id, snapshot)
+            if result.status != "restored":
+                await query.answer("Запись изменилась — обнови корзину", show_alert=True)
+                return
+            await query.answer()
+            restored_task = snapshot[0].get("kind") == "task"
+            restored_status = snapshot[0].get("pre_trash_status")
+            destination_text = (
+                "Задача снова доступна в разделе «Задачи и напоминания». "
+                if restored_task
+                else "Запись снова доступна в Inbox. "
+            )
+            if restored_task and restored_status == "archived":
+                destination_text = "Архивная задача снова доступна в разделе задач. "
+            restore_text = f"Запись восстановлена. {destination_text}"
+            if restored_task:
+                restore_text += (
+                    "Прежнее напоминание осталось выключенным — включи новое явно через /tasks."
+                )
+            await self._inbox_edit_or_reply(
+                query,
+                restore_text,
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Открыть задачи" if restored_task else "Открыть Inbox",
+                                callback_data="task:hub" if restored_task else "ibox:page:0",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🗑 Вернуться в корзину",
+                                callback_data="ibox:trashlist:0",
+                            )
+                        ],
+                    ]
+                ),
+            )
+            return
+        if action in {"view", "trashview"}:
+            expected_status = "trashed" if action == "trashview" else "confirmed"
+            async with self.db.sessions() as session:
+                item = await session.scalar(
+                    select(InboxItem).where(
+                        InboxItem.id == item_id,
+                        InboxItem.user_id == user.id,
+                        InboxItem.status == expected_status,
+                    )
+                )
+            if item is None:
+                await query.answer("Запись уже изменилась", show_alert=True)
+                return
+            await query.answer()
+            await self._send_saved_inbox_card(query, item, trashed=expected_status == "trashed")
+            return
+        await self._stale_callback(query)
+
+    async def _send_saved_inbox_page(
+        self,
+        target: object,
+        owner_id: int,
+        page: int,
+        *,
+        trashed: bool,
+        edit: bool,
+    ) -> None:
+        page_size = 6
+        status = "trashed" if trashed else "confirmed"
         async with self.db.sessions() as session:
+            total = int(
+                await session.scalar(
+                    select(func.count(InboxItem.id)).where(
+                        InboxItem.user_id == owner_id,
+                        InboxItem.status == status,
+                    )
+                )
+                or 0
+            )
+            pages = max(1, (total + page_size - 1) // page_size)
+            safe_page = min(max(page, 0), pages - 1)
             items = (
                 await session.scalars(
                     select(InboxItem)
-                    .where(InboxItem.user_id == user.id, InboxItem.status == "confirmed")
+                    .where(InboxItem.user_id == owner_id, InboxItem.status == status)
                     .order_by(InboxItem.id.desc())
-                    .limit(10)
+                    .offset(safe_page * page_size)
+                    .limit(page_size)
                 )
             ).all()
-        text = "\n".join(f"• [{LABELS[item.kind]}] {item.title}" for item in items)
-        if text:
-            text = (
-                "Последние сохранённые записи Inbox\n\n"
-                f"{text}\n\nАктивные и просроченные задачи: /tasks."
+        rows: list[list[InlineKeyboardButton]] = []
+        lines: list[str] = []
+        for index, item in enumerate(items, start=safe_page * page_size + 1):
+            label = LABELS.get(item.kind, item.kind)
+            title = _truncate_utf16(item.title, 44)
+            lines.append(f"{index}. [{label}] {title}")
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"Открыть {index}",
+                        callback_data=(
+                            f"ibox:trashview:{item.id}" if trashed else f"ibox:view:{item.id}"
+                        ),
+                    ),
+                    *(
+                        []
+                        if trashed
+                        else [
+                            InlineKeyboardButton(
+                                f"В корзину {index}",
+                                callback_data=f"ibox:trash:{item.id}",
+                            )
+                        ]
+                    ),
+                ]
             )
+        pagination: list[InlineKeyboardButton] = []
+        prefix = "trashlist" if trashed else "page"
+        if safe_page > 0:
+            pagination.append(
+                InlineKeyboardButton("← Назад", callback_data=f"ibox:{prefix}:{safe_page - 1}")
+            )
+        if safe_page + 1 < pages:
+            pagination.append(
+                InlineKeyboardButton("Далее →", callback_data=f"ibox:{prefix}:{safe_page + 1}")
+            )
+        if pagination:
+            rows.append(pagination)
+        if trashed:
+            rows.extend(
+                [
+                    [InlineKeyboardButton("← К Inbox", callback_data="ibox:page:0")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
+                ]
+            )
+            heading = "🗑 Корзина Inbox"
+            empty = "Корзина пуста."
         else:
-            text = "Inbox пока пуст. Активные задачи и напоминания: /tasks."
-        await update.effective_message.reply_text(text)
+            page_signature = self._inbox_page_signature([item.id for item in items])
+            rows.extend(
+                [
+                    *(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🗑 В корзину эту страницу",
+                                    callback_data=(f"ibox:trashpage:{safe_page}.{page_signature}"),
+                                )
+                            ]
+                        ]
+                        if items
+                        else []
+                    ),
+                    [
+                        InlineKeyboardButton(
+                            "🧹 Убрать ошибочные команды",
+                            callback_data="ibox:cleanup:commands",
+                        )
+                    ],
+                    [InlineKeyboardButton("🗑 Корзина", callback_data="ibox:trashlist:0")],
+                    [InlineKeyboardButton("✅ Задачи", callback_data="task:hub")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
+                ]
+            )
+            heading = "Последние сохранённые записи Inbox"
+            empty = "Inbox пока пуст."
+        listing = "\n".join(lines) if lines else empty
+        text = f"{heading} — {total}\nСтраница {safe_page + 1}/{pages}\n\n{listing}"
+        markup = InlineKeyboardMarkup(rows)
+        if edit:
+            await self._inbox_edit_or_reply(target, text, markup)
+        else:
+            await target.reply_text(text, reply_markup=markup)
+
+    @staticmethod
+    def _inbox_page_signature(item_ids: list[int]) -> str:
+        payload = ",".join(str(item_id) for item_id in item_ids).encode("ascii")
+        return blake2s(payload, digest_size=6).hexdigest()
+
+    async def _send_saved_inbox_card(
+        self,
+        query: object,
+        item: InboxItem,
+        *,
+        trashed: bool,
+    ) -> None:
+        details = ""
+        if item.description:
+            details += f"\n\nОписание: {_truncate_utf16(item.description, 1_800)}"
+        if item.next_step:
+            details += f"\nСледующий шаг: {_truncate_utf16(item.next_step, 600)}"
+        text = (
+            f"{LABELS.get(item.kind, item.kind).capitalize()}: "
+            f"{_truncate_utf16(item.title, 700)}{details}"
+        )
+        if trashed:
+            rows = [
+                [
+                    InlineKeyboardButton(
+                        "↩️ Восстановить",
+                        callback_data=f"ibox:restore:{item.id}",
+                    )
+                ],
+                [InlineKeyboardButton("← К корзине", callback_data="ibox:trashlist:0")],
+            ]
+        else:
+            rows = [
+                [
+                    InlineKeyboardButton(
+                        "🗑 В корзину",
+                        callback_data=f"ibox:trash:{item.id}",
+                    )
+                ],
+                [InlineKeyboardButton("← К Inbox", callback_data="ibox:page:0")],
+            ]
+        rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")])
+        await self._inbox_edit_or_reply(query, text, InlineKeyboardMarkup(rows))
+
+    @staticmethod
+    async def _inbox_edit_or_reply(
+        query: object,
+        text: str,
+        markup: InlineKeyboardMarkup,
+    ) -> None:
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except (TelegramError, TypeError):
+            await query.message.reply_text(text, reply_markup=markup)
 
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await self._user(update.effective_user.id)

@@ -2,10 +2,12 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from autotester.fakes import FakeCallbackQuery, FakeMessage, ScriptedTranscription
+from sqlalchemy import select
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.drafts import DraftInboxService
+from future_self.models import InboxItem, TaskReminder, TaskState
 from future_self.schemas import ParsedThought, TemporalResolution
 
 
@@ -102,6 +104,7 @@ async def test_tasks_menu_has_required_buttons_and_creation_uses_existing_previe
         "Просроченные",
         "Без срока",
         "Выполненные",
+        "🧹 Очистить просроченные",
         "Создать задачу",
         "Как работают напоминания",
         "← Назад",
@@ -114,9 +117,38 @@ async def test_tasks_menu_has_required_buttons_and_creation_uses_existing_previe
     assert fake_ai.route_calls == []
 
 
+async def test_task_hub_cleanup_button_starts_existing_overdue_preview(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created = await create_confirmed_task(bot)
+    async with db.session() as session:
+        state = await session.scalar(
+            select(TaskState).where(TaskState.inbox_item_id == created.inbox_item.id)
+        )
+        state.event_at = datetime.now(UTC) - timedelta(days=2)
+
+    message = FakeMessage("/tasks")
+    await bot.tasks_command(update_for(message), context())
+    callback = callback_by_label(message, "🧹 Очистить просроченные")
+    assert callback == "task:cleanup:overdue"
+    assert len(callback.encode()) <= 64
+
+    query = FakeCallbackQuery(callback, message)
+    await bot.task_callback(update_for(message, query=query), context())
+
+    assert query.answers
+    assert message.replies[-1]["text"].startswith("Нашёл просроченных задач: 1.")
+    async with db.sessions() as session:
+        item = await session.get(InboxItem, created.inbox_item.id)
+        state = await session.scalar(
+            select(TaskState).where(TaskState.inbox_item_id == created.inbox_item.id)
+        )
+    assert (item.status, state.status) == ("confirmed", "active")
+    assert fake_ai.route_calls == []
+
+
 async def test_card_complete_replay_reopen_and_delete_navigation_are_deterministic(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
-    await create_confirmed_task(bot, same_local_day=True)
+    created = await create_confirmed_task(bot, same_local_day=True)
     listing = FakeMessage()
     await bot.task_today(update_for(listing), context())
     open_callback = callback_by_label(listing, "Открыть 1")
@@ -146,6 +178,33 @@ async def test_card_complete_replay_reopen_and_delete_navigation_are_determinist
     reopened = FakeCallbackQuery(reopen_callback, listing)
     await bot.task_callback(update_for(listing, query=reopened), context())
     assert "Старое напоминание не включено" in listing.replies[-1]["text"]
+
+    delete_callback = callback_by_label(listing, "Удалить")
+    await bot.task_callback(
+        update_for(listing, query=FakeCallbackQuery(delete_callback, listing)), context()
+    )
+    confirm_callback = callback_by_label(listing, "Да, в корзину")
+    await bot.task_callback(
+        update_for(listing, query=FakeCallbackQuery(confirm_callback, listing)), context()
+    )
+    assert "Задача перенесена в корзину" in listing.replies[-1]["text"]
+    assert "восстановить задачу можно через /inbox" in listing.replies[-1]["text"]
+    assert "История" in listing.replies[-1]["text"]
+    async with db.sessions() as session:
+        item = await session.get(InboxItem, created.inbox_item.id)
+        state = await session.scalar(
+            select(TaskState).where(TaskState.inbox_item_id == created.inbox_item.id)
+        )
+        reminder = await session.scalar(
+            select(TaskReminder).where(TaskReminder.inbox_item_id == created.inbox_item.id)
+        )
+    assert (item.status, state.status, reminder.status) == (
+        "trashed",
+        "active",
+        "cancelled",
+    )
+    assert item.pre_trash_status == "confirmed"
+    assert item.trashed_at is not None
     assert fake_ai.route_calls == []
 
 

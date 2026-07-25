@@ -1,17 +1,26 @@
 import logging
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select, text
-from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler
+from telegram import Chat, Message, Update
+from telegram import User as TelegramUser
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+    ExtBot,
+    MessageHandler,
+)
 
 import future_self.main as main_module
 from future_self.bot import FutureSelfBot, log_safe_failure
 from future_self.config import Settings
 from future_self.doctor import run_diagnostics
 from future_self.main import create_application, format_configuration_error, run
-from future_self.models import InboxItem, OnboardingState
+from future_self.models import InboxItem, OnboardingState, User
 from future_self.repositories import OnboardingRepository, UserRepository
 
 
@@ -48,7 +57,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260722_0019')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260725_0020')")
         )
 
     async def forbidden_network(*args, **kwargs):
@@ -98,6 +107,8 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     handlers = application.handlers[0]
     vision_gate_handlers = application.handlers[-1]
 
+    assert application.handlers[-4][0].callback.__name__ == "private_chat_guard"
+    assert application.handlers[-3][0].callback.__name__ == "system_action_text_gate"
     assert isinstance(handlers[0], ConversationHandler)
     assert isinstance(handlers[1], ConversationHandler)
     assert isinstance(handlers[2], ConversationHandler)
@@ -159,9 +170,14 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "doctor_find",
         "doctor_find_task",
     } <= commands
-    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 13
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 14
     assert any(
         isinstance(handler, CallbackQueryHandler) and handler.callback.__name__ == "profile_action"
+        for handler in handlers
+    )
+    assert any(
+        isinstance(handler, CallbackQueryHandler)
+        and handler.callback.__name__ == "saved_inbox_action"
         for handler in handlers
     )
     assert sum(isinstance(handler, MessageHandler) for handler in handlers) == 2
@@ -177,6 +193,151 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     assert bot.error_handler.__name__ in {
         callback.__name__ for callback in application.error_handlers
     }
+
+
+async def test_real_application_routes_cleanup_before_persistent_onboarding(
+    db, fake_ai, monkeypatch
+):
+    core = FutureSelfBot(runtime_settings(), db, fake_ai, FakeTranscription())
+    application = core.build()
+    application._initialized = True
+    owner = await core._user(712345)
+    async with db.session() as session:
+        session.add(
+            OnboardingState(
+                user_id=owner.id,
+                current_step=2,
+                answers={"display_name": "Тест"},
+                status="in_progress",
+            )
+        )
+
+    sent: list[dict[str, object]] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return message
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    telegram_user = TelegramUser(712345, False, "Тест")
+    chat = Chat(712345, "private")
+    message = Message(
+        91,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text="Удали все просроченные",
+    )
+    update = Update(991, message=message)
+    update.set_bot(application.bot)
+    message.set_bot(application.bot)
+
+    await application.process_update(update)
+
+    assert sent and sent[-1]["text"].startswith("Неактуальных задач не найдено")
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+        inbox_count = len((await session.scalars(select(InboxItem))).all())
+    assert state.current_step == 2
+    assert state.answers == {"display_name": "Тест"}
+    assert inbox_count == 0
+    assert fake_ai.route_calls == []
+
+    reminder_control_message = Message(
+        92,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text="Отключи старые напоминания",
+    )
+    reminder_control_update = Update(992, message=reminder_control_message)
+    reminder_control_update.set_bot(application.bot)
+    reminder_control_message.set_bot(application.bot)
+
+    await application.process_update(reminder_control_update)
+
+    assert sent[-1]["text"].startswith("Похоже на команду удаления")
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+    assert state.current_step == 2
+    assert state.answers == {"display_name": "Тест"}
+
+    narrative = "В будущем я хочу научиться удалять все неактуальные задачи вовремя"
+    narrative_message = Message(
+        93,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=narrative,
+    )
+    narrative_update = Update(993, message=narrative_message)
+    narrative_update.set_bot(application.bot)
+    narrative_message.set_bot(application.bot)
+
+    await application.process_update(narrative_update)
+
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+        inbox_count = len((await session.scalars(select(InboxItem))).all())
+    assert state.current_step == 3
+    assert state.answers["display_name"] == "Тест"
+    assert state.answers["future_life"] == narrative
+    assert inbox_count == 0
+    assert fake_ai.route_calls == []
+
+    ambiguous_narrative = "В будущем я хочу научиться удалять просроченные файлы без стресса"
+    ambiguous_message = Message(
+        94,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=ambiguous_narrative,
+    )
+    ambiguous_update = Update(994, message=ambiguous_message)
+    ambiguous_update.set_bot(application.bot)
+    ambiguous_message.set_bot(application.bot)
+
+    await application.process_update(ambiguous_update)
+
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+        inbox_count = len((await session.scalars(select(InboxItem))).all())
+    assert state.current_step == 4
+    assert state.answers["residence"] == ambiguous_narrative
+    assert inbox_count == 0
+    assert fake_ai.route_calls == []
+
+    async with db.session() as session:
+        stored_owner = await session.get(User, owner.id)
+        stored_state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+        stored_owner.onboarding_completed = True
+        stored_state.status = "completed"
+    sent.clear()
+    task_message = Message(
+        95,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text="Открой задачи и напоминания",
+    )
+    task_update = Update(995, message=task_message)
+    task_update.set_bot(application.bot)
+    task_message.set_bot(application.bot)
+
+    await application.process_update(task_update)
+
+    assert sent and str(sent[-1]["text"]).startswith("✅ Задачи и напоминания")
 
 
 async def test_state_survives_new_repository_and_session(db):
@@ -210,7 +371,7 @@ class FakeCallbackQuery:
     async def answer(self, text: str | None = None, show_alert: bool = False):
         self.answers.append((text, show_alert))
 
-    async def edit_message_text(self, text: str):
+    async def edit_message_text(self, text: str, **kwargs):
         self.edited.append(text)
 
     async def edit_message_reply_markup(self, reply_markup=None):

@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import Database
+from .inbox import InboxLifecycleService
 from .models import (
     InboxItem,
     LifeCollection,
@@ -214,6 +215,7 @@ class LifeCollectionService:
         self.input_ttl = input_ttl or self.INPUT_TTL
         self.context_ttl = context_ttl or self.CONTEXT_TTL
         self.task_date_event_hour = task_date_event_hour
+        self.inbox_lifecycle = InboxLifecycleService(db)
 
     async def cleanup(self, *, now: datetime | None = None) -> tuple[int, int]:
         current = self._utc(now or datetime.now(UTC))
@@ -355,9 +357,12 @@ class LifeCollectionService:
             raise ValueError("Unknown collection status")
         count_subquery = (
             select(func.count(LifeCollectionLink.id))
+            .join(InboxItem, InboxItem.id == LifeCollectionLink.inbox_item_id)
             .where(
                 LifeCollectionLink.owner_id == owner_id,
                 LifeCollectionLink.collection_id == LifeCollection.id,
+                InboxItem.user_id == owner_id,
+                InboxItem.status != "trashed",
             )
             .correlate(LifeCollection)
             .scalar_subquery()
@@ -403,9 +408,13 @@ class LifeCollectionService:
             if collection is None:
                 return None
             count = await session.scalar(
-                select(func.count(LifeCollectionLink.id)).where(
+                select(func.count(LifeCollectionLink.id))
+                .join(InboxItem, InboxItem.id == LifeCollectionLink.inbox_item_id)
+                .where(
                     LifeCollectionLink.owner_id == owner_id,
                     LifeCollectionLink.collection_id == collection_id,
+                    InboxItem.user_id == owner_id,
+                    InboxItem.status != "trashed",
                 )
             )
             return CollectionSummary(collection, int(count or 0))
@@ -434,6 +443,7 @@ class LifeCollectionService:
                         LifeCollectionLink.owner_id == owner_id,
                         LifeCollectionLink.collection_id == collection_id,
                         InboxItem.user_id == owner_id,
+                        InboxItem.status != "trashed",
                     )
                     .order_by(LifeCollectionLink.created_at.desc(), InboxItem.id.desc())
                 )
@@ -470,6 +480,7 @@ class LifeCollectionService:
                         LifeCollectionLink.collection_id == collection_id,
                         LifeCollectionLink.inbox_item_id == inbox_item_id,
                         InboxItem.user_id == owner_id,
+                        InboxItem.status != "trashed",
                     )
                 )
             ).one_or_none()
@@ -658,7 +669,9 @@ class LifeCollectionService:
                 )
                 item = await session.scalar(
                     select(InboxItem).where(
-                        InboxItem.id == inbox_item_id, InboxItem.user_id == owner_id
+                        InboxItem.id == inbox_item_id,
+                        InboxItem.user_id == owner_id,
+                        InboxItem.status != "trashed",
                     )
                 )
                 if collection is None or item is None:
@@ -698,6 +711,15 @@ class LifeCollectionService:
                 session, owner_id, collection_id, expected_version
             )
             if collection is None:
+                return CollectionMutation("stale")
+            live_item = await session.scalar(
+                select(InboxItem.id).where(
+                    InboxItem.id == inbox_item_id,
+                    InboxItem.user_id == owner_id,
+                    InboxItem.status != "trashed",
+                )
+            )
+            if live_item is None:
                 return CollectionMutation("stale")
             result = await session.execute(
                 delete(LifeCollectionLink).where(
@@ -739,7 +761,14 @@ class LifeCollectionService:
                         LifeCollectionLink.inbox_item_id == inbox_item_id,
                     )
                 )
-                if source is None or target is None or link is None:
+                live_item = await session.scalar(
+                    select(InboxItem.id).where(
+                        InboxItem.id == inbox_item_id,
+                        InboxItem.user_id == owner_id,
+                        InboxItem.status != "trashed",
+                    )
+                )
+                if source is None or target is None or link is None or live_item is None:
                     return CollectionMutation("stale")
                 duplicate = await session.scalar(
                     select(LifeCollectionLink.id).where(
@@ -851,14 +880,16 @@ class LifeCollectionService:
                     LifeCollectionLink.inbox_item_id == inbox_item_id,
                 )
             )
-            item = await session.scalar(
-                select(InboxItem).where(
-                    InboxItem.id == inbox_item_id, InboxItem.user_id == owner_id
-                )
-            )
-            if collection is None or link is None or item is None:
+            if collection is None or link is None:
                 return CollectionMutation("stale")
-            await session.delete(item)
+            lifecycle_result = await self.inbox_lifecycle.trash_live_item_in_session(
+                session,
+                owner_id,
+                inbox_item_id,
+                owner_locked=True,
+            )
+            if lifecycle_result.status != "trashed":
+                return CollectionMutation("stale")
             collection.version += 1
             await session.flush()
             return CollectionMutation("item_deleted", collection)
@@ -887,7 +918,9 @@ class LifeCollectionService:
             if last_inbox_item_id is not None:
                 owned_item = await session.scalar(
                     select(InboxItem.id).where(
-                        InboxItem.id == last_inbox_item_id, InboxItem.user_id == owner_id
+                        InboxItem.id == last_inbox_item_id,
+                        InboxItem.user_id == owner_id,
+                        InboxItem.status != "trashed",
                     )
                 )
                 if owned_item is None:

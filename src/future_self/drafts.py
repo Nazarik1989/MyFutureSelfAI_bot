@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 
 from .db import Database
-from .models import DraftInboxItem, InboxItem, TaskReminder, User
+from .models import DraftInboxItem, InboxItem, TaskReminder, TaskState, User
 from .reminders import reminder_for_inbox_item
 from .schemas import ParsedThought
 from .tasks import add_task_state
@@ -22,6 +22,7 @@ class DraftResult:
     draft: DraftInboxItem | None = None
     inbox_item: InboxItem | None = None
     reminder: TaskReminder | None = None
+    duplicate: bool = False
 
 
 @dataclass(slots=True)
@@ -67,6 +68,8 @@ def log_transition(
 
 class DraftInboxService:
     """Persistent draft state machine. Only confirm creates an InboxItem."""
+
+    SAVED_DEDUP_WINDOW = timedelta(minutes=10)
 
     def __init__(
         self,
@@ -582,6 +585,66 @@ class DraftInboxService:
             if changed.scalar_one_or_none() is None:
                 return DraftResult(False)
             draft = await session.get(DraftInboxItem, draft_id)
+            # Serialize confirmed-record deduplication per owner. A repeated
+            # preview is allowed, but confirming identical canonical content
+            # within a short window reuses the live record instead of creating
+            # a second task/reminder.
+            await session.execute(
+                update(User).where(User.id == draft.user_id).values(updated_at=User.updated_at)
+            )
+            recent_items = (
+                await session.execute(
+                    select(InboxItem, TaskState)
+                    .outerjoin(
+                        TaskState,
+                        and_(
+                            TaskState.inbox_item_id == InboxItem.id,
+                            TaskState.owner_id == InboxItem.user_id,
+                        ),
+                    )
+                    .where(
+                        InboxItem.user_id == draft.user_id,
+                        or_(
+                            InboxItem.status == "confirmed",
+                            and_(
+                                InboxItem.kind == "task",
+                                InboxItem.status == "archived",
+                            ),
+                        ),
+                        InboxItem.created_at >= now - self.SAVED_DEDUP_WINDOW,
+                    )
+                    .order_by(InboxItem.id.desc())
+                )
+            ).all()
+            duplicate = next(
+                (
+                    item
+                    for item, task_state in recent_items
+                    if (item.kind != "task" or task_state is not None)
+                    and (item.kind != "task" or task_state.status == "active")
+                    if self.saved_semantic_key(item) == self.saved_semantic_key(draft)
+                ),
+                None,
+            )
+            if duplicate is not None:
+                reminder = await session.scalar(
+                    select(TaskReminder).where(TaskReminder.inbox_item_id == duplicate.id)
+                )
+                log_transition(
+                    draft_id,
+                    telegram_user_id,
+                    "preview",
+                    "confirmed",
+                    "reuse_saved_duplicate",
+                    inbox_created=False,
+                )
+                return DraftResult(
+                    True,
+                    draft=draft,
+                    inbox_item=duplicate,
+                    reminder=reminder,
+                    duplicate=True,
+                )
             inbox_item = InboxItem(
                 draft_id=draft.id,
                 user_id=draft.user_id,
@@ -676,7 +739,7 @@ class DraftInboxService:
         return re.sub(r"[^a-zа-я0-9]+", " ", value.lower().replace("ё", "е")).strip()
 
     @classmethod
-    def semantic_key(cls, draft: DraftInboxItem) -> tuple[str, ...]:
+    def semantic_key(cls, draft: DraftInboxItem | InboxItem) -> tuple[str, ...]:
         temporal = draft.temporal_resolution or {}
         canonical_temporal = tuple(
             str(temporal.get(field) or "")
@@ -696,4 +759,14 @@ class DraftInboxService:
             cls._normalize(draft.description or ""),
             draft.resolved_date.isoformat() if draft.resolved_date else "",
             *canonical_temporal,
+        )
+
+    @classmethod
+    def saved_semantic_key(cls, item: DraftInboxItem | InboxItem) -> tuple[str, ...]:
+        """Canonical fields that define a short-window confirmed duplicate."""
+
+        return (
+            *cls.semantic_key(item),
+            cls._normalize(item.next_step or ""),
+            cls._normalize(item.raw_text),
         )

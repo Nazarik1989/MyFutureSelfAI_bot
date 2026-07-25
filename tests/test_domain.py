@@ -10,7 +10,7 @@ from future_self.domain import (
     next_notification_utc,
 )
 from future_self.drafts import DraftInboxService
-from future_self.models import Goal, InboxItem, Routine, User
+from future_self.models import Goal, InboxItem, Routine, TaskState, User
 from future_self.repositories import ProfileRepository, UserRepository
 from future_self.schemas import ParsedThought, VisionSummary
 
@@ -95,6 +95,121 @@ async def test_confirmation_and_discard_are_idempotent(db, fake_ai):
     assert (await service.drop(dropped.id, 1, 10, 100)).ok is False
     async with db.sessions() as session:
         assert await session.scalar(select(func.count(InboxItem.id))) == 1
+
+
+async def test_recent_exact_confirmed_duplicate_reuses_live_inbox_item(db):
+    async with db.session() as session:
+        owner = await UserRepository(session).get_or_create(11, "UTC")
+        owner_id = owner.id
+    service = DraftInboxService(db, 60)
+    parsed = ParsedThought(
+        kind="task",
+        title="Позвонить Варваре",
+        description="Обсудить планы",
+        next_step="Позвонить",
+    )
+    first = await service.create(
+        user_id=owner_id,
+        telegram_user_id=11,
+        chat_id=101,
+        source="text",
+        raw_text="Позвонить Варваре",
+        parsed=parsed,
+    )
+    second = await service.create(
+        user_id=owner_id,
+        telegram_user_id=11,
+        chat_id=101,
+        source="voice",
+        raw_text="позвонить Варваре!",
+        parsed=parsed,
+    )
+
+    created = await service.confirm(first.id, first.version, 11, 101)
+    duplicate = await service.confirm(second.id, second.version, 11, 101)
+
+    assert created.ok and not created.duplicate
+    assert duplicate.ok and duplicate.duplicate
+    assert duplicate.inbox_item.id == created.inbox_item.id
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(InboxItem.id))) == 1
+
+
+async def test_recent_completed_task_is_not_reused_as_active_duplicate(db):
+    async with db.session() as session:
+        owner = await UserRepository(session).get_or_create(12, "UTC")
+        owner_id = owner.id
+    service = DraftInboxService(db, 60)
+    parsed = ParsedThought(
+        kind="task",
+        title="Позвонить Варваре",
+        description="Обсудить планы",
+        next_step="Позвонить",
+    )
+    first = await service.create(
+        user_id=owner_id,
+        telegram_user_id=12,
+        chat_id=102,
+        source="text",
+        raw_text="Позвонить Варваре",
+        parsed=parsed,
+    )
+    created = await service.confirm(first.id, first.version, 12, 102)
+    async with db.session() as session:
+        state = await session.scalar(
+            select(TaskState).where(TaskState.inbox_item_id == created.inbox_item.id)
+        )
+        state.status = "completed"
+        state.completed_at = datetime.now(UTC)
+        state.version += 1
+
+    second = await service.create(
+        user_id=owner_id,
+        telegram_user_id=12,
+        chat_id=102,
+        source="text",
+        raw_text="Позвонить Варваре",
+        parsed=parsed,
+    )
+    repeated = await service.confirm(second.id, second.version, 12, 102)
+
+    assert repeated.ok and not repeated.duplicate
+    assert repeated.inbox_item.id != created.inbox_item.id
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(InboxItem.id))) == 2
+
+
+async def test_recent_legacy_archived_active_task_is_reused(db):
+    async with db.session() as session:
+        owner = await UserRepository(session).get_or_create(13, "UTC")
+        owner_id = owner.id
+    service = DraftInboxService(db, 60)
+    parsed = ParsedThought(kind="task", title="Подать документы", next_step="Собрать пакет")
+    first = await service.create(
+        user_id=owner_id,
+        telegram_user_id=13,
+        chat_id=103,
+        source="text",
+        raw_text="Подать документы",
+        parsed=parsed,
+    )
+    created = await service.confirm(first.id, first.version, 13, 103)
+    async with db.session() as session:
+        item = await session.get(InboxItem, created.inbox_item.id)
+        item.status = "archived"
+
+    second = await service.create(
+        user_id=owner_id,
+        telegram_user_id=13,
+        chat_id=103,
+        source="text",
+        raw_text="Подать документы",
+        parsed=parsed,
+    )
+    repeated = await service.confirm(second.id, second.version, 13, 103)
+
+    assert repeated.ok and repeated.duplicate
+    assert repeated.inbox_item.id == created.inbox_item.id
 
 
 async def test_user_data_is_isolated(db, fake_ai):

@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from .db import Database
 from .models import ConversationMessage, ConversationSession, DraftInboxItem, InboxItem, User
@@ -40,6 +40,13 @@ class ConversationSnapshot:
             "pending_action": self.pending_action,
             "system_pending_action": self.system_pending_action,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SystemActionClaim:
+    action: str
+    snapshot: list[dict[str, object]]
+    version: int
 
 
 class ConversationContextService:
@@ -324,22 +331,138 @@ class ConversationContextService:
             conversation = await self._get_or_create_session(
                 session, telegram_user_id, chat_id, now
             )
-            conversation.system_action_version = (conversation.system_action_version or 0) + 1
-            conversation.system_pending_action = action
-            conversation.system_draft_snapshot = draft_snapshot
-            conversation.system_action_expires_at = now + self.system_action_ttl
-            conversation.expires_at = now + self.ttl
-            return conversation.system_action_version
+            bumped = await session.execute(
+                update(ConversationSession)
+                .where(ConversationSession.id == conversation.id)
+                .values(
+                    system_action_version=ConversationSession.system_action_version + 1,
+                    system_pending_action=action,
+                    system_draft_snapshot=draft_snapshot,
+                    system_action_expires_at=now + self.system_action_ttl,
+                    expires_at=now + self.ttl,
+                )
+                .returning(ConversationSession.system_action_version)
+                .execution_options(synchronize_session=False)
+            )
+            return int(bumped.scalar_one())
 
-    async def clear_system_action(self, telegram_user_id: int, chat_id: int) -> None:
+    async def claim_system_action(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_version: int,
+    ) -> SystemActionClaim | None:
+        """Atomically consume one current system action and return its immutable payload."""
+
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version <= 0
+        ):
+            return None
         now = datetime.now(UTC)
         async with self.db.session() as session:
-            conversation = await self._get_or_create_session(
-                session, telegram_user_id, chat_id, now
+            result = await session.execute(
+                update(ConversationSession)
+                .where(
+                    ConversationSession.telegram_user_id == telegram_user_id,
+                    ConversationSession.chat_id == chat_id,
+                    ConversationSession.system_action_version == expected_version,
+                    ConversationSession.system_pending_action.is_not(None),
+                    ConversationSession.system_action_expires_at.is_not(None),
+                    ConversationSession.system_action_expires_at > now,
+                    ConversationSession.expires_at > now,
+                )
+                # Keep the payload available to RETURNING, but make the row
+                # immediately ineligible for a replaying claim.
+                .values(system_action_expires_at=None)
+                .returning(
+                    ConversationSession.system_pending_action,
+                    ConversationSession.system_draft_snapshot,
+                    ConversationSession.system_action_version,
+                )
+                .execution_options(synchronize_session=False)
             )
-            conversation.system_pending_action = None
-            conversation.system_draft_snapshot = None
-            conversation.system_action_expires_at = None
+            claimed = result.mappings().one_or_none()
+            if claimed is None:
+                return None
+            return SystemActionClaim(
+                action=str(claimed["system_pending_action"]),
+                snapshot=list(claimed["system_draft_snapshot"] or []),
+                version=int(claimed["system_action_version"]),
+            )
+
+    async def clear_system_action(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_version: int | None = None,
+    ) -> bool:
+        """Cancel an unclaimed action, optionally only at one exact version."""
+
+        if expected_version is not None and (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version <= 0
+        ):
+            return False
+        async with self.db.session() as session:
+            statement = update(ConversationSession).where(
+                ConversationSession.telegram_user_id == telegram_user_id,
+                ConversationSession.chat_id == chat_id,
+                ConversationSession.system_pending_action.is_not(None),
+                ConversationSession.system_action_expires_at.is_not(None),
+            )
+            if expected_version is not None:
+                statement = statement.where(
+                    ConversationSession.system_action_version == expected_version,
+                )
+            cleared = await session.execute(
+                statement.values(
+                    system_pending_action=None,
+                    system_draft_snapshot=None,
+                    system_action_expires_at=None,
+                )
+                .returning(ConversationSession.id)
+                .execution_options(synchronize_session=False)
+            )
+            return cleared.scalar_one_or_none() is not None
+
+    async def finalize_system_action_claim(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_version: int,
+    ) -> bool:
+        """Clear only the exact action already consumed by ``claim_system_action``."""
+
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version <= 0
+        ):
+            return False
+        async with self.db.session() as session:
+            cleared = await session.execute(
+                update(ConversationSession)
+                .where(
+                    ConversationSession.telegram_user_id == telegram_user_id,
+                    ConversationSession.chat_id == chat_id,
+                    ConversationSession.system_action_version == expected_version,
+                    ConversationSession.system_pending_action.is_not(None),
+                    ConversationSession.system_action_expires_at.is_(None),
+                )
+                .values(
+                    system_pending_action=None,
+                    system_draft_snapshot=None,
+                )
+                .returning(ConversationSession.id)
+                .execution_options(synchronize_session=False)
+            )
+            return cleared.scalar_one_or_none() is not None
 
     async def record_saved(
         self,
@@ -357,6 +480,7 @@ class ConversationContextService:
                 .join(User, User.id == InboxItem.user_id)
                 .where(
                     InboxItem.id == inbox_item_id,
+                    InboxItem.status == "confirmed",
                     User.telegram_id == telegram_user_id,
                 )
             )

@@ -2318,7 +2318,7 @@ TASK_HUB_SCENARIOS = (
             ScenarioStep("task_replay_callback", "complete", reply_contains=("выполнена",)),
             ScenarioStep("task_replay_callback", "complete", reply_contains=("уже выполнена",)),
             ScenarioStep("task_callback", "reopen", reply_contains=("Старое напоминание",)),
-            ScenarioStep("task_callback", "delete", reply_contains=("Удалить задачу",)),
+            ScenarioStep("task_callback", "delete", reply_contains=("задачу в корзину",)),
             ScenarioStep("task_callback", "cancel", reply_contains=("Удаление отменено",)),
         ),
         expected=ExpectedState(
@@ -2383,7 +2383,7 @@ TASK_HUB_SCENARIOS = (
         ),
     ),
     Scenario(
-        name="task-hub-persistent-delete-removes-task-but-keeps-draft-history",
+        name="task-hub-persistent-delete-trashes-task-and-keeps-history",
         llm_stubs=(
             capture(
                 "Удаляемая задача Task Hub",
@@ -2400,10 +2400,15 @@ TASK_HUB_SCENARIOS = (
             ScenarioStep("task_callback", "open"),
             ScenarioStep("task_callback", "delete"),
             ScenarioStep("restart"),
-            ScenarioStep("task_callback", "delete-confirm", reply_contains=("Задача удалена",)),
+            ScenarioStep(
+                "task_callback",
+                "delete-confirm",
+                reply_contains=("Задача перенесена в корзину",),
+            ),
         ),
         expected=ExpectedState(
             drafts=(DraftState("Удаляемая задача", "task", "confirmed", "text"),),
+            inbox=(InboxState("Удаляемая задача", "task", "text", "trashed"),),
             llm_inputs=("Удаляемая задача Task Hub",),
         ),
     ),

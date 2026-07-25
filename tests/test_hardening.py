@@ -309,7 +309,7 @@ def test_container_and_build_context_are_hardened() -> None:
 def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260722_0019"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260725_0020"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
     for access_model in (
         "Workspace",

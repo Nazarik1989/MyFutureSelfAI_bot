@@ -169,7 +169,7 @@ def test_knowledge_migration_is_additive_and_downgrade_never_touches_files(tmp_p
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260722_0019"
+        "20260725_0020"
     )
     assert KNOWLEDGE_TABLES <= _tables(connection)
     assert connection.execute(

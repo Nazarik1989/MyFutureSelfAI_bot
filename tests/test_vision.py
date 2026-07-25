@@ -14,6 +14,7 @@ from telegram.ext import ApplicationHandlerStop
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
+from future_self.inbox import InboxLifecycleService
 from future_self.models import InboxItem, TaskReminder, TaskState, VisionDraft, VisionItem
 from future_self.vision import CATEGORY_META
 
@@ -450,6 +451,57 @@ async def test_create_task_is_atomic_idempotent_and_never_creates_reminder(db, f
         assert tasks[0].next_step == "Написать план"
         assert await session.scalar(select(func.count(TaskReminder.id))) == 0
         assert await session.scalar(select(func.count(TaskState.id))) == 1
+
+
+async def test_linked_trashed_task_is_stale_and_never_duplicated(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created = await create_item(bot, "Запустить проект", first_step="Написать план")
+    item = created.item
+    task = await bot.vision_service.create_task(item.owner_id, item.id)
+    lifecycle = InboxLifecycleService(db)
+    snapshot = await lifecycle.confirmed_snapshot(item.owner_id, {task.task.id})
+    assert (await lifecycle.trash_snapshot(item.owner_id, snapshot)).status == "trashed"
+
+    repeated = await bot.vision_service.create_task(item.owner_id, item.id)
+
+    assert repeated.status == "stale"
+    assert repeated.task is None
+    async with db.sessions() as session:
+        stored = await session.get(VisionItem, item.id)
+        assert stored.linked_task_id == task.task.id
+        assert await session.scalar(select(func.count(InboxItem.id))) == 1
+
+
+async def test_linked_foreign_owner_task_is_stale_and_never_exposed(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created = await create_item(bot, "Запустить проект", first_step="Написать план")
+    foreign_owner = await bot._user(7002)
+    async with db.session() as session:
+        foreign_task = InboxItem(
+            user_id=foreign_owner.id,
+            kind="task",
+            title="Чужая задача",
+            description=None,
+            raw_text="Чужая задача",
+            next_step="Секретный шаг",
+            resolved_date=None,
+            temporal_resolution=None,
+            source="text",
+            status="confirmed",
+        )
+        session.add(foreign_task)
+        await session.flush()
+        stored = await session.get(VisionItem, created.item.id)
+        stored.linked_task_id = foreign_task.id
+        foreign_task_id = foreign_task.id
+
+    result = await bot.vision_service.create_task(created.item.owner_id, created.item.id)
+
+    assert result.status == "stale"
+    assert result.task is None
+    async with db.sessions() as session:
+        assert await session.get(InboxItem, foreign_task_id) is not None
+        assert await session.scalar(select(func.count(InboxItem.id))) == 1
 
 
 async def test_missing_first_step_does_not_create_task(db, fake_ai):
