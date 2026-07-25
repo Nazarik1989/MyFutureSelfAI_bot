@@ -13,6 +13,10 @@ from future_self.navigation import (
     PUBLIC_COMMANDS,
     SECTIONS,
     NavigationFlowStore,
+    advanced_commands,
+    navigation_actions,
+    navigation_sections,
+    public_commands,
     validate_catalog,
 )
 
@@ -121,6 +125,34 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
     ]
     assert all(len(value.encode()) <= 64 for value in callbacks)
     assert all(not any(char.isdigit() for char in value) for value in callbacks)
+
+
+def test_knowledge_catalog_is_flag_aware_and_capture_stays_advanced():
+    validate_catalog(False, True, False)
+    validate_catalog(True, True, True)
+
+    disabled_public = {item.command for item in public_commands(False, False)}
+    hub_public = {item.command for item in public_commands(False, True)}
+    combined_public = {item.command for item in public_commands(True, True)}
+    assert "knowledge" not in disabled_public
+    assert "capture" not in disabled_public
+    assert hub_public - disabled_public == {"knowledge"}
+    assert {"spaces", "knowledge"} <= combined_public
+    assert "capture" not in combined_public
+
+    assert "capture" not in advanced_commands(False, False)
+    assert "capture" in advanced_commands(False, True)
+    assert "workspaces" in advanced_commands(True, True)
+
+    hub_only = navigation_sections(False, True, False)
+    with_capture = navigation_sections(False, True, True)
+    assert hub_only["knowledge"].actions == ("knowledge",)
+    assert with_capture["knowledge"].actions == ("knowledge", "capture")
+    assert set(navigation_actions(False, True, False)) - set(ACTIONS) == {"knowledge"}
+    assert set(navigation_actions(False, True, True)) - set(ACTIONS) == {
+        "knowledge",
+        "capture",
+    }
 
 
 def test_every_registered_command_is_catalogued_or_explicitly_advanced(db, fake_ai):

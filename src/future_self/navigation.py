@@ -46,6 +46,8 @@ PUBLIC_COMMANDS = (
 
 WORKSPACE_PUBLIC_COMMANDS = (CommandSpec("spaces", "Совместные пространства"),)
 
+KNOWLEDGE_PUBLIC_COMMANDS = (CommandSpec("knowledge", "База знаний"),)
+
 # Existing commands remain supported, but intentionally stay outside Telegram's
 # compact native menu. Keeping this explicit lets tests detect catalog drift.
 ADVANCED_COMMANDS = frozenset(
@@ -78,6 +80,8 @@ ADVANCED_COMMANDS = frozenset(
 )
 
 WORKSPACE_ADVANCED_COMMANDS = frozenset({"workspaces"})
+
+KNOWLEDGE_ADVANCED_COMMANDS = frozenset({"capture"})
 
 ACTIONS = {
     action.key: action
@@ -176,6 +180,21 @@ WORKSPACE_ACTIONS = {
     )
 }
 
+KNOWLEDGE_ACTIONS = {
+    "knowledge": NavigationAction(
+        "knowledge",
+        "Открыть базу знаний",
+        "Личные и доступные совместные материалы с безопасными статусами обработки.",
+        "knowledge_command",
+    ),
+    "capture": NavigationAction(
+        "capture",
+        "Добавить материал",
+        "Явный Capture текста, документа, изображения или ссылки с preview и подтверждением.",
+        "capture_command",
+    ),
+}
+
 SECTIONS = {
     section.key: section
     for section in (
@@ -254,6 +273,17 @@ WORKSPACE_SECTION = NavigationSection(
     ("spaces",),
 )
 
+
+def _knowledge_section(enable_capture: bool) -> NavigationSection:
+    return NavigationSection(
+        "knowledge",
+        "📚",
+        "База знаний",
+        "Источники хранятся отдельно от Inbox и не используются LLM-контекстом.",
+        ("knowledge", "capture") if enable_capture else ("knowledge",),
+    )
+
+
 HELP_TOPICS = {
     "quick": (
         "Быстрый старт",
@@ -295,66 +325,130 @@ HELP_TOPICS = {
 }
 
 
-def public_commands(enable_workspace_access: bool = False) -> tuple[CommandSpec, ...]:
+def public_commands(
+    enable_workspace_access: bool = False,
+    enable_knowledge_hub: bool = False,
+) -> tuple[CommandSpec, ...]:
     """Return the native command catalog without exposing disabled features."""
 
-    if not enable_workspace_access:
+    if not enable_workspace_access and not enable_knowledge_hub:
         return PUBLIC_COMMANDS
     result: list[CommandSpec] = []
     for item in PUBLIC_COMMANDS:
         result.append(item)
         if item.command == "collections":
-            result.extend(WORKSPACE_PUBLIC_COMMANDS)
+            if enable_workspace_access:
+                result.extend(WORKSPACE_PUBLIC_COMMANDS)
+            if enable_knowledge_hub:
+                result.extend(KNOWLEDGE_PUBLIC_COMMANDS)
     return tuple(result)
 
 
-def advanced_commands(enable_workspace_access: bool = False) -> frozenset[str]:
-    return (
-        ADVANCED_COMMANDS | WORKSPACE_ADVANCED_COMMANDS
-        if enable_workspace_access
-        else ADVANCED_COMMANDS
-    )
+def advanced_commands(
+    enable_workspace_access: bool = False,
+    enable_knowledge_capture: bool = False,
+) -> frozenset[str]:
+    result = ADVANCED_COMMANDS
+    if enable_workspace_access:
+        result |= WORKSPACE_ADVANCED_COMMANDS
+    if enable_knowledge_capture:
+        result |= KNOWLEDGE_ADVANCED_COMMANDS
+    return result
 
 
-def navigation_actions(enable_workspace_access: bool = False) -> dict[str, NavigationAction]:
-    if not enable_workspace_access:
-        return ACTIONS
-    return {**ACTIONS, **WORKSPACE_ACTIONS}
+def navigation_actions(
+    enable_workspace_access: bool = False,
+    enable_knowledge_hub: bool = False,
+    enable_knowledge_capture: bool = False,
+) -> dict[str, NavigationAction]:
+    result = dict(ACTIONS)
+    if enable_workspace_access:
+        result.update(WORKSPACE_ACTIONS)
+    if enable_knowledge_hub:
+        result["knowledge"] = KNOWLEDGE_ACTIONS["knowledge"]
+        if enable_knowledge_capture:
+            result["capture"] = KNOWLEDGE_ACTIONS["capture"]
+    return result
 
 
-def navigation_sections(enable_workspace_access: bool = False) -> dict[str, NavigationSection]:
-    if not enable_workspace_access:
+def navigation_sections(
+    enable_workspace_access: bool = False,
+    enable_knowledge_hub: bool = False,
+    enable_knowledge_capture: bool = False,
+) -> dict[str, NavigationSection]:
+    if not enable_workspace_access and not enable_knowledge_hub:
         return SECTIONS
     result: dict[str, NavigationSection] = {}
     for key, section in SECTIONS.items():
         result[key] = section
         if key == "collections":
-            result[WORKSPACE_SECTION.key] = WORKSPACE_SECTION
+            if enable_workspace_access:
+                result[WORKSPACE_SECTION.key] = WORKSPACE_SECTION
+            if enable_knowledge_hub:
+                knowledge = _knowledge_section(enable_knowledge_capture)
+                result[knowledge.key] = knowledge
     return result
 
 
-def help_topics(enable_workspace_access: bool = False) -> dict[str, tuple[str, str]]:
+def help_topics(
+    enable_workspace_access: bool = False,
+    enable_knowledge_hub: bool = False,
+    enable_knowledge_capture: bool = False,
+) -> dict[str, tuple[str, str]]:
     """Build flag-aware help text while keeping the PR #22 constants stable."""
 
-    if not enable_workspace_access:
+    if not enable_workspace_access and not enable_knowledge_hub:
         return HELP_TOPICS
     topics = dict(HELP_TOPICS)
-    sections = navigation_sections(True)
+    sections = navigation_sections(
+        enable_workspace_access,
+        enable_knowledge_hub,
+        enable_knowledge_capture,
+    )
     topics["features"] = (
         "Что умеет бот",
         "\n".join(f"{item.emoji} {item.label} — {item.description}" for item in sections.values()),
     )
     topics["commands"] = (
         "Основные команды",
-        "\n".join(f"/{item.command} — {item.description}" for item in public_commands(True)),
+        "\n".join(
+            f"/{item.command} — {item.description}"
+            for item in public_commands(enable_workspace_access, enable_knowledge_hub)
+        ),
+    )
+    privacy_parts = [
+        "Бот работает только в личном чате. Личные карточки, анализы, health-данные и "
+        "личные разделы не становятся общими автоматически."
+    ]
+    if enable_workspace_access:
+        privacy_parts.append(
+            "В совместном пространстве видны только явно добавленные данные и только "
+            "участникам с действующим доступом."
+        )
+    if enable_knowledge_hub:
+        privacy_parts.append(
+            "База знаний показывает только личные или доступные участнику источники."
+        )
+    privacy_parts.append(
+        "Telegram ID не включаются в диагностические логи. Явные команды разделов "
+        "обрабатываются без LLM."
     )
     topics["privacy"] = (
         "Конфиденциальность",
-        "Бот работает только в личном чате. Личные карточки, анализы, health-данные "
-        "и личные разделы не становятся общими автоматически. Пространства открывают "
-        "только свои данные участникам с действующим доступом. Telegram ID не включаются "
-        "в диагностические логи. Явные команды разделов обрабатываются без LLM.",
+        " ".join(privacy_parts),
     )
+    if enable_knowledge_hub:
+        capture_note = (
+            " /capture добавляет текст, документ, изображение или ссылку через preview и явное "
+            "подтверждение."
+            if enable_knowledge_capture
+            else " Добавление новых материалов сейчас отключено настройкой."
+        )
+        topics["knowledge"] = (
+            "📚 База знаний",
+            "/knowledge показывает личные и доступные совместные источники и их статус."
+            f"{capture_note} Материалы не попадают в LLM-контекст автоматически.",
+        )
     return topics
 
 
@@ -418,10 +512,22 @@ class NavigationFlowStore:
             self._sessions.pop(token, None)
 
 
-def validate_catalog(enable_workspace_access: bool = False) -> None:
-    commands = public_commands(enable_workspace_access)
-    actions = navigation_actions(enable_workspace_access)
-    sections = navigation_sections(enable_workspace_access)
+def validate_catalog(
+    enable_workspace_access: bool = False,
+    enable_knowledge_hub: bool = False,
+    enable_knowledge_capture: bool = False,
+) -> None:
+    commands = public_commands(enable_workspace_access, enable_knowledge_hub)
+    actions = navigation_actions(
+        enable_workspace_access,
+        enable_knowledge_hub,
+        enable_knowledge_capture,
+    )
+    sections = navigation_sections(
+        enable_workspace_access,
+        enable_knowledge_hub,
+        enable_knowledge_capture,
+    )
     command_names = [item.command for item in commands]
     if len(command_names) != len(set(command_names)):
         raise ValueError("Duplicate public navigation commands")

@@ -8,6 +8,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from uuid import uuid4
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +17,7 @@ from sqlalchemy.orm import aliased
 
 from .db import Database
 from .models import (
+    KnowledgeAuditEvent,
     KnowledgeSpace,
     User,
     Workspace,
@@ -311,15 +313,28 @@ class WorkspaceAccessService:
                         version=1,
                     )
                 )
-                session.add(
-                    KnowledgeSpace(
-                        kind="workspace",
-                        workspace_id=workspace.id,
-                        status="active",
-                        version=1,
-                    )
+                knowledge_space = KnowledgeSpace(
+                    kind="workspace",
+                    workspace_id=workspace.id,
+                    status="active",
+                    version=1,
                 )
+                session.add(knowledge_space)
                 await session.flush()
+                await self._knowledge_access_audit(
+                    session,
+                    "workspace.created",
+                    actor_user_id=actor_user_id,
+                    workspace_id=workspace.id,
+                    knowledge_space_id=knowledge_space.id,
+                )
+                await self._knowledge_access_audit(
+                    session,
+                    "space.created",
+                    actor_user_id=actor_user_id,
+                    workspace_id=workspace.id,
+                    knowledge_space_id=knowledge_space.id,
+                )
                 return workspace
         except IntegrityError as exc:
             raise WorkspaceConflictError("Пространство с таким названием уже существует.") from exc
@@ -345,6 +360,13 @@ class WorkspaceAccessService:
                 )
                 session.add(space)
                 await session.flush()
+                await self._knowledge_access_audit(
+                    session,
+                    "space.created",
+                    actor_user_id=actor_user_id,
+                    workspace_id=None,
+                    knowledge_space_id=space.id,
+                )
                 return space
         except IntegrityError as exc:
             raise WorkspaceConflictError("Не удалось создать личную область.") from exc
@@ -503,6 +525,12 @@ class WorkspaceAccessService:
                     )
                     .values(status="active", version=KnowledgeSpace.version + 1)
                 )
+            await self._knowledge_access_audit(
+                session,
+                "workspace.archived" if archived else "workspace.restored",
+                actor_user_id=context.actor_user_id,
+                workspace_id=workspace.id,
+            )
             await session.flush()
             return workspace
 
@@ -583,6 +611,13 @@ class WorkspaceAccessService:
             member.version += 1
             workspace.access_epoch += 1
             workspace.version += 1
+            await self._knowledge_access_audit(
+                session,
+                "workspace.role_changed",
+                actor_user_id=context.actor_user_id,
+                workspace_id=workspace.id,
+                safe_metadata={"role": clean_role},
+            )
             await session.flush()
             return member
 
@@ -618,6 +653,12 @@ class WorkspaceAccessService:
             member.version += 1
             workspace.access_epoch += 1
             workspace.version += 1
+            await self._knowledge_access_audit(
+                session,
+                "workspace.member_revoked",
+                actor_user_id=context.actor_user_id,
+                workspace_id=workspace.id,
+            )
             await session.flush()
             return member
 
@@ -642,6 +683,12 @@ class WorkspaceAccessService:
             actor.version += 1
             workspace.access_epoch += 1
             workspace.version += 1
+            await self._knowledge_access_audit(
+                session,
+                "workspace.member_left",
+                actor_user_id=context.actor_user_id,
+                workspace_id=workspace.id,
+            )
             await session.flush()
             return actor
 
@@ -1004,17 +1051,30 @@ class WorkspaceAccessService:
                 )
                 session.add(project)
                 await session.flush()
-                session.add(
-                    KnowledgeSpace(
-                        kind="project",
-                        workspace_id=workspace.id,
-                        workspace_project_id=project.id,
-                        status="active",
-                        version=1,
-                    )
+                knowledge_space = KnowledgeSpace(
+                    kind="project",
+                    workspace_id=workspace.id,
+                    workspace_project_id=project.id,
+                    status="active",
+                    version=1,
                 )
+                session.add(knowledge_space)
                 workspace.version += 1
                 await session.flush()
+                await self._knowledge_access_audit(
+                    session,
+                    "workspace.project_created",
+                    actor_user_id=context.actor_user_id,
+                    workspace_id=workspace.id,
+                    knowledge_space_id=knowledge_space.id,
+                )
+                await self._knowledge_access_audit(
+                    session,
+                    "space.created",
+                    actor_user_id=context.actor_user_id,
+                    workspace_id=workspace.id,
+                    knowledge_space_id=knowledge_space.id,
+                )
                 return project
         except IntegrityError as exc:
             raise WorkspaceConflictError("Проект с таким названием уже существует.") from exc
@@ -1119,6 +1179,13 @@ class WorkspaceAccessService:
                 project.name = display
                 project.normalized_name = normalized
                 project.version += 1
+                await self._knowledge_access_audit(
+                    session,
+                    "workspace.project_renamed",
+                    actor_user_id=context.actor_user_id,
+                    workspace_id=context.workspace_id,
+                    workspace_project_id=project.id,
+                )
                 await session.flush()
                 return project
         except IntegrityError as exc:
@@ -1156,6 +1223,13 @@ class WorkspaceAccessService:
                     KnowledgeSpace.workspace_project_id == project.id,
                 )
                 .values(status=new_status, version=KnowledgeSpace.version + 1)
+            )
+            await self._knowledge_access_audit(
+                session,
+                "workspace.project_archived" if archived else "workspace.project_restored",
+                actor_user_id=context.actor_user_id,
+                workspace_id=context.workspace_id,
+                workspace_project_id=project.id,
             )
             await session.flush()
             return project
@@ -1830,6 +1904,13 @@ class WorkspaceAccessService:
             existing.version += 1
         workspace.access_epoch += 1
         workspace.version += 1
+        await self._knowledge_access_audit(
+            session,
+            "workspace.member_added",
+            actor_user_id=actor_user_id,
+            workspace_id=workspace.id,
+            safe_metadata={"role": invitation.role},
+        )
         await session.flush()
         return AccessContext(actor_user_id, workspace.id, workspace.access_epoch)
 
@@ -2026,6 +2107,51 @@ class WorkspaceAccessService:
         if locked.rowcount != 1:
             raise WorkspaceAccessDenied("Пространство недоступно.")
         return await self._read_access(session, context, roles=roles, require_active=require_active)
+
+    @staticmethod
+    async def _knowledge_access_audit(
+        session: AsyncSession,
+        event_type: str,
+        *,
+        actor_user_id: int,
+        workspace_id: int | None,
+        knowledge_space_id: int | None = None,
+        workspace_project_id: int | None = None,
+        safe_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if knowledge_space_id is None and workspace_id is not None:
+            conditions = [KnowledgeSpace.workspace_id == workspace_id]
+            if workspace_project_id is None:
+                conditions.extend(
+                    [
+                        KnowledgeSpace.kind == "workspace",
+                        KnowledgeSpace.workspace_project_id.is_(None),
+                    ]
+                )
+            else:
+                conditions.extend(
+                    [
+                        KnowledgeSpace.kind == "project",
+                        KnowledgeSpace.workspace_project_id == workspace_project_id,
+                    ]
+                )
+            knowledge_space_id = await session.scalar(select(KnowledgeSpace.id).where(*conditions))
+        metadata = None
+        if safe_metadata is not None:
+            role = safe_metadata.get("role")
+            if set(safe_metadata) != {"role"} or role not in WORKSPACE_ROLES:
+                raise WorkspaceAccessError("Некорректные audit metadata.")
+            metadata = {"role": role}
+        session.add(
+            KnowledgeAuditEvent(
+                public_id=str(uuid4()),
+                event_type=event_type,
+                actor_user_id=actor_user_id,
+                workspace_id=workspace_id,
+                knowledge_space_id=knowledge_space_id,
+                safe_metadata=metadata,
+            )
+        )
 
     @staticmethod
     async def _lock_workspace_unscoped(session: AsyncSession, workspace_id: int) -> None:

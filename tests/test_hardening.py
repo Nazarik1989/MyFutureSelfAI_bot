@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from future_self.safe_media.pdf import SafePdfError, render_pdf_pages
 from future_self.safe_media.subprocess import (
     SafeSubprocessError,
     ensure_child,
+    regular_private_file,
     run_isolated_python_module,
     sanitized_environment,
     write_private_file,
@@ -237,6 +239,19 @@ def test_private_file_and_resolved_root_reject_symlink_and_traversal(tmp_path: P
         )
 
 
+def test_private_file_rejects_hardlinks(tmp_path: Path) -> None:
+    original = tmp_path / "original.bin"
+    write_private_file(original, b"private")
+    linked = tmp_path / "linked.bin"
+    try:
+        os.link(original, linked)
+    except OSError:
+        pytest.skip("hardlink creation is not available")
+
+    assert not regular_private_file(original, max_bytes=100)
+    assert not regular_private_file(linked, max_bytes=100)
+
+
 def test_public_safe_pdf_boundary_accepts_plain_and_rejects_active_content(
     tmp_path: Path,
 ) -> None:
@@ -265,6 +280,21 @@ def test_container_and_build_context_are_hardened() -> None:
         line in {"!.env", "!data", "!data/**", "!.git", "!.git/**"} for line in dockerignore
     )
     assert "127.0.0.1:5432:5432" in compose
+    assert 'network_mode: "none"' in compose
+    assert "stop_grace_period: 180s" in compose
+    assert "umask 077 && exec future-self-knowledge-runner" in compose
+    runner_runbook = runbook.split("### Secret-free runner profile", 1)[1].split(
+        "Never add `--env-file`", 1
+    )[0]
+    assert (
+        '--health-cmd "umask 077 && exec future-self-knowledge-runner --doctor"' in runner_runbook
+    )
+    assert "--health-interval=60s" in runner_runbook
+    assert "--health-timeout=20s" in runner_runbook
+    assert "--health-start-period=30s" in runner_runbook
+    assert "--health-retries=3" in runner_runbook
+    assert "--env LOG_LEVEL=INFO" in runner_runbook
+    assert "/data/backups,readonly" in runner_runbook
     for control in (
         "--read-only",
         "--cap-drop ALL",
@@ -276,10 +306,10 @@ def test_container_and_build_context_are_hardened() -> None:
         assert control in runbook
 
 
-def test_pr23_adds_only_access_foundation_schema() -> None:
+def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260722_0018"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260722_0019"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
     for access_model in (
         "Workspace",
@@ -291,10 +321,20 @@ def test_pr23_adds_only_access_foundation_schema() -> None:
         "WorkspaceActionToken",
     ):
         assert f"class {access_model}" in model_source
-    for future_model in (
+    for knowledge_model in (
         "KnowledgeSource",
+        "KnowledgeSourceRevision",
+        "KnowledgeIngestionJob",
+        "KnowledgeCaptureDraft",
+        "KnowledgeQuotaReservation",
+        "KnowledgeAuditEvent",
+    ):
+        assert f"class {knowledge_model}" in model_source
+    for deferred_model in (
         "KnowledgeChunk",
         "KnowledgeEmbedding",
+        "KnowledgeCard",
+        "KnowledgePack",
         "CouncilSession",
     ):
-        assert f"class {future_model}" not in model_source
+        assert f"class {deferred_model}" not in model_source

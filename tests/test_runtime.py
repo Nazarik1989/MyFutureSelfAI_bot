@@ -48,7 +48,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260722_0018')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260722_0019')")
         )
 
     async def forbidden_network(*args, **kwargs):

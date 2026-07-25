@@ -3,6 +3,7 @@ import re
 import warnings
 from datetime import UTC, date, datetime, time, timedelta
 from html import escape
+from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -62,6 +63,9 @@ from .health import (
     prolonged_weakness_message,
     urgent_safety_message,
 )
+from .knowledge import KnowledgeQuotaPolicy, KnowledgeService
+from .knowledge_handlers import KnowledgeHandlers
+from .knowledge_storage import KnowledgeAssetStore
 from .lab_handlers import LabHandlers
 from .labs import LabDocumentService, LabUploadSessionStore
 from .location import LocationService, location_from_user, parse_location
@@ -148,6 +152,7 @@ class FutureSelfBot(
     TaskHandlers,
     CollectionHandlers,
     WorkspaceHandlers,
+    KnowledgeHandlers,
     NavigationHandlers,
 ):
     def __init__(
@@ -197,6 +202,31 @@ class FutureSelfBot(
             task_date_event_hour=settings.task_date_event_hour,
         )
         self.workspace_service = WorkspaceAccessService(db)
+        self.knowledge_service = KnowledgeService(
+            db,
+            quota_policy=KnowledgeQuotaPolicy(
+                max_source_bytes=settings.knowledge_max_source_bytes,
+                max_extracted_bytes=settings.knowledge_extraction_max_text_bytes,
+                daily_ingest_bytes_per_user=settings.knowledge_daily_ingest_bytes_per_user,
+                storage_bytes_per_user=settings.knowledge_storage_quota_bytes_per_user,
+                daily_sources_per_user=settings.knowledge_daily_sources_per_user,
+                max_pending_jobs_per_user=settings.knowledge_max_pending_jobs_per_user,
+                daily_ingest_bytes_per_space=settings.knowledge_daily_ingest_bytes_per_space,
+                storage_bytes_per_space=settings.knowledge_storage_quota_bytes_per_space,
+                daily_sources_per_space=settings.knowledge_daily_sources_per_space,
+                max_pending_jobs_per_space=settings.knowledge_max_pending_jobs_per_space,
+            ),
+        )
+        self.knowledge_storage = (
+            KnowledgeAssetStore(
+                Path(settings.knowledge_asset_root),
+                max_source_bytes=settings.knowledge_max_source_bytes,
+                max_extracted_bytes=settings.knowledge_extraction_max_text_bytes,
+                min_free_bytes=settings.runtime_min_free_bytes,
+            )
+            if getattr(settings, "enable_knowledge_capture", False)
+            else None
+        )
         self.intent_router = IntentRouter(ai, settings.intent_confidence_threshold)
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
@@ -250,6 +280,10 @@ class FutureSelfBot(
         ]
         if getattr(self.settings, "enable_workspace_access", False):
             gated_public_commands.extend(("spaces", "workspaces"))
+        if getattr(self.settings, "enable_knowledge_hub", False):
+            gated_public_commands.append("knowledge")
+        if getattr(self.settings, "enable_knowledge_capture", False):
+            gated_public_commands.append("capture")
         app.add_handler(
             CommandHandler(
                 gated_public_commands,
@@ -262,7 +296,7 @@ class FutureSelfBot(
             group=-2,
         )
         app.add_handler(
-            CallbackQueryHandler(self.workspace_other_callback_gate),
+            CallbackQueryHandler(self.knowledge_other_callback_gate),
             group=-2,
         )
         # Vision drafts must keep receiving text/voice even while another PTB
@@ -429,6 +463,10 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("collections", self.collections_command))
         if getattr(self.settings, "enable_workspace_access", False):
             app.add_handler(CommandHandler(["spaces", "workspaces"], self.spaces_command))
+        if getattr(self.settings, "enable_knowledge_hub", False):
+            app.add_handler(CommandHandler("knowledge", self.knowledge_command))
+        if getattr(self.settings, "enable_knowledge_capture", False):
+            app.add_handler(CommandHandler("capture", self.capture_command))
         app.add_handler(CommandHandler("doctor", self.doctor_command))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
@@ -454,6 +492,8 @@ class FutureSelfBot(
         app.add_handler(CallbackQueryHandler(self.collection_callback, pattern=r"^collection:"))
         if getattr(self.settings, "enable_workspace_access", False):
             app.add_handler(CallbackQueryHandler(self.workspace_callback, pattern=r"^spacei?:"))
+        if getattr(self.settings, "enable_knowledge_hub", False):
+            app.add_handler(CallbackQueryHandler(self.knowledge_callback, pattern=r"^kh:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -466,6 +506,10 @@ class FutureSelfBot(
         app.add_handler(CallbackQueryHandler(self.inbox_action, pattern=r"^inbox:"))
         app.add_handler(CallbackQueryHandler(self.goals_action, pattern=r"^goals:"))
         app.add_handler(CallbackQueryHandler(self.routines_action, pattern=r"^routines:"))
+        if getattr(self.settings, "enable_knowledge_capture", False):
+            app.add_handler(
+                MessageHandler(filters.PHOTO | filters.Document.ALL, self.knowledge_media_gate)
+            )
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.voice))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text))
         app.add_error_handler(self.error_handler)
@@ -495,7 +539,16 @@ class FutureSelfBot(
         await self.collection_service.cleanup()
         if getattr(self.settings, "enable_workspace_access", False):
             await self.workspace_service.cleanup()
-        commands = public_commands(getattr(self.settings, "enable_workspace_access", False))
+        if getattr(self.settings, "enable_knowledge_hub", False):
+            await self.knowledge_service.cleanup_expired()
+        if self.knowledge_storage is not None:
+            self.knowledge_storage.cleanup_staging(
+                older_than_seconds=self.settings.knowledge_staging_ttl_minutes * 60
+            )
+        commands = public_commands(
+            getattr(self.settings, "enable_workspace_access", False),
+            getattr(self.settings, "enable_knowledge_hub", False),
+        )
         await app.bot.set_my_commands(
             [BotCommand(item.command, item.description) for item in commands],
             scope=BotCommandScopeAllPrivateChats(),
@@ -984,9 +1037,34 @@ class FutureSelfBot(
                 else:
                     await update.effective_message.reply_text("Не удалось переименовать эту цель.")
             return
+        if await self.knowledge_pending_text(update, update.effective_message.text or "", "text"):
+            return
         await self._route_message(update, context, update.effective_message.text, "text")
 
     async def voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        medical_flow = await self._knowledge_medical_flow(update, context)
+        if medical_flow is not None:
+            await update.effective_message.reply_text(
+                "В медицинском сценарии голос не отправляется на распознавание или в LLM. "
+                "Ответь текстом либо заверши сценарий через /cancel."
+            )
+            return
+        if getattr(self.settings, "enable_knowledge_capture", False):
+            # Capture never silently turns voice into Knowledge material. Check its
+            # persistent state before Telegram download or STT so expiry and an
+            # open preview cannot fall through to the generic assistant pipeline.
+            flow = await self._knowledge_specialized_flow(update, context)
+            if flow is None:
+                user = await self._user(update.effective_user.id)
+                state = await self.knowledge_service.capture_state(
+                    user.id, update.effective_chat.id
+                )
+                if state.preview is not None or state.expired_now:
+                    await update.effective_message.reply_text(
+                        "Capture ожидает текст, ссылку, фото или документ. "
+                        "Аудио не отправлено на распознавание; используй preview или /cancel."
+                    )
+                    return
         media = update.effective_message.voice or update.effective_message.audio
         if not self.voice_enabled:
             message = (
@@ -2508,6 +2586,11 @@ class FutureSelfBot(
         if await self.vision_service.cancel(user.id, update.effective_chat.id):
             await update.effective_message.reply_text(
                 "Операция с карточкой отменена, ничего не сохранено и не удалено."
+            )
+            return
+        if await self.cancel_knowledge_state(update):
+            await update.effective_message.reply_text(
+                "Capture отменён. Источник, задание и оригинал не создавались."
             )
             return
         await self.conversation.clear_focus(update.effective_user.id, update.effective_chat.id)

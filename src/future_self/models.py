@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -843,9 +844,21 @@ class KnowledgeSpace(TimestampMixin, Base):
             sqlite_where=text("kind = 'project'"),
             postgresql_where=text("kind = 'project'"),
         ),
+        Index("uq_knowledge_space_public_id", "public_id", unique=True),
+        Index("uq_knowledge_space_id_kind", "id", "kind", unique=True),
+        CheckConstraint(
+            "public_id IS NULL OR length(public_id) = 36",
+            name="ck_knowledge_space_public_id_length",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Nullable at the database boundary so a PR #23 rollback image can still
+    # insert a space against the additive PR #24 schema. New code always
+    # supplies a UUID and KnowledgeService repairs legacy NULL rows on access.
+    public_id: Mapped[str | None] = mapped_column(
+        String(36), default=lambda: str(uuid4()), index=False
+    )
     kind: Mapped[str] = mapped_column(String(20), index=True)
     personal_owner_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
@@ -981,6 +994,666 @@ class WorkspaceActionToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class KnowledgeSource(TimestampMixin, Base):
+    """A logical, space-owned source with a mutable lifecycle pointer."""
+
+    __tablename__ = "knowledge_sources"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["knowledge_space_id", "space_kind"],
+            ["knowledge_spaces.id", "knowledge_spaces.kind"],
+            ondelete="CASCADE",
+            name="fk_knowledge_source_space_scope",
+        ),
+        UniqueConstraint("public_id", name="uq_knowledge_source_public_id"),
+        UniqueConstraint("id", "knowledge_space_id", name="uq_knowledge_source_id_space"),
+        CheckConstraint("length(public_id) = 36", name="ck_knowledge_source_public_id_length"),
+        CheckConstraint(
+            "source_type IN ('text', 'forward', 'document', 'image', 'url')",
+            name="ck_knowledge_source_type",
+        ),
+        CheckConstraint(
+            "processing_status IN "
+            "('queued', 'processing', 'ready', 'partial', 'failed', 'quarantined', "
+            "'cancelled')",
+            name="ck_knowledge_source_processing_status",
+        ),
+        CheckConstraint(
+            "lifecycle_status IN ('active', 'trashed', 'purge_pending', 'purge_failed', 'purged')",
+            name="ck_knowledge_source_lifecycle_status",
+        ),
+        CheckConstraint(
+            "knowledge_role IN "
+            "('foundation', 'trusted', 'perspective', 'discussion', 'counterpoint', "
+            "'hypothesis')",
+            name="ck_knowledge_source_role",
+        ),
+        CheckConstraint(
+            "priority IN ('high', 'normal', 'low')",
+            name="ck_knowledge_source_priority",
+        ),
+        CheckConstraint(
+            "publication_state IN ('draft', 'publication_ready')",
+            name="ck_knowledge_source_publication_state",
+        ),
+        CheckConstraint(
+            "system_classification IN ('general', 'health_private')",
+            name="ck_knowledge_source_system_classification",
+        ),
+        CheckConstraint(
+            "system_classification != 'health_private' OR space_kind = 'personal'",
+            name="ck_knowledge_source_health_personal_only",
+        ),
+        CheckConstraint(
+            "system_classification != 'health_private' OR publication_state = 'draft'",
+            name="ck_knowledge_source_health_not_publication_ready",
+        ),
+        CheckConstraint("length(title) BETWEEN 1 AND 200", name="ck_knowledge_source_title"),
+        CheckConstraint(
+            "length(provenance_kind) BETWEEN 1 AND 40",
+            name="ck_knowledge_source_provenance_kind",
+        ),
+        CheckConstraint(
+            "user_classification IS NULL OR length(user_classification) BETWEEN 1 AND 64",
+            name="ck_knowledge_source_user_classification",
+        ),
+        CheckConstraint("version > 0", name="ck_knowledge_source_version"),
+        CheckConstraint(
+            "(lifecycle_status = 'purged' AND current_revision_number IS NULL) OR "
+            "(lifecycle_status != 'purged' AND current_revision_number > 0)",
+            name="ck_knowledge_source_current_revision",
+        ),
+        CheckConstraint(
+            "(lifecycle_status = 'active' AND trashed_at IS NULL "
+            "AND purge_requested_at IS NULL "
+            "AND purged_at IS NULL) OR "
+            "(lifecycle_status = 'trashed' AND trashed_at IS NOT NULL "
+            "AND purge_requested_at IS NULL "
+            "AND purged_at IS NULL) OR "
+            "(lifecycle_status IN ('purge_pending', 'purge_failed') "
+            "AND trashed_at IS NOT NULL "
+            "AND purge_requested_at IS NOT NULL AND purged_at IS NULL) OR "
+            "(lifecycle_status = 'purged' AND trashed_at IS NOT NULL "
+            "AND purge_requested_at IS NOT NULL "
+            "AND purged_at IS NOT NULL)",
+            name="ck_knowledge_source_lifecycle_times",
+        ),
+        Index(
+            "ix_knowledge_sources_space_lifecycle_updated",
+            "knowledge_space_id",
+            "lifecycle_status",
+            "updated_at",
+        ),
+        Index(
+            "ix_knowledge_sources_space_processing",
+            "knowledge_space_id",
+            "processing_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    knowledge_space_id: Mapped[int] = mapped_column(Integer, index=True)
+    space_kind: Mapped[str] = mapped_column(String(20), index=True)
+    created_by_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
+    )
+    source_type: Mapped[str] = mapped_column(String(20), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    provenance_kind: Mapped[str] = mapped_column(String(40))
+    provenance: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    processing_status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    knowledge_role: Mapped[str] = mapped_column(String(20), default="trusted", index=True)
+    priority: Mapped[str] = mapped_column(String(20), default="normal", index=True)
+    publication_state: Mapped[str] = mapped_column(String(24), default="draft", index=True)
+    system_classification: Mapped[str] = mapped_column(String(24), default="general", index=True)
+    user_classification: Mapped[str | None] = mapped_column(String(64), index=True)
+    current_revision_number: Mapped[int | None] = mapped_column(Integer)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    trashed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    trashed_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    purge_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class KnowledgeSourceRevision(Base):
+    """Original identity plus a write-once deterministic extraction result."""
+
+    __tablename__ = "knowledge_source_revisions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "knowledge_space_id"],
+            ["knowledge_sources.id", "knowledge_sources.knowledge_space_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_revision_source_space",
+        ),
+        ForeignKeyConstraint(
+            ["original_revision_id", "source_id", "knowledge_space_id"],
+            [
+                "knowledge_source_revisions.id",
+                "knowledge_source_revisions.source_id",
+                "knowledge_source_revisions.knowledge_space_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_knowledge_revision_original_scope",
+        ),
+        UniqueConstraint("public_id", name="uq_knowledge_revision_public_id"),
+        UniqueConstraint("id", "source_id", name="uq_knowledge_revision_id_source"),
+        UniqueConstraint(
+            "id",
+            "source_id",
+            "knowledge_space_id",
+            name="uq_knowledge_revision_id_source_space",
+        ),
+        UniqueConstraint(
+            "source_id", "revision_number", name="uq_knowledge_revision_source_number"
+        ),
+        UniqueConstraint("original_storage_key", name="uq_knowledge_revision_original_key"),
+        UniqueConstraint("extracted_storage_key", name="uq_knowledge_revision_extracted_key"),
+        CheckConstraint("length(public_id) = 36", name="ck_knowledge_revision_public_id_length"),
+        CheckConstraint("revision_number > 0", name="ck_knowledge_revision_number"),
+        CheckConstraint("length(sha256) = 64", name="ck_knowledge_revision_sha256_length"),
+        CheckConstraint("size_bytes >= 0", name="ck_knowledge_revision_size"),
+        CheckConstraint(
+            "detected_format IN ('text', 'txt', 'markdown', 'pdf', 'docx', 'epub', 'image', 'url')",
+            name="ck_knowledge_revision_format",
+        ),
+        CheckConstraint(
+            "extraction_status IN "
+            "('pending', 'ready', 'partial', 'failed', 'quarantined', 'cancelled')",
+            name="ck_knowledge_revision_extraction_status",
+        ),
+        CheckConstraint(
+            "original_storage_key IS NULL OR length(original_storage_key) BETWEEN 1 AND 512",
+            name="ck_knowledge_revision_original_key_length",
+        ),
+        CheckConstraint(
+            "(original_revision_id IS NULL AND original_storage_key IS NOT NULL) OR "
+            "(original_revision_id IS NOT NULL AND original_storage_key IS NULL)",
+            name="ck_knowledge_revision_original_reference",
+        ),
+        CheckConstraint(
+            "length(safe_display_name) BETWEEN 1 AND 255",
+            name="ck_knowledge_revision_display_name",
+        ),
+        CheckConstraint(
+            "(extracted_storage_key IS NULL AND extracted_sha256 IS NULL "
+            "AND extracted_size_bytes IS NULL) OR "
+            "(extracted_storage_key IS NOT NULL AND extracted_sha256 IS NOT NULL "
+            "AND length(extracted_sha256) = 64 AND extracted_size_bytes >= 0)",
+            name="ck_knowledge_revision_extracted_tuple",
+        ),
+        CheckConstraint(
+            "(extraction_status = 'pending' AND finalized_at IS NULL) OR "
+            "(extraction_status != 'pending' AND finalized_at IS NOT NULL)",
+            name="ck_knowledge_revision_finalized_time",
+        ),
+        Index(
+            "ix_knowledge_revisions_space_sha256",
+            "knowledge_space_id",
+            "sha256",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    source_id: Mapped[int] = mapped_column(Integer, index=True)
+    knowledge_space_id: Mapped[int] = mapped_column(Integer, index=True)
+    revision_number: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    original_revision_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    original_storage_key: Mapped[str | None] = mapped_column(String(512))
+    declared_mime: Mapped[str | None] = mapped_column(String(127))
+    detected_mime: Mapped[str] = mapped_column(String(127))
+    detected_format: Mapped[str] = mapped_column(String(20), index=True)
+    safe_display_name: Mapped[str] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    extracted_storage_key: Mapped[str | None] = mapped_column(String(512))
+    extracted_sha256: Mapped[str | None] = mapped_column(String(64))
+    extracted_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    extraction_status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    extraction_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    provenance: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_by_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
+    )
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class KnowledgeIngestionJob(TimestampMixin, Base):
+    __tablename__ = "knowledge_ingestion_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "knowledge_space_id"],
+            ["knowledge_sources.id", "knowledge_sources.knowledge_space_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_job_source_space",
+        ),
+        ForeignKeyConstraint(
+            ["revision_id", "source_id"],
+            ["knowledge_source_revisions.id", "knowledge_source_revisions.source_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_job_revision_source",
+        ),
+        UniqueConstraint("public_id", name="uq_knowledge_job_public_id"),
+        UniqueConstraint("idempotency_key", name="uq_knowledge_job_idempotency"),
+        CheckConstraint("length(public_id) = 36", name="ck_knowledge_job_public_id_length"),
+        CheckConstraint("job_type IN ('extract', 'purge')", name="ck_knowledge_job_type"),
+        CheckConstraint(
+            "(job_type = 'extract' AND revision_id IS NOT NULL) OR "
+            "(job_type = 'purge' AND revision_id IS NULL)",
+            name="ck_knowledge_job_revision_scope",
+        ),
+        CheckConstraint(
+            "status IN "
+            "('queued', 'processing', 'ready', 'partial', 'failed', 'quarantined', "
+            "'cancelled')",
+            name="ck_knowledge_job_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0 AND max_attempts BETWEEN 1 AND 20 "
+            "AND attempt_count <= max_attempts",
+            name="ck_knowledge_job_attempts",
+        ),
+        CheckConstraint("source_version > 0", name="ck_knowledge_job_source_version"),
+        CheckConstraint("version > 0", name="ck_knowledge_job_version"),
+        CheckConstraint(
+            "(status = 'processing' AND lease_owner IS NOT NULL AND lease_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL "
+            "AND finished_at IS NULL) OR "
+            "(status = 'queued' AND lease_owner IS NULL AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND heartbeat_at IS NULL AND finished_at IS NULL) OR "
+            "(status IN ('ready', 'partial', 'failed', 'quarantined', 'cancelled') "
+            "AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL "
+            "AND heartbeat_at IS NULL AND finished_at IS NOT NULL)",
+            name="ck_knowledge_job_lease_state",
+        ),
+        CheckConstraint(
+            "status NOT IN ('ready', 'cancelled') OR safe_error_code IS NULL",
+            name="ck_knowledge_job_safe_error",
+        ),
+        Index(
+            "ix_knowledge_jobs_poll",
+            "status",
+            "available_at",
+            "id",
+        ),
+        Index(
+            "ix_knowledge_jobs_stale_lease",
+            "status",
+            "lease_expires_at",
+        ),
+        Index("ix_knowledge_jobs_source_status", "source_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    knowledge_space_id: Mapped[int] = mapped_column(Integer, index=True)
+    source_id: Mapped[int] = mapped_column(Integer, index=True)
+    revision_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    requested_by_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
+    )
+    job_type: Mapped[str] = mapped_column(String(20), default="extract", index=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(64))
+    lease_token: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    safe_error_code: Mapped[str | None] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    pipeline_version: Mapped[str] = mapped_column(String(32), default="v1")
+    source_version: Mapped[int] = mapped_column(Integer)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class KnowledgeCaptureDraft(TimestampMixin, Base):
+    __tablename__ = "knowledge_capture_drafts"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_knowledge_capture_public_id"),
+        UniqueConstraint("id", "knowledge_space_id", name="uq_knowledge_capture_id_space"),
+        ForeignKeyConstraint(
+            ["confirmed_source_id", "knowledge_space_id"],
+            ["knowledge_sources.id", "knowledge_sources.knowledge_space_id"],
+            ondelete="RESTRICT",
+            name="fk_knowledge_capture_confirmed_source_space",
+        ),
+        CheckConstraint("length(public_id) = 36", name="ck_knowledge_capture_public_id_length"),
+        CheckConstraint(
+            "capture_kind IN ('text', 'forward', 'document', 'image', 'url')",
+            name="ck_knowledge_capture_kind",
+        ),
+        CheckConstraint(
+            "status IN "
+            "('collecting', 'awaiting_confirmation', 'confirming', 'confirmed', "
+            "'cancelled', 'expired')",
+            name="ck_knowledge_capture_status",
+        ),
+        CheckConstraint(
+            "knowledge_role IN "
+            "('foundation', 'trusted', 'perspective', 'discussion', 'counterpoint', "
+            "'hypothesis')",
+            name="ck_knowledge_capture_role",
+        ),
+        CheckConstraint(
+            "priority IN ('high', 'normal', 'low')",
+            name="ck_knowledge_capture_priority",
+        ),
+        CheckConstraint(
+            "system_classification IN ('general', 'health_private')",
+            name="ck_knowledge_capture_system_classification",
+        ),
+        CheckConstraint("version > 0", name="ck_knowledge_capture_version"),
+        CheckConstraint(
+            "declared_size_bytes IS NULL OR declared_size_bytes >= 0",
+            name="ck_knowledge_capture_declared_size",
+        ),
+        CheckConstraint(
+            "(status IN ('collecting', 'confirmed', 'cancelled', 'expired') "
+            "AND text_content IS NULL AND source_url IS NULL "
+            "AND telegram_file_id IS NULL) OR "
+            "(status IN ('awaiting_confirmation', 'confirming') "
+            "AND capture_kind IN ('text', 'forward') AND text_content IS NOT NULL "
+            "AND source_url IS NULL AND telegram_file_id IS NULL) OR "
+            "(status IN ('awaiting_confirmation', 'confirming') "
+            "AND capture_kind = 'url' AND source_url IS NOT NULL AND text_content IS NULL "
+            "AND telegram_file_id IS NULL) OR "
+            "(status IN ('awaiting_confirmation', 'confirming') "
+            "AND capture_kind IN ('document', 'image') AND telegram_file_id IS NOT NULL "
+            "AND text_content IS NULL AND source_url IS NULL)",
+            name="ck_knowledge_capture_payload",
+        ),
+        CheckConstraint(
+            "(status IN ('collecting', 'cancelled', 'expired')) OR "
+            "(knowledge_space_id IS NOT NULL AND knowledge_space_version IS NOT NULL "
+            "AND title IS NOT NULL)",
+            name="ck_knowledge_capture_configured",
+        ),
+        CheckConstraint(
+            "(status = 'confirmed' AND confirmed_source_id IS NOT NULL "
+            "AND completed_at IS NOT NULL) OR "
+            "(status IN ('cancelled', 'expired') AND confirmed_source_id IS NULL "
+            "AND completed_at IS NOT NULL) OR "
+            "(status IN ('collecting', 'awaiting_confirmation', 'confirming') "
+            "AND confirmed_source_id IS NULL AND completed_at IS NULL)",
+            name="ck_knowledge_capture_completion",
+        ),
+        Index(
+            "uq_knowledge_capture_active_actor_chat",
+            "actor_user_id",
+            "chat_id",
+            unique=True,
+            sqlite_where=text("status IN ('collecting', 'awaiting_confirmation', 'confirming')"),
+            postgresql_where=text(
+                "status IN ('collecting', 'awaiting_confirmation', 'confirming')"
+            ),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    actor_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    capture_kind: Mapped[str] = mapped_column(String(20))
+    text_content: Mapped[str | None] = mapped_column(Text)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    telegram_file_id: Mapped[str | None] = mapped_column(String(512))
+    telegram_file_unique_id_hash: Mapped[str | None] = mapped_column(String(64))
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    declared_mime: Mapped[str | None] = mapped_column(String(127))
+    safe_display_name: Mapped[str | None] = mapped_column(String(255))
+    declared_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    provenance: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    knowledge_space_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_spaces.id", ondelete="CASCADE"), index=True
+    )
+    knowledge_space_version: Mapped[int | None] = mapped_column(Integer)
+    workspace_access_epoch: Mapped[int | None] = mapped_column(Integer)
+    workspace_project_version: Mapped[int | None] = mapped_column(Integer)
+    title: Mapped[str | None] = mapped_column(String(200))
+    knowledge_role: Mapped[str] = mapped_column(String(20), default="trusted")
+    priority: Mapped[str] = mapped_column(String(20), default="normal")
+    system_classification: Mapped[str] = mapped_column(String(24), default="general")
+    user_classification: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(24), default="collecting", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    confirmed_source_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class KnowledgeActionToken(Base):
+    __tablename__ = "knowledge_action_tokens"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["capture_draft_id", "knowledge_space_id"],
+            ["knowledge_capture_drafts.id", "knowledge_capture_drafts.knowledge_space_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_action_capture_space",
+        ),
+        ForeignKeyConstraint(
+            ["source_id", "knowledge_space_id"],
+            ["knowledge_sources.id", "knowledge_sources.knowledge_space_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_action_source_space",
+        ),
+        CheckConstraint("length(token_hash) = 64", name="ck_knowledge_action_hash"),
+        CheckConstraint(
+            "scope_kind IN ('capture', 'source', 'space')",
+            name="ck_knowledge_action_scope_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'awaiting_input', 'consumed')",
+            name="ck_knowledge_action_status",
+        ),
+        CheckConstraint(
+            "(status IN ('pending', 'awaiting_input') AND consumed_at IS NULL) OR "
+            "(status = 'consumed' AND consumed_at IS NOT NULL)",
+            name="ck_knowledge_action_consumed",
+        ),
+        CheckConstraint(
+            "(scope_kind = 'capture' AND capture_draft_id IS NOT NULL "
+            "AND capture_version IS NOT NULL AND source_id IS NULL) OR "
+            "(scope_kind = 'source' AND capture_draft_id IS NULL "
+            "AND capture_version IS NULL AND source_id IS NOT NULL "
+            "AND source_version IS NOT NULL) OR "
+            "(scope_kind = 'space' AND capture_draft_id IS NULL "
+            "AND capture_version IS NULL AND source_id IS NULL "
+            "AND source_version IS NULL)",
+            name="ck_knowledge_action_scope",
+        ),
+    )
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    scope_kind: Mapped[str] = mapped_column(String(20))
+    knowledge_space_id: Mapped[int] = mapped_column(
+        ForeignKey("knowledge_spaces.id", ondelete="CASCADE"), index=True
+    )
+    knowledge_space_version: Mapped[int] = mapped_column(Integer)
+    workspace_access_epoch: Mapped[int | None] = mapped_column(Integer)
+    capture_draft_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    capture_version: Mapped[int | None] = mapped_column(Integer)
+    source_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    source_version: Mapped[int | None] = mapped_column(Integer)
+    action: Mapped[str] = mapped_column(String(48), index=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class KnowledgeQuotaReservation(TimestampMixin, Base):
+    __tablename__ = "knowledge_quota_reservations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["capture_draft_id", "knowledge_space_id"],
+            ["knowledge_capture_drafts.id", "knowledge_capture_drafts.knowledge_space_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_quota_capture_space",
+        ),
+        ForeignKeyConstraint(
+            ["source_id", "knowledge_space_id"],
+            ["knowledge_sources.id", "knowledge_sources.knowledge_space_id"],
+            ondelete="CASCADE",
+            name="fk_knowledge_quota_source_space",
+        ),
+        ForeignKeyConstraint(
+            ["revision_id", "source_id", "knowledge_space_id"],
+            [
+                "knowledge_source_revisions.id",
+                "knowledge_source_revisions.source_id",
+                "knowledge_source_revisions.knowledge_space_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_knowledge_quota_revision_source_space",
+        ),
+        UniqueConstraint("public_id", name="uq_knowledge_quota_reservation_public_id"),
+        UniqueConstraint("idempotency_key", name="uq_knowledge_quota_reservation_key"),
+        CheckConstraint("length(public_id) = 36", name="ck_knowledge_quota_reservation_public_id"),
+        CheckConstraint(
+            "status IN ('reserved', 'committed', 'released', 'expired')",
+            name="ck_knowledge_quota_reservation_status",
+        ),
+        CheckConstraint(
+            "reserved_bytes >= 0 AND reserved_sources > 0 AND reserved_jobs >= 0",
+            name="ck_knowledge_quota_reservation_amounts",
+        ),
+        CheckConstraint(
+            "(status = 'reserved' AND completed_at IS NULL AND source_id IS NULL "
+            "AND revision_id IS NULL) OR "
+            "(status = 'committed' AND completed_at IS NOT NULL AND source_id IS NOT NULL "
+            "AND revision_id IS NOT NULL) OR "
+            "(status IN ('released', 'expired') AND completed_at IS NOT NULL "
+            "AND source_id IS NULL AND revision_id IS NULL)",
+            name="ck_knowledge_quota_reservation_completion",
+        ),
+        Index(
+            "ix_knowledge_quota_actor_status",
+            "actor_user_id",
+            "status",
+        ),
+        Index(
+            "ix_knowledge_quota_space_status",
+            "knowledge_space_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    actor_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    knowledge_space_id: Mapped[int] = mapped_column(
+        ForeignKey("knowledge_spaces.id", ondelete="CASCADE"), index=True
+    )
+    capture_draft_id: Mapped[int] = mapped_column(Integer, index=True)
+    reserved_bytes: Mapped[int] = mapped_column(Integer)
+    reserved_sources: Mapped[int] = mapped_column(Integer, default=1)
+    reserved_jobs: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="reserved", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source_id: Mapped[int | None] = mapped_column(Integer)
+    revision_id: Mapped[int | None] = mapped_column(Integer)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class KnowledgeAuditEvent(Base):
+    """Append-only, allowlisted metadata; never stores source content or raw URLs."""
+
+    __tablename__ = "knowledge_audit_events"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_knowledge_audit_public_id"),
+        CheckConstraint("length(public_id) = 36", name="ck_knowledge_audit_public_id"),
+        CheckConstraint(
+            "event_type IN ("
+            "'workspace.created', 'workspace.member_added', 'workspace.role_changed', "
+            "'workspace.member_revoked', 'workspace.member_left', 'workspace.archived', "
+            "'workspace.restored', 'workspace.project_created', "
+            "'workspace.project_renamed', 'workspace.project_archived', "
+            "'workspace.project_restored', 'space.created', 'capture.started', "
+            "'capture.confirmed', "
+            "'capture.cancelled', 'capture.expired', 'source.created', "
+            "'revision.created', 'ingestion.status_changed', 'source.trashed', "
+            "'source.restored', 'source.purge_requested', 'source.purged', "
+            "'source.purge_failed', 'source.classification_changed')",
+            name="ck_knowledge_audit_event_type",
+        ),
+        Index(
+            "ix_knowledge_audit_space_created",
+            "knowledge_space_id",
+            "created_at",
+        ),
+        Index(
+            "ix_knowledge_audit_source_created",
+            "source_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    event_type: Mapped[str] = mapped_column(String(48), index=True)
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    workspace_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="SET NULL"), index=True
+    )
+    knowledge_space_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_spaces.id", ondelete="SET NULL"), index=True
+    )
+    capture_draft_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_capture_drafts.id", ondelete="SET NULL"), index=True
+    )
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="SET NULL"), index=True
+    )
+    revision_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_source_revisions.id", ondelete="SET NULL"), index=True
+    )
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_ingestion_jobs.id", ondelete="SET NULL"), index=True
+    )
+    safe_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class KnowledgeRuntimeState(Base):
+    """Singleton DB fence coordinating capture/runner with consistent backups."""
+
+    __tablename__ = "knowledge_runtime_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_knowledge_runtime_singleton"),
+        CheckConstraint("version > 0", name="ck_knowledge_runtime_version"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    maintenance_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class DailyCheckIn(TimestampMixin, Base):
