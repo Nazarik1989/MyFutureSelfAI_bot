@@ -1,6 +1,25 @@
-# «Моя будущая версия»
+<p align="center">
+  <img src="./docs/assets/avatar.webp" width="230" alt="Future Self AI avatar" />
+</p>
 
-MVP Telegram-ассистента, который связывает образ желаемой жизни с небольшими ежедневными действиями и принимает спонтанные мысли текстом или голосом.
+<h1 align="center">Future Self AI</h1>
+
+<p align="center">
+  <strong>«Моя будущая версия» — приватный Telegram-ассистент, связывающий желаемое будущее с небольшими ежедневными действиями.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/Telegram-Private_Chat-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Private Telegram" />
+  <img src="https://img.shields.io/badge/Knowledge_Hub-Feature_Flagged-2FD6BE?style=flat-square" alt="Knowledge Hub" />
+  <img src="https://img.shields.io/badge/Status-Active_Development-00C853?style=flat-square" alt="Status" />
+</p>
+
+MVP принимает мысли текстом или голосом, ведёт цели, задачи, напоминания и приватные жизненные контуры. Knowledge Hub и Universal Capture работают только по явной команде/кнопке, с preview/confirm, immutable revisions и отдельным ingestion runner без Telegram/AI/STT-секретов и сети.
+
+<p align="center">
+  <img src="./docs/assets/architecture.svg" width="100%" alt="Future Self AI architecture" />
+</p>
 
 ## Что работает
 
