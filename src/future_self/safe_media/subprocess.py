@@ -121,6 +121,7 @@ def regular_private_file(path: Path, *, max_bytes: int) -> bool:
     return (
         stat.S_ISREG(info.st_mode)
         and not path.is_symlink()
+        and info.st_nlink == 1
         and private_permissions
         and 0 <= info.st_size <= max_bytes
     )

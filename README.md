@@ -20,6 +20,10 @@ MVP Telegram-ассистента, который связывает образ 
   существующие записи Inbox и Task Hub без копирования содержимого или состояния задач;
 - совместные пространства с отдельным ACL-контуром: роли owner/editor/viewer,
   одноразовые приглашения, проекты, немедленный revoke и перезапускоустойчивые действия;
+- Knowledge Hub с личными, workspace- и project-пространствами, стабильными public ID,
+  неизменяемыми ревизиями, ролями знания, очередью обработки и двухступенчатым удалением;
+- Universal Capture только по явной команде/кнопке и с обязательным preview/confirm;
+  документы разбирает отдельный локальный runner без Telegram/AI/STT-секретов и сети;
 - private-chat-only transport: любые сообщения и callback в группах/каналах блокируются до
   feature handlers, а reminder доставляется по Telegram ID владельца, не по сохранённому chat ID;
 - Health Track MVP: приватные пошаговые check-in, субъективная шкала 0–100, недельная
@@ -96,6 +100,41 @@ DATABASE_URL=postgresql+asyncpg://future_self:future_self@localhost:5432/future_
 Compose публикует демонстрационный PostgreSQL только на loopback `127.0.0.1`; его
 credentials нельзя использовать для публичного или production-развёртывания.
 
+### Knowledge ingestion runner
+
+PR #24 оставляет Hub, Capture и runner выключенными по умолчанию. После Alembic migration
+их можно включать независимо; runner запускается тем же image отдельным процессом:
+
+```bash
+future-self-knowledge-runner
+future-self-knowledge-runner --doctor
+```
+
+Он читает только allowlist DB/storage/limit variables, не загружает bot `.env`, не имеет
+Telegram/LLM/STT полей конфигурации и рассчитан на контейнер без сети. Hardened локальный
+profile доступен командой `docker compose --profile knowledge up -d knowledge-runner`;
+путь данных задаётся `KNOWLEDGE_DATA_PATH`, а миграция выполняется приложением заранее.
+
+Детерминированно извлекаются TXT, Markdown, текстовый PDF, DOCX и EPUB. Изображения,
+сканы и image-only PDF сохраняются со статусом `partial` без OCR. URL остаётся только
+ссылкой: runner не скачивает страницу, не следует redirect и не получает preview.
+
+Согласованный SQLite+assets backup и автономная проверка:
+
+```bash
+future-self-knowledge-backup create \
+  --database /data/future_self.db \
+  --assets /data/knowledge \
+  --destination /data/backups/knowledge-<UTC> \
+  --application-sha <DEPLOYED_SHA>
+future-self-knowledge-backup verify /data/backups/knowledge-<UTC>
+```
+
+Команда create ставит maintenance marker, ждёт завершения активной lease, делает
+`sqlite3.Connection.backup()`, копирует assets с SHA-256 и публикует backup только после
+успешной проверки manifest. Полный runbook находится в
+`docs/operations/production-hardening.md`.
+
 ## Команды
 
 - `/menu` — открыть кнопочное главное меню;
@@ -113,7 +152,9 @@ credentials нельзя использовать для публичного и
 - `/tasks` — Task Hub: активные, предстоящие, просроченные и выполненные задачи;
 - `/collections` — «Мои разделы»: темы, проекты, списки и стартовые сферы по явному выбору;
 - `/spaces` — совместные пространства, участники, приглашения и workspace-проекты;
-  `/workspaces` остаётся расширенным алиасом;
+`/workspaces` остаётся расширенным алиасом;
+- `/knowledge` — доступные базы знаний и материалы (только при включённом Hub);
+- `/capture` — явное добавление текста, документа, изображения или ссылки с подтверждением;
 - `/drafts` — активные preview-карточки с действиями «Открыть», «Сохранить» и «Удалить»;
 - `/last_saved` — последняя подтверждённая запись inbox;
 - `/cleanup_drafts` — открыть подтверждение очистки активных drafts, ничего не удаляя сразу;

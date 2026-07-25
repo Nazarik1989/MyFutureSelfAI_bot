@@ -85,8 +85,8 @@ class Settings(BaseSettings):
     # fail-closed unless the deployment explicitly enables its UI and ACL paths.
     enable_workspace_access: bool = False
 
-    # PR #22 reserves bounded, disabled-by-default policy for later Knowledge
-    # stages. These flags do not register commands, handlers, workers, or models.
+    # PR #24 implements Hub/Capture/Runner behind independent rollout gates. All
+    # later Knowledge/Council stages remain reserved and disabled by default.
     enable_knowledge_hub: bool = False
     enable_knowledge_capture: bool = False
     enable_knowledge_runner: bool = False
@@ -112,6 +112,30 @@ class Settings(BaseSettings):
     )
     knowledge_daily_sources_per_user: int = Field(default=20, ge=1, le=1_000)
     knowledge_max_pending_jobs_per_user: int = Field(default=4, ge=1, le=100)
+    knowledge_daily_ingest_bytes_per_space: int = Field(
+        default=250 * 1024 * 1024, ge=1_000_000, le=5 * 1024 * 1024 * 1024
+    )
+    knowledge_storage_quota_bytes_per_space: int = Field(
+        default=5 * 1024 * 1024 * 1024, ge=10_000_000, le=100 * 1024 * 1024 * 1024
+    )
+    knowledge_daily_sources_per_space: int = Field(default=100, ge=1, le=10_000)
+    knowledge_max_pending_jobs_per_space: int = Field(default=20, ge=1, le=1_000)
+    knowledge_capture_ttl_minutes: int = Field(default=30, ge=5, le=24 * 60)
+    knowledge_action_ttl_minutes: int = Field(default=15, ge=1, le=60)
+    knowledge_staging_ttl_minutes: int = Field(default=60, ge=10, le=24 * 60)
+    knowledge_runner_poll_seconds: float = Field(default=2.0, ge=0.25, le=60.0)
+    knowledge_runner_lease_seconds: int = Field(default=120, ge=30, le=3600)
+    knowledge_runner_heartbeat_seconds: int = Field(default=30, ge=5, le=600)
+    knowledge_runner_max_attempts: int = Field(default=3, ge=1, le=10)
+    knowledge_extraction_wall_seconds: int = Field(default=30, ge=5, le=300)
+    knowledge_extraction_max_pages: int = Field(default=500, ge=1, le=500)
+    knowledge_extraction_max_archive_entries: int = Field(default=2_000, ge=10, le=5_000)
+    knowledge_extraction_max_unpacked_bytes: int = Field(
+        default=100 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024
+    )
+    knowledge_extraction_max_text_bytes: int = Field(
+        default=10 * 1024 * 1024, ge=100_000, le=20_000_000
+    )
     knowledge_provider_daily_token_budget_per_user: int = Field(
         default=100_000, ge=1_000, le=10_000_000
     )
@@ -254,10 +278,29 @@ class Settings(BaseSettings):
             raise ValueError("External Knowledge processing consent cannot be disabled")
         if self.knowledge_max_source_bytes > self.knowledge_daily_ingest_bytes_per_user:
             raise ValueError("Knowledge source limit cannot exceed the daily ingest quota")
+        if self.knowledge_max_source_bytes > self.knowledge_daily_ingest_bytes_per_space:
+            raise ValueError("Knowledge source limit cannot exceed the per-space daily quota")
         if self.knowledge_daily_ingest_bytes_per_user > self.knowledge_storage_quota_bytes_per_user:
             raise ValueError("Knowledge daily ingest quota cannot exceed storage quota")
         if self.database_url.startswith("sqlite") and self.knowledge_runner_concurrency != 1:
             raise ValueError("SQLite Knowledge deployments require exactly one runner")
+        if (
+            self.knowledge_daily_ingest_bytes_per_space
+            > self.knowledge_storage_quota_bytes_per_space
+        ):
+            raise ValueError("Knowledge per-space daily quota cannot exceed its storage quota")
+        if (
+            self.knowledge_max_source_bytes + self.knowledge_extraction_max_text_bytes
+            > self.knowledge_storage_quota_bytes_per_user
+        ):
+            raise ValueError("One Knowledge source and extraction must fit the user storage quota")
+        if (
+            self.knowledge_max_source_bytes + self.knowledge_extraction_max_text_bytes
+            > self.knowledge_storage_quota_bytes_per_space
+        ):
+            raise ValueError("One Knowledge source and extraction must fit the space storage quota")
+        if self.knowledge_runner_heartbeat_seconds * 2 >= self.knowledge_runner_lease_seconds:
+            raise ValueError("Knowledge runner heartbeat must be less than half the lease")
         return self
 
 

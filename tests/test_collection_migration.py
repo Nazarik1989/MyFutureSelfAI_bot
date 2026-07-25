@@ -59,7 +59,7 @@ def test_collection_migration_has_no_seed_and_round_trips_existing_schema(tmp_pa
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260722_0018"
+        "20260722_0019"
     )
     tables = {
         row[0]
@@ -116,7 +116,7 @@ def test_collection_migration_has_no_seed_and_round_trips_existing_schema(tmp_pa
     alembic(project_root, environment, "upgrade", "head")
     connection = sqlite3.connect(database)
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260722_0018"
+        "20260722_0019"
     )
     assert connection.execute("SELECT COUNT(*) FROM life_collections").fetchone()[0] == 0
     assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -131,7 +131,7 @@ def test_collection_migration_upgrades_clean_sqlite(tmp_path):
     alembic(project_root, environment, "upgrade", "head")
     connection = sqlite3.connect(database)
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260722_0018"
+        "20260722_0019"
     )
     assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     connection.close()

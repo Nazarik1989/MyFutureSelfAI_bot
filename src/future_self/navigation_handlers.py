@@ -17,6 +17,7 @@ FLOW_LABELS = {
     "vision_image": "добавление личного фото",
     "labs": "загрузка результатов анализов",
     "workspace": "операция с совместным пространством",
+    "knowledge_capture": "добавление материала в базу знаний",
     "rename_goal": "переименование цели",
 }
 
@@ -111,9 +112,21 @@ class NavigationHandlers:
                 self._help_keyboard(),
             )
             return None
-        sections = navigation_sections(self._workspace_enabled())
-        actions = navigation_actions(self._workspace_enabled())
-        topics = help_topics(self._workspace_enabled())
+        sections = navigation_sections(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )
+        actions = navigation_actions(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )
+        topics = help_topics(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )
         if data.startswith("nav:section:"):
             section_key = data.removeprefix("nav:section:")
             if section_key not in sections:
@@ -169,6 +182,8 @@ class NavigationHandlers:
             if action.handler.startswith("task_") or action.handler in {
                 "collections_command",
                 "spaces_command",
+                "knowledge_command",
+                "capture_command",
             }:
                 return None
             await query.message.reply_text(
@@ -239,9 +254,13 @@ class NavigationHandlers:
                     "Отправь фото/PDF или используй кнопки preview."
                     if current == "labs"
                     else (
-                        "Пришли запрошенный текст или используй /cancel."
-                        if current == "workspace"
-                        else "Ответь на текущий вопрос."
+                        "Пришли материал или используй кнопки Capture preview."
+                        if current == "knowledge_capture"
+                        else (
+                            "Пришли запрошенный текст или используй /cancel."
+                            if current == "workspace"
+                            else "Ответь на текущий вопрос."
+                        )
                     )
                 )
             )
@@ -299,6 +318,10 @@ class NavigationHandlers:
             return "vision_image"
         if await self.vision_service.draft(user.id, update.effective_chat.id) is not None:
             return "vision"
+        if self._knowledge_capture_enabled():
+            capture = await self.knowledge_service.capture_state(user.id, update.effective_chat.id)
+            if capture.preview is not None:
+                return "knowledge_capture"
         return None
 
     async def _clear_navigation_flow(
@@ -329,6 +352,18 @@ class NavigationHandlers:
                 await self.vision_image_sessions.cancel_active(user.id, update.effective_chat.id)
             elif flow == "vision":
                 await self.vision_service.cancel(user.id, update.effective_chat.id)
+            elif flow == "knowledge_capture":
+                state = await self.knowledge_service.capture_state(
+                    user.id, update.effective_chat.id
+                )
+                await self.knowledge_service.cancel_pending_input(user.id, update.effective_chat.id)
+                if state.preview is not None:
+                    await self.knowledge_service.cancel_capture(
+                        user.id,
+                        update.effective_chat.id,
+                        state.preview.draft_public_id,
+                        state.preview.version,
+                    )
 
     async def _prompt_navigation_flow(self, message: Any, update: Update, flow: str) -> None:
         token = await self.navigation_flow_sessions.issue(
@@ -370,14 +405,22 @@ class NavigationHandlers:
         )
 
     async def _send_navigation_section(self, message: Any, section_key: str) -> None:
-        section = navigation_sections(self._workspace_enabled())[section_key]
+        section = navigation_sections(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )[section_key]
         await message.reply_text(
             f"{section.emoji} {section.label}\n\n{section.description}",
             reply_markup=self._section_keyboard(section_key),
         )
 
     def _root_keyboard(self) -> InlineKeyboardMarkup:
-        sections = navigation_sections(self._workspace_enabled())
+        sections = navigation_sections(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )
         rows = [
             [
                 InlineKeyboardButton(
@@ -391,8 +434,16 @@ class NavigationHandlers:
         return InlineKeyboardMarkup(rows)
 
     def _section_keyboard(self, section_key: str) -> InlineKeyboardMarkup:
-        sections = navigation_sections(self._workspace_enabled())
-        actions = navigation_actions(self._workspace_enabled())
+        sections = navigation_sections(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )
+        actions = navigation_actions(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )
         section = sections[section_key]
         rows = [
             [
@@ -415,7 +466,11 @@ class NavigationHandlers:
         return InlineKeyboardMarkup(rows)
 
     def _help_keyboard(self) -> InlineKeyboardMarkup:
-        topics = help_topics(self._workspace_enabled())
+        topics = help_topics(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        )
         labels = {
             "quick": "Быстрый старт",
             "features": "Что умеет бот",
@@ -423,6 +478,7 @@ class NavigationHandlers:
             "commands": "Команды",
             "privacy": "Конфиденциальность",
             "safety": "Здоровье и безопасность",
+            "knowledge": "📚 База знаний",
         }
         rows = [
             [InlineKeyboardButton(labels[key], callback_data=f"nav:help:{key}")] for key in topics
@@ -443,10 +499,20 @@ class NavigationHandlers:
         )
 
     def _section_for_action(self, action_key: str) -> str:
-        for section in navigation_sections(self._workspace_enabled()).values():
+        for section in navigation_sections(
+            self._workspace_enabled(),
+            self._knowledge_hub_enabled(),
+            self._knowledge_capture_enabled(),
+        ).values():
             if action_key in section.actions:
                 return f"nav:section:{section.key}"
         return "nav:root"
 
     def _workspace_enabled(self) -> bool:
         return bool(getattr(self.settings, "enable_workspace_access", False))
+
+    def _knowledge_hub_enabled(self) -> bool:
+        return bool(getattr(self.settings, "enable_knowledge_hub", False))
+
+    def _knowledge_capture_enabled(self) -> bool:
+        return bool(getattr(self.settings, "enable_knowledge_capture", False))
