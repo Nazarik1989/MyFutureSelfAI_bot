@@ -8,7 +8,16 @@ from sqlalchemy import select
 from .ai import AIService
 from .db import Database
 from .location import parse_location
-from .models import DailyCheckIn, Goal, InboxItem, Routine, User, VisionProfile
+from .models import (
+    DailyCheckIn,
+    Goal,
+    InboxItem,
+    Routine,
+    User,
+    VisionCompanionPreference,
+    VisionItem,
+    VisionProfile,
+)
 from .repositories import ProfileRepository
 from .schemas import AssistantAnswer, IntentResult, ParsedThought, TodayPlan
 
@@ -266,6 +275,27 @@ class FocusService:
                     .limit(7)
                 )
             ).all()
+            companion = await session.scalar(
+                select(VisionCompanionPreference).where(
+                    VisionCompanionPreference.owner_id == user_id,
+                    VisionCompanionPreference.enabled.is_(True),
+                )
+            )
+            vision_focus = None
+            if companion is not None:
+                item = await session.scalar(
+                    select(VisionItem).where(
+                        VisionItem.id == companion.vision_item_id,
+                        VisionItem.owner_id == user_id,
+                        VisionItem.status == "active",
+                    )
+                )
+                if item is not None:
+                    vision_focus = {
+                        "wish": item.wish_text,
+                        "why": item.why_text,
+                        "first_step": item.first_step,
+                    }
             context = {
                 "profile": profile.summary if profile else None,
                 "goals": [goal.title for goal in goals],
@@ -273,6 +303,7 @@ class FocusService:
                 "confirmed_tasks": [task.title for task in tasks],
                 "recent_completed": [x for row in history for x in row.completed_actions],
                 "recent_skipped": [x for row in history for x in row.skipped_actions],
+                "vision_focus": vision_focus,
             }
         return await self.ai.make_today_plan(context)
 

@@ -18,7 +18,11 @@ ApplicationRunner = Callable[[Application], None]
 
 def format_configuration_error(exc: ValidationError) -> str:
     error_text = str(exc)
-    known_variables = ("TELEGRAM_BOT_TOKEN", "AI_API_KEY", "TRANSCRIPTION_API_KEY")
+    known_variables = (
+        "TELEGRAM_BOT_TOKEN",
+        "AI_API_KEY",
+        "TRANSCRIPTION_API_KEY",
+    )
     invalid = ["TELEGRAM_BOT_TOKEN", "AI_API_KEY"]
     invalid.extend(name for name in known_variables if name in error_text)
     if any(item["loc"] and item["loc"][0] == "telegram_bot_token" for item in exc.errors()):

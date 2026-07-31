@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     transcription_base_url: str | None = "https://api.openai.com/v1"
     transcription_model: str = "gpt-4o-mini-transcribe"
 
+    # Image generation is intentionally isolated from text and transcription:
+    # it uses OpenRouter's dedicated Images API and the existing text-provider key.
+    enable_vision_image_generation: bool = False
+    image_generation_model: Literal["openai/gpt-image-2"] = "openai/gpt-image-2"
+    image_generation_size: Literal["1024x1024", "1536x1024", "1024x1536"] = "1024x1024"
+    image_generation_quality: Literal["low", "medium", "high", "auto"] = "medium"
+    image_generation_timeout_seconds: float = Field(default=150.0, ge=30.0, le=300.0)
+
     # Temporary compatibility only. New deployments must use AI_* variables.
     openai_api_key: str | None = Field(default=None, exclude=True, repr=False)
     openai_model: str | None = Field(default=None, exclude=True, repr=False)
@@ -241,6 +249,8 @@ class Settings(BaseSettings):
             )
         if not self.transcription_base_url:
             self.transcription_base_url = "https://api.openai.com/v1"
+        if self.enable_vision_image_generation and self.ai_provider != "openrouter":
+            raise ValueError("Vision image generation requires AI_PROVIDER=openrouter")
 
         knowledge_children = (
             self.enable_knowledge_capture,

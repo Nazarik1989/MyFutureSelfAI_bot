@@ -16,6 +16,7 @@ from future_self.transcription import (
 
 def settings(**overrides) -> Settings:
     values = {
+        "_env_file": None,
         "telegram_bot_token": "123456:TEST",
         "ai_provider": "openrouter",
         "ai_api_key": "router-key",

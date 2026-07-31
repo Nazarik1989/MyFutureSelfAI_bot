@@ -72,9 +72,16 @@ def test_vision_migration_upgrades_from_pr13_and_preserves_existing_data(tmp_pat
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     connection.close()
 
-    assert revision == "20260725_0020"
+    assert revision == "20260731_0022"
     assert display_name == "Сохранённый пользователь"
     assert existing_task == "Существующая задача"
-    assert {"vision_items", "vision_drafts", "vision_item_images"} <= tables
+    assert {
+        "vision_items",
+        "vision_drafts",
+        "vision_item_images",
+        "vision_companion_preferences",
+        "vision_companion_checkins",
+        "vision_references",
+    } <= tables
     assert {"lab_documents", "lab_document_pages", "lab_delete_confirmations"} <= tables
     assert integrity == "ok"

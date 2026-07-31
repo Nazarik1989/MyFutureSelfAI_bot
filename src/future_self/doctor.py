@@ -442,6 +442,16 @@ async def run_diagnostics(
         f"enable_voice={str(settings.enable_voice).lower()}; "
         f"key_configured={str(bool(settings.transcription_api_key)).lower()}",
     )
+    image_status = "OK" if settings.enable_vision_image_generation else "WARN"
+    report.add(
+        "vision_image_generation",
+        image_status,
+        f"enabled={str(settings.enable_vision_image_generation).lower()}; "
+        f"provider={settings.ai_provider}; "
+        f"endpoint={safe_base_url(settings.ai_base_url)}/images; "
+        f"model={settings.image_generation_model}; key_source=AI_API_KEY; "
+        "diagnostic_generated_image=false",
+    )
     _check_pdf_renderer(report)
     _check_storage_capacity(report, settings)
     await _check_database(

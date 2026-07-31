@@ -4,7 +4,7 @@ import pytest
 from autotester.fakes import FakeBot, FakeCallbackQuery, FakeMessage, ScriptedTranscription
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
 
-from future_self.bot import FutureSelfBot
+from future_self.bot import EVENING_WORKED, FutureSelfBot
 from future_self.config import Settings
 from future_self.navigation import (
     ACTIONS,
@@ -94,6 +94,8 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
     names = [item.command for item in PUBLIC_COMMANDS]
     assert names == [
         "menu",
+        "today",
+        "evening",
         "inbox",
         "tasks",
         "collections",
@@ -352,3 +354,31 @@ async def test_start_after_onboarding_offers_main_menu_without_llm(db, fake_ai):
     assert result == ConversationHandler.END
     assert callback_from(message, "nav:root") == "nav:root"
     assert fake_ai.route_calls == []
+
+
+async def test_evening_reflection_starts_from_main_menu_button(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    ctx = context()
+    message = FakeMessage()
+    query = FakeCallbackQuery("nav:action:evening", message)
+
+    result = await bot.navigation_evening_entry(update_for(message, query=query), ctx)
+
+    assert result == EVENING_WORKED
+    assert ctx.user_data["evening"] == {}
+    assert any("Что сегодня получилось" in reply["text"] for reply in message.replies)
+    assert fake_ai.route_calls == []
+
+    blocked_context = context()
+    blocked_context.user_data["health_checkin"] = {"energy": 4}
+    blocked_message = FakeMessage()
+    blocked_query = FakeCallbackQuery("nav:action:evening", blocked_message)
+
+    blocked_result = await bot.navigation_evening_entry(
+        update_for(blocked_message, query=blocked_query), blocked_context
+    )
+
+    assert blocked_result is None
+    assert blocked_context.user_data["health_checkin"] == {"energy": 4}
+    assert "evening" not in blocked_context.user_data
+    assert callback_from(blocked_message, "nav:flow:continue:").startswith("nav:flow:continue:")

@@ -7,12 +7,23 @@ from .domain import next_notification_utc
 from .reminders import TaskReminderEngine
 
 SendCallback = Callable[[int, str], Awaitable[int | None]]
+VisionSendCallback = Callable[[int, str], Awaitable[None]]
 
 
 class Scheduler(Protocol):
     def schedule_user(self, telegram_id: int, timezone: str) -> None: ...
 
     def remove_user(self, telegram_id: int) -> None: ...
+
+
+class VisionCompanionSchedule(Protocol):
+    id: int
+    owner_id: int
+    telegram_user_id: int
+    timezone: str
+    morning_time: time
+    evening_time: time
+    extra_times: list[str]
 
 
 class JobQueueScheduler:
@@ -26,6 +37,7 @@ class JobQueueScheduler:
         evening_hour: int,
         weekly_weekday: int,
         weekly_enabled: bool = True,
+        vision_send: VisionSendCallback | None = None,
     ):
         self.job_queue = job_queue
         self.send = send
@@ -33,6 +45,7 @@ class JobQueueScheduler:
         self.evening_hour = evening_hour
         self.weekly_weekday = weekly_weekday
         self.weekly_enabled = weekly_enabled
+        self.vision_send = vision_send
 
     @staticmethod
     def next_run(timezone: str, hour: int, now: datetime | None = None) -> datetime:
@@ -140,3 +153,53 @@ class JobQueueScheduler:
         if get_jobs:
             for job in get_jobs(f"health:{user_id}:daily"):
                 job.schedule_removal()
+
+    def schedule_vision_companion(self, preference: VisionCompanionSchedule) -> None:
+        if self.vision_send is None:
+            return
+        preference_id = int(preference.id)
+        owner_id = int(preference.owner_id)
+        telegram_user_id = int(preference.telegram_user_id)
+        timezone = str(preference.timezone)
+        zone = ZoneInfo(timezone)
+        self.remove_vision_companion(owner_id)
+        get_jobs = getattr(self.job_queue, "get_jobs_by_name", None)
+        if get_jobs:
+            for suffix in ("morning", "evening"):
+                for job in get_jobs(f"user:{telegram_user_id}:{suffix}"):
+                    job.schedule_removal()
+        moments = [
+            ("morning", preference.morning_time),
+            ("evening", preference.evening_time),
+        ]
+        moments.extend(
+            (f"extra-{index}", time.fromisoformat(raw))
+            for index, raw in enumerate(preference.extra_times, start=1)
+        )
+        for moment, local_time in moments:
+            self.job_queue.run_daily(
+                self._vision_companion,
+                time=local_time.replace(tzinfo=zone),
+                data={"preference_id": preference_id, "moment": moment},
+                name=f"vision-companion:{owner_id}:{moment}",
+            )
+
+    async def _vision_companion(self, context: object) -> None:
+        if self.vision_send is None:
+            return
+        data = context.job.data
+        await self.vision_send(data["preference_id"], data["moment"])
+
+    def remove_vision_companion(self, owner_id: int) -> None:
+        get_jobs = getattr(self.job_queue, "jobs", None)
+        if get_jobs is not None:
+            prefix = f"vision-companion:{owner_id}:"
+            for job in tuple(get_jobs()):
+                if getattr(job, "name", "").startswith(prefix):
+                    job.schedule_removal()
+            return
+        by_name = getattr(self.job_queue, "get_jobs_by_name", None)
+        if by_name:
+            for suffix in ("morning", "evening", "extra-1", "extra-2", "extra-3"):
+                for job in by_name(f"vision-companion:{owner_id}:{suffix}"):
+                    job.schedule_removal()

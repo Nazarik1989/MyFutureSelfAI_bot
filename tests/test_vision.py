@@ -339,6 +339,69 @@ async def test_archive_is_listable_and_restorable_and_invalid_list_callback_is_s
     assert any(text and "устарело" in text for text, _show_alert in query.answers)
 
 
+async def test_vision_navigation_exposes_every_status_and_keeps_card_context(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    menu = FakeMessage("/vision")
+    await bot.vision_command(update_for(menu), None)
+
+    assert callback_from(menu, "vision:list:active:0") == "vision:list:active:0"
+    assert callback_from(menu, "vision:list:achieved:0") == "vision:list:achieved:0"
+    assert callback_from(menu, "vision:list:archived:0") == "vision:list:archived:0"
+    assert callback_from(menu, "nav:root") == "nav:root"
+
+    created = await create_item(bot, "Сохранить контекст карточки")
+    archived = await bot.vision_service.set_status(
+        created.item.owner_id, created.item.id, "archived"
+    )
+    listing = FakeMessage()
+    await bot._vision_send_page(listing, archived.owner_id, "archived", 0)
+    assert callback_from(listing, "vision:list:active:0") == "vision:list:active:0"
+    assert callback_from(listing, "vision:list:achieved:0") == "vision:list:achieved:0"
+    assert callback_from(listing, "vision:menu") == "vision:menu"
+
+    card = FakeMessage()
+    await bot._vision_send_item(card, archived)
+    assert callback_from(card, "vision:list:archived:0") == "vision:list:archived:0"
+    assert callback_from(card, "vision:menu") == "vision:menu"
+
+    edit_update, _ = callback_update(callback_from(card, "vision:edit:"), card)
+    await bot.vision_action(edit_update, None)
+    assert callback_from(card, f"vision:view:{archived.id}") == f"vision:view:{archived.id}"
+    assert callback_from(card, "vision:menu") == "vision:menu"
+
+
+async def test_archive_task_and_cancel_actions_return_to_a_clear_vision_context(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created = await create_item(bot, "Вернуться после действия", first_step="Сделать шаг")
+    card = FakeMessage()
+    await bot._vision_send_item(card, created.item)
+
+    archive_update, archive_query = callback_update(callback_from(card, "vision:archive:"), card)
+    await bot.vision_action(archive_update, None)
+    assert any("архивирована" in edit for edit in archive_query.edits)
+    assert callback_from(card, "vision:list:archived:0") == "vision:list:archived:0"
+    assert callback_from(card, "vision:menu") == "vision:menu"
+
+    restored = await bot.vision_service.set_status(created.item.owner_id, created.item.id, "active")
+    task_card = FakeMessage()
+    await bot._vision_send_item(task_card, restored)
+    task_update, task_query = callback_update(callback_from(task_card, "vision:task:"), task_card)
+    await bot.vision_action(task_update, None)
+    assert any("Задача создана" in edit for edit in task_query.edits)
+    assert callback_from(task_card, "vision:list:active:0") == "vision:list:active:0"
+
+    draft_message = await start_draft(bot, user_id=7301, chat_id=17301)
+    cancel_update, cancel_query = callback_update(
+        callback_from(draft_message, "vision:cancel:"),
+        draft_message,
+        user_id=7301,
+        chat_id=17301,
+    )
+    await bot.vision_action(cancel_update, None)
+    assert any("отменено" in edit for edit in cancel_query.edits)
+    assert callback_from(draft_message, "vision:add") == "vision:add"
+
+
 async def test_delete_requires_exact_persistent_confirmation_and_is_idempotent(db, fake_ai):
     first_bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     created = await create_item(first_bot, "Удалить только после подтверждения")
