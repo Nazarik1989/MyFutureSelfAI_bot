@@ -327,6 +327,8 @@ async def test_handler_renders_only_active_owner_items_and_downloads_documents(
 
     photos = [reply for reply in message.replies if reply.get("kind") == "photo"]
     assert len(photos) == 1
+    assert message.reply_text_calls == 1
+    assert message.deleted is True
     assert captured_dates == [date(2026, 7, 21)]
     assert "Активных желаний: 2" in photos[0]["text"]
     image = Image.open(BytesIO(photos[0]["data"]))

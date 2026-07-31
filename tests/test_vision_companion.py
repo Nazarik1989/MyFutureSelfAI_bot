@@ -227,3 +227,4 @@ async def test_card_offers_opt_in_and_frequency_without_starting_image_generatio
     assert preference is not None
     assert preference.enabled is True
     assert preference.extra_times == ["12:00", "16:00"]
+    assert message.reply_text_calls == 1
