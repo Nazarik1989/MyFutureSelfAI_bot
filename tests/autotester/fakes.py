@@ -114,9 +114,12 @@ class FakeMessage:
         self.reply_to_message = None
         self.replies: list[dict[str, Any]] = []
         self.edits: list[str] = []
+        self.reply_text_calls = 0
+        self.deleted = False
         self.message_id = next(self._ids)
 
     async def reply_text(self, text: str, **kwargs: Any) -> "FakeMessage":
+        self.reply_text_calls += 1
         self.replies.append({"text": text, **kwargs})
         return self
 
@@ -154,6 +157,9 @@ class FakeMessage:
 
     async def edit_text(self, text: str) -> None:
         self.edits.append(text)
+
+    async def delete(self) -> None:
+        self.deleted = True
 
 
 class FakeCallbackQuery:

@@ -102,13 +102,47 @@ class VisionHandlers:
         await self._vision_menu(update.effective_message)
 
     @staticmethod
-    async def _vision_menu(message: Any) -> None:
-        await message.reply_text(
+    async def _vision_edit_or_send(
+        query: Any | None,
+        message: Any,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None,
+    ) -> None:
+        """Reuse a callback message when Telegram permits it; otherwise retire its buttons."""
+        if query is not None:
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup)
+                return
+            except TelegramError as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+            except (TypeError, AttributeError):
+                pass
+            edit_caption = getattr(query, "edit_message_caption", None)
+            if edit_caption is not None and len(text) <= 1024:
+                try:
+                    await edit_caption(caption=text, reply_markup=reply_markup)
+                    return
+                except TelegramError as exc:
+                    if "message is not modified" in str(exc).lower():
+                        return
+                except (TypeError, AttributeError):
+                    pass
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except (TelegramError, TypeError, AttributeError):
+                pass
+        await message.reply_text(text, reply_markup=reply_markup)
+
+    async def _vision_menu(self, message: Any, *, query: Any | None = None) -> None:
+        await self._vision_edit_or_send(
+            query,
+            message,
             "Карта желаний\n\n"
             "Желание → зачем это важно → первый шаг → действие.\n\n"
             "Активные желания находятся в «Моей карте», завершённые — в «Достигнуто», "
             "отложенные — в «Архиве».",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")],
                     [
@@ -165,23 +199,29 @@ class VisionHandlers:
         rows.append([InlineKeyboardButton("Отменить", callback_data=f"vision:cancel:{draft.id}")])
         return InlineKeyboardMarkup(rows)
 
-    async def _vision_prompt(self, message: Any, draft: Any) -> None:
+    async def _vision_prompt(self, message: Any, draft: Any, *, query: Any | None = None) -> None:
         if draft.step == "category":
-            await message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                message,
                 "Выбери категорию желания:",
-                reply_markup=self._vision_category_keyboard(draft),
+                self._vision_category_keyboard(draft),
             )
             return
         if draft.step == "edit_value" and draft.edit_field == "category":
-            await message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                message,
                 "Выбери новую категорию:",
-                reply_markup=self._vision_category_keyboard(draft, edit=True),
+                self._vision_category_keyboard(draft, edit=True),
             )
             return
         if draft.step == "delete_confirm":
-            await message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                message,
                 "Удаление ожидает явного подтверждения.",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -223,9 +263,11 @@ class VisionHandlers:
             rows.append(
                 [InlineKeyboardButton("Отменить", callback_data=f"vision:cancel:{draft.id}")]
             )
-            await message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                message,
                 prompts[draft.step],
-                reply_markup=InlineKeyboardMarkup(rows),
+                InlineKeyboardMarkup(rows),
             )
             return
         if draft.step == "edit_value":
@@ -248,15 +290,19 @@ class VisionHandlers:
             rows.append(
                 [InlineKeyboardButton("Отменить", callback_data=f"vision:cancel:{draft.id}")]
             )
-            await message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                message,
                 f"Пришли {field_name} текстом или голосом.",
-                reply_markup=InlineKeyboardMarkup(rows),
+                InlineKeyboardMarkup(rows),
             )
             return
         if draft.step == "preview":
-            await message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                message,
                 self._vision_preview_text(draft),
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -383,15 +429,15 @@ class VisionHandlers:
                     "Незавершённая карточка уже открыта в другом личном чате."
                 )
                 return
-            await self._vision_prompt(query.message, draft)
+            await self._vision_prompt(query.message, draft, query=query)
             return
         if action == "menu" and len(parts) == 2:
             await query.answer()
-            await self._vision_menu(query.message)
+            await self._vision_menu(query.message, query=query)
             return
         if action == "refs" and len(parts) == 2:
             await query.answer()
-            await self._vision_reference_library(query.message, user.id)
+            await self._vision_reference_library(query.message, user.id, query=query)
             return
         if action == "refadd" and len(parts) == 2:
             await self._vision_reference_add(query, user.id, chat_id)
@@ -441,7 +487,7 @@ class VisionHandlers:
                 return
             await query.answer()
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await query.edit_message_text("Создаю карту желаний… Это займёт несколько секунд.")
             except TelegramError:
                 pass
             await self._vision_render_and_send(
@@ -450,6 +496,7 @@ class VisionHandlers:
                 None if selection == "all" else selection,
                 token=token,
                 as_document=False,
+                remove_source=True,
             )
             return
         if action == "renderdownload" and len(parts) == 3:
@@ -473,6 +520,7 @@ class VisionHandlers:
                 None if selection == "all" else selection,
                 token=token,
                 as_document=True,
+                remove_source=False,
             )
             return
         if action == "rendercancel" and len(parts) == 3:
@@ -578,7 +626,7 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await self._vision_send_page(query.message, user.id, parts[2], page)
+            await self._vision_send_page(query.message, user.id, parts[2], page, query=query)
             return
         if action == "cat" and len(parts) == 5:
             try:
@@ -598,7 +646,7 @@ class VisionHandlers:
                 return
             await query.answer()
             await query.edit_message_reply_markup(reply_markup=None)
-            await self._vision_prompt(query.message, outcome.draft)
+            await self._vision_prompt(query.message, outcome.draft, query=query)
             return
         if action == "editcat" and len(parts) == 4:
             try:
@@ -613,9 +661,9 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await query.edit_message_reply_markup(reply_markup=None)
-            await query.message.reply_text("Категория обновлена.")
-            await self._vision_send_item(query.message, outcome.item)
+            await self._vision_send_item(
+                query.message, outcome.item, query=query, include_image=False
+            )
             return
         if action == "skip" and len(parts) == 4:
             try:
@@ -628,12 +676,12 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await query.edit_message_reply_markup(reply_markup=None)
             if outcome.status == "edited":
-                await query.message.reply_text("Поле очищено.")
-                await self._vision_send_item(query.message, outcome.item)
+                await self._vision_send_item(
+                    query.message, outcome.item, query=query, include_image=False
+                )
             else:
-                await self._vision_prompt(query.message, outcome.draft)
+                await self._vision_prompt(query.message, outcome.draft, query=query)
             return
         if action == "confirm" and len(parts) == 4:
             try:
@@ -647,7 +695,9 @@ class VisionHandlers:
                 return
             await query.answer()
             await query.edit_message_text("Желание сохранено в твою карту.")
-            await self._vision_send_item(query.message, outcome.item)
+            await self._vision_send_item(
+                query.message, outcome.item, query=query, include_image=False
+            )
             return
         if action == "cancel" and len(parts) == 3:
             try:
@@ -666,9 +716,11 @@ class VisionHandlers:
             if editing_item_id is not None:
                 item = await self.vision_service.get_item(user.id, editing_item_id)
                 if item is not None:
-                    await self._vision_send_item(query.message, item)
+                    await self._vision_send_item(
+                        query.message, item, query=query, include_image=False
+                    )
                     return
-            await self._vision_menu(query.message)
+            await self._vision_menu(query.message, query=query)
             return
         if (
             action
@@ -732,7 +784,9 @@ class VisionHandlers:
             else:
                 await query.edit_message_text("Удаление отменено.")
             if outcome.status == "cancelled":
-                await self._vision_send_item(query.message, outcome.item)
+                await self._vision_send_item(
+                    query.message, outcome.item, query=query, include_image=False
+                )
             return
         if action == "status" and len(parts) == 4:
             try:
@@ -746,7 +800,7 @@ class VisionHandlers:
                 return
             await query.answer()
             await query.edit_message_text("Статус карточки обновлён.")
-            await self._vision_send_item(query.message, item)
+            await self._vision_send_item(query.message, item, query=query, include_image=False)
             return
         if action == "editfield" and len(parts) == 4:
             try:
@@ -762,7 +816,7 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await self._vision_prompt(query.message, outcome.draft)
+            await self._vision_prompt(query.message, outcome.draft, query=query)
             return
         await self._vision_stale(query)
 
@@ -771,8 +825,16 @@ class VisionHandlers:
         available = {category for category, count in counts.items() if count > 0}
         await query.answer()
         if not available:
-            await query.message.reply_text(
-                "Активных желаний пока нет. Сначала добавь желание через /vision."
+            await self._vision_edit_or_send(
+                query,
+                query.message,
+                "Активных желаний пока нет. Сначала добавь желание.",
+                InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")],
+                        [InlineKeyboardButton("← Меню карты", callback_data="vision:menu")],
+                    ]
+                ),
             )
             return
         token = await self.vision_render_sessions.issue(owner_id, chat_id, available)
@@ -803,9 +865,11 @@ class VisionHandlers:
                 )
             ]
         )
-        await query.message.reply_text(
+        await self._vision_edit_or_send(
+            query,
+            query.message,
             "Что визуализировать? В изображение попадут только активные желания.",
-            reply_markup=InlineKeyboardMarkup(rows),
+            InlineKeyboardMarkup(rows),
         )
 
     async def _vision_render_and_send(
@@ -816,6 +880,7 @@ class VisionHandlers:
         *,
         token: str,
         as_document: bool,
+        remove_source: bool = False,
     ) -> None:
         if not await self.vision_render_limiter.acquire(user.id):
             await message.reply_text(
@@ -884,8 +949,12 @@ class VisionHandlers:
                                         InlineKeyboardButton(
                                             "Скачать PNG",
                                             callback_data=f"vision:renderdownload:{token}",
-                                        )
-                                    ]
+                                        ),
+                                        InlineKeyboardButton(
+                                            "← Меню карты",
+                                            callback_data="vision:menu",
+                                        ),
+                                    ],
                                 ]
                             )
                         await message.reply_photo(
@@ -895,6 +964,13 @@ class VisionHandlers:
                         )
                 finally:
                     stream.close()
+            if remove_source:
+                delete = getattr(message, "delete", None)
+                if delete is not None:
+                    try:
+                        await delete()
+                    except (TelegramError, TypeError, AttributeError):
+                        pass
         except Exception as exc:  # Telegram and Pillow adapters fail closed here.
             logger.error("Vision render failed error_type=%s", type(exc).__name__)
             await message.reply_text(
@@ -923,13 +999,15 @@ class VisionHandlers:
             return
         if action == "view":
             await query.answer()
-            await self._vision_send_item(query.message, item)
+            await self._vision_send_item(query.message, item, query=query)
             return
         if action == "edit":
             await query.answer()
-            await query.message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                query.message,
                 "Что изменить?",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -1001,7 +1079,7 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await self._vision_prompt(query.message, outcome.draft)
+            await self._vision_prompt(query.message, outcome.draft, query=query)
             return
         if action == "task":
             result = await self.vision_service.create_task(owner_id, item.id)
@@ -1022,9 +1100,13 @@ class VisionHandlers:
             )
             refreshed = await self.vision_service.get_item(owner_id, item.id)
             if refreshed is not None:
-                await self._vision_send_item(query.message, refreshed)
+                await self._vision_send_item(
+                    query.message, refreshed, query=query, include_image=False
+                )
 
-    async def _vision_reference_library(self, message: Any, owner_id: int) -> None:
+    async def _vision_reference_library(
+        self, message: Any, owner_id: int, *, query: Any | None = None
+    ) -> None:
         references = await self.vision_reference_service.list(owner_id)
         lines = [
             "Мои референсы",
@@ -1052,7 +1134,12 @@ class VisionHandlers:
                 [InlineKeyboardButton("➕ Добавить референс", callback_data="vision:refadd")]
             )
         rows.append([InlineKeyboardButton("← К карте желаний", callback_data="vision:menu")])
-        await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+        await self._vision_edit_or_send(
+            query,
+            message,
+            "\n".join(lines),
+            InlineKeyboardMarkup(rows),
+        )
 
     async def _vision_reference_add(self, query: Any, owner_id: int, chat_id: int) -> None:
         if await self.vision_reference_service.count(owner_id) >= MAX_VISION_REFERENCES:
@@ -1079,9 +1166,11 @@ class VisionHandlers:
             for kind, label in REFERENCE_KINDS.items()
         ]
         rows.append([InlineKeyboardButton("Отмена", callback_data=f"vision:refcancel:{token}")])
-        await query.message.reply_text(
+        await self._vision_edit_or_send(
+            query,
+            query.message,
             "Что показывает этот референс? Тип поможет модели правильно его использовать.",
-            reply_markup=InlineKeyboardMarkup(rows),
+            InlineKeyboardMarkup(rows),
         )
 
     async def _vision_reference_kind(
@@ -1125,16 +1214,19 @@ class VisionHandlers:
             return
         await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
-        await self._vision_reference_upload_prompt(query.message, token)
+        await self._vision_reference_upload_prompt(query.message, token, query=query)
 
-    @staticmethod
-    async def _vision_reference_upload_prompt(message: Any, token: str) -> None:
-        await message.reply_text(
+    async def _vision_reference_upload_prompt(
+        self, message: Any, token: str, *, query: Any | None = None
+    ) -> None:
+        await self._vision_edit_or_send(
+            query,
+            message,
             "Теперь отправь одно фото или image-document в JPEG, PNG или WebP. "
             f"До {MAX_IMAGE_INPUT_BYTES // (1024 * 1024)} МБ и "
             f"{MAX_IMAGE_PIXELS // 1_000_000} Мп. Метаданные и оригинал не сохраняются: "
             "в библиотеку попадёт безопасная нормализованная копия.",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 [[InlineKeyboardButton("Отмена", callback_data=f"vision:refcancel:{token}")]]
             ),
         )
@@ -1222,6 +1314,10 @@ class VisionHandlers:
             await self._vision_stale(query)
             return
         await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
         stream = BytesIO(reference.image_bytes)
         stream.name = "vision-reference.jpg"
         try:
@@ -1284,10 +1380,15 @@ class VisionHandlers:
             )
             return
         await query.answer()
-        await query.message.reply_text(
-            f"Замена референса «{reference.name}». Старое фото останется до подтверждения нового."
+        await self._vision_edit_or_send(
+            query,
+            query.message,
+            f"Замена референса «{reference.name}». Старое фото останется до подтверждения нового.\n\n"
+            "Теперь отправь новое фото или image-document в JPEG, PNG или WebP.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data=f"vision:refcancel:{token}")]]
+            ),
         )
-        await self._vision_reference_upload_prompt(query.message, token)
 
     async def _vision_reference_rename(
         self, query: Any, owner_id: int, chat_id: int, reference_id: int
@@ -1314,9 +1415,11 @@ class VisionHandlers:
             )
             return
         await query.answer()
-        await query.message.reply_text(
+        await self._vision_edit_or_send(
+            query,
+            query.message,
             f"Текущее название: «{reference.name}». Напиши новое название (до 60 символов).",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 [[InlineKeyboardButton("Отмена", callback_data=f"vision:refcancel:{token}")]]
             ),
         )
@@ -1344,9 +1447,11 @@ class VisionHandlers:
             )
             return
         await query.answer()
-        await query.message.reply_text(
+        await self._vision_edit_or_send(
+            query,
+            query.message,
             f"Удалить референс «{reference.name}» навсегда? Карточки желаний останутся.",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 [
                     [
                         InlineKeyboardButton(
@@ -1436,7 +1541,7 @@ class VisionHandlers:
                     else "Референс сохранён и останется в приватной библиотеке."
                 )
             )
-            await self._vision_reference_library(query.message, owner_id)
+            await self._vision_reference_library(query.message, owner_id, query=query)
             return
         capability = await self.vision_reference_sessions.claim_delete(token, owner_id, chat_id)
         if (
@@ -1456,7 +1561,7 @@ class VisionHandlers:
             return
         await query.answer()
         await query.edit_message_text("Референс удалён из приватной библиотеки.")
-        await self._vision_reference_library(query.message, owner_id)
+        await self._vision_reference_library(query.message, owner_id, query=query)
 
     async def _vision_image_action(
         self,
@@ -1500,9 +1605,11 @@ class VisionHandlers:
                 )
                 return
             await query.answer()
-            await query.message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                query.message,
                 "Удалить личное фото из этой карточки? Карточка желания останется.",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -1532,11 +1639,13 @@ class VisionHandlers:
             )
             return
         await query.answer()
-        await query.message.reply_text(
+        await self._vision_edit_or_send(
+            query,
+            query.message,
             "Отправь одно фото или image-document в JPEG, PNG или WebP. "
             f"До {MAX_IMAGE_INPUT_BYTES // (1024 * 1024)} МБ и {MAX_IMAGE_PIXELS // 1_000_000} Мп. "
             "Оригинал и его metadata сохраняться не будут.",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 [
                     [
                         InlineKeyboardButton(
@@ -1611,7 +1720,9 @@ class VisionHandlers:
             )
         rows.append([InlineKeyboardButton("Отмена", callback_data=f"vision:imagecancel:{token}")])
         await query.answer()
-        await query.message.reply_text(
+        await self._vision_edit_or_send(
+            query,
+            query.message,
             "Перед отправкой через OpenRouter к модели OpenAI проверь запрос. В него входят "
             "только желание и категория; остальные поля карточки не передаются. Запрос "
             "станет платным только после нажатия кнопки генерации. Сейчас референсы не "
@@ -1620,7 +1731,7 @@ class VisionHandlers:
             f"Размер: {self.image_generation.size}\n"
             f"Качество: {self.image_generation.quality}\n\n"
             f"Точный запрос:\n{prompt}",
-            reply_markup=InlineKeyboardMarkup(rows),
+            InlineKeyboardMarkup(rows),
         )
 
     async def _vision_generation_references_begin(
@@ -1808,9 +1919,14 @@ class VisionHandlers:
             )
             if len(references) != len(capability.reference_ids):
                 await self.vision_image_sessions.cancel(token, owner_id, chat_id)
-                await query.message.reply_text(
+                await self._vision_edit_or_send(
+                    query,
+                    query.message,
                     "Один из выбранных референсов был удалён. Ничего не отправлено; "
-                    "открой генерацию заново."
+                    "открой генерацию заново.",
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("← Меню карты", callback_data="vision:menu")]]
+                    ),
                 )
                 return
             raw = await self.image_generation.generate(
@@ -1835,8 +1951,13 @@ class VisionHandlers:
                 normalized,
             )
             if not attached:
-                await query.message.reply_text(
-                    "Превью не удалось удержать во временной памяти. Запусти генерацию ещё раз."
+                await self._vision_edit_or_send(
+                    query,
+                    query.message,
+                    "Превью не удалось удержать во временной памяти. Запусти генерацию ещё раз.",
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("← Меню карты", callback_data="vision:menu")]]
+                    ),
                 )
                 return
             stream = BytesIO(normalized.image_bytes)
@@ -1869,21 +1990,38 @@ class VisionHandlers:
         except ImageGenerationError as exc:
             await self.vision_image_sessions.cancel(token, owner_id, chat_id)
             logger.error("Vision image generation failed error_code=%s", exc.code)
-            await query.message.reply_text(self._vision_image_generation_error(exc.code))
+            await self._vision_edit_or_send(
+                query,
+                query.message,
+                self._vision_image_generation_error(exc.code),
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Меню карты", callback_data="vision:menu")]]
+                ),
+            )
         except VisionImageError:
             await self.vision_image_sessions.cancel(token, owner_id, chat_id)
             logger.error("Vision image generation returned unsafe image")
-            await query.message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                query.message,
                 "Провайдер вернул изображение, которое не прошло безопасную обработку. "
-                "Ничего не сохранено; можно попробовать ещё раз."
+                "Ничего не сохранено; можно попробовать ещё раз.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Меню карты", callback_data="vision:menu")]]
+                ),
             )
         except TelegramError as exc:
             await self.vision_image_sessions.cancel(token, owner_id, chat_id)
             logger.error(
                 "Vision generated image transport failed error_type=%s", type(exc).__name__
             )
-            await query.message.reply_text(
-                "Изображение создано, но Telegram не принял превью. Ничего не сохранено."
+            await self._vision_edit_or_send(
+                query,
+                query.message,
+                "Изображение создано, но Telegram не принял превью. Ничего не сохранено.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Меню карты", callback_data="vision:menu")]]
+                ),
             )
 
     @staticmethod
@@ -1948,14 +2086,20 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await query.edit_message_text(
+            notice = (
                 "Фото уже было сохранено; дубль не создан."
                 if result.status == "existing"
                 else "Фото сохранено в карточке."
             )
             item = await self.vision_service.get_item(owner_id, capability.item_id)
             if item is not None:
-                await self._vision_send_item(query.message, item)
+                await self._vision_send_item(
+                    query.message,
+                    item,
+                    query=query,
+                    include_image=False,
+                    notice=f"{notice}\n\nЛичное фото этой карточки.",
+                )
             return
         capability = await self.vision_image_sessions.claim_delete(
             token,
@@ -1974,10 +2118,15 @@ class VisionHandlers:
             await self._vision_stale(query)
             return
         await query.answer()
-        await query.edit_message_text("Фото удалено. Карточка желания сохранена.")
         item = await self.vision_service.get_item(owner_id, capability.item_id)
         if item is not None:
-            await self._vision_send_item(query.message, item)
+            await self._vision_send_item(
+                query.message,
+                item,
+                query=query,
+                include_image=False,
+                notice="Фото удалено. Карточка желания сохранена.",
+            )
 
     async def _vision_image_input(self, update: Update, user: Any) -> None:
         message = update.effective_message
@@ -2087,7 +2236,15 @@ class VisionHandlers:
             mime_type=getattr(document, "mime_type", None),
         )
 
-    async def _vision_send_page(self, message: Any, owner_id: int, status: str, page: int) -> None:
+    async def _vision_send_page(
+        self,
+        message: Any,
+        owner_id: int,
+        status: str,
+        page: int,
+        *,
+        query: Any | None = None,
+    ) -> None:
         items, total = await self.vision_service.page(owner_id, status, page)
         counts = await self.vision_service.category_counts(owner_id, status)
         title = {
@@ -2102,9 +2259,11 @@ class VisionHandlers:
                     [InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")]
                 )
             rows.extend(self._vision_list_navigation(status))
-            await message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                message,
                 f"{title}: карточек пока нет.",
-                reply_markup=InlineKeyboardMarkup(rows),
+                InlineKeyboardMarkup(rows),
             )
             return
         lines = [f"{title} — {total}"]
@@ -2135,7 +2294,12 @@ class VisionHandlers:
         if navigation:
             rows.append(navigation)
         rows.extend(self._vision_list_navigation(status))
-        await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+        await self._vision_edit_or_send(
+            query,
+            message,
+            "\n".join(lines),
+            InlineKeyboardMarkup(rows),
+        )
 
     async def _vision_companion_settings(self, query: Any, user: Any, item_id: int) -> None:
         item = await self.vision_service.get_item(user.id, item_id)
@@ -2145,13 +2309,15 @@ class VisionHandlers:
         preference = await self.vision_companion_service.get(user.id)
         await query.answer()
         if preference is None or not preference.enabled:
-            await query.message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                query.message,
                 "Включить добровольное сопровождение этой карточки?\n\n"
                 f"Утром в {self.settings.morning_hour:02d}:00 бот спросит о шаге, "
                 f"вечером в {self.settings.evening_hour:02d}:00 — как прошёл день. "
                 "Дополнительные напоминания изначально выключены. Одновременно "
                 "сопровождается только одно желание, новую картинку бот не генерирует.",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -2166,10 +2332,12 @@ class VisionHandlers:
             )
             return
         if preference.vision_item_id != item_id:
-            await query.message.reply_text(
+            await self._vision_edit_or_send(
+                query,
+                query.message,
                 "Сейчас сопровождается другая карточка. Переключить фокус на это желание? "
                 "История прежних отметок сохранится.",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -2184,7 +2352,7 @@ class VisionHandlers:
                 ),
             )
             return
-        await self._vision_companion_send_controls(query.message, preference)
+        await self._vision_companion_send_controls(query.message, preference, query=query)
 
     async def _vision_companion_enable(
         self, query: Any, user: Any, chat_id: int, item_id: int
@@ -2204,8 +2372,7 @@ class VisionHandlers:
         if self.scheduler:
             self.scheduler.schedule_vision_companion(preference)
         await query.answer("Сопровождение включено")
-        await query.edit_message_reply_markup(reply_markup=None)
-        await self._vision_companion_send_controls(query.message, preference)
+        await self._vision_companion_send_controls(query.message, preference, query=query)
 
     async def _vision_companion_frequency(
         self, query: Any, owner_id: int, item_id: int, count: int
@@ -2220,8 +2387,7 @@ class VisionHandlers:
         if self.scheduler:
             self.scheduler.schedule_vision_companion(preference)
         await query.answer("Частота обновлена")
-        await query.edit_message_reply_markup(reply_markup=None)
-        await self._vision_companion_send_controls(query.message, preference)
+        await self._vision_companion_send_controls(query.message, preference, query=query)
 
     async def _vision_companion_disable(self, query: Any, user: Any, item_id: int) -> None:
         disabled = await self.vision_companion_service.disable(user.id, item_id)
@@ -2235,16 +2401,20 @@ class VisionHandlers:
             else "Сопровождение уже было отключено."
         )
 
-    async def _vision_companion_send_controls(self, message: Any, preference: Any) -> None:
+    async def _vision_companion_send_controls(
+        self, message: Any, preference: Any, *, query: Any | None = None
+    ) -> None:
         extras = ", ".join(preference.extra_times) if preference.extra_times else "выключены"
-        await message.reply_text(
+        await self._vision_edit_or_send(
+            query,
+            message,
             "Сопровождение включено.\n\n"
             f"Утренний вопрос: {preference.morning_time.strftime('%H:%M')}\n"
             f"Вечерний вопрос: {preference.evening_time.strftime('%H:%M')}\n"
             f"Дополнительные напоминания: {extras}\n"
             f"Часовой пояс: {preference.timezone}\n\n"
             "Выбери количество дополнительных мягких напоминаний между утром и вечером:",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 [
                     [
                         InlineKeyboardButton(
@@ -2365,7 +2535,15 @@ class VisionHandlers:
         await query.answer(replies[response], show_alert=True)
         await query.edit_message_reply_markup(reply_markup=None)
 
-    async def _vision_send_item(self, message: Any, item: Any) -> None:
+    async def _vision_send_item(
+        self,
+        message: Any,
+        item: Any,
+        *,
+        query: Any | None = None,
+        include_image: bool = True,
+        notice: str | None = None,
+    ) -> None:
         emoji, category = CATEGORY_META[item.category]
         status = {
             "active": "активно",
@@ -2373,7 +2551,7 @@ class VisionHandlers:
             "archived": "в архиве",
         }[item.status]
         image = await self.vision_image_service.get(item.owner_id, item.id)
-        if image is not None:
+        if image is not None and include_image:
             stream = BytesIO(image.image_bytes)
             stream.name = "vision-photo.jpg"
             try:
@@ -2420,14 +2598,21 @@ class VisionHandlers:
                 ]
             )
         image_rows.append([InlineKeyboardButton("🧩 Мои референсы", callback_data="vision:refs")])
-        await message.reply_text(
+        card_text = (
             f"{emoji} #{item.id} · {category} · {status}\n\n"
             f"Желание: {item.wish_text}\n"
             f"Почему важно: {item.why_text or 'не указано'}\n"
             f"Желаемая дата: "
             f"{item.target_date.strftime('%d.%m.%Y') if item.target_date else 'не указана'}\n"
-            f"Первый шаг: {item.first_step or 'не указан'}",
-            reply_markup=InlineKeyboardMarkup(
+            f"Первый шаг: {item.first_step or 'не указан'}"
+        )
+        if notice:
+            card_text = f"{notice}\n\n{card_text}"
+        await self._vision_edit_or_send(
+            query,
+            message,
+            card_text,
+            InlineKeyboardMarkup(
                 image_rows
                 + (
                     [

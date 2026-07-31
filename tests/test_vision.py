@@ -370,6 +370,23 @@ async def test_vision_navigation_exposes_every_status_and_keeps_card_context(db,
     assert callback_from(card, "vision:menu") == "vision:menu"
 
 
+async def test_vision_menu_navigation_reuses_one_bot_message(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage("/vision")
+    await bot.vision_command(update_for(message), None)
+
+    list_update, list_query = callback_update(
+        callback_from(message, "vision:list:active:0"), message
+    )
+    await bot.vision_action(list_update, None)
+    menu_update, menu_query = callback_update(callback_from(message, "vision:menu"), message)
+    await bot.vision_action(menu_update, None)
+
+    assert list_query.edits
+    assert menu_query.edits
+    assert message.reply_text_calls == 1
+
+
 async def test_archive_task_and_cancel_actions_return_to_a_clear_vision_context(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     created = await create_item(bot, "Вернуться после действия", first_step="Сделать шаг")
