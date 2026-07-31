@@ -66,6 +66,7 @@ from .health import (
     prolonged_weakness_message,
     urgent_safety_message,
 )
+from .image_generation import ImageGenerationService, create_image_generation_service
 from .inbox import InboxLifecycleService
 from .knowledge import KnowledgeQuotaPolicy, KnowledgeService
 from .knowledge_handlers import KnowledgeHandlers
@@ -92,8 +93,10 @@ from .task_handlers import TaskHandlers
 from .tasks import TaskService
 from .transcription import TranscriptionError, TranscriptionService
 from .vision import VisionService
+from .vision_companion import VisionCompanionService
 from .vision_handlers import VisionHandlers
 from .vision_images import VisionImageService, VisionImageSessionStore
+from .vision_references import VisionReferenceService, VisionReferenceSessionStore
 from .vision_renderer import (
     VisionBoardRenderer,
     VisionRenderLimiter,
@@ -175,11 +178,13 @@ class FutureSelfBot(
         db: Database,
         ai: AIService,
         transcription: TranscriptionService,
+        image_generation: ImageGenerationService | None = None,
     ):
         self.settings = settings
         self.db = db
         self.ai = ai
         self.transcription = transcription
+        self.image_generation = image_generation or create_image_generation_service(settings)
         self.draft_service = DraftInboxService(
             db,
             settings.inbox_draft_ttl_minutes,
@@ -247,8 +252,11 @@ class FutureSelfBot(
         self.health_service = HealthService(db)
         self.location_service = LocationService(db)
         self.vision_service = VisionService(db)
+        self.vision_companion_service = VisionCompanionService(db)
         self.vision_image_service = VisionImageService(db)
         self.vision_image_sessions = VisionImageSessionStore()
+        self.vision_reference_service = VisionReferenceService(db)
+        self.vision_reference_sessions = VisionReferenceSessionStore()
         self.lab_documents = LabDocumentService(db)
         self.lab_uploads = LabUploadSessionStore()
         self.vision_renderer = VisionBoardRenderer()
@@ -276,6 +284,7 @@ class FutureSelfBot(
             Application.builder()
             .token(self.settings.telegram_bot_token)
             .post_init(self._post_init)
+            .post_shutdown(self._post_shutdown)
             .build()
         )
         # This assistant handles profiles, health notes and reminders. Telegram
@@ -392,7 +401,13 @@ class FutureSelfBot(
                 allow_reentry=True,
             )
         evening = _conversation_handler(
-            entry_points=[CommandHandler("evening", self.evening_start)],
+            entry_points=[
+                CommandHandler("evening", self.evening_start),
+                CallbackQueryHandler(
+                    self.navigation_evening_entry,
+                    pattern=r"^nav:action:evening$",
+                ),
+            ],
             states={
                 EVENING_WORKED: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.evening_worked)
@@ -600,6 +615,9 @@ class FutureSelfBot(
         async def delete_stale_reminder(telegram_id: int, message_id: int) -> None:
             await app.bot.delete_message(chat_id=telegram_id, message_id=message_id)
 
+        async def send_vision_companion(preference_id: int, moment: str) -> None:
+            await self._vision_companion_notification(app.bot, preference_id, moment)
+
         if app.job_queue is None:
             logger.warning("JobQueue is unavailable; scheduled messages are disabled")
             return
@@ -616,6 +634,7 @@ class FutureSelfBot(
             self.settings.evening_hour,
             self.settings.weekly_review_weekday,
             self.settings.enable_weekly_review,
+            send_vision_companion,
         )
         if self.settings.enable_task_reminders:
             self.reminder_engine = TaskReminderEngine(
@@ -643,6 +662,12 @@ class FutureSelfBot(
                 timezone=preference.timezone,
                 local_time=preference.local_time,
             )
+        for preference in await self.vision_companion_service.enabled_preferences():
+            self.scheduler.schedule_vision_companion(preference)
+
+    async def _post_shutdown(self, app: Application) -> None:
+        del app
+        await self.image_generation.close()
 
     async def _user(self, telegram_id: int) -> User:
         async with self.db.session() as session:

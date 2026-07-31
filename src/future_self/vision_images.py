@@ -26,6 +26,7 @@ _safe_rgb = safe_images.safe_rgb
 IMAGE_UPLOAD_TTL_SECONDS = 10 * 60
 MAX_PENDING_IMAGE_SESSIONS = 32
 MAX_PENDING_IMAGE_BYTES = 16 * 1024 * 1024
+MAX_SELECTED_IMAGE_REFERENCES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,8 @@ class VisionImageCapability:
     mode: str
     expected_version: int | None
     image: NormalizedVisionImage | None = None
+    prompt: str | None = None
+    reference_ids: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)
@@ -64,6 +67,8 @@ class _VisionImageSession:
     expires_at: float
     stage: str
     image: NormalizedVisionImage | None = None
+    prompt: str | None = None
+    reference_ids: tuple[int, ...] = ()
 
 
 class VisionImageSessionStore:
@@ -119,6 +124,28 @@ class VisionImageSessionStore:
             stage="delete_confirm",
         )
 
+    async def issue_generation(
+        self,
+        owner_id: int,
+        chat_id: int,
+        item_id: int,
+        *,
+        mode: str,
+        expected_version: int | None,
+        prompt: str,
+    ) -> str | None:
+        if mode not in {"add", "replace"} or not prompt.strip():
+            return None
+        return await self._issue(
+            owner_id,
+            chat_id,
+            item_id,
+            mode=mode,
+            expected_version=expected_version,
+            stage="generation_confirm",
+            prompt=prompt,
+        )
+
     async def _issue(
         self,
         owner_id: int,
@@ -128,6 +155,7 @@ class VisionImageSessionStore:
         mode: str,
         expected_version: int | None,
         stage: str,
+        prompt: str | None = None,
     ) -> str | None:
         async with self._lock:
             self._prune()
@@ -146,6 +174,7 @@ class VisionImageSessionStore:
                 expected_version=expected_version,
                 expires_at=monotonic() + self.ttl_seconds,
                 stage=stage,
+                prompt=prompt,
             )
             return token
 
@@ -155,7 +184,7 @@ class VisionImageSessionStore:
             return any(
                 session.owner_id == owner_id
                 and session.chat_id == chat_id
-                and session.stage in {"awaiting_upload", "processing"}
+                and session.stage in {"awaiting_upload", "processing_upload"}
                 for session in self._sessions.values()
             )
 
@@ -188,15 +217,79 @@ class VisionImageSessionStore:
                     and session.chat_id == chat_id
                     and session.stage == "awaiting_upload"
                 ):
-                    session.stage = "processing"
+                    session.stage = "processing_upload"
                     return self._snapshot(token, session)
             return None
 
     async def retry_upload(self, token: str, owner_id: int, chat_id: int) -> None:
         async with self._lock:
             session = self._owned(token, owner_id, chat_id)
-            if session is not None and session.stage == "processing":
+            if session is not None and session.stage == "processing_upload":
                 session.stage = "awaiting_upload"
+
+    async def claim_generation(
+        self, token: str, owner_id: int, chat_id: int
+    ) -> VisionImageCapability | None:
+        async with self._lock:
+            session = self._owned(token, owner_id, chat_id)
+            if session is None or session.stage != "generation_confirm" or session.prompt is None:
+                return None
+            session.stage = "processing_generation"
+            return self._snapshot(token, session)
+
+    async def begin_reference_selection(
+        self, token: str, owner_id: int, chat_id: int
+    ) -> VisionImageCapability | None:
+        async with self._lock:
+            session = self._owned(token, owner_id, chat_id)
+            if session is None or session.stage != "generation_confirm":
+                return None
+            session.stage = "reference_select"
+            return self._snapshot(token, session)
+
+    async def toggle_reference(
+        self, token: str, owner_id: int, chat_id: int, reference_id: int
+    ) -> VisionImageCapability | None:
+        async with self._lock:
+            session = self._owned(token, owner_id, chat_id)
+            if session is None or session.stage != "reference_select":
+                return None
+            selected = list(session.reference_ids)
+            if reference_id in selected:
+                selected.remove(reference_id)
+            elif len(selected) >= MAX_SELECTED_IMAGE_REFERENCES:
+                return None
+            else:
+                selected.append(reference_id)
+            session.reference_ids = tuple(selected)
+            session.expires_at = monotonic() + self.ttl_seconds
+            return self._snapshot(token, session)
+
+    async def reference_selection(
+        self, token: str, owner_id: int, chat_id: int
+    ) -> VisionImageCapability | None:
+        async with self._lock:
+            session = self._owned(token, owner_id, chat_id)
+            if session is None or session.stage != "reference_select":
+                return None
+            return self._snapshot(token, session)
+
+    async def finish_reference_selection(
+        self,
+        token: str,
+        owner_id: int,
+        chat_id: int,
+        *,
+        prompt: str,
+    ) -> VisionImageCapability | None:
+        async with self._lock:
+            session = self._owned(token, owner_id, chat_id)
+            if session is None or session.stage != "reference_select" or not prompt.strip():
+                return None
+            session.prompt = prompt
+            session.stage = "generation_confirm"
+            session.expires_at = monotonic() + self.ttl_seconds
+            return self._snapshot(token, session)
 
     async def attach_preview(
         self,
@@ -207,7 +300,10 @@ class VisionImageSessionStore:
     ) -> bool:
         async with self._lock:
             session = self._owned(token, owner_id, chat_id)
-            if session is None or session.stage != "processing":
+            if session is None or session.stage not in {
+                "processing_upload",
+                "processing_generation",
+            }:
                 return False
             retained = sum(
                 len(value.image.image_bytes)
@@ -269,6 +365,8 @@ class VisionImageSessionStore:
             mode=session.mode,
             expected_version=session.expected_version,
             image=session.image,
+            prompt=session.prompt,
+            reference_ids=session.reference_ids,
         )
 
     def _prune(self) -> None:

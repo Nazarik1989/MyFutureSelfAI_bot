@@ -57,6 +57,15 @@ class User(TimestampMixin, Base):
     doctor_visit_preps: Mapped[list[DoctorVisitPrep]] = relationship(back_populates="user")
     vision_items: Mapped[list[VisionItem]] = relationship(back_populates="owner")
     vision_item_images: Mapped[list[VisionItemImage]] = relationship(back_populates="owner")
+    vision_references: Mapped[list[VisionReference]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan"
+    )
+    vision_companion_preference: Mapped[VisionCompanionPreference | None] = relationship(
+        back_populates="owner", uselist=False, cascade="all, delete-orphan"
+    )
+    vision_companion_checkins: Mapped[list[VisionCompanionCheckIn]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan"
+    )
     lab_documents: Mapped[list[LabDocument]] = relationship(back_populates="owner")
     task_states: Mapped[list[TaskState]] = relationship(
         back_populates="owner", overlaps="inbox_item,task_state"
@@ -263,6 +272,12 @@ class VisionItem(TimestampMixin, Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    companion_preference: Mapped[VisionCompanionPreference | None] = relationship(
+        back_populates="vision_item", uselist=False
+    )
+    companion_checkins: Mapped[list[VisionCompanionCheckIn]] = relationship(
+        back_populates="vision_item", cascade="all, delete-orphan"
+    )
 
 
 class VisionItemImage(TimestampMixin, Base):
@@ -289,6 +304,96 @@ class VisionItemImage(TimestampMixin, Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     vision_item: Mapped[VisionItem] = relationship(back_populates="image")
     owner: Mapped[User] = relationship(back_populates="vision_item_images")
+
+
+class VisionReference(TimestampMixin, Base):
+    __tablename__ = "vision_references"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "sha256", name="uq_vision_reference_owner_sha256"),
+        CheckConstraint(
+            "kind IN ('self', 'person', 'place', 'object', 'style')",
+            name="ck_vision_reference_kind",
+        ),
+        CheckConstraint(
+            "length(name) BETWEEN 1 AND 60",
+            name="ck_vision_reference_name_length",
+        ),
+        CheckConstraint("width > 0 AND height > 0", name="ck_vision_reference_dimensions"),
+        CheckConstraint("version > 0", name="ck_vision_reference_version"),
+        CheckConstraint(
+            "mime_type IN ('image/jpeg', 'image/png', 'image/webp')",
+            name="ck_vision_reference_mime_type",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    name: Mapped[str] = mapped_column(String(60))
+    image_bytes: Mapped[bytes] = mapped_column(LargeBinary)
+    mime_type: Mapped[str] = mapped_column(String(40))
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    owner: Mapped[User] = relationship(back_populates="vision_references")
+
+
+class VisionCompanionPreference(TimestampMixin, Base):
+    __tablename__ = "vision_companion_preferences"
+    __table_args__ = (
+        CheckConstraint("extra_per_day BETWEEN 0 AND 3", name="ck_vision_companion_extra_count"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    vision_item_id: Mapped[int] = mapped_column(
+        ForeignKey("vision_items.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    timezone: Mapped[str] = mapped_column(String(64))
+    morning_time: Mapped[time] = mapped_column(Time)
+    evening_time: Mapped[time] = mapped_column(Time)
+    extra_per_day: Mapped[int] = mapped_column(Integer, default=0)
+    extra_times: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    owner: Mapped[User] = relationship(back_populates="vision_companion_preference")
+    vision_item: Mapped[VisionItem] = relationship(back_populates="companion_preference")
+
+
+class VisionCompanionCheckIn(TimestampMixin, Base):
+    __tablename__ = "vision_companion_checkins"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id",
+            "vision_item_id",
+            "local_date",
+            "moment",
+            name="uq_vision_companion_checkin_day",
+        ),
+        CheckConstraint(
+            "moment IN ('morning', 'evening', 'extra')",
+            name="ck_vision_companion_checkin_moment",
+        ),
+        CheckConstraint(
+            "response IN ('committed', 'pause', 'done', 'partial', 'missed', 'later')",
+            name="ck_vision_companion_checkin_response",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    vision_item_id: Mapped[int] = mapped_column(
+        ForeignKey("vision_items.id", ondelete="CASCADE"), index=True
+    )
+    local_date: Mapped[date] = mapped_column(Date, index=True)
+    moment: Mapped[str] = mapped_column(String(16))
+    response: Mapped[str] = mapped_column(String(16))
+    owner: Mapped[User] = relationship(back_populates="vision_companion_checkins")
+    vision_item: Mapped[VisionItem] = relationship(back_populates="companion_checkins")
 
 
 class LabDocument(TimestampMixin, Base):

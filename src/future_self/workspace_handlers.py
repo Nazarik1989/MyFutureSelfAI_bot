@@ -825,6 +825,7 @@ class WorkspaceHandlers:
         await self.collection_service.clear_context(actor_id, chat_id)
         await self.lab_uploads.cancel_active(actor_id, chat_id)
         await self.vision_image_sessions.cancel_active(actor_id, chat_id)
+        await self.vision_reference_sessions.cancel_active(actor_id, chat_id)
         await self.vision_service.cancel(actor_id, chat_id)
 
     async def _send_workspace_hub(
@@ -2404,6 +2405,7 @@ class WorkspaceHandlers:
         await self.collection_service.clear_context(actor_id, chat_id)
         await self.lab_uploads.cancel_active(actor_id, chat_id)
         await self.vision_image_sessions.cancel_active(actor_id, chat_id)
+        await self.vision_reference_sessions.cancel_active(actor_id, chat_id)
         await self.vision_service.cancel(actor_id, chat_id)
         await self.workspace_service.begin_input(
             actor_id,

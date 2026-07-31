@@ -1468,7 +1468,9 @@ class KnowledgeHandlers:
             return "labs"
         if self._owned_document_edit(context, user.id, chat_id):
             return "labs"
-        if await self.vision_image_sessions.has_active(user.id, chat_id):
+        if await self.vision_image_sessions.has_active(
+            user.id, chat_id
+        ) or await self.vision_reference_sessions.has_active(user.id, chat_id):
             return "vision_image"
         if await self.vision_service.draft(user.id, chat_id) is not None:
             return "vision"

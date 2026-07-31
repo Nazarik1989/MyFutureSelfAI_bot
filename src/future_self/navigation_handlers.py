@@ -14,7 +14,7 @@ FLOW_LABELS = {
     "health": "health check-in",
     "doctor": "подготовка к приёму",
     "vision": "создание карточки желания",
-    "vision_image": "добавление личного фото",
+    "vision_image": "работа с изображением или личным референсом",
     "labs": "загрузка результатов анализов",
     "workspace": "операция с совместным пространством",
     "knowledge_capture": "добавление материала в базу знаний",
@@ -167,6 +167,7 @@ class NavigationHandlers:
             action_key = data.removeprefix("nav:action:")
             action = actions.get(action_key)
             if action is None or action.handler in {
+                "evening_start",
                 "health_checkin_start",
                 "doctor_prepare_start",
                 "start",
@@ -214,6 +215,17 @@ class NavigationHandlers:
             return None
         await update.callback_query.answer()
         return await self.health_checkin_start(update, context)
+
+    async def navigation_evening_entry(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int | None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None:
+            await update.callback_query.answer()
+            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            return None
+        await update.callback_query.answer()
+        return await self.evening_start(update, context)
 
     async def navigation_doctor_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -344,7 +356,9 @@ class NavigationHandlers:
             return "labs"
         if "onboarding_user_id" in context.user_data and not user.onboarding_completed:
             return "onboarding"
-        if await self.vision_image_sessions.has_active(user.id, update.effective_chat.id):
+        if await self.vision_image_sessions.has_active(
+            user.id, update.effective_chat.id
+        ) or await self.vision_reference_sessions.has_active(user.id, update.effective_chat.id):
             return "vision_image"
         if await self.vision_service.draft(user.id, update.effective_chat.id) is not None:
             return "vision"
@@ -391,6 +405,9 @@ class NavigationHandlers:
                 context.user_data.pop("lab_document_edit", None)
             elif flow == "vision_image":
                 await self.vision_image_sessions.cancel_active(user.id, update.effective_chat.id)
+                await self.vision_reference_sessions.cancel_active(
+                    user.id, update.effective_chat.id
+                )
             elif flow == "vision":
                 await self.vision_service.cancel(user.id, update.effective_chat.id)
             elif flow == "knowledge_capture":
@@ -516,6 +533,7 @@ class NavigationHandlers:
         )
         labels = {
             "quick": "🚀 Быстрый старт",
+            "day": "🌱 Мой день",
             "features": "🧭 Что умеет бот",
             "voice": "🎙 Голосом",
             "drafts": "📝 Inbox и черновики",

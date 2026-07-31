@@ -32,6 +32,8 @@ class NavigationSection:
 
 PUBLIC_COMMANDS = (
     CommandSpec("menu", "Главное меню"),
+    CommandSpec("today", "Фокус на сегодня"),
+    CommandSpec("evening", "Вечерняя рефлексия"),
     CommandSpec("inbox", "Сохранённые идеи и заметки"),
     CommandSpec("tasks", "Задачи и напоминания"),
     CommandSpec("collections", "Мои разделы"),
@@ -62,8 +64,6 @@ ADVANCED_COMMANDS = frozenset(
         "drafts",
         "last_saved",
         "cleanup_drafts",
-        "today",
-        "evening",
         "health_edit",
         "health_delete",
         "health_reminder_on",
@@ -86,6 +86,18 @@ KNOWLEDGE_ADVANCED_COMMANDS = frozenset({"capture"})
 ACTIONS = {
     action.key: action
     for action in (
+        NavigationAction(
+            "today",
+            "Фокус на сегодня",
+            "Короткий персональный план: один фокус, до трёх действий и минимальный шаг.",
+            "today",
+        ),
+        NavigationAction(
+            "evening",
+            "Вечерняя рефлексия",
+            "Пять спокойных вопросов о дне без оценок и давления.",
+            "evening_start",
+        ),
         NavigationAction("inbox", "Мои записи", "Последние сохранённые идеи и заметки.", "inbox"),
         NavigationAction(
             "drafts", "Черновики", "Preview-карточки до сохранения.", "drafts_command"
@@ -199,6 +211,13 @@ SECTIONS = {
     section.key: section
     for section in (
         NavigationSection(
+            "day",
+            "🌱",
+            "Мой день",
+            "Свяжи образ будущего с небольшим действием сегодня и спокойно подведи итог вечером.",
+            ("today", "evening"),
+        ),
+        NavigationSection(
             "ideas",
             "📝",
             "Идеи и заметки",
@@ -292,6 +311,13 @@ HELP_TOPICS = {
         "3. Нажми «Сохранить», «Редактировать» или «Не сохранять».\n"
         "4. Записи ищи в /inbox, задачи и сроки — в /tasks.\n\n"
         "Команды помнить не нужно: /menu открывает все разделы.",
+    ),
+    "day": (
+        "🌱 Мой день",
+        "/today собирает персональный фокус из подтверждённых целей, рутин и задач: один "
+        "главный ориентир, до трёх небольших действий и минимальный план на сложный день. "
+        "/evening запускает короткую рефлексию из пяти вопросов и сохраняет её для будущего "
+        "планирования. Оба сценария доступны кнопками в разделе «Мой день».",
     ),
     "features": (
         "🧭 Что умеет бот",
