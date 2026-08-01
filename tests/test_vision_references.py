@@ -5,9 +5,14 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from autotester.fakes import FakeCallbackQuery, FakeImageMedia, FakeMessage, ScriptedTranscription
+from autotester.fakes import (
+    FakeCallbackQuery,
+    FakeImageMedia,
+    FakeMediaCallbackQuery,
+    FakeMessage,
+    ScriptedTranscription,
+)
 from PIL import Image
-from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop
 
 from future_self.bot import FutureSelfBot
@@ -67,25 +72,8 @@ def callback_update(data: str, message: FakeMessage, *, user_id: int, chat_id: i
     )
 
 
-class MediaCallbackQuery(FakeCallbackQuery):
-    """Telegram rejects editMessageText for a photo and requires editMessageCaption."""
-
-    def __init__(self, data: str, message: FakeMessage):
-        super().__init__(data, message)
-        self.text_attempts = 0
-        self.caption_edits: list[str] = []
-
-    async def edit_message_text(self, text: str, **kwargs) -> None:
-        self.text_attempts += 1
-        raise BadRequest("There is no text in the message to edit")
-
-    async def edit_message_caption(self, caption: str, **kwargs) -> None:
-        self.caption_edits.append(caption)
-        self.message.replies.append({"text": caption, **kwargs})
-
-
 def media_callback_update(data: str, message: FakeMessage, *, user_id: int, chat_id: int):
-    query = MediaCallbackQuery(data, message)
+    query = FakeMediaCallbackQuery(data, message)
     update = SimpleNamespace(
         effective_message=message,
         callback_query=query,
@@ -244,15 +232,15 @@ async def test_telegram_library_selects_saved_reference_only_after_explicit_choi
     )
     kind_callback = callback_from(library, "vision:refkind:")
     kind_token = kind_callback.split(":")[2]
-    await bot.vision_action(
-        callback_update(
-            f"vision:refkind:{kind_token}:self",
-            library,
-            user_id=telegram_id,
-            chat_id=chat_id,
-        ),
-        None,
+    kind_update, kind_query = media_callback_update(
+        f"vision:refkind:{kind_token}:self",
+        library,
+        user_id=telegram_id,
+        chat_id=chat_id,
     )
+    await bot.vision_action(kind_update, None)
+    assert kind_query.text_attempts == 1
+    assert any("Тип: Я / моя внешность" in text for text in kind_query.caption_edits)
     name = FakeMessage("Я в будущем")
     with pytest.raises(ApplicationHandlerStop):
         await bot.vision_text_gate(update_for(name, user_id=telegram_id, chat_id=chat_id), None)
@@ -277,53 +265,45 @@ async def test_telegram_library_selects_saved_reference_only_after_explicit_choi
 
     card = FakeMessage()
     await bot._vision_send_item(card, item)
-    await bot.vision_action(
-        callback_update(
-            callback_from(card, "vision:imagegenerateask:"),
-            card,
-            user_id=telegram_id,
-            chat_id=chat_id,
-        ),
-        None,
+    ask_update, _ask_query = media_callback_update(
+        callback_from(card, "vision:imagegenerateask:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
     )
+    await bot.vision_action(ask_update, None)
     assert generator.calls == []
-    await bot.vision_action(
-        callback_update(
-            callback_from(card, "vision:genrefs:"),
-            card,
-            user_id=telegram_id,
-            chat_id=chat_id,
-        ),
-        None,
+    refs_update, _refs_query = media_callback_update(
+        callback_from(card, "vision:genrefs:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
     )
-    await bot.vision_action(
-        callback_update(
-            callback_from(card, "vision:genreftoggle:"),
-            card,
-            user_id=telegram_id,
-            chat_id=chat_id,
-        ),
-        None,
+    await bot.vision_action(refs_update, None)
+    toggle_update, _toggle_query = media_callback_update(
+        callback_from(card, "vision:genreftoggle:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
     )
-    await bot.vision_action(
-        callback_update(
-            callback_from(card, "vision:genrefdone:"),
-            card,
-            user_id=telegram_id,
-            chat_id=chat_id,
-        ),
-        None,
+    await bot.vision_action(toggle_update, None)
+    done_update, _done_query = media_callback_update(
+        callback_from(card, "vision:genrefdone:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
     )
+    await bot.vision_action(done_update, None)
     assert generator.calls == []
-    await bot.vision_action(
-        callback_update(
-            callback_from(card, "vision:imagegenerate:"),
-            card,
-            user_id=telegram_id,
-            chat_id=chat_id,
-        ),
-        None,
+    generate_update, generate_query = media_callback_update(
+        callback_from(card, "vision:imagegenerate:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
     )
+    await bot.vision_action(generate_update, None)
+    assert generate_query.text_attempts == 1
+    assert any("Создаю изображение" in text for text in generate_query.caption_edits)
     assert len(generator.calls) == 1
     prompt, sent_references = generator.calls[0]
     assert "Изображение 1" in prompt

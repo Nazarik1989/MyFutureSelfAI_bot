@@ -1,6 +1,8 @@
 from itertools import count
 from typing import Any
 
+from telegram.error import BadRequest
+
 from future_self.schemas import AssistantAnswer, IntentResult
 
 
@@ -180,6 +182,23 @@ class FakeCallbackQuery:
 
     async def edit_message_reply_markup(self, reply_markup: object = None) -> None:
         self.markup_removed += 1
+
+
+class FakeMediaCallbackQuery(FakeCallbackQuery):
+    """Model Telegram's edit rules for callback buttons attached to photos."""
+
+    def __init__(self, data: str, message: FakeMessage):
+        super().__init__(data, message)
+        self.text_attempts = 0
+        self.caption_edits: list[str] = []
+
+    async def edit_message_text(self, text: str, **kwargs: Any) -> None:
+        self.text_attempts += 1
+        raise BadRequest("There is no text in the message to edit")
+
+    async def edit_message_caption(self, caption: str, **kwargs: Any) -> None:
+        self.caption_edits.append(caption)
+        self.message.replies.append({"text": caption, **kwargs})
 
 
 class FakeBot:
