@@ -307,6 +307,13 @@ async def test_handler_renders_only_active_owner_items_and_downloads_documents(
 
     message = FakeMessage("/vision")
     await bot.vision_command(command_update(message, user_id=8101, chat_id=18101), None)
+    list_update, _ = callback_update(
+        callback_from(message, "vision:list:active:0"),
+        message,
+        user_id=8101,
+        chat_id=18101,
+    )
+    await bot.vision_action(list_update, None)
     render_update, _ = callback_update(
         callback_from(message, "vision:render"),
         message,
@@ -364,7 +371,7 @@ async def test_empty_category_forged_owner_and_restart_callbacks_fail_closed(db,
     empty = FakeMessage("/vision")
     await bot.vision_command(command_update(empty, user_id=8202, chat_id=18202), None)
     empty_update, _ = callback_update(
-        callback_from(empty, "vision:render"),
+        "vision:render",
         empty,
         user_id=8202,
         chat_id=18202,
@@ -375,6 +382,13 @@ async def test_empty_category_forged_owner_and_restart_callbacks_fail_closed(db,
     await add_item(db, owner.id, "Владелец видит свою карточку")
     message = FakeMessage("/vision")
     await bot.vision_command(command_update(message, user_id=8201, chat_id=18201), None)
+    list_update, _ = callback_update(
+        callback_from(message, "vision:list:active:0"),
+        message,
+        user_id=8201,
+        chat_id=18201,
+    )
+    await bot.vision_action(list_update, None)
     render_update, _ = callback_update(
         callback_from(message, "vision:render"),
         message,
@@ -429,7 +443,7 @@ async def test_renderer_failure_and_stream_failure_are_safe_and_leave_no_temp_fi
             token="safe-token",
             as_document=False,
         )
-    assert "Не удалось создать визуализацию" in message.replies[-1]["text"]
+    assert "Не удалось собрать PNG-карту" in message.replies[-1]["text"]
     assert "private/internal" not in caplog.text
     assert "private wish" not in caplog.text
     assert "Секретное желание" not in caplog.text
@@ -456,4 +470,4 @@ async def test_renderer_failure_and_stream_failure_are_safe_and_leave_no_temp_fi
         as_document=False,
     )
     assert failing_message.captured_stream.closed is True
-    assert "Не удалось создать визуализацию" in failing_message.replies[-1]["text"]
+    assert "Не удалось собрать PNG-карту" in failing_message.replies[-1]["text"]

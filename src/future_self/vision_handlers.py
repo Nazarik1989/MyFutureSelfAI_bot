@@ -156,30 +156,32 @@ class VisionHandlers:
         )
         if notice:
             menu_text = f"{notice}\n\n{menu_text}"
+        rows = [[InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")]]
+        if self.image_generation.enabled:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✨ Создать AI-визуализацию",
+                        callback_data="vision:imagepick:0",
+                    )
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton("🗺 Моя карта", callback_data="vision:list:active:0"),
+                    InlineKeyboardButton("✅ Достигнуто", callback_data="vision:list:achieved:0"),
+                ],
+                [InlineKeyboardButton("📦 Архив", callback_data="vision:list:archived:0")],
+                [InlineKeyboardButton("🧩 Мои референсы", callback_data="vision:refs")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
+            ]
+        )
         await self._vision_edit_or_send(
             query,
             message,
             menu_text,
-            InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")],
-                    [
-                        InlineKeyboardButton(
-                            "🖼 Создать визуализацию",
-                            callback_data="vision:render",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton("🗺 Моя карта", callback_data="vision:list:active:0"),
-                        InlineKeyboardButton(
-                            "✅ Достигнуто", callback_data="vision:list:achieved:0"
-                        ),
-                    ],
-                    [InlineKeyboardButton("📦 Архив", callback_data="vision:list:archived:0")],
-                    [InlineKeyboardButton("🧩 Мои референсы", callback_data="vision:refs")],
-                    [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
-                ]
-            ),
+            InlineKeyboardMarkup(rows),
         )
 
     @staticmethod
@@ -492,6 +494,26 @@ class VisionHandlers:
         if action == "render" and len(parts) == 2:
             await self._vision_render_menu(query, user.id, chat_id)
             return
+        if action == "imagepick" and len(parts) == 3:
+            try:
+                page = max(0, int(parts[2]))
+            except ValueError:
+                await self._vision_stale(query)
+                return
+            await self._vision_image_picker(query, user.id, page)
+            return
+        if action == "imagepickitem" and len(parts) == 3:
+            try:
+                item_id = int(parts[2])
+            except ValueError:
+                await self._vision_stale(query)
+                return
+            item = await self.vision_service.get_item(user.id, item_id)
+            if item is None or item.status != "active":
+                await self._vision_stale(query)
+                return
+            await self._vision_image_generation_ask(query, user.id, chat_id, item_id)
+            return
         if action == "renderpick" and len(parts) == 4:
             token, category = parts[2], parts[3]
             selection = await self.vision_render_sessions.claim_selection(
@@ -508,7 +530,7 @@ class VisionHandlers:
                 await self._vision_edit_or_send(
                     query,
                     query.message,
-                    "Создаю карту желаний… Это займёт несколько секунд.",
+                    "Собираю PNG-карту желаний… Это займёт несколько секунд.",
                     None,
                 )
             except TelegramError:
@@ -551,7 +573,7 @@ class VisionHandlers:
                 await self._vision_render_stale(query)
                 return
             await query.answer()
-            await self._vision_edit_or_send(query, query.message, "Визуализация отменена.", None)
+            await self._vision_edit_or_send(query, query.message, "Экспорт PNG отменён.", None)
             return
         if action in {"imageadd", "imagereplace", "imagedeleteask"} and len(parts) == 3:
             try:
@@ -915,7 +937,67 @@ class VisionHandlers:
         await self._vision_edit_or_send(
             query,
             query.message,
-            "Что визуализировать? В изображение попадут только активные желания.",
+            "Что добавить в PNG-карту? В неё попадут только активные желания.",
+            InlineKeyboardMarkup(rows),
+        )
+
+    async def _vision_image_picker(self, query: Any, owner_id: int, page: int) -> None:
+        if not self.image_generation.enabled:
+            await query.answer(
+                "AI-генерация пока не подключена администратором.",
+                show_alert=True,
+            )
+            return
+        items, total = await self.vision_service.page(owner_id, "active", page)
+        await query.answer()
+        if not items:
+            await self._vision_edit_or_send(
+                query,
+                query.message,
+                "Активных желаний пока нет. Сначала добавь желание — оно станет основой визуализации.",
+                InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")],
+                        [InlineKeyboardButton("← Меню карты", callback_data="vision:menu")],
+                    ]
+                ),
+            )
+            return
+
+        lines = [
+            "Выбери желание для AI-визуализации.",
+            "После выбора можно отметить сохранённые референсы и проверить точный запрос до платной генерации.",
+        ]
+        rows: list[list[InlineKeyboardButton]] = []
+        for item in items:
+            emoji, category = CATEGORY_META[item.category]
+            lines.append(f"\n{emoji} #{item.id} · {category}\n{item.wish_text[:120]}")
+            button_text = f"{emoji} #{item.id} · {item.wish_text}"[:60]
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        button_text,
+                        callback_data=f"vision:imagepickitem:{item.id}",
+                    )
+                ]
+            )
+
+        navigation: list[InlineKeyboardButton] = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton("←", callback_data=f"vision:imagepick:{page - 1}")
+            )
+        if (page + 1) * PAGE_SIZE < total:
+            navigation.append(
+                InlineKeyboardButton("→", callback_data=f"vision:imagepick:{page + 1}")
+            )
+        if navigation:
+            rows.append(navigation)
+        rows.append([InlineKeyboardButton("← Меню карты", callback_data="vision:menu")])
+        await self._vision_edit_or_send(
+            query,
+            query.message,
+            "\n".join(lines),
             InlineKeyboardMarkup(rows),
         )
 
@@ -1021,7 +1103,7 @@ class VisionHandlers:
         except Exception as exc:  # Telegram and Pillow adapters fail closed here.
             logger.error("Vision render failed error_type=%s", type(exc).__name__)
             await message.reply_text(
-                "Не удалось создать визуализацию. Попробуй ещё раз немного позже."
+                "Не удалось собрать PNG-карту. Попробуй ещё раз немного позже."
             )
         finally:
             await self.vision_render_limiter.release(user.id)
@@ -1029,7 +1111,7 @@ class VisionHandlers:
     @staticmethod
     async def _vision_render_stale(query: Any) -> None:
         await query.answer(
-            "Запрос визуализации недоступен или устарел. Открой /vision ещё раз.",
+            "Запрос PNG-карты недоступен или устарел. Открой /vision ещё раз.",
             show_alert=True,
         )
         try:
@@ -2387,6 +2469,15 @@ class VisionHandlers:
             )
         if navigation:
             rows.append(navigation)
+        if status == "active":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🗺 Скачать карту желаний в PNG",
+                        callback_data="vision:render",
+                    )
+                ]
+            )
         rows.extend(self._vision_list_navigation(status))
         await self._vision_edit_or_send(
             query,
