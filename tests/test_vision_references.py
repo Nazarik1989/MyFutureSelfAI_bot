@@ -7,6 +7,7 @@ import httpx
 import pytest
 from autotester.fakes import FakeCallbackQuery, FakeImageMedia, FakeMessage, ScriptedTranscription
 from PIL import Image
+from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop
 
 from future_self.bot import FutureSelfBot
@@ -64,6 +65,34 @@ def callback_update(data: str, message: FakeMessage, *, user_id: int, chat_id: i
         effective_user=SimpleNamespace(id=user_id),
         effective_chat=SimpleNamespace(id=chat_id, type="private"),
     )
+
+
+class MediaCallbackQuery(FakeCallbackQuery):
+    """Telegram rejects editMessageText for a photo and requires editMessageCaption."""
+
+    def __init__(self, data: str, message: FakeMessage):
+        super().__init__(data, message)
+        self.text_attempts = 0
+        self.caption_edits: list[str] = []
+
+    async def edit_message_text(self, text: str, **kwargs) -> None:
+        self.text_attempts += 1
+        raise BadRequest("There is no text in the message to edit")
+
+    async def edit_message_caption(self, caption: str, **kwargs) -> None:
+        self.caption_edits.append(caption)
+        self.message.replies.append({"text": caption, **kwargs})
+
+
+def media_callback_update(data: str, message: FakeMessage, *, user_id: int, chat_id: int):
+    query = MediaCallbackQuery(data, message)
+    update = SimpleNamespace(
+        effective_message=message,
+        callback_query=query,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=chat_id, type="private"),
+    )
+    return update, query
 
 
 class FakeGeneration:
@@ -232,18 +261,19 @@ async def test_telegram_library_selects_saved_reference_only_after_explicit_choi
     )
     with pytest.raises(ApplicationHandlerStop):
         await bot.vision_image_gate(update_for(upload, user_id=telegram_id, chat_id=chat_id), None)
-    await bot.vision_action(
-        callback_update(
-            callback_from(upload, "vision:refconfirm:"),
-            upload,
-            user_id=telegram_id,
-            chat_id=chat_id,
-        ),
-        None,
+    confirm_update, confirm_query = media_callback_update(
+        callback_from(upload, "vision:refconfirm:"),
+        upload,
+        user_id=telegram_id,
+        chat_id=chat_id,
     )
+    await bot.vision_action(confirm_update, None)
     references = await bot.vision_reference_service.list(owner.id)
     assert len(references) == 1
     assert references[0].name == "Я в будущем"
+    assert confirm_query.text_attempts == 1
+    assert any("Референс сохранён" in text for text in confirm_query.caption_edits)
+    assert any("Мои референсы" in text for text in confirm_query.caption_edits)
 
     card = FakeMessage()
     await bot._vision_send_item(card, item)
