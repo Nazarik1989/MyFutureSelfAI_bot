@@ -12,6 +12,13 @@ class VisionSummary(BaseModel):
     motivation_style: str | None = None
 
 
+class TimezoneResolution(BaseModel):
+    timezone: str | None = Field(default=None, max_length=64)
+    city: str | None = Field(default=None, max_length=120)
+    country: str | None = Field(default=None, max_length=120)
+    ambiguous: bool = False
+
+
 class GoalProposal(BaseModel):
     life_area: str
     title: str

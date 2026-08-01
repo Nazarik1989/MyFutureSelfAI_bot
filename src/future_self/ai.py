@@ -12,6 +12,7 @@ from .schemas import (
     IntentResult,
     ParsedThought,
     RoutineProposals,
+    TimezoneResolution,
     TodayPlan,
     VisionSummary,
 )
@@ -27,6 +28,8 @@ class AIService(Protocol):
     async def health_check(self) -> ProviderHealthCheck: ...
 
     async def summarize_vision(self, answers: dict[str, str]) -> VisionSummary: ...
+
+    async def resolve_timezone(self, location_text: str) -> TimezoneResolution: ...
 
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals: ...
 
@@ -80,6 +83,9 @@ class OpenAICompatibleAIService:
 
     async def summarize_vision(self, answers: dict[str, str]) -> VisionSummary:
         return await self._parse(VisionSummary, prompts.VISION_SYSTEM, repr(answers))
+
+    async def resolve_timezone(self, location_text: str) -> TimezoneResolution:
+        return await self._parse(TimezoneResolution, prompts.TIMEZONE_SYSTEM, location_text)
 
     async def health_check(self) -> ProviderHealthCheck:
         return await self._parse(

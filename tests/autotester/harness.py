@@ -792,6 +792,24 @@ class BotAutotester:
         update = self._update_for(message)
         context = SimpleNamespace(user_data={"onboarding_user_id": user.id})
         await self.bot.onboarding_answer(update, context)
+        confirmation = next(
+            button.callback_data
+            for reply in reversed(message.replies)
+            if (markup := reply.get("reply_markup")) is not None
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+            and button.callback_data.startswith("onboarding:timezone:confirm:")
+        )
+        query = FakeCallbackQuery(confirmation, message)
+        confirmation_update = SimpleNamespace(
+            effective_message=message,
+            message=message,
+            callback_query=query,
+            effective_user=SimpleNamespace(id=self.telegram_user_id),
+            effective_chat=SimpleNamespace(id=self.chat_id, type="private"),
+        )
+        await self.bot.onboarding_timezone_action(confirmation_update, context)
         async with self.database.sessions() as session:
             state = await OnboardingRepository(session).get_or_create(user.id)
             saved = state.answers.get("timezone")
