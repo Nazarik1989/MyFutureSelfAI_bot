@@ -12,6 +12,7 @@ from future_self.schemas import (
     ParsedThought,
     RoutineProposal,
     RoutineProposals,
+    TimezoneResolution,
     TodayPlan,
     VisionSummary,
 )
@@ -22,6 +23,8 @@ class FakeAI:
         self.last_today_context: dict[str, object] | None = None
         self.route_calls: list[tuple[str, dict[str, str]]] = []
         self.conversation_contexts: list[dict[str, object]] = []
+        self.timezone_calls: list[str] = []
+        self.timezone_results: dict[str, TimezoneResolution] = {}
 
     async def summarize_vision(self, answers: dict[str, str]) -> VisionSummary:
         return VisionSummary(
@@ -30,6 +33,13 @@ class FakeAI:
             desired_identity=["человек, который действует последовательно"],
             constraints=[answers["obstacles"]] if answers.get("obstacles") else [],
             motivation_style=answers.get("support_style"),
+        )
+
+    async def resolve_timezone(self, location_text: str) -> TimezoneResolution:
+        self.timezone_calls.append(location_text)
+        return self.timezone_results.get(
+            location_text,
+            TimezoneResolution(timezone=None, city=None, country=None, ambiguous=True),
         )
 
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals:

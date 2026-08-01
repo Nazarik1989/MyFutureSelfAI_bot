@@ -60,6 +60,7 @@ ADVANCED_COMMANDS = frozenset(
         "skip",
         "cancel",
         "profile",
+        "timezone",
         "goals",
         "drafts",
         "last_saved",

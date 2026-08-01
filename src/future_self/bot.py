@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from hashlib import blake2s
 from html import escape
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -74,7 +75,16 @@ from .knowledge_storage import KnowledgeAssetStore
 from .lab_handlers import LabHandlers
 from .labs import LabDocumentService, LabUploadSessionStore
 from .location import LocationService, location_from_user, parse_location
-from .models import DraftInboxItem, Goal, InboxItem, Routine, User, VisionProfile
+from .models import (
+    DraftInboxItem,
+    Goal,
+    HealthReminderPreference,
+    InboxItem,
+    Routine,
+    User,
+    VisionCompanionPreference,
+    VisionProfile,
+)
 from .natural_commands import NaturalAction, NaturalCommandRouter
 from .navigation import NavigationFlowStore, public_commands
 from .navigation_handlers import NavigationHandlers
@@ -91,6 +101,7 @@ from .schemas import IntentResult, ParsedThought, TemporalResolution, VisionSumm
 from .system_actions import SystemActionRoute, SystemActionRouter
 from .task_handlers import TaskHandlers
 from .tasks import TaskService
+from .timezones import TimezoneCandidate, TimezoneResolver, timezone_candidate_text
 from .transcription import TranscriptionError, TranscriptionService
 from .vision import VisionService
 from .vision_companion import VisionCompanionService
@@ -109,6 +120,8 @@ logger = logging.getLogger(__name__)
 
 ONBOARDING_INPUT, PROFILE_CONFIRM = range(2)
 _ONBOARDING_META_KEY = "__onboarding_flow__"
+_PENDING_ONBOARDING_TIMEZONE = "pending_timezone"
+_PENDING_TIMEZONE_UPDATE = "pending_timezone_update"
 _ACTIVE_ONBOARDING_STATUSES = frozenset({"in_progress", "awaiting_confirmation"})
 EVENING_WORKED, EVENING_FAILED, EVENING_ENERGY, EVENING_OBSTACLE, EVENING_TOMORROW = range(10, 15)
 (
@@ -251,6 +264,7 @@ class FutureSelfBot(
         self.focus_service = FocusService(db, ai)
         self.health_service = HealthService(db)
         self.location_service = LocationService(db)
+        self.timezone_resolver = TimezoneResolver(ai)
         self.vision_service = VisionService(db)
         self.vision_companion_service = VisionCompanionService(db)
         self.vision_image_service = VisionImageService(db)
@@ -387,6 +401,10 @@ class FutureSelfBot(
                         MessageHandler(filters.Regex("^Назад$"), self.onboarding_back),
                         MessageHandler(filters.Regex("^Пропустить$"), self.onboarding_skip),
                         MessageHandler(filters.VOICE | filters.AUDIO, self.voice),
+                        CallbackQueryHandler(
+                            self.onboarding_timezone_action,
+                            pattern=r"^onboarding:timezone:",
+                        ),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, self.onboarding_answer),
                     ],
                     PROFILE_CONFIRM: [
@@ -516,6 +534,7 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("profile", self.profile))
         app.add_handler(CommandHandler("location", self.location_command))
+        app.add_handler(CommandHandler("timezone", self.timezone_command))
         app.add_handler(CommandHandler("goals", self.goals_command))
         app.add_handler(CommandHandler("inbox", self.inbox))
         app.add_handler(CommandHandler("drafts", self.drafts_command))
@@ -542,6 +561,13 @@ class FutureSelfBot(
         # Fallback for a confirmation button sent before a process restart. The
         # ConversationHandler handles it normally while its in-memory state exists.
         app.add_handler(CallbackQueryHandler(self.profile_action, pattern=r"^profile:"))
+        app.add_handler(
+            CallbackQueryHandler(
+                self.onboarding_timezone_action,
+                pattern=r"^onboarding:timezone:",
+            )
+        )
+        app.add_handler(CallbackQueryHandler(self.timezone_action, pattern=r"^timezone:update:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -909,14 +935,34 @@ class FutureSelfBot(
                 )
                 await self._ask_question(update, step)
                 return ONBOARDING_INPUT
-            answers = OnboardingFlow.answer(answers, step, text)
             question_key = ONBOARDING_QUESTIONS[step][0]
             if question_key == "timezone":
-                from .domain import canonical_timezone
-
-                answers["timezone"] = canonical_timezone(text)
-            elif question_key == "location":
+                try:
+                    candidate = await self.timezone_resolver.resolve(text)
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    log_safe_failure("Onboarding timezone resolution failed", exc, user_id=user_id)
+                    await update.effective_message.reply_text(
+                        "Сейчас не удалось определить часовой пояс. "
+                        "Ответ не сохранён — попробуй ещё раз немного позже."
+                    )
+                    return ONBOARDING_INPUT
+                return await self._present_onboarding_timezone_candidate(
+                    update,
+                    user_id,
+                    step,
+                    answers,
+                    candidate,
+                    delivery_key=delivery_key,
+                )
+            answers = OnboardingFlow.answer(answers, step, text)
+            if question_key == "location":
                 parse_location(text)
+                metadata = self._onboarding_meta(answers)
+                metadata.pop("location_autofilled", None)
+                metadata.pop("skip_location_once", None)
+                answers[_ONBOARDING_META_KEY] = metadata
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return ONBOARDING_INPUT
@@ -941,6 +987,147 @@ class FutureSelfBot(
                 "Не удалось сохранить ответ. Шаг не изменён — попробуй ещё раз или продолжи через /start."
             )
             return ONBOARDING_INPUT
+
+    async def _present_onboarding_timezone_candidate(
+        self,
+        update: Update,
+        user_id: int,
+        step: int,
+        answers: dict[str, object],
+        candidate: TimezoneCandidate,
+        *,
+        delivery_key: str | None,
+    ) -> int:
+        token = uuid4().hex[:16]
+        stale_step = None
+        async with self.db.session() as session:
+            state = await OnboardingRepository(session).get_or_create(user_id)
+            if state.current_step != step or ONBOARDING_QUESTIONS[step][0] != "timezone":
+                stale_step = state.current_step
+            else:
+                current_answers = dict(state.answers)
+                metadata = self._onboarding_meta(current_answers)
+                previous = metadata.get(_PENDING_ONBOARDING_TIMEZONE)
+                if (
+                    delivery_key is not None
+                    and isinstance(previous, dict)
+                    and previous.get("delivery_key") == delivery_key
+                ):
+                    token = str(previous.get("token") or token)
+                metadata[_PENDING_ONBOARDING_TIMEZONE] = {
+                    "token": token,
+                    "timezone": candidate.timezone,
+                    "city": candidate.city,
+                    "source": candidate.source,
+                    "delivery_key": delivery_key,
+                }
+                current_answers[_ONBOARDING_META_KEY] = metadata
+                state.answers = current_answers
+        if stale_step is not None:
+            await update.effective_message.reply_text(
+                "Этот ответ относится к предыдущему шагу. Показываю текущий вопрос."
+            )
+            if stale_step < len(ONBOARDING_QUESTIONS):
+                await self._ask_question(update, stale_step)
+                return ONBOARDING_INPUT
+            return await self._present_onboarding_summary(update, SimpleNamespace(user_data={}))
+        await update.effective_message.reply_text(
+            timezone_candidate_text(candidate),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Верно",
+                            callback_data=f"onboarding:timezone:confirm:{token}",
+                        ),
+                        InlineKeyboardButton(
+                            "✏️ Другой город",
+                            callback_data=f"onboarding:timezone:retry:{token}",
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return ONBOARDING_INPUT
+
+    async def onboarding_timezone_action(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        query = update.callback_query
+        parts = (query.data or "").split(":")
+        if len(parts) != 4 or parts[:2] != ["onboarding", "timezone"]:
+            await query.answer("Эта кнопка больше не действует", show_alert=True)
+            return ConversationHandler.END
+        action, token = parts[2], parts[3]
+        user = await self._user(update.effective_user.id)
+        context.user_data["onboarding_user_id"] = user.id
+        async with self.db.sessions() as session:
+            state = await OnboardingRepository(session).get(user.id)
+            if state is None:
+                pending = None
+                step = 0
+                answers: dict[str, object] = {}
+            else:
+                step = state.current_step
+                answers = dict(state.answers)
+                pending = self._onboarding_meta(answers).get(_PENDING_ONBOARDING_TIMEZONE)
+        if (
+            state is None
+            or step >= len(ONBOARDING_QUESTIONS)
+            or ONBOARDING_QUESTIONS[step][0] != "timezone"
+            or not isinstance(pending, dict)
+            or pending.get("token") != token
+            or action not in {"confirm", "retry"}
+        ):
+            await query.answer("Этот выбор устарел. Продолжи через /start.", show_alert=True)
+            return ConversationHandler.END if user.onboarding_completed else ONBOARDING_INPUT
+
+        if action == "retry":
+            metadata = self._onboarding_meta(answers)
+            metadata.pop(_PENDING_ONBOARDING_TIMEZONE, None)
+            answers[_ONBOARDING_META_KEY] = metadata
+            async with self.db.session() as session:
+                latest = await OnboardingRepository(session).get_or_create(user.id)
+                if latest.current_step == step:
+                    latest_answers = dict(latest.answers)
+                    latest_metadata = self._onboarding_meta(latest_answers)
+                    current = latest_metadata.get(_PENDING_ONBOARDING_TIMEZONE)
+                    if isinstance(current, dict) and current.get("token") == token:
+                        latest_metadata.pop(_PENDING_ONBOARDING_TIMEZONE, None)
+                        latest_answers[_ONBOARDING_META_KEY] = latest_metadata
+                        latest.answers = latest_answers
+            await query.answer()
+            await query.edit_message_reply_markup(reply_markup=None)
+            await self._ask_question(update, step)
+            return ONBOARDING_INPUT
+
+        timezone = str(pending.get("timezone") or "")
+        try:
+            timezone = ZoneInfo(timezone).key
+        except Exception:
+            await query.answer(
+                "Часовой пояс больше недоступен. Выбери город заново.", show_alert=True
+            )
+            return ONBOARDING_INPUT
+        city = pending.get("city")
+        location = parse_location(str(city)) if city else None
+        answers["timezone"] = timezone
+        metadata = self._onboarding_meta(answers)
+        metadata.pop(_PENDING_ONBOARDING_TIMEZONE, None)
+        if location is not None:
+            answers["location"] = location.label
+            metadata["skip_location_once"] = True
+        answers[_ONBOARDING_META_KEY] = metadata
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=None)
+        return await self._advance_onboarding(
+            update,
+            context,
+            user.id,
+            step,
+            answers,
+            delivery_key=f"timezone-confirm:{token}",
+        )
 
     async def onboarding_skip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         user_id, step, answers = await self._state(update, context)
@@ -976,6 +1163,16 @@ class FutureSelfBot(
         delivery_key: str | None = None,
     ) -> int:
         next_step = OnboardingFlow.next_step(step)
+        metadata = self._onboarding_meta(answers)
+        if (
+            next_step < len(ONBOARDING_QUESTIONS)
+            and ONBOARDING_QUESTIONS[next_step][0] == "location"
+            and answers.get("location")
+            and metadata.pop("skip_location_once", False)
+        ):
+            metadata["location_autofilled"] = True
+            answers[_ONBOARDING_META_KEY] = metadata
+            next_step = OnboardingFlow.next_step(next_step)
         outcome = "advanced"
         async with self.db.session() as session:
             state = await OnboardingRepository(session).get_or_create(user_id)
@@ -1464,6 +1661,189 @@ class FutureSelfBot(
             return
         await update.effective_message.reply_text(
             f"Локация сохранена: {location.label}. /doctor_find будет использовать её."
+        )
+
+    async def timezone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = await self._user(update.effective_user.id)
+        if not user.onboarding_completed:
+            await update.effective_message.reply_text(
+                "Сначала заверши настройку через /start — часовой пояс входит в неё."
+            )
+            return
+        args = getattr(context, "args", [])
+        if not args:
+            local_now = datetime.now(UTC).astimezone(ZoneInfo(user.timezone))
+            await update.effective_message.reply_text(
+                f"Текущий часовой пояс: {user.timezone}\n"
+                f"Местное время: {local_now.strftime('%H:%M')}\n\n"
+                "Изменить: /timezone Казань или /timezone Берлин, Германия."
+            )
+            return
+        raw = " ".join(args)
+        try:
+            candidate = await self.timezone_resolver.resolve(raw)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        except Exception as exc:
+            log_safe_failure("Timezone resolution failed", exc, user_id=user.id)
+            await update.effective_message.reply_text(
+                "Сейчас не удалось определить часовой пояс. Попробуй ещё раз немного позже."
+            )
+            return
+
+        token = uuid4().hex[:16]
+        async with self.db.session() as session:
+            state = await OnboardingRepository(session).get_or_create(user.id)
+            answers = dict(state.answers)
+            metadata = self._onboarding_meta(answers)
+            metadata[_PENDING_TIMEZONE_UPDATE] = {
+                "token": token,
+                "timezone": candidate.timezone,
+                "city": candidate.city,
+                "source": candidate.source,
+            }
+            answers[_ONBOARDING_META_KEY] = metadata
+            state.answers = answers
+        location_note = (
+            "\nПосле подтверждения этот город также станет локацией для раздела врача."
+            if candidate.city
+            else ""
+        )
+        await update.effective_message.reply_text(
+            timezone_candidate_text(candidate) + location_note,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Сохранить",
+                            callback_data=f"timezone:update:confirm:{token}",
+                        ),
+                        InlineKeyboardButton(
+                            "Отмена",
+                            callback_data=f"timezone:update:cancel:{token}",
+                        ),
+                    ]
+                ]
+            ),
+        )
+
+    async def timezone_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        query = update.callback_query
+        parts = (query.data or "").split(":")
+        if len(parts) != 4 or parts[:2] != ["timezone", "update"]:
+            await query.answer("Эта кнопка больше не действует", show_alert=True)
+            return
+        action, token = parts[2], parts[3]
+        user = await self._user(update.effective_user.id)
+        async with self.db.sessions() as session:
+            state = await OnboardingRepository(session).get(user.id)
+            answers = dict(state.answers) if state is not None else {}
+            pending = self._onboarding_meta(answers).get(_PENDING_TIMEZONE_UPDATE)
+        if (
+            not isinstance(pending, dict)
+            or pending.get("token") != token
+            or action not in {"confirm", "cancel"}
+        ):
+            await query.answer("Этот выбор устарел. Запусти /timezone заново.", show_alert=True)
+            return
+
+        if action == "cancel":
+            async with self.db.session() as session:
+                state = await OnboardingRepository(session).get_or_create(user.id)
+                latest = dict(state.answers)
+                metadata = self._onboarding_meta(latest)
+                current = metadata.get(_PENDING_TIMEZONE_UPDATE)
+                if isinstance(current, dict) and current.get("token") == token:
+                    metadata.pop(_PENDING_TIMEZONE_UPDATE, None)
+                    latest[_ONBOARDING_META_KEY] = metadata
+                    state.answers = latest
+            await query.answer()
+            await query.edit_message_text("Изменение часового пояса отменено.")
+            return
+
+        timezone = str(pending.get("timezone") or "")
+        try:
+            timezone = ZoneInfo(timezone).key
+            location = parse_location(str(pending["city"])) if pending.get("city") else None
+        except (KeyError, ValueError):
+            await query.answer("Данные устарели. Запусти /timezone заново.", show_alert=True)
+            return
+
+        health_schedule: tuple[int, time] | None = None
+        companion_schedule: SimpleNamespace | None = None
+        async with self.db.session() as session:
+            stored_user = await session.scalar(
+                select(User)
+                .where(User.id == user.id, User.telegram_id == update.effective_user.id)
+                .with_for_update()
+            )
+            state = await OnboardingRepository(session).get_or_create(user.id)
+            latest = dict(state.answers)
+            metadata = self._onboarding_meta(latest)
+            current = metadata.get(_PENDING_TIMEZONE_UPDATE)
+            if (
+                stored_user is None
+                or not isinstance(current, dict)
+                or current.get("token") != token
+            ):
+                await query.answer("Этот выбор уже обработан.", show_alert=True)
+                return
+            stored_user.timezone = timezone
+            latest["timezone"] = timezone
+            if location is not None:
+                stored_user.location_city = location.city
+                stored_user.location_fallback_city = None
+                latest["location"] = location.label
+            metadata.pop(_PENDING_TIMEZONE_UPDATE, None)
+            latest[_ONBOARDING_META_KEY] = metadata
+            state.answers = latest
+
+            health = await session.scalar(
+                select(HealthReminderPreference).where(
+                    HealthReminderPreference.user_id == stored_user.id
+                )
+            )
+            if health is not None:
+                health.timezone = timezone
+                if health.enabled:
+                    health_schedule = (health.user_id, health.local_time)
+            companion = await session.scalar(
+                select(VisionCompanionPreference).where(
+                    VisionCompanionPreference.owner_id == stored_user.id
+                )
+            )
+            if companion is not None:
+                companion.timezone = timezone
+                if companion.enabled:
+                    companion_schedule = SimpleNamespace(
+                        id=companion.id,
+                        owner_id=companion.owner_id,
+                        telegram_user_id=stored_user.telegram_id,
+                        timezone=timezone,
+                        morning_time=companion.morning_time,
+                        evening_time=companion.evening_time,
+                        extra_times=tuple(companion.extra_times),
+                    )
+
+        if self.scheduler is not None:
+            self.scheduler.schedule_user(user.telegram_id, timezone)
+            if health_schedule is not None:
+                health_user_id, local_time = health_schedule
+                self.scheduler.schedule_health_reminder(
+                    user_id=health_user_id,
+                    chat_id=user.telegram_id,
+                    timezone=timezone,
+                    local_time=local_time,
+                )
+            if companion_schedule is not None:
+                self.scheduler.schedule_vision_companion(companion_schedule)
+        await query.answer()
+        location_text = f"\nЛокация: {location.label}." if location is not None else ""
+        await query.edit_message_text(
+            f"Часовой пояс обновлён: {timezone}.{location_text}\n"
+            "Новые напоминания и ежедневные сценарии будут использовать это местное время."
         )
 
     async def text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4519,6 +4899,7 @@ class FutureSelfBot(
             "/health — состояние и динамика, /checkin — health check-in, "
             "/doctor_prepare — подготовка к визиту к врачу, "
             "/location — личный город или маршрут, "
+            "/timezone — проверить или изменить часовой пояс, "
             "/vision — персональная карта желаний, "
             "/doctor_find — официальный поиск терапевта по твоей локации."
         )

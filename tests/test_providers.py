@@ -8,6 +8,7 @@ from openai import AuthenticationError, BadRequestError
 from future_self.ai import OpenAICompatibleAIService, ProviderHealthCheck, create_ai_service
 from future_self.config import LegacyConfigurationWarning, Settings, resolve_env_file
 from future_self.doctor import DoctorReport, duplicate_env_keys, run_provider_check
+from future_self.schemas import TimezoneResolution
 from future_self.transcription import (
     DisabledTranscriptionService,
     create_transcription_service,
@@ -146,6 +147,32 @@ async def test_openrouter_health_check_uses_working_structured_parse_path():
     assert result.ok is True
     assert responses.parse_kwargs["text_format"] is ProviderHealthCheck
     assert "max_output_tokens" not in responses.parse_kwargs
+
+
+async def test_timezone_resolution_uses_structured_output_on_text_provider():
+    class Responses:
+        def __init__(self):
+            self.parse_kwargs = None
+
+        async def parse(self, **kwargs):
+            self.parse_kwargs = kwargs
+            return SimpleNamespace(
+                output_parsed=TimezoneResolution(
+                    timezone="Europe/Lisbon",
+                    city="Лиссабон",
+                    country="Португалия",
+                    ambiguous=False,
+                )
+            )
+
+    responses = Responses()
+    service = OpenAICompatibleAIService(SimpleNamespace(responses=responses), "openai/gpt-5.4-mini")
+
+    result = await service.resolve_timezone("живу в Лиссабоне")
+
+    assert result.timezone == "Europe/Lisbon"
+    assert responses.parse_kwargs["text_format"] is TimezoneResolution
+    assert responses.parse_kwargs["input"][1]["content"] == "живу в Лиссабоне"
 
 
 async def test_doctor_bad_request_is_safe_and_includes_status():
