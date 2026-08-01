@@ -1149,6 +1149,7 @@ VISION_SCENARIOS = (
                 reply_contains=("устарело",),
             ),
             ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "list:active:0"),
             ScenarioStep("vision_callback", "render"),
             ScenarioStep("vision_callback", "renderall", reply_contains=("Активных желаний: 1",)),
             ScenarioStep("vision_callback", "download", reply_contains=("Активных желаний: 1",)),
@@ -1358,8 +1359,8 @@ VISION_SCENARIOS = (
         steps=(
             ScenarioStep("command", "/vision"),
             ScenarioStep(
-                "vision_callback",
-                "render",
+                "vision_raw_callback",
+                "vision:render",
                 reply_contains=("Сначала добавь желание",),
             ),
         ),
@@ -1377,7 +1378,8 @@ VISION_SCENARIOS = (
             ScenarioStep("vision_callback", "skip"),
             ScenarioStep("vision_callback", "confirm"),
             ScenarioStep("command", "/vision"),
-            ScenarioStep("vision_callback", "render", reply_contains=("Что визуализировать",)),
+            ScenarioStep("vision_callback", "list:active:0"),
+            ScenarioStep("vision_callback", "render", reply_contains=("PNG-карту",)),
             ScenarioStep("vision_capture_callback", "renderall"),
             ScenarioStep(
                 "vision_replay_callback",
@@ -1420,6 +1422,7 @@ VISION_SCENARIOS = (
             ScenarioStep("vision_callback", "skip"),
             ScenarioStep("vision_callback", "confirm"),
             ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "list:active:0"),
             ScenarioStep("vision_callback", "render"),
             ScenarioStep("vision_capture_callback", "rendertravel"),
             ScenarioStep("switch_user", "900002:910002"),
@@ -1447,6 +1450,7 @@ VISION_SCENARIOS = (
         steps=(
             *VISION_PAGINATION_STEPS,
             ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "list:active:0"),
             ScenarioStep("vision_callback", "render"),
             ScenarioStep(
                 "vision_callback",
@@ -1477,6 +1481,7 @@ VISION_SCENARIOS = (
             ScenarioStep("vision_callback", "skip"),
             ScenarioStep("vision_callback", "confirm"),
             ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "list:active:0"),
             ScenarioStep("vision_callback", "render"),
             ScenarioStep("vision_capture_callback", "renderall"),
             ScenarioStep("vision_hold_render"),
@@ -1503,12 +1508,13 @@ VISION_SCENARIOS = (
             ScenarioStep("vision_callback", "skip"),
             ScenarioStep("vision_callback", "confirm"),
             ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "list:active:0"),
             ScenarioStep("vision_callback", "render"),
             ScenarioStep("vision_capture_callback", "rendercancel"),
             ScenarioStep(
                 "vision_replay_callback",
                 "rendercancel",
-                reply_contains=("отменена",),
+                reply_contains=("Экспорт PNG отменён",),
             ),
             ScenarioStep(
                 "vision_replay_callback",
@@ -1745,6 +1751,7 @@ VISION_SCENARIOS = (
             ScenarioStep("vision_replay_callback", "imageconfirm", reply_contains=("сохранено",)),
             ScenarioStep("vision_replay_callback", "imageconfirm", reply_contains=("устарело",)),
             ScenarioStep("command", "/vision"),
+            ScenarioStep("vision_callback", "list:active:0"),
             ScenarioStep("vision_callback", "render"),
             ScenarioStep("vision_callback", "renderall", reply_contains=("Активных желаний: 1",)),
             ScenarioStep("vision_callback", "download", reply_contains=("Активных желаний: 1",)),

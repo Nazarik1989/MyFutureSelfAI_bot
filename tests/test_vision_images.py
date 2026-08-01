@@ -655,6 +655,58 @@ async def test_gpt_image_2_requires_consent_previews_then_saves_once(db, fake_ai
     assert stored.mime_type == "image/jpeg"
 
 
+async def test_main_visualization_entry_picks_active_wish_without_rendering_png(db, fake_ai):
+    generator = FakeImageGeneration()
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id, chat_id = 9355, 19355
+    owner = await bot._user(telegram_id)
+    active = await add_item(db, owner.id, "Я работаю над любимым проектом у океана")
+    archived = await add_item(db, owner.id, "Устаревшее желание")
+    await bot.vision_service.set_status(owner.id, archived.id, "archived")
+
+    message = FakeMessage("/vision")
+    await bot.vision_command(update_for(message, user_id=telegram_id, chat_id=chat_id), None)
+    picker_data = callback_from(message, "vision:imagepick:0")
+    assert not any(
+        button.callback_data == "vision:render"
+        for row in message.replies[-1]["reply_markup"].inline_keyboard
+        for button in row
+    )
+
+    picker_update, _ = callback_update(
+        picker_data,
+        message,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(picker_update, None)
+    picker_text = message.replies[-1]["text"]
+    assert "Выбери желание для AI-визуализации" in picker_text
+    assert active.wish_text in picker_text
+    assert archived.wish_text not in picker_text
+    assert not any(reply.get("kind") in {"photo", "document"} for reply in message.replies)
+    assert generator.prompts == []
+
+    item_update, _ = callback_update(
+        callback_from(message, f"vision:imagepickitem:{active.id}"),
+        message,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(item_update, None)
+    disclosure = message.replies[-1]["text"]
+    assert "Точный запрос" in disclosure
+    assert active.wish_text in disclosure
+    assert "gpt-image-2" in disclosure
+    assert generator.prompts == []
+
+
 async def test_moderation_failure_is_safe_not_retried_or_saved(db, fake_ai, caplog):
     generator = FakeImageGeneration(error="moderation_blocked")
     configured = Settings(
