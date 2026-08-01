@@ -11,6 +11,7 @@ import pytest
 from autotester.fakes import (
     FakeCallbackQuery,
     FakeImageMedia,
+    FakeMediaCallbackQuery,
     FakeMessage,
     ScriptedTranscription,
 )
@@ -120,8 +121,15 @@ def update_for(message: FakeMessage, *, user_id: int, chat_id: int, chat_type="p
     )
 
 
-def callback_update(data: str, message: FakeMessage, *, user_id: int, chat_id: int):
-    query = FakeCallbackQuery(data, message)
+def callback_update(
+    data: str,
+    message: FakeMessage,
+    *,
+    user_id: int,
+    chat_id: int,
+    media: bool = False,
+):
+    query = FakeMediaCallbackQuery(data, message) if media else FakeCallbackQuery(data, message)
     return (
         SimpleNamespace(
             effective_message=message,
@@ -518,13 +526,16 @@ async def test_handler_photo_preview_confirm_repeat_replace_cancel_and_delete(
         await bot.vision_image_gate(
             update_for(replacement, user_id=telegram_id, chat_id=chat_id), None
         )
-    cancel_update, _ = callback_update(
+    cancel_update, cancel_query = callback_update(
         callback_from(replacement, "vision:imagecancel:"),
         replacement,
         user_id=telegram_id,
         chat_id=chat_id,
+        media=True,
     )
     await bot.vision_action(cancel_update, None)
+    assert cancel_query.text_attempts == 1
+    assert any("Действие с изображением отменено" in text for text in cancel_query.caption_edits)
     unchanged = await bot.vision_image_service.get(owner.id, item.id)
     assert unchanged and unchanged.version == 1 and unchanged.sha256 == stored.sha256
 
