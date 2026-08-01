@@ -133,6 +133,13 @@ class VisionHandlers:
             except (TelegramError, TypeError, AttributeError):
                 pass
         await message.reply_text(text, reply_markup=reply_markup)
+        if query is not None:
+            delete = getattr(message, "delete", None)
+            if delete is not None:
+                try:
+                    await delete()
+                except (TelegramError, TypeError, AttributeError):
+                    pass
 
     async def _vision_menu(self, message: Any, *, query: Any | None = None) -> None:
         await self._vision_edit_or_send(
@@ -1105,10 +1112,15 @@ class VisionHandlers:
                 )
 
     async def _vision_reference_library(
-        self, message: Any, owner_id: int, *, query: Any | None = None
+        self,
+        message: Any,
+        owner_id: int,
+        *,
+        query: Any | None = None,
+        notice: str | None = None,
     ) -> None:
         references = await self.vision_reference_service.list(owner_id)
-        lines = [
+        lines = ([notice, ""] if notice else []) + [
             "Мои референсы",
             "",
             "Это приватная библиотека: фото остаются в боте и используются только "
@@ -1479,10 +1491,15 @@ class VisionHandlers:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await query.edit_message_text(
-                "Добавление референса отменено."
-                if action == "refcancel"
-                else "Удаление референса отменено."
+            await self._vision_reference_library(
+                query.message,
+                owner_id,
+                query=query,
+                notice=(
+                    "Добавление референса отменено."
+                    if action == "refcancel"
+                    else "Удаление референса отменено."
+                ),
             )
             return
         if action == "refconfirm":
@@ -1517,31 +1534,43 @@ class VisionHandlers:
                 )
             if result.status == "limit":
                 await query.answer()
-                await query.edit_message_text(
-                    f"Лимит {MAX_VISION_REFERENCES} референсов достигнут. "
-                    "Удалить ненужный можно в библиотеке."
+                await self._vision_reference_library(
+                    query.message,
+                    owner_id,
+                    query=query,
+                    notice=(
+                        f"Лимит {MAX_VISION_REFERENCES} референсов достигнут. "
+                        "Удалить ненужный можно в библиотеке."
+                    ),
                 )
                 return
             if result.status == "duplicate":
                 await query.answer()
-                await query.edit_message_text(
-                    "Такое фото уже сохранено как другой референс; замена не выполнена."
+                await self._vision_reference_library(
+                    query.message,
+                    owner_id,
+                    query=query,
+                    notice=("Такое фото уже сохранено как другой референс; замена не выполнена."),
                 )
                 return
             if result.status not in {"created", "replaced", "existing"}:
                 await self._vision_stale(query)
                 return
             await query.answer()
-            await query.edit_message_text(
-                "Такое изображение уже есть в библиотеке; дубль не создан."
-                if result.status == "existing"
-                else (
-                    "Фото референса заменено."
-                    if result.status == "replaced"
-                    else "Референс сохранён и останется в приватной библиотеке."
-                )
+            await self._vision_reference_library(
+                query.message,
+                owner_id,
+                query=query,
+                notice=(
+                    "Такое изображение уже есть в библиотеке; дубль не создан."
+                    if result.status == "existing"
+                    else (
+                        "Фото референса заменено."
+                        if result.status == "replaced"
+                        else "Референс сохранён и останется в приватной библиотеке."
+                    )
+                ),
             )
-            await self._vision_reference_library(query.message, owner_id, query=query)
             return
         capability = await self.vision_reference_sessions.claim_delete(token, owner_id, chat_id)
         if (
@@ -1560,8 +1589,12 @@ class VisionHandlers:
             await self._vision_stale(query)
             return
         await query.answer()
-        await query.edit_message_text("Референс удалён из приватной библиотеки.")
-        await self._vision_reference_library(query.message, owner_id, query=query)
+        await self._vision_reference_library(
+            query.message,
+            owner_id,
+            query=query,
+            notice="Референс удалён из приватной библиотеки.",
+        )
 
     async def _vision_image_action(
         self,
