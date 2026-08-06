@@ -4,11 +4,14 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
+from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy.sql.elements import ColumnElement
 
+from .access import FULL_ACCESS_TIERS, is_full_access_tier
 from .db import Database
 from .models import DraftInboxItem, InboxItem, TaskReminder, TaskState, User
 from .schemas import TemporalResolution
@@ -17,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 ReminderSendCallback = Callable[[int, str], Awaitable[int | None]]
 ReminderDeleteCallback = Callable[[int, int], Awaitable[None]]
+ReminderReadiness = Literal["ready", "access_denied", "stale"]
 
 
 def as_utc(value: datetime) -> datetime:
@@ -142,12 +146,14 @@ class TaskReminderEngine:
                     select(InboxItem, DraftInboxItem, TaskState)
                     .join(DraftInboxItem, DraftInboxItem.id == InboxItem.draft_id)
                     .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
+                    .join(User, User.id == InboxItem.user_id)
                     .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
                     .where(
                         InboxItem.kind == "task",
                         InboxItem.status == "confirmed",
                         InboxItem.temporal_resolution.is_not(None),
                         TaskReminder.id.is_(None),
+                        User.access_tier.in_(FULL_ACCESS_TIERS),
                     )
                 )
             ).all()
@@ -183,7 +189,11 @@ class TaskReminderEngine:
         await self.expire_stale(now=current)
         delivered = 0
         for reminder in await self._claim_due(current):
-            if not await self._still_current(reminder):
+            readiness = await self._delivery_readiness(reminder)
+            if readiness == "access_denied":
+                await self._release_access_claim(reminder)
+                continue
+            if readiness == "stale":
                 await self._cancel_claim(reminder)
                 continue
             try:
@@ -201,19 +211,25 @@ class TaskReminderEngine:
                 continue
             if await self._mark_sent(reminder, current, message_id):
                 delivered += 1
-            elif message_id is not None and self.delete_sent is not None:
-                # The task may have been trashed/rescheduled after the final
-                # pre-send check but before Telegram returned. Compensate by
-                # removing that now-stale delivery; lifecycle state remains the
-                # source of truth even if Telegram deletion itself fails.
+                continue
+
+            # The task or access tier may have changed while Telegram was in
+            # flight. Remove the now-invalid delivery before releasing its
+            # durable claim according to the current cause.
+            readiness = await self._delivery_readiness(reminder)
+            if message_id is not None and self.delete_sent is not None:
                 try:
                     await self.delete_sent(reminder.chat_id, message_id)
                 except Exception as exc:
                     logger.warning(
-                        "Stale task reminder compensation failed reminder_id=%s error_type=%s",
+                        "Task reminder compensation failed reminder_id=%s error_type=%s",
                         reminder.id,
                         type(exc).__name__,
                     )
+            if readiness == "access_denied":
+                await self._release_access_claim(reminder)
+            elif readiness == "stale":
+                await self._cancel_claim(reminder)
         return delivered
 
     async def expire_stale(self, *, now: datetime | None = None) -> int:
@@ -296,26 +312,7 @@ class TaskReminderEngine:
             TaskReminder.claimed_at <= stale_before,
             TaskReminder.remind_at >= event_cutoff,
         )
-        async with self.db.session() as session:
-            candidate_ids = list(
-                (
-                    await session.scalars(
-                        select(TaskReminder.id)
-                        .join(TaskState, TaskState.inbox_item_id == TaskReminder.inbox_item_id)
-                        .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
-                        .where(or_(due_pending, stale_processing))
-                        .where(
-                            TaskState.status == "active",
-                            TaskState.version == TaskReminder.task_version,
-                            TaskState.owner_id == InboxItem.user_id,
-                            InboxItem.kind == "task",
-                            InboxItem.status == "confirmed",
-                        )
-                        .order_by(TaskReminder.remind_at, TaskReminder.id)
-                        .limit(self.batch_size)
-                    )
-                ).all()
-            )
+        candidate_ids = await self._candidate_ids(due_pending, stale_processing)
 
         claimed: list[ClaimedReminder] = []
         for reminder_id in candidate_ids:
@@ -326,6 +323,14 @@ class TaskReminderEngine:
                     .where(
                         TaskReminder.id == reminder_id,
                         or_(due_pending, stale_processing),
+                        exists(
+                            select(User.id)
+                            .join(InboxItem, InboxItem.user_id == User.id)
+                            .where(
+                                InboxItem.id == TaskReminder.inbox_item_id,
+                                User.access_tier.in_(FULL_ACCESS_TIERS),
+                            )
+                        ),
                     )
                     .values(
                         status="processing",
@@ -339,6 +344,8 @@ class TaskReminderEngine:
                 if changed.scalar_one_or_none() is None:
                     continue
                 reminder = await session.get(TaskReminder, reminder_id)
+                if reminder is None:
+                    continue
                 row = await session.execute(
                     select(InboxItem, User, TaskState)
                     .join(User, User.id == InboxItem.user_id)
@@ -370,6 +377,24 @@ class TaskReminderEngine:
                     )
                     continue
                 item, owner, state = current_row
+                if not is_full_access_tier(owner.access_tier):
+                    await session.execute(
+                        update(TaskReminder)
+                        .where(
+                            TaskReminder.id == reminder_id,
+                            TaskReminder.status == "processing",
+                            TaskReminder.claim_token == token,
+                        )
+                        .values(
+                            status="pending",
+                            claim_token=None,
+                            claimed_at=None,
+                            next_attempt_at=None,
+                            attempt_count=max(0, reminder.attempt_count - 1),
+                            last_error_type=None,
+                        )
+                    )
+                    continue
                 claimed.append(
                     ClaimedReminder(
                         id=reminder.id,
@@ -389,6 +414,34 @@ class TaskReminderEngine:
                 )
         return claimed
 
+    async def _candidate_ids(
+        self,
+        due_pending: ColumnElement[bool],
+        stale_processing: ColumnElement[bool],
+    ) -> list[int]:
+        async with self.db.session() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(TaskReminder.id)
+                        .join(TaskState, TaskState.inbox_item_id == TaskReminder.inbox_item_id)
+                        .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
+                        .join(User, User.id == InboxItem.user_id)
+                        .where(or_(due_pending, stale_processing))
+                        .where(
+                            TaskState.status == "active",
+                            TaskState.version == TaskReminder.task_version,
+                            TaskState.owner_id == InboxItem.user_id,
+                            InboxItem.kind == "task",
+                            InboxItem.status == "confirmed",
+                            User.access_tier.in_(FULL_ACCESS_TIERS),
+                        )
+                        .order_by(TaskReminder.remind_at, TaskReminder.id)
+                        .limit(self.batch_size)
+                    )
+                ).all()
+            )
+
     async def _mark_sent(
         self,
         reminder: ClaimedReminder,
@@ -406,6 +459,7 @@ class TaskReminderEngine:
                     exists(
                         select(TaskState.id)
                         .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+                        .join(User, User.id == InboxItem.user_id)
                         .where(
                             TaskState.inbox_item_id == reminder.inbox_item_id,
                             TaskState.owner_id == reminder.owner_id,
@@ -414,6 +468,7 @@ class TaskReminderEngine:
                             InboxItem.user_id == reminder.owner_id,
                             InboxItem.kind == "task",
                             InboxItem.status == "confirmed",
+                            User.access_tier.in_(FULL_ACCESS_TIERS),
                         )
                     ),
                 )
@@ -432,27 +487,35 @@ class TaskReminderEngine:
 
     async def _still_current(self, reminder: ClaimedReminder) -> bool:
         """Final owner/state/version/claim check immediately before Telegram I/O."""
+        return await self._delivery_readiness(reminder) == "ready"
+
+    async def _delivery_readiness(self, reminder: ClaimedReminder) -> ReminderReadiness:
         async with self.db.sessions() as session:
-            return (
-                await session.scalar(
-                    select(TaskReminder.id)
-                    .join(TaskState, TaskState.inbox_item_id == TaskReminder.inbox_item_id)
-                    .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
-                    .where(
-                        TaskReminder.id == reminder.id,
-                        TaskReminder.status == "processing",
-                        TaskReminder.claim_token == reminder.claim_token,
-                        TaskReminder.task_version == reminder.task_version,
-                        TaskState.inbox_item_id == reminder.inbox_item_id,
-                        TaskState.owner_id == reminder.owner_id,
-                        TaskState.status == "active",
-                        TaskState.version == reminder.task_version,
-                        InboxItem.user_id == reminder.owner_id,
-                        InboxItem.kind == "task",
-                        InboxItem.status == "confirmed",
-                    )
+            tier = await session.scalar(
+                select(User.access_tier)
+                .select_from(TaskReminder)
+                .join(TaskState, TaskState.inbox_item_id == TaskReminder.inbox_item_id)
+                .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
+                .join(User, User.id == InboxItem.user_id)
+                .where(
+                    TaskReminder.id == reminder.id,
+                    TaskReminder.status == "processing",
+                    TaskReminder.claim_token == reminder.claim_token,
+                    TaskReminder.task_version == reminder.task_version,
+                    TaskState.inbox_item_id == reminder.inbox_item_id,
+                    TaskState.owner_id == reminder.owner_id,
+                    TaskState.status == "active",
+                    TaskState.version == reminder.task_version,
+                    InboxItem.user_id == reminder.owner_id,
+                    InboxItem.kind == "task",
+                    InboxItem.status == "confirmed",
                 )
-            ) is not None
+            )
+        if tier is None:
+            return "stale"
+        if not is_full_access_tier(tier):
+            return "access_denied"
+        return "ready"
 
     async def _cancel_claim(self, reminder: ClaimedReminder) -> None:
         async with self.db.session() as session:
@@ -468,6 +531,25 @@ class TaskReminderEngine:
                     claim_token=None,
                     claimed_at=None,
                     next_attempt_at=None,
+                )
+            )
+
+    async def _release_access_claim(self, reminder: ClaimedReminder) -> None:
+        async with self.db.session() as session:
+            await session.execute(
+                update(TaskReminder)
+                .where(
+                    TaskReminder.id == reminder.id,
+                    TaskReminder.status == "processing",
+                    TaskReminder.claim_token == reminder.claim_token,
+                )
+                .values(
+                    status="pending",
+                    claim_token=None,
+                    claimed_at=None,
+                    next_attempt_at=None,
+                    attempt_count=max(0, reminder.attempt_count - 1),
+                    last_error_type=None,
                 )
             )
 

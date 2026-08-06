@@ -61,7 +61,7 @@ def test_workspace_migration_is_additive_constrained_and_round_trips(tmp_path):
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260731_0022"
+        "20260805_0023"
     )
     tables = {
         row[0]
@@ -209,7 +209,7 @@ def test_workspace_migration_is_additive_constrained_and_round_trips(tmp_path):
     alembic(project_root, environment, "upgrade", "head")
     connection = sqlite3.connect(database)
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260731_0022"
+        "20260805_0023"
     )
     assert all(
         connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
@@ -227,7 +227,7 @@ def test_workspace_migration_upgrades_clean_sqlite(tmp_path):
     alembic(project_root, environment, "upgrade", "head")
     connection = sqlite3.connect(database)
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260731_0022"
+        "20260805_0023"
     )
     assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     connection.close()

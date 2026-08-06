@@ -39,6 +39,13 @@ class TimestampMixin:
 
 class User(TimestampMixin, Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(
+            "access_tier IN ('guest', 'subscriber', 'admin', 'blocked')",
+            name="ck_users_access_tier",
+        ),
+        CheckConstraint("access_version > 0", name="ck_users_access_version"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
@@ -47,6 +54,8 @@ class User(TimestampMixin, Base):
     location_city: Mapped[str | None] = mapped_column(String(120))
     location_fallback_city: Mapped[str | None] = mapped_column(String(120))
     onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    access_tier: Mapped[str] = mapped_column(String(16), default="guest", server_default="guest")
+    access_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     vision_profile: Mapped[VisionProfile | None] = relationship(
         back_populates="user", uselist=False
     )
@@ -70,6 +79,31 @@ class User(TimestampMixin, Base):
     task_states: Mapped[list[TaskState]] = relationship(
         back_populates="owner", overlaps="inbox_item,task_state"
     )
+
+
+class AccessTierChange(Base):
+    __tablename__ = "access_tier_changes"
+    __table_args__ = (
+        CheckConstraint(
+            "from_tier IN ('guest', 'subscriber', 'admin', 'blocked')",
+            name="ck_access_tier_changes_from_tier",
+        ),
+        CheckConstraint(
+            "to_tier IN ('guest', 'subscriber', 'admin', 'blocked')",
+            name="ck_access_tier_changes_to_tier",
+        ),
+        CheckConstraint(
+            "length(source) BETWEEN 1 AND 64",
+            name="ck_access_tier_changes_source_length",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    from_tier: Mapped[str] = mapped_column(String(16))
+    to_tier: Mapped[str] = mapped_column(String(16))
+    source: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class DraftInboxItem(Base):

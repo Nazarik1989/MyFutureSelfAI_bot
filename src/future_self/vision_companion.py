@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
+from .access import FULL_ACCESS_TIERS
 from .db import Database
 from .models import (
     User,
@@ -156,8 +157,11 @@ class VisionCompanionService:
             return list(
                 (
                     await session.scalars(
-                        select(VisionCompanionPreference).where(
-                            VisionCompanionPreference.enabled.is_(True)
+                        select(VisionCompanionPreference)
+                        .join(User, User.id == VisionCompanionPreference.owner_id)
+                        .where(
+                            VisionCompanionPreference.enabled.is_(True),
+                            User.access_tier.in_(FULL_ACCESS_TIERS),
                         )
                     )
                 ).all()
@@ -165,14 +169,19 @@ class VisionCompanionService:
 
     async def snapshot(self, preference_id: int) -> CompanionSnapshot | None:
         async with self.db.session() as session:
-            preference = await session.scalar(
-                select(VisionCompanionPreference).where(
+            row = await session.execute(
+                select(VisionCompanionPreference, User)
+                .join(User, User.id == VisionCompanionPreference.owner_id)
+                .where(
                     VisionCompanionPreference.id == preference_id,
                     VisionCompanionPreference.enabled.is_(True),
+                    User.access_tier.in_(FULL_ACCESS_TIERS),
                 )
             )
-            if preference is None:
+            current = row.one_or_none()
+            if current is None:
                 return None
+            preference, owner = current
             item = await session.scalar(
                 select(VisionItem).where(
                     VisionItem.id == preference.vision_item_id,
@@ -192,7 +201,7 @@ class VisionCompanionService:
                 preference_id=preference.id,
                 owner_id=preference.owner_id,
                 item_id=item.id,
-                chat_id=preference.chat_id,
+                chat_id=owner.telegram_id,
                 timezone=preference.timezone,
                 wish_text=item.wish_text,
                 why_text=item.why_text,

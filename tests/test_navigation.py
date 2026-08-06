@@ -2,8 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 from autotester.fakes import FakeBot, FakeCallbackQuery, FakeMessage, ScriptedTranscription
+from telegram import BotCommandScopeAllPrivateChats
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
 
+from future_self.access import AccessService
 from future_self.bot import EVENING_WORKED, FutureSelfBot
 from future_self.config import Settings
 from future_self.navigation import (
@@ -337,14 +339,18 @@ async def test_native_private_commands_are_registered_once_during_startup(db, fa
     await bot._post_init(app)
     assert len(telegram.command_calls) == 1
     assert [item.command for item in telegram.command_calls[0][0]] == [
-        item.command for item in PUBLIC_COMMANDS
+        "start",
+        "menu",
+        "help",
     ]
+    assert isinstance(telegram.command_calls[0][1]["scope"], BotCommandScopeAllPrivateChats)
     assert len(telegram.menu_calls) == 1
 
 
 async def test_start_after_onboarding_offers_main_menu_without_llm(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     user = await bot._user(777)
+    await AccessService(db).grant_subscriber(777, source="test")
     async with db.session() as session:
         stored = await session.get(type(user), user.id)
         stored.onboarding_completed = True

@@ -13,9 +13,11 @@ from telegram.ext import (
     ConversationHandler,
     ExtBot,
     MessageHandler,
+    TypeHandler,
 )
 
 import future_self.main as main_module
+from future_self.access import AccessService
 from future_self.bot import FutureSelfBot, log_safe_failure
 from future_self.config import Settings
 from future_self.doctor import run_diagnostics
@@ -57,7 +59,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260731_0022')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260805_0023')")
         )
 
     async def forbidden_network(*args, **kwargs):
@@ -107,7 +109,9 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     handlers = application.handlers[0]
     vision_gate_handlers = application.handlers[-1]
 
-    assert application.handlers[-4][0].callback.__name__ == "private_chat_guard"
+    assert application.handlers[-5][0].callback.__name__ == "private_chat_guard"
+    assert isinstance(application.handlers[-4][0], TypeHandler)
+    assert application.handlers[-4][0].callback.__name__ == "access_gate"
     assert application.handlers[-3][0].callback.__name__ == "system_action_text_gate"
     assert isinstance(handlers[0], ConversationHandler)
     assert isinstance(handlers[1], ConversationHandler)
@@ -149,9 +153,9 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     }
     assert {
         "help",
-            "profile",
-            "location",
-            "timezone",
+        "profile",
+        "location",
+        "timezone",
         "goals",
         "inbox",
         "tasks",
@@ -203,6 +207,7 @@ async def test_real_application_routes_cleanup_before_persistent_onboarding(
     application = core.build()
     application._initialized = True
     owner = await core._user(712345)
+    await AccessService(db).grant_subscriber(712345, source="test")
     async with db.session() as session:
         session.add(
             OnboardingState(

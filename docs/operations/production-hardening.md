@@ -57,7 +57,7 @@ offsite retention and secret rotation remain host-operator responsibilities.
    override it with a local process/SQLite check compatible with the retained revision:
 
    ```bash
-   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\"} else 1)'" \
+   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\",\"20260805_0023\"} else 1)'" \
    --health-interval=60s --health-timeout=20s --health-start-period=30s \
    --health-retries=3
    ```

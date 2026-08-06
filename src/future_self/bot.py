@@ -35,6 +35,8 @@ from telegram.ext import (
 )
 from telegram.warnings import PTBUserWarning
 
+from .access import BLOCKED, FULL_ACCESS_TIERS, GUEST, AccessService, is_full_access_tier
+from .access_handlers import GUEST_COMMANDS, AccessHandlers
 from .actions import (
     ActionCommandRouter,
     ActionOutcome,
@@ -86,7 +88,7 @@ from .models import (
     VisionProfile,
 )
 from .natural_commands import NaturalAction, NaturalCommandRouter
-from .navigation import NavigationFlowStore, public_commands
+from .navigation import NavigationFlowStore
 from .navigation_handlers import NavigationHandlers
 from .reminders import TaskReminderEngine
 from .repositories import (
@@ -177,6 +179,7 @@ def log_safe_failure(event: str, exc: BaseException | None, *, user_id: int | No
 
 
 class FutureSelfBot(
+    AccessHandlers,
     LabHandlers,
     VisionHandlers,
     TaskHandlers,
@@ -195,6 +198,8 @@ class FutureSelfBot(
     ):
         self.settings = settings
         self.db = db
+        self.access_service = AccessService(db)
+        self._access_scope_cache = {}
         self.ai = ai
         self.transcription = transcription
         self.image_generation = image_generation or create_image_generation_service(settings)
@@ -304,7 +309,8 @@ class FutureSelfBot(
         # This assistant handles profiles, health notes and reminders. Telegram
         # group/channel replies would disclose that data to other chat members,
         # so stop every non-private update before any feature handler sees it.
-        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-4)
+        app.add_handler(TypeHandler(Update, self.private_chat_guard), group=-5)
+        app.add_handler(TypeHandler(Update, self.access_gate), group=-4)
         # Destructive natural-language controls must win over every stateful
         # text flow (onboarding, Labs, Vision, health, doctor, and so on).
         # Keeping this in its own group also means a non-matching phrase can
@@ -624,15 +630,17 @@ class FutureSelfBot(
             self.knowledge_storage.cleanup_staging(
                 older_than_seconds=self.settings.knowledge_staging_ttl_minutes * 60
             )
-        commands = public_commands(
-            getattr(self.settings, "enable_workspace_access", False),
-            getattr(self.settings, "enable_knowledge_hub", False),
-        )
-        await app.bot.set_my_commands(
-            [BotCommand(item.command, item.description) for item in commands],
-            scope=BotCommandScopeAllPrivateChats(),
-        )
-        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        try:
+            await app.bot.set_my_commands(
+                [BotCommand(item.command, item.description) for item in GUEST_COMMANDS],
+                scope=BotCommandScopeAllPrivateChats(),
+            )
+        except TelegramError as exc:
+            log_safe_failure("Global command scope setup failed", exc)
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        except TelegramError as exc:
+            log_safe_failure("Global menu button setup failed", exc)
 
         async def send(telegram_id: int, text: str) -> int | None:
             message = await app.bot.send_message(chat_id=telegram_id, text=text)
@@ -643,6 +651,13 @@ class FutureSelfBot(
 
         async def send_vision_companion(preference_id: int, moment: str) -> None:
             await self._vision_companion_notification(app.bot, preference_id, moment)
+
+        async def can_send(telegram_id: int) -> bool:
+            try:
+                return await self.access_service.has_full_access_by_telegram_id(telegram_id)
+            except Exception as exc:
+                log_safe_failure("Background access check failed", exc, user_id=telegram_id)
+                return False
 
         if app.job_queue is None:
             logger.warning("JobQueue is unavailable; scheduled messages are disabled")
@@ -661,6 +676,7 @@ class FutureSelfBot(
             self.settings.weekly_review_weekday,
             self.settings.enable_weekly_review,
             send_vision_companion,
+            can_send=can_send,
         )
         if self.settings.enable_task_reminders:
             self.reminder_engine = TaskReminderEngine(
@@ -678,7 +694,14 @@ class FutureSelfBot(
                 interval_seconds=self.settings.task_reminder_poll_seconds,
             )
         async with self.db.sessions() as session:
-            users = (await session.scalars(select(User).where(User.onboarding_completed))).all()
+            users = (
+                await session.scalars(
+                    select(User).where(
+                        User.onboarding_completed.is_(True),
+                        User.access_tier.in_(FULL_ACCESS_TIERS),
+                    )
+                )
+            ).all()
         for user in users:
             self.scheduler.schedule_user(user.telegram_id, user.timezone)
         for preference in await self.health_service.reminder_preferences():
@@ -848,9 +871,15 @@ class FutureSelfBot(
         raise ApplicationHandlerStop
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        if await self.workspace_start_invitation(update, context):
-            return ConversationHandler.END
         user = await self._user(update.effective_user.id)
+        if user.access_tier == GUEST:
+            await self.show_guest_root(update)
+            return ConversationHandler.END
+        if user.access_tier == BLOCKED or not is_full_access_tier(user.access_tier):
+            await self.show_blocked_screen(update)
+            return ConversationHandler.END
+        if await self.workspace_start_invitation(update, context, access_user=user):
+            return ConversationHandler.END
         if user.onboarding_completed:
             context.user_data.pop("onboarding_user_id", None)
             context.user_data.pop("onboarding_detached", None)

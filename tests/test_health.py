@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import func, select
 from telegram.ext import ConversationHandler
 
+from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER
 from future_self.bot import (
     HEALTH_ENERGY,
     HEALTH_MOOD,
@@ -309,6 +310,49 @@ async def test_health_reminder_rejects_non_hhmm_time(db, fake_ai):
     assert "формате HH:MM" in message.replies[-1]["text"]
     async with db.sessions() as session:
         assert await session.scalar(select(func.count(HealthReminderPreference.id))) == 0
+
+
+async def test_startup_health_preferences_include_only_full_access_owners(db):
+    service = HealthService(db)
+    tiers = [GUEST, SUBSCRIBER, ADMIN, BLOCKED]
+    owner_ids: dict[str, int] = {}
+    for offset, tier in enumerate(tiers, start=1):
+        telegram_id = 94000 + offset
+        async with db.session() as session:
+            owner = await UserRepository(session).get_or_create(telegram_id, "Europe/Moscow")
+            owner.access_tier = tier
+            owner_ids[tier] = owner.id
+        await service.set_reminder(
+            user_id=owner_ids[tier],
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+            timezone="Europe/Moscow",
+            local_time=time(20),
+            enabled=True,
+        )
+
+    async with db.session() as session:
+        preferences = list((await session.scalars(select(HealthReminderPreference))).all())
+        for preference in preferences:
+            preference.telegram_user_id += 10_000
+            preference.chat_id += 10_000
+
+    enabled = await service.reminder_preferences()
+    assert {preference.user_id for preference in enabled} == {
+        owner_ids[SUBSCRIBER],
+        owner_ids[ADMIN],
+    }
+    assert all(preference.chat_id == preference.telegram_user_id for preference in enabled)
+    assert {preference.telegram_user_id for preference in enabled} == {94002, 94003}
+    async with db.sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count(HealthReminderPreference.id)).where(
+                    HealthReminderPreference.enabled.is_(True)
+                )
+            )
+            == 4
+        )
 
 
 def test_scheduler_health_reminder_uses_recurring_timezone_job_and_deduplicated_name():

@@ -8,6 +8,7 @@ from autotester.fakes import FakeBot, FakeCallbackQuery, FakeMessage, ScriptedTr
 from sqlalchemy import select, update
 from telegram.ext import ApplicationHandlerStop, ConversationHandler
 
+from future_self.access import AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.labs import LabUploadSessionStore
@@ -165,6 +166,10 @@ async def test_direct_deep_link_precedes_onboarding_and_capabilities_survive_res
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     owner = await bot._user(OWNER_TELEGRAM_ID)
     recipient = await bot._user(RECIPIENT_TELEGRAM_ID)
+    await bot._user(OTHER_TELEGRAM_ID)
+    await AccessService(db).grant_subscriber(OWNER_TELEGRAM_ID, source="test")
+    await AccessService(db).grant_subscriber(RECIPIENT_TELEGRAM_ID, source="test")
+    await AccessService(db).grant_subscriber(OTHER_TELEGRAM_ID, source="test")
     await set_display_name(db, owner.id, "<b>Alice & Bob</b>")
     workspace = await bot.workspace_service.create_workspace(
         owner.id,
@@ -309,6 +314,7 @@ async def test_revoked_invitation_action_is_generic_and_unusable(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     owner = await bot._user(OWNER_TELEGRAM_ID)
     target = await bot._user(RECIPIENT_TELEGRAM_ID)
+    await AccessService(db).grant_subscriber(RECIPIENT_TELEGRAM_ID, source="test")
     workspace = await bot.workspace_service.create_workspace(owner.id, "team", "Revocation")
     access = await bot.workspace_service.access_context(owner.id, workspace.id)
     issued = await bot.workspace_service.create_invitation(

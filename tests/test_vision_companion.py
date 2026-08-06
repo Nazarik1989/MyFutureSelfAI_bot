@@ -2,11 +2,17 @@ from datetime import UTC, datetime, time
 from types import SimpleNamespace
 
 from autotester.fakes import FakeCallbackQuery, FakeMessage, ScriptedTranscription
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
+from future_self.access import GUEST, SUBSCRIBER, AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
-from future_self.models import VisionCompanionCheckIn, VisionItem
+from future_self.models import (
+    VisionCompanionCheckIn,
+    VisionCompanionPreference,
+    VisionItem,
+    VisionItemImage,
+)
 from future_self.repositories import UserRepository
 from future_self.scheduler import JobQueueScheduler
 from future_self.vision_companion import VisionCompanionService, companion_extra_times
@@ -48,9 +54,16 @@ def callback_from(message: FakeMessage, prefix: str) -> str:
     raise AssertionError(f"Missing callback {prefix!r}")
 
 
-async def vision_item(db, *, telegram_id: int = 501, wish: str = "Выступить уверенно"):
+async def vision_item(
+    db,
+    *,
+    telegram_id: int = 501,
+    wish: str = "Выступить уверенно",
+    access_tier: str = SUBSCRIBER,
+):
     async with db.session() as session:
         owner = await UserRepository(session).get_or_create(telegram_id, "Europe/Moscow")
+        owner.access_tier = access_tier
         item = VisionItem(
             owner_id=owner.id,
             category="growth_creativity",
@@ -198,6 +211,87 @@ async def test_inactive_item_disables_future_companion_delivery(db):
     assert await service.snapshot(preference.id) is None
     stored = await service.get(owner_id)
     assert stored is not None and stored.enabled is False
+
+
+async def test_snapshot_gates_access_before_item_or_image_load_and_preserves_opt_in(db, fake_ai):
+    service = VisionCompanionService(db)
+    owner_id, item_id = await vision_item(db, telegram_id=504, access_tier=GUEST)
+    preference = await service.enable(
+        owner_id=owner_id,
+        item_id=item_id,
+        telegram_user_id=504,
+        chat_id=999_504,
+        timezone="Europe/Moscow",
+        morning_time=time(8),
+        evening_time=time(20),
+    )
+    assert preference is not None
+    async with db.session() as session:
+        session.add(
+            VisionItemImage(
+                vision_item_id=item_id,
+                owner_id=owner_id,
+                image_bytes=b"private-image",
+                mime_type="image/jpeg",
+                width=1,
+                height=1,
+                sha256="0" * 64,
+            )
+        )
+
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(" ".join(statement.upper().split()))
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        assert await service.snapshot(preference.id) is None
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    assert not any(" FROM VISION_ITEMS " in statement for statement in statements)
+    assert not any(" FROM VISION_ITEM_IMAGES " in statement for statement in statements)
+    assert not any(statement.startswith(("INSERT", "UPDATE", "DELETE")) for statement in statements)
+    assert await service.enabled_preferences() == []
+    async with db.sessions() as session:
+        stored = await session.get(VisionCompanionPreference, preference.id)
+    assert stored.enabled is True
+
+    deliveries: list[tuple[str, int]] = []
+
+    class TelegramBot:
+        async def send_photo(self, *, chat_id, **kwargs):
+            deliveries.append(("photo", chat_id))
+
+        async def send_message(self, *, chat_id, **kwargs):
+            deliveries.append(("message", chat_id))
+
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await bot._vision_companion_notification(TelegramBot(), preference.id, "morning")
+    assert deliveries == []
+
+    await AccessService(db).grant_subscriber(504, source="test")
+    snapshot = await service.snapshot(preference.id)
+    assert snapshot is not None
+    assert snapshot.chat_id == 504
+    assert snapshot.image_bytes == b"private-image"
+    assert [item.id for item in await service.enabled_preferences()] == [preference.id]
+    await bot._vision_companion_notification(TelegramBot(), preference.id, "morning")
+    assert deliveries == [("photo", 504)]
+
+    await AccessService(db).block(504, source="test")
+    await bot._vision_companion_notification(TelegramBot(), preference.id, "morning")
+    assert deliveries == [("photo", 504)]
+    async with db.sessions() as session:
+        stored = await session.get(VisionCompanionPreference, preference.id)
+    assert stored.enabled is True
 
 
 async def test_card_offers_opt_in_and_frequency_without_starting_image_generation(db, fake_ai):

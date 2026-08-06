@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
+from .access import FULL_ACCESS_TIERS
 from .db import Database
 from .models import HealthCheckIn, HealthReminderPreference, User
 
@@ -284,7 +285,10 @@ class HealthService:
                 await session.execute(
                     select(HealthReminderPreference, User)
                     .join(User, User.id == HealthReminderPreference.user_id)
-                    .where(HealthReminderPreference.enabled.is_(True))
+                    .where(
+                        HealthReminderPreference.enabled.is_(True),
+                        User.access_tier.in_(FULL_ACCESS_TIERS),
+                    )
                 )
             ).all()
             preferences: list[HealthReminderPreference] = []

@@ -13,6 +13,7 @@ from autotester.fakes import (
 from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
 
+from future_self.access import AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.navigation import (
@@ -262,6 +263,8 @@ async def test_invite_preview_edit_confirm_and_deep_link_accept_survive_restart(
     assert "Пересланную ссылку" in issued_text
 
     recipient = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    await recipient._user(880002)
+    await AccessService(db).grant_subscriber(880002, source="test")
     invitation = FakeMessage("/start")
     result = await recipient.start(
         update_for(invitation, user_id=880002),

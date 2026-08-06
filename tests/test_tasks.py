@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
 
+from future_self.access import SUBSCRIBER
 from future_self.models import InboxItem, TaskActionToken, TaskReminder, TaskState, VisionItem
 from future_self.reminders import TaskReminderEngine, as_utc
 from future_self.repositories import UserRepository
@@ -22,6 +23,7 @@ async def create_task(
 ):
     async with db.session() as session:
         owner = await UserRepository(session).get_or_create(telegram_id, timezone)
+        owner.access_tier = SUBSCRIBER
         local = event_at.astimezone(__import__("zoneinfo").ZoneInfo(timezone)) if event_at else None
         item = InboxItem(
             user_id=owner.id,

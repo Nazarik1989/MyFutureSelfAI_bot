@@ -109,6 +109,61 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\clean_caches.ps1
 ```
 
+## Управление доступом (этапы 1, 2 и 2.1)
+
+В таблице `users` хранится единый источник авторизации — `access_tier`:
+
+- `guest` — гостевой уровень без права на полный бот;
+- `subscriber` — полный пользовательский доступ;
+- `admin` — полный доступ администратора;
+- `blocked` — доступ заблокирован независимо от состояния профиля.
+
+`onboarding_completed` означает только завершённость настройки профиля и не является
+подпиской. Изменение onboarding не повышает и не понижает `access_tier`. Команды оператора
+не создают отсутствующих пользователей и не удаляют профиль, задачи, workspace, health или
+другие пользовательские данные:
+
+```bash
+future-self-access status <telegram_id>
+future-self-access grant subscriber <telegram_id>
+future-self-access grant admin <telegram_id>
+future-self-access set guest <telegram_id>
+future-self-access block <telegram_id>
+future-self-access unblock <telegram_id>
+```
+
+После применения миграции назначьте согласованного администратора отдельной командой — ID не
+зашит в приложение или схему БД:
+
+```bash
+future-self-access grant admin 530129470
+```
+
+Операторский rollout выполняется только при остановленном poller:
+
+1. Остановить bot process.
+2. Сделать backup БД.
+3. Выполнить `alembic upgrade head`.
+4. Развернуть совместимый код.
+5. Выдать admin через `future-self-access grant admin 530129470`.
+6. Запустить bot process.
+
+Ранний access gate, гостевой входящий контур, безопасные Telegram command scopes и защита
+исходящих фоновых отправок подключены. Daily/weekly, Health, Vision Companion и Task Reminder
+проверяют актуальный `access_tier`; Task Reminder сохраняет pending-строку при потере доступа и
+может доставить её после возврата subscriber/admin.
+
+Известное ограничение: уже включённые Health/Vision preferences пользователя, которому выдали
+subscriber/admin, не добавляются в in-memory JobQueue автоматически. Они начнут планироваться после
+перезапуска bot process либо после изменения соответствующей настройки самим пользователем;
+периодического access polling нет.
+
+Production rollout всё ещё запрещён: гостевые AI demos и согласованный daily quota/usage
+enforcement будут реализованы отдельными этапами. До них последовательность rollout выше остаётся
+только планом.
+Возврат к коду без access enforcement security-sensitive; downgrade допустим только при
+остановленном bot process и с отдельной оценкой последствий отката.
+
 ## PostgreSQL
 
 ```bash
