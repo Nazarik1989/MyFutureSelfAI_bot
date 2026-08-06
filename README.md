@@ -452,3 +452,11 @@ scripts/              установка, запуск и безопасная �
 ```
 
 Не коммитьте `.env`, локальные базы и пользовательские аудиофайлы. Подробные продуктовые границы описаны в [docs/PRD.md](docs/PRD.md), а первый smoke-test — в [docs/MANUAL_TEST.md](docs/MANUAL_TEST.md).
+
+---
+
+## Naz AI Lab
+
+This project is part of [Naz AI Lab](https://naz-ai-lab.ru/) — the digital laboratory of [Nazar Zykov](https://naz-ai-lab.ru/creator/).
+
+[Official project page](https://naz-ai-lab.ru/projects/future-self-ai/) · [All Naz AI Lab projects](https://naz-ai-lab.ru/projects/)
