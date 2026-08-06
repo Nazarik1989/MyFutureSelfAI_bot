@@ -106,6 +106,140 @@ class AccessTierChange(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class GuestQuotaDay(Base):
+    __tablename__ = "guest_quota_days"
+
+    quota_day: Mapped[date] = mapped_column(Date, primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class GuestUsageLedger(Base):
+    __tablename__ = "guest_usage_ledger"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "idempotency_key",
+            name="uq_guest_usage_user_idempotency",
+        ),
+        UniqueConstraint("reservation_token", name="uq_guest_usage_reservation_token"),
+        CheckConstraint(
+            "demo_kind IN ('thought_breakdown', 'first_step')",
+            name="ck_guest_usage_demo_kind",
+        ),
+        CheckConstraint(
+            "status IN ('reserved', 'succeeded', 'failed', 'expired')",
+            name="ck_guest_usage_status",
+        ),
+        CheckConstraint(
+            "length(idempotency_key) BETWEEN 1 AND 128",
+            name="ck_guest_usage_idempotency_length",
+        ),
+        CheckConstraint(
+            "expires_at > reserved_at",
+            name="ck_guest_usage_expiry_order",
+        ),
+        CheckConstraint(
+            "(status = 'reserved' AND completed_at IS NULL) OR "
+            "(status IN ('succeeded', 'failed', 'expired') AND completed_at IS NOT NULL)",
+            name="ck_guest_usage_completion_state",
+        ),
+        CheckConstraint(
+            "provider_started_at IS NULL OR "
+            "(provider_started_at >= reserved_at AND provider_started_at < expires_at)",
+            name="ck_guest_usage_provider_start_window",
+        ),
+        CheckConstraint(
+            "status <> 'succeeded' OR provider_started_at IS NOT NULL",
+            name="ck_guest_usage_success_requires_provider_start",
+        ),
+        Index(
+            "uq_guest_usage_one_reserved_per_user",
+            "user_id",
+            unique=True,
+            sqlite_where=text("status = 'reserved'"),
+            postgresql_where=text("status = 'reserved'"),
+        ),
+        Index(
+            "ix_guest_usage_quota_status_expiry",
+            "quota_day",
+            "status",
+            "expires_at",
+        ),
+        Index("ix_guest_usage_user_status", "user_id", "status"),
+        Index("ix_guest_usage_provider_started_at", "provider_started_at"),
+        Index(
+            "ix_guest_usage_unstarted_status_expiry",
+            "status",
+            "expires_at",
+            sqlite_where=text("provider_started_at IS NULL"),
+            postgresql_where=text("provider_started_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    demo_kind: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    telegram_update_id: Mapped[int | None] = mapped_column(BigInteger)
+    reservation_token: Mapped[str] = mapped_column(String(64))
+    quota_day: Mapped[date] = mapped_column(Date)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    provider_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GuestDemoSession(Base):
+    __tablename__ = "guest_demo_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "chat_id", name="uq_guest_demo_session_user_chat"),
+        CheckConstraint(
+            "demo_kind IN ('thought_breakdown', 'first_step')",
+            name="ck_guest_demo_session_kind",
+        ),
+        CheckConstraint(
+            "status IN ('awaiting_input', 'processing', 'result_ready', "
+            "'completed', 'cancelled', 'expired')",
+            name="ck_guest_demo_session_status",
+        ),
+        CheckConstraint("version > 0", name="ck_guest_demo_session_version"),
+        CheckConstraint("access_version > 0", name="ck_guest_demo_session_access_version"),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_guest_demo_session_expiry_order",
+        ),
+        CheckConstraint(
+            "(status = 'result_ready' AND result_payload IS NOT NULL "
+            "AND result_expires_at IS NOT NULL) OR "
+            "(status <> 'result_ready' AND result_payload IS NULL "
+            "AND result_expires_at IS NULL)",
+            name="ck_guest_demo_session_result_state",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    access_version: Mapped[int] = mapped_column(Integer)
+    demo_kind: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(20))
+    prompt_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    consumed_update_id: Mapped[int | None] = mapped_column(BigInteger)
+    consumed_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    usage_id: Mapped[int | None] = mapped_column(
+        ForeignKey("guest_usage_ledger.id", ondelete="SET NULL")
+    )
+    result_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    result_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class DraftInboxItem(Base):
     __tablename__ = "draft_inbox_items"
 

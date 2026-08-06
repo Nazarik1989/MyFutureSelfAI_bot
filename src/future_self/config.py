@@ -12,6 +12,9 @@ class LegacyConfigurationWarning(UserWarning):
     pass
 
 
+GUEST_TEXT_PROVIDER_TIMEOUT_SECONDS = 90
+
+
 def resolve_env_file(
     *,
     cwd: Path | None = None,
@@ -81,6 +84,12 @@ class Settings(BaseSettings):
     task_reminder_lead_minutes: int = Field(default=30, ge=0, le=10080)
     task_reminder_poll_seconds: int = Field(default=15, ge=5, le=300)
     task_reminder_lease_seconds: int = Field(default=120, ge=30, le=3600)
+    guest_ai_enabled: bool = True
+    guest_operation_limit: int = Field(default=2, ge=1, le=10)
+    guest_global_daily_limit: int = Field(default=50, ge=1, le=100_000)
+    guest_reservation_ttl_minutes: int = Field(default=10, ge=2, le=60)
+    guest_input_ttl_minutes: int = Field(default=15, ge=5, le=120)
+    guest_result_ttl_minutes: int = Field(default=15, ge=5, le=120)
     collection_action_ttl_minutes: int = Field(default=15, ge=1, le=60)
     collection_input_ttl_minutes: int = Field(default=20, ge=1, le=120)
     collection_context_ttl_minutes: int = Field(default=20, ge=1, le=1440)
@@ -311,6 +320,8 @@ class Settings(BaseSettings):
             raise ValueError("One Knowledge source and extraction must fit the space storage quota")
         if self.knowledge_runner_heartbeat_seconds * 2 >= self.knowledge_runner_lease_seconds:
             raise ValueError("Knowledge runner heartbeat must be less than half the lease")
+        if self.guest_reservation_ttl_minutes * 60 <= GUEST_TEXT_PROVIDER_TIMEOUT_SECONDS:
+            raise ValueError("Guest reservation TTL must exceed the guest text-provider timeout")
         return self
 
 

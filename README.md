@@ -158,9 +158,33 @@ subscriber/admin, не добавляются в in-memory JobQueue автома
 перезапуска bot process либо после изменения соответствующей настройки самим пользователем;
 периодического access polling нет.
 
-Production rollout всё ещё запрещён: гостевые AI demos и согласованный daily quota/usage
-enforcement будут реализованы отдельными этапами. До них последовательность rollout выше остаётся
-только планом.
+### Основа квоты гостевых AI-demo (этап 3A)
+
+Data/domain foundation реализован, но AI provider и приём гостевого текста в Telegram handlers
+ещё не подключены. Личная квота списывается только за valid structured result и разрешает гостю
+две успешные AI-операции за всё время, а общий бюджет —
+50 фактически начатых provider-вызовов на UTC-сутки. Активная reservation временно занимает личный
+и общий слот до начала вызова или завершения TTL. Сбой до старта provider освобождает оба слота;
+после старта сбой или timeout остаётся в общем бюджете, но не расходует личную lifetime-квоту.
+Duplicate update и повторный старт не создают новую попытку. Ограниченный структурированный
+результат хранится только в restart-safe session до доставки, отмены или истечения result TTL.
+
+```dotenv
+GUEST_AI_ENABLED=true
+GUEST_OPERATION_LIMIT=2
+GUEST_GLOBAL_DAILY_LIMIT=50
+GUEST_RESERVATION_TTL_MINUTES=10
+GUEST_INPUT_TTL_MINUTES=15
+GUEST_RESULT_TTL_MINUTES=15
+```
+
+`GUEST_AI_ENABLED=false` запрещает только новые reservations и не отключает access gate, не меняет
+`access_tier` и не выдаёт полный доступ. Операторская команда и порядок назначения admin остаются
+прежними.
+
+Production rollout всё ещё запрещён до отдельного этапа 3B: demo-кнопки пока показывают прежний
+временный экран, гостевой текст не передаётся AI provider, а последовательность rollout выше
+остаётся только планом.
 Возврат к коду без access enforcement security-sensitive; downgrade допустим только при
 остановленном bot process и с отдельной оценкой последствий отката.
 
