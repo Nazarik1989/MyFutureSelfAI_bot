@@ -5,12 +5,13 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import func, select
 
+from future_self.access import BLOCKED, GUEST, SUBSCRIBER, AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.dates import DateResolver
 from future_self.drafts import DraftInboxService
 from future_self.inbox import InboxLifecycleService
-from future_self.models import DraftInboxItem, InboxItem, TaskReminder, TaskState
+from future_self.models import DraftInboxItem, InboxItem, TaskReminder, TaskState, User
 from future_self.reminders import TaskReminderEngine, as_utc, schedule_from_temporal
 from future_self.repositories import UserRepository
 from future_self.scheduler import JobQueueScheduler
@@ -113,9 +114,11 @@ async def create_reminder(
     kind: str = "task",
     temporal_resolution: TemporalResolution | None = None,
     lead_minutes: int = 30,
+    access_tier: str = SUBSCRIBER,
 ) -> tuple[InboxItem, TaskReminder | None]:
     async with db.session() as session:
         user = await UserRepository(session).get_or_create(telegram_user_id, "Europe/Moscow")
+        user.access_tier = access_tier
         user_id = user.id
     service = DraftInboxService(
         db,
@@ -342,6 +345,7 @@ async def test_relative_reminder_text_and_voice_route_save_and_deliver(
         sent.append((target_chat_id, text))
         return 700
 
+    await AccessService(db).grant_subscriber(user_id, source="test")
     engine = TaskReminderEngine(db, send)
     assert await engine.deliver_due(now=now + delta - timedelta(seconds=1)) == 0
     assert await engine.deliver_due(now=now + delta) == 1
@@ -616,6 +620,174 @@ async def test_parallel_workers_claim_a_due_reminder_only_once(db):
     assert len(sent) == 1
 
 
+@pytest.mark.parametrize("access_tier", [GUEST, BLOCKED])
+async def test_guest_and_blocked_due_reminders_stay_pending_without_attempts(db, access_tier):
+    item, reminder = await create_reminder(
+        db,
+        telegram_user_id=71,
+        temporal_resolution=temporal(resolved_at=datetime(2026, 7, 20, 15, tzinfo=UTC)),
+        access_tier=access_tier,
+    )
+    assert reminder is not None
+    async with db.session() as session:
+        owner = await session.get(User, item.user_id)
+        owner.onboarding_completed = True
+
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 1
+
+    assert (
+        await TaskReminderEngine(db, send).deliver_due(
+            now=datetime(2026, 7, 20, 14, 30, tzinfo=UTC)
+        )
+        == 0
+    )
+    async with db.sessions() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+    assert sent == []
+    assert stored.status == "pending"
+    assert stored.attempt_count == 0
+    assert stored.claim_token is None
+
+
+async def test_guest_reminder_delivers_same_row_after_subscriber_grant(db):
+    _, reminder = await create_reminder(
+        db,
+        telegram_user_id=72,
+        temporal_resolution=temporal(resolved_at=datetime(2026, 7, 20, 15, tzinfo=UTC)),
+        access_tier=GUEST,
+    )
+    assert reminder is not None
+    original = (reminder.id, reminder.delivery_key, reminder.task_version)
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 7
+
+    engine = TaskReminderEngine(db, send)
+    now = datetime(2026, 7, 20, 14, 30, tzinfo=UTC)
+    assert await engine.deliver_due(now=now) == 0
+    await AccessService(db).grant_subscriber(72, source="test")
+    assert await engine.deliver_due(now=now) == 1
+    async with db.sessions() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+    assert sent
+    assert (stored.id, stored.delivery_key, stored.task_version) == original
+    assert stored.status == "sent"
+
+
+async def test_downgrade_between_candidate_scan_and_claim_keeps_attempt_unchanged(db, monkeypatch):
+    _, reminder = await create_reminder(
+        db,
+        telegram_user_id=73,
+        temporal_resolution=temporal(resolved_at=datetime(2026, 7, 20, 15, tzinfo=UTC)),
+    )
+    assert reminder is not None
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 1
+
+    engine = TaskReminderEngine(db, send)
+    original_candidates = engine._candidate_ids
+
+    async def downgrade_after_candidates(due_pending, stale_processing):
+        candidate_ids = await original_candidates(due_pending, stale_processing)
+        await AccessService(db).set_guest(73, source="test")
+        return candidate_ids
+
+    monkeypatch.setattr(engine, "_candidate_ids", downgrade_after_candidates)
+    assert await engine.deliver_due(now=datetime(2026, 7, 20, 14, 30, tzinfo=UTC)) == 0
+    async with db.sessions() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+    assert sent == []
+    assert (stored.status, stored.attempt_count, stored.claim_token) == ("pending", 0, None)
+
+
+async def test_downgrade_after_claim_releases_pending_without_send(db, monkeypatch):
+    _, reminder = await create_reminder(
+        db,
+        telegram_user_id=74,
+        temporal_resolution=temporal(resolved_at=datetime(2026, 7, 20, 15, tzinfo=UTC)),
+    )
+    assert reminder is not None
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        sent.append(text)
+        return 1
+
+    engine = TaskReminderEngine(db, send)
+    original_claim = engine._claim_due
+
+    async def downgrade_after_claim(now):
+        claimed = await original_claim(now)
+        await AccessService(db).block(74, source="test")
+        return claimed
+
+    monkeypatch.setattr(engine, "_claim_due", downgrade_after_claim)
+    assert await engine.deliver_due(now=datetime(2026, 7, 20, 14, 30, tzinfo=UTC)) == 0
+    async with db.sessions() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+    assert sent == []
+    assert (stored.status, stored.attempt_count, stored.claim_token) == ("pending", 0, None)
+
+
+async def test_downgrade_while_sending_compensates_and_releases_same_row(db):
+    _, reminder = await create_reminder(
+        db,
+        telegram_user_id=75,
+        temporal_resolution=temporal(resolved_at=datetime(2026, 7, 20, 15, tzinfo=UTC)),
+    )
+    assert reminder is not None
+    deleted: list[tuple[int, int]] = []
+
+    async def send(chat_id: int, text: str) -> int:
+        await AccessService(db).set_guest(75, source="test")
+        return 808
+
+    async def delete_sent(chat_id: int, message_id: int) -> None:
+        deleted.append((chat_id, message_id))
+
+    engine = TaskReminderEngine(db, send, delete_sent=delete_sent)
+    assert await engine.deliver_due(now=datetime(2026, 7, 20, 14, 30, tzinfo=UTC)) == 0
+    async with db.sessions() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+    assert deleted == [(75, 808)]
+    assert stored.id == reminder.id
+    assert (stored.status, stored.attempt_count, stored.claim_token) == ("pending", 0, None)
+
+
+async def test_reconcile_missing_skips_guest_until_access_is_granted(db):
+    _, reminder = await create_reminder(
+        db,
+        telegram_user_id=76,
+        temporal_resolution=temporal(
+            resolved_at=datetime(2027, 7, 20, 15, tzinfo=UTC),
+            local_date=date(2027, 7, 20),
+        ),
+        access_tier=GUEST,
+    )
+    assert reminder is not None
+    async with db.session() as session:
+        await session.delete(await session.get(TaskReminder, reminder.id))
+
+    async def send(chat_id: int, text: str) -> int:
+        return 1
+
+    engine = TaskReminderEngine(db, send)
+    now = datetime(2026, 7, 17, tzinfo=UTC)
+    assert await engine.reconcile_missing(now=now) == 0
+    await AccessService(db).grant_subscriber(76, source="test")
+    assert await engine.reconcile_missing(now=now) == 1
+    assert await engine.reconcile_missing(now=now) == 0
+
+
 async def test_new_engine_instance_delivers_pending_state_after_restart(db):
     await create_reminder(
         db,
@@ -796,6 +968,44 @@ async def test_bot_startup_expires_very_old_reminder_without_telegram_delivery(d
     assert saved.status == "expired"
     assert saved.telegram_message_id is None
     assert saved_item.status == "archived"
+
+
+async def test_bot_startup_immediate_delivery_skips_guest_reminder(db, fake_ai):
+    now = datetime.now(UTC).replace(microsecond=0)
+    _, reminder = await create_reminder(
+        db,
+        telegram_user_id=78,
+        temporal_resolution=temporal(
+            resolved_at=now + timedelta(minutes=5),
+            local_date=(now + timedelta(minutes=5)).date(),
+        ),
+        access_tier=GUEST,
+    )
+    assert reminder is not None
+    sent: list[int] = []
+
+    class TelegramBot:
+        async def set_my_commands(self, commands, *, scope):
+            return None
+
+        async def set_chat_menu_button(self, *, menu_button):
+            return None
+
+        async def send_message(self, *, chat_id: int, text: str):
+            sent.append(chat_id)
+            return SimpleNamespace(message_id=901)
+
+    class Queue:
+        def run_repeating(self, callback, **kwargs):
+            return None
+
+    bot = FutureSelfBot(route_settings(), db, fake_ai, PhraseTranscription(""))
+    await bot._post_init(SimpleNamespace(bot=TelegramBot(), job_queue=Queue()))
+
+    assert sent == []
+    async with db.sessions() as session:
+        stored = await session.get(TaskReminder, reminder.id)
+    assert (stored.status, stored.attempt_count, stored.claim_token) == ("pending", 0, None)
 
 
 def test_scheduler_registers_single_persistent_outbox_poller():

@@ -19,6 +19,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 from telegram.helpers import create_deep_linked_url
 
+from .access import BLOCKED, GUEST, is_full_access_tier
 from .workspace_access import (
     AccessContext,
     InvitationActionResult,
@@ -119,13 +120,24 @@ class WorkspaceHandlers:
         await self._send_workspace_hub(update.effective_message, user.id, chat_id)
 
     async def workspace_start_invitation(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        access_user: Any | None = None,
     ) -> bool:
         if not self._workspace_enabled():
             return False
         args = tuple(getattr(context, "args", ()) or ())
         if not args or not args[0].startswith("space_"):
             return False
+        user = access_user or await self._user(update.effective_user.id)
+        if user.access_tier == GUEST:
+            await self.show_guest_root(update)
+            return True
+        if user.access_tier == BLOCKED or not is_full_access_tier(user.access_tier):
+            await self.show_blocked_screen(update)
+            return True
         if len(args) != 1:
             await update.effective_message.reply_text("Приглашение недействительно.")
             return True
@@ -137,7 +149,6 @@ class WorkspaceHandlers:
         if active_flow is not None:
             await self._prompt_navigation_flow(update.effective_message, update, active_flow)
             return True
-        user = await self._user(update.effective_user.id)
         try:
             incoming = await self.workspace_service.issue_incoming_actions(
                 user.id, update.effective_chat.id, raw_token

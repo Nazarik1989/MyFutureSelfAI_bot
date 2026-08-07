@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -13,9 +14,11 @@ from telegram.ext import (
     ConversationHandler,
     ExtBot,
     MessageHandler,
+    TypeHandler,
 )
 
 import future_self.main as main_module
+from future_self.access import AccessService
 from future_self.bot import FutureSelfBot, log_safe_failure
 from future_self.config import Settings
 from future_self.doctor import run_diagnostics
@@ -57,7 +60,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260731_0022')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260806_0024')")
         )
 
     async def forbidden_network(*args, **kwargs):
@@ -80,6 +83,253 @@ def test_application_starts_with_fake_services(fake_ai):
     )
     assert len(captured) == 1
     assert captured[0].bot.token.startswith("123456:")
+
+
+async def test_guest_services_share_one_policy_instance(db, fake_ai):
+    bot = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    assert bot.guest_session_service.policy is bot.guest_quota_policy
+    assert bot.guest_quota_service is bot.guest_session_service.quota
+    assert bot.guest_quota_service.policy is bot.guest_quota_policy
+
+
+async def test_post_init_schedules_guest_recovery_before_job_queue_early_return(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    recovery_started = asyncio.Event()
+    recovery_release = asyncio.Event()
+
+    async def blocked_recovery(_telegram_bot):
+        recovery_started.set()
+        await recovery_release.wait()
+
+    monkeypatch.setattr(bot, "_recover_guest_demo_results", blocked_recovery)
+
+    class TelegramBot:
+        async def set_my_commands(self, commands, **kwargs):
+            return None
+
+        async def set_chat_menu_button(self, **kwargs):
+            return None
+
+    def forbidden_application_task(*args, **kwargs):
+        raise AssertionError("post_init must not use Application.create_task")
+
+    await bot._post_init(
+        SimpleNamespace(
+            bot=TelegramBot(),
+            job_queue=None,
+            create_task=forbidden_application_task,
+            post_stop=bot._post_stop,
+        )
+    )
+    await recovery_started.wait()
+    maintenance = bot._guest_maintenance_task
+    assert maintenance is not None
+    assert maintenance.get_name() == "guest-result-maintenance"
+    assert not maintenance.done()
+    await bot._post_stop(SimpleNamespace())
+    assert maintenance.done()
+    assert bot._guest_maintenance_task is None
+    recovery_release.set()
+    await bot._post_shutdown(SimpleNamespace())
+    assert bot._guest_maintenance_task is None
+
+
+async def test_guest_maintenance_cleanup_repeats_without_sleep_based_race(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    cleanup_calls = 0
+    events: list[str] = []
+    first_wait = asyncio.Event()
+    release_wait = asyncio.Event()
+    second_cleanup = asyncio.Event()
+
+    async def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        events.append("cleanup")
+        if cleanup_calls == 2:
+            second_cleanup.set()
+
+    async def recovery(_telegram_bot):
+        events.append("recovery")
+        return None
+
+    async def controlled_wait():
+        first_wait.set()
+        await release_wait.wait()
+        release_wait.clear()
+
+    monkeypatch.setattr(bot, "_cleanup_guest_results_safely", cleanup)
+    monkeypatch.setattr(bot, "_recover_guest_demo_results", recovery)
+    monkeypatch.setattr(bot, "_guest_maintenance_wait", controlled_wait)
+    bot._start_guest_maintenance(SimpleNamespace())
+    await first_wait.wait()
+    assert cleanup_calls == 1
+    assert events == ["cleanup", "recovery"]
+    release_wait.set()
+    await second_cleanup.wait()
+    assert cleanup_calls == 2
+    await bot._stop_guest_maintenance()
+
+
+async def test_scheduler_startup_does_not_wait_for_blocked_guest_recovery(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = FutureSelfBot(
+        runtime_settings(database_url=db.url, enable_task_reminders=False),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    recovery_started = asyncio.Event()
+    recovery_release = asyncio.Event()
+    repeating: list[str] = []
+
+    async def blocked_recovery(_telegram_bot):
+        recovery_started.set()
+        await recovery_release.wait()
+
+    monkeypatch.setattr(bot, "_recover_guest_demo_results", blocked_recovery)
+
+    class TelegramBot:
+        async def set_my_commands(self, commands, **kwargs):
+            return None
+
+        async def set_chat_menu_button(self, **kwargs):
+            return None
+
+    class Queue:
+        def run_repeating(self, callback, **kwargs):
+            repeating.append(kwargs["name"])
+
+    await bot._post_init(
+        SimpleNamespace(
+            bot=TelegramBot(),
+            job_queue=Queue(),
+            post_stop=bot._post_stop,
+        )
+    )
+    assert bot.scheduler is not None
+    assert repeating == ["labs:cleanup"]
+    await recovery_started.wait()
+    assert bot._guest_maintenance_task is not None
+    assert not bot._guest_maintenance_task.done()
+    recovery_release.set()
+    await bot._post_stop(SimpleNamespace())
+
+
+async def test_guest_cleanup_iteration_failure_is_safe_and_loop_continues(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+):
+    bot = FutureSelfBot(runtime_settings(database_url=db.url), db, fake_ai, FakeTranscription())
+    calls = 0
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    recovered = asyncio.Event()
+    private_detail = "PRIVATE_MAINTENANCE_DETAIL"
+
+    async def cleanup_undeliverable_results():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError(private_detail)
+        recovered.set()
+        return 0
+
+    async def recovery(_telegram_bot):
+        return None
+
+    async def controlled_wait():
+        wait_started.set()
+        await release_wait.wait()
+        release_wait.clear()
+
+    monkeypatch.setattr(
+        bot.guest_session_service,
+        "cleanup_undeliverable_results",
+        cleanup_undeliverable_results,
+    )
+    monkeypatch.setattr(bot, "_recover_guest_demo_results", recovery)
+    monkeypatch.setattr(bot, "_guest_maintenance_wait", controlled_wait)
+    with caplog.at_level(logging.ERROR):
+        bot._start_guest_maintenance(SimpleNamespace())
+        await wait_started.wait()
+        release_wait.set()
+        await recovered.wait()
+        await bot._stop_guest_maintenance()
+    assert calls == 2
+    assert "Guest result cleanup failed error_type=RuntimeError" in caplog.text
+    assert private_detail not in caplog.text
+
+
+async def test_blocked_guest_recovery_does_not_delay_scheduler(db, fake_ai, monkeypatch):
+    bot = FutureSelfBot(
+        runtime_settings(database_url=db.url, enable_task_reminders=False),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    recovery_started = asyncio.Event()
+    recovery_release = asyncio.Event()
+    repeating: list[str] = []
+
+    async def blocked_recovery(_telegram_bot):
+        recovery_started.set()
+        await recovery_release.wait()
+
+    monkeypatch.setattr(bot, "_recover_guest_demo_results", blocked_recovery)
+
+    class TelegramBot:
+        async def set_my_commands(self, commands, **kwargs):
+            return None
+
+        async def set_chat_menu_button(self, **kwargs):
+            return None
+
+    class Queue:
+        def run_repeating(self, callback, **kwargs):
+            repeating.append(kwargs["name"])
+
+    app = SimpleNamespace(
+        bot=TelegramBot(),
+        job_queue=Queue(),
+        post_stop=bot._post_stop,
+    )
+    await bot._post_init(app)
+    assert bot.scheduler is not None
+    assert repeating == ["labs:cleanup"]
+    await recovery_started.wait()
+    assert bot._guest_maintenance_task is not None
+    assert not bot._guest_maintenance_task.done()
+    recovery_release.set()
+    await bot._post_stop(app)
 
 
 def test_critical_startup_error_is_safe_and_nonzero(monkeypatch, caplog):
@@ -107,7 +357,9 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     handlers = application.handlers[0]
     vision_gate_handlers = application.handlers[-1]
 
-    assert application.handlers[-4][0].callback.__name__ == "private_chat_guard"
+    assert application.handlers[-5][0].callback.__name__ == "private_chat_guard"
+    assert isinstance(application.handlers[-4][0], TypeHandler)
+    assert application.handlers[-4][0].callback.__name__ == "access_gate"
     assert application.handlers[-3][0].callback.__name__ == "system_action_text_gate"
     assert isinstance(handlers[0], ConversationHandler)
     assert isinstance(handlers[1], ConversationHandler)
@@ -149,9 +401,9 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     }
     assert {
         "help",
-            "profile",
-            "location",
-            "timezone",
+        "profile",
+        "location",
+        "timezone",
         "goals",
         "inbox",
         "tasks",
@@ -194,6 +446,10 @@ def test_key_telegram_handlers_are_registered(fake_ai):
     assert bot.error_handler.__name__ in {
         callback.__name__ for callback in application.error_handlers
     }
+    assert application.post_stop is not None
+    assert application.post_stop.__name__ == "_post_stop"
+    assert application.post_stop is not None
+    assert application.post_stop.__self__.__class__ is FutureSelfBot
 
 
 async def test_real_application_routes_cleanup_before_persistent_onboarding(
@@ -203,6 +459,7 @@ async def test_real_application_routes_cleanup_before_persistent_onboarding(
     application = core.build()
     application._initialized = True
     owner = await core._user(712345)
+    await AccessService(db).grant_subscriber(712345, source="test")
     async with db.session() as session:
         session.add(
             OnboardingState(

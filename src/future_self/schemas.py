@@ -1,7 +1,12 @@
 from datetime import date, datetime, time
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+GuestAction = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+]
 
 
 class VisionSummary(BaseModel):
@@ -63,6 +68,23 @@ class ParsedThought(BaseModel):
     next_step: str | None = None
     resolved_date: date | None = None
     temporal_resolution: TemporalResolution | None = None
+
+
+class GuestThoughtBreakdown(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    category: Literal["idea", "task", "desire", "note"]
+    title: str = Field(min_length=1, max_length=120)
+    essence: str = Field(min_length=1, max_length=500)
+    next_step: str = Field(min_length=1, max_length=300)
+
+
+class GuestFirstStep(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    focus: str = Field(min_length=1, max_length=300)
+    first_step: str = Field(min_length=1, max_length=300)
+    actions: list[GuestAction] = Field(min_length=0, max_length=3)
 
 
 MessageIntent = Literal[

@@ -2,6 +2,9 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import DailyCheckIn, Goal, OnboardingState, Routine, User, VisionProfile
@@ -13,11 +16,43 @@ class UserRepository:
         self.session = session
 
     async def get_or_create(self, telegram_id: int, timezone: str) -> User:
-        user = await self.session.scalar(select(User).where(User.telegram_id == telegram_id))
+        user = await self.by_telegram_id(telegram_id)
+        if user is not None:
+            return user
+
+        values = {
+            "telegram_id": telegram_id,
+            "timezone": timezone,
+            "onboarding_completed": False,
+            "access_tier": "guest",
+            "access_version": 1,
+        }
+        dialect_name = self.session.get_bind().dialect.name
+        if dialect_name == "sqlite":
+            statement = (
+                sqlite_insert(User)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=[User.telegram_id])
+            )
+            await self.session.execute(statement)
+        elif dialect_name == "postgresql":
+            statement = (
+                postgresql_insert(User)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=[User.telegram_id])
+            )
+            await self.session.execute(statement)
+        else:
+            try:
+                async with self.session.begin_nested():
+                    self.session.add(User(**values))
+                    await self.session.flush()
+            except IntegrityError:
+                # The savepoint, rather than the caller's transaction, is rolled back.
+                pass
+        user = await self.by_telegram_id(telegram_id)
         if user is None:
-            user = User(telegram_id=telegram_id, timezone=timezone)
-            self.session.add(user)
-            await self.session.flush()
+            raise RuntimeError("User creation did not produce a visible row")
         return user
 
     async def by_telegram_id(self, telegram_id: int) -> User | None:

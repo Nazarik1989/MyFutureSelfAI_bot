@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from telegram import ReplyKeyboardRemove
 from telegram.ext import ApplicationHandlerStop, ConversationHandler
 
+from future_self.access import AccessService
 from future_self.bot import ONBOARDING_INPUT, PROFILE_CONFIRM, FutureSelfBot
 from future_self.config import Settings
 from future_self.domain import ONBOARDING_QUESTIONS
@@ -407,6 +408,7 @@ async def test_onboarding_flow_exit_is_durable_and_start_resumes_saved_step(db, 
     assert any("Главное меню" in reply["text"] for reply in message.replies)
 
     restarted = make_bot(db, fake_ai)
+    await AccessService(db).grant_subscriber(8824, source="test")
     resume_context = context()
     resume_message = FakeMessage("/start")
     resume_result = await restarted.start(
@@ -562,6 +564,7 @@ async def test_summary_failure_keeps_final_answer_and_resumes_on_start(db, fake_
 
     fake_ai.summarize_vision = working_summary
     restarted = make_bot(db, fake_ai)
+    await AccessService(db).grant_subscriber(8804, source="test")
     resume_message = FakeMessage("/start")
     resume_result = await restarted.start(update_for(resume_message, user_id=8804), context())
     assert resume_result == PROFILE_CONFIRM
@@ -588,6 +591,7 @@ async def test_oversized_ai_summary_is_bounded_cached_and_still_reaches_confirma
         )
 
     fake_ai.summarize_vision = oversized_summary
+    await AccessService(db).grant_subscriber(8811, source="test")
     message = FakeMessage("/start")
     result = await bot.start(update_for(message, user_id=8811), context())
 
@@ -782,6 +786,7 @@ async def test_legacy_oversized_stored_name_is_clipped_in_returning_greeting(db,
         stored = await session.get(User, user.id)
         stored.display_name = "Ж" * 500
         stored.onboarding_completed = True
+    await AccessService(db).grant_subscriber(8815, source="test")
     message = FakeMessage("/start")
     result = await bot.start(update_for(message, user_id=8815), context())
 

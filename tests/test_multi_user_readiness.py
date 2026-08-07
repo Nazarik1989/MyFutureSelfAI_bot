@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 from telegram.ext import ApplicationHandlerStop
 
+from future_self.access import SUBSCRIBER
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.doctor_prep import DoctorVisitPrepService
@@ -112,6 +113,8 @@ async def test_two_users_are_isolated_across_all_private_data_paths(db, fake_ai)
     async with db.session() as session:
         first = await UserRepository(session).get_or_create(first_tg, "Europe/Moscow")
         second = await UserRepository(session).get_or_create(second_tg, "Europe/Moscow")
+        first.access_tier = SUBSCRIBER
+        second.access_tier = SUBSCRIBER
         first_state = await OnboardingRepository(session).get_or_create(first.id)
         second_state = await OnboardingRepository(session).get_or_create(second.id)
         first_state.answers = {"future_life": first_marker}

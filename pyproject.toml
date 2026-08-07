@@ -27,6 +27,7 @@ dev = ["pytest>=8.3", "pytest-asyncio>=0.25", "ruff>=0.11"]
 
 [project.scripts]
 future-self-bot = "future_self.main:main"
+future-self-access = "future_self.access_cli:main"
 future-self-knowledge-runner = "future_self.knowledge_runner:main"
 future-self-knowledge-backup = "future_self.knowledge_backup:main"
 

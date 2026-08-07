@@ -9,6 +9,8 @@ from .config import Settings
 from .schemas import (
     AssistantAnswer,
     GoalProposals,
+    GuestFirstStep,
+    GuestThoughtBreakdown,
     IntentResult,
     ParsedThought,
     RoutineProposals,
@@ -18,6 +20,20 @@ from .schemas import (
 )
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+GUEST_DEMO_MAX_INPUT_CHARS = 1200
+
+
+def _guest_demo_input(text: str) -> str:
+    if not isinstance(text, str):
+        raise ValueError("guest demo input must be a string")
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("guest demo input must not be empty")
+    if len(cleaned) > GUEST_DEMO_MAX_INPUT_CHARS:
+        raise ValueError(
+            f"guest demo input must not exceed {GUEST_DEMO_MAX_INPUT_CHARS} characters"
+        )
+    return cleaned
 
 
 class ProviderHealthCheck(BaseModel):
@@ -36,6 +52,10 @@ class AIService(Protocol):
     async def propose_routines(self, goals: GoalProposals) -> RoutineProposals: ...
 
     async def parse_thought(self, text: str) -> ParsedThought: ...
+
+    async def guest_thought_breakdown(self, text: str) -> GuestThoughtBreakdown: ...
+
+    async def guest_first_step(self, text: str) -> GuestFirstStep: ...
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan: ...
 
@@ -67,8 +87,20 @@ class OpenAICompatibleAIService:
         self.model = model
         self.tone = tone
 
-    async def _parse(self, schema: type[SchemaT], system: str, user: str) -> SchemaT:
-        response = await self.client.responses.parse(
+    async def _parse(
+        self,
+        schema: type[SchemaT],
+        system: str,
+        user: str,
+        *,
+        max_retries: int | None = None,
+    ) -> SchemaT:
+        client = (
+            self.client
+            if max_retries is None
+            else self.client.with_options(max_retries=max_retries)
+        )
+        response = await client.responses.parse(
             model=self.model,
             input=[
                 {"role": "system", "content": f"{system}\nСтиль ответа: {self.tone}."},
@@ -102,6 +134,22 @@ class OpenAICompatibleAIService:
 
     async def parse_thought(self, text: str) -> ParsedThought:
         return await self._parse(ParsedThought, prompts.INBOX_SYSTEM, text)
+
+    async def guest_thought_breakdown(self, text: str) -> GuestThoughtBreakdown:
+        return await self._parse(
+            GuestThoughtBreakdown,
+            prompts.GUEST_THOUGHT_SYSTEM,
+            _guest_demo_input(text),
+            max_retries=0,
+        )
+
+    async def guest_first_step(self, text: str) -> GuestFirstStep:
+        return await self._parse(
+            GuestFirstStep,
+            prompts.GUEST_FIRST_STEP_SYSTEM,
+            _guest_demo_input(text),
+            max_retries=0,
+        )
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan:
         return await self._parse(TodayPlan, prompts.TODAY_SYSTEM, repr(context))

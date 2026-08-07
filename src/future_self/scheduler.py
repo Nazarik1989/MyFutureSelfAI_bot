@@ -8,6 +8,7 @@ from .reminders import TaskReminderEngine
 
 SendCallback = Callable[[int, str], Awaitable[int | None]]
 VisionSendCallback = Callable[[int, str], Awaitable[None]]
+CanSendCallback = Callable[[int], Awaitable[bool]]
 
 
 class Scheduler(Protocol):
@@ -38,6 +39,7 @@ class JobQueueScheduler:
         weekly_weekday: int,
         weekly_enabled: bool = True,
         vision_send: VisionSendCallback | None = None,
+        can_send: CanSendCallback | None = None,
     ):
         self.job_queue = job_queue
         self.send = send
@@ -46,6 +48,7 @@ class JobQueueScheduler:
         self.weekly_weekday = weekly_weekday
         self.weekly_enabled = weekly_enabled
         self.vision_send = vision_send
+        self.can_send = can_send
 
     @staticmethod
     def next_run(timezone: str, hour: int, now: datetime | None = None) -> datetime:
@@ -83,19 +86,22 @@ class JobQueueScheduler:
 
     async def _morning(self, context: object) -> None:
         data = context.job.data
-        await self.send(data["telegram_id"], "/today — выбери небольшой фокус на сегодня.")
+        if await self._can_send(data["telegram_id"]):
+            await self.send(data["telegram_id"], "/today — выбери небольшой фокус на сегодня.")
         self._schedule_daily(data["telegram_id"], data["timezone"], "morning", self.morning_hour)
 
     async def _evening(self, context: object) -> None:
         data = context.job.data
-        await self.send(data["telegram_id"], "Время короткой рефлексии: /evening")
+        if await self._can_send(data["telegram_id"]):
+            await self.send(data["telegram_id"], "Время короткой рефлексии: /evening")
         self._schedule_daily(data["telegram_id"], data["timezone"], "evening", self.evening_hour)
 
     async def _weekly(self, context: object) -> None:
         data = context.job.data
-        await self.send(
-            data["telegram_id"], "Пора спокойно посмотреть на неделю и скорректировать систему."
-        )
+        if await self._can_send(data["telegram_id"]):
+            await self.send(
+                data["telegram_id"], "Пора спокойно посмотреть на неделю и скорректировать систему."
+            )
         self._schedule_weekly(data["telegram_id"], data["timezone"])
 
     def remove_user(self, telegram_id: int) -> None:
@@ -143,10 +149,14 @@ class JobQueueScheduler:
 
     async def _health_checkin(self, context: object) -> None:
         data = context.job.data
-        await self.send(
-            data["chat_id"],
-            "Добровольный health check-in: /checkin. Это самонаблюдение, не медицинский диагноз.",
-        )
+        if await self._can_send(data["chat_id"]):
+            await self.send(
+                data["chat_id"],
+                "Добровольный health check-in: /checkin. Это самонаблюдение, не медицинский диагноз.",
+            )
+
+    async def _can_send(self, telegram_id: int) -> bool:
+        return self.can_send is None or await self.can_send(telegram_id)
 
     def remove_health_reminder(self, user_id: int) -> None:
         get_jobs = getattr(self.job_queue, "get_jobs_by_name", None)

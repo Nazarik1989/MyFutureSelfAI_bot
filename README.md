@@ -109,6 +109,92 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\clean_caches.ps1
 ```
 
+## Управление доступом (этапы 1, 2 и 2.1)
+
+В таблице `users` хранится единый источник авторизации — `access_tier`:
+
+- `guest` — гостевой уровень без права на полный бот;
+- `subscriber` — полный пользовательский доступ;
+- `admin` — полный доступ администратора;
+- `blocked` — доступ заблокирован независимо от состояния профиля.
+
+`onboarding_completed` означает только завершённость настройки профиля и не является
+подпиской. Изменение onboarding не повышает и не понижает `access_tier`. Команды оператора
+не создают отсутствующих пользователей и не удаляют профиль, задачи, workspace, health или
+другие пользовательские данные:
+
+```bash
+future-self-access status <telegram_id>
+future-self-access grant subscriber <telegram_id>
+future-self-access grant admin <telegram_id>
+future-self-access set guest <telegram_id>
+future-self-access block <telegram_id>
+future-self-access unblock <telegram_id>
+```
+
+После применения миграции назначьте согласованного администратора отдельной командой — ID не
+зашит в приложение или схему БД:
+
+```bash
+future-self-access grant admin 530129470
+```
+
+Операторский rollout выполняется только при остановленном poller:
+
+1. Остановить bot process.
+2. Сделать backup БД.
+3. Выполнить `alembic upgrade head`.
+4. Развернуть совместимый код.
+5. Выдать admin через `future-self-access grant admin 530129470`.
+6. Запустить bot process.
+
+Ранний access gate, гостевой входящий контур, безопасные Telegram command scopes и защита
+исходящих фоновых отправок подключены. Daily/weekly, Health, Vision Companion и Task Reminder
+проверяют актуальный `access_tier`; Task Reminder сохраняет pending-строку при потере доступа и
+может доставить её после возврата subscriber/admin.
+
+Известное ограничение: уже включённые Health/Vision preferences пользователя, которому выдали
+subscriber/admin, не добавляются в in-memory JobQueue автоматически. Они начнут планироваться после
+перезапуска bot process либо после изменения соответствующей настройки самим пользователем;
+периодического access polling нет.
+
+### Гостевые AI-demo (этапы 3A–3B.2)
+
+Интерактивные demo «Разобрать мысль» и «Найти первый шаг» подключены внутри раннего access gate.
+Handler фиксирует session/reservation, редактирует одно каноническое сообщение и запускает provider
+в фоновой задаче, не блокируя обработку следующих Telegram updates. Личная квота списывается только
+за valid structured result и разрешает гостю
+две успешные AI-операции за всё время, а общий бюджет —
+50 фактически начатых provider-вызовов на UTC-сутки. Активная reservation временно занимает личный
+и общий слот до начала вызова или завершения TTL. Сбой до старта provider освобождает оба слота;
+после старта сбой или timeout остаётся в общем бюджете, но не расходует личную lifetime-квоту.
+Duplicate update и повторный старт не создают новую попытку. Ограниченный структурированный
+результат хранится только в restart-safe session до доставки, отмены или истечения result TTL.
+
+```dotenv
+GUEST_AI_ENABLED=true
+GUEST_OPERATION_LIMIT=2
+GUEST_GLOBAL_DAILY_LIMIT=50
+GUEST_RESERVATION_TTL_MINUTES=10
+GUEST_INPUT_TTL_MINUTES=15
+GUEST_RESULT_TTL_MINUTES=15
+```
+
+`GUEST_AI_ENABLED=false` запрещает только новые reservations и не отключает access gate, не меняет
+`access_tier` и не выдаёт полный доступ. Операторская команда и порядок назначения admin остаются
+прежними.
+
+Успешный structured result сохраняется в restart-safe session до доставки. Startup recovery повторяет
+только Telegram edit без нового AI-вызова; недоступное каноническое сообщение не создаёт reply/send
+fallback. Lifecycle-managed task сначала очищает недоставляемые payload, один раз выполняет startup
+recovery, затем периодически повторяет только cleanup и явно отменяется/ожидается при остановке бота;
+result TTL повторно проверяется при подтверждении доставки.
+При смене доступа бот делает best-effort нейтральное редактирование канонического сообщения, но
+Telegram не гарантирует удаление уже показанного текста, если последующий edit недоступен.
+Raw guest input, provider errors и reservation tokens не сохраняются в логах или session.
+Возврат к коду без access enforcement security-sensitive; downgrade допустим только при
+остановленном bot process и с отдельной оценкой последствий отката.
+
 ## PostgreSQL
 
 ```bash
