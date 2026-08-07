@@ -13,10 +13,11 @@ from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER, AccessService
 from future_self.access_handlers import (
     FULL_VERSION_ALERT,
     GUEST_CALLBACK_ROUTES,
-    GUEST_DEMO_PENDING_TEXT,
     GUEST_FEATURE_TEXTS,
+    GUEST_FIRST_STEP_INPUT_TEXT,
     GUEST_MEDIA_NOTICE,
     GUEST_ROOT_TEXT,
+    GUEST_THOUGHT_INPUT_TEXT,
     SERVICE_UNAVAILABLE_TEXT,
     STALE_GUEST_ALERT,
 )
@@ -61,6 +62,7 @@ class GateMessage:
         photo: list[Any] | None = None,
         document: Any = None,
         users_shared: Any = None,
+        message_id: int = 100,
     ) -> None:
         self.text = text
         self.voice = voice
@@ -68,6 +70,7 @@ class GateMessage:
         self.photo = photo or []
         self.document = document
         self.users_shared = users_shared
+        self.message_id = message_id
         self.replies: list[dict[str, Any]] = []
 
     async def reply_text(self, text: str, **kwargs: Any) -> GateMessage:
@@ -123,8 +126,10 @@ def update_for(
     user_id: int | None = 7001,
     chat_id: int | None = 8001,
     query: GateQuery | None = None,
+    update_id: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        update_id=update_id,
         effective_user=SimpleNamespace(id=user_id) if user_id is not None else None,
         effective_chat=(
             SimpleNamespace(id=chat_id, type="private") if chat_id is not None else None
@@ -136,7 +141,13 @@ def update_for(
 
 
 def context(bot: ScopeBot | None = None, *, args: list[str] | None = None) -> SimpleNamespace:
-    return SimpleNamespace(user_data={}, args=args or [], bot=bot or ScopeBot())
+    telegram = bot or ScopeBot()
+    return SimpleNamespace(
+        user_data={},
+        args=args or [],
+        bot=telegram,
+        application=SimpleNamespace(create_task=lambda *_args, **_kwargs: None),
+    )
 
 
 async def set_user_state(
@@ -294,7 +305,12 @@ async def test_all_guest_callback_routes_answer_and_edit(db, fake_ai, route):
     else:
         assert "7040" not in rendered["text"]
     if route in {"guest:demo:thought", "guest:demo:first-step"}:
-        assert rendered["text"] == GUEST_DEMO_PENDING_TEXT
+        expected = (
+            GUEST_THOUGHT_INPUT_TEXT
+            if route == "guest:demo:thought"
+            else GUEST_FIRST_STEP_INPUT_TEXT
+        )
+        assert rendered["text"] == expected
 
 
 async def test_guest_features_have_medical_disclaimers_and_exact_routes(db, fake_ai):
@@ -341,13 +357,13 @@ async def test_forged_guest_callback_is_stale_and_does_not_edit(db, fake_ai):
     assert query.edits == []
 
 
-async def test_guest_callback_edit_error_uses_one_reply_fallback(db, fake_ai):
+async def test_guest_callback_edit_error_has_no_reply_fallback(db, fake_ai):
     bot, _transcription = make_bot(db, fake_ai)
     message = GateMessage()
     query = GateQuery("guest:features", message, fail_edit=True)
     await run_guest_gate(bot, update_for(message, user_id=7052, chat_id=7052, query=query))
     assert query.answers == [(None, False)]
-    assert len(message.replies) == 1
+    assert message.replies == []
 
 
 @pytest.mark.parametrize("media_kind", ["voice", "audio", "photo", "document"])
@@ -467,6 +483,28 @@ async def test_command_scope_telegram_error_is_not_cached_or_used_as_authorizati
     assert len(telegram.command_calls) == 2
     assert 8090 not in bot._access_scope_cache
     assert "private Telegram API detail" not in caplog.text
+
+
+async def test_subscriber_command_scope_runtime_error_does_not_break_full_access(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+):
+    bot, _transcription = make_bot(db, fake_ai)
+    await set_user_state(bot, 7091, tier=SUBSCRIBER)
+    telegram = ScopeBot()
+    private_detail = "PRIVATE_SCOPE_RUNTIME_DETAIL"
+
+    async def fail_scope(*args, **kwargs):
+        raise RuntimeError(private_detail)
+
+    monkeypatch.setattr(telegram, "set_my_commands", fail_scope)
+    update = update_for(GateMessage("/today"), user_id=7091, chat_id=8091)
+    with caplog.at_level("ERROR"):
+        await bot.access_gate(update, context(telegram))
+    assert 8091 not in bot._access_scope_cache
+    assert private_detail not in caplog.text
 
 
 async def test_direct_workspace_deep_link_rejects_guest_before_service(db, fake_ai):

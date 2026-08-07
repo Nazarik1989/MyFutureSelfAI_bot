@@ -204,6 +204,13 @@ class GuestSessionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class GuestPendingResultCandidate:
+    user_id: int
+    chat_id: int
+    access_version: int
+
+
+@dataclass(frozen=True, slots=True)
 class GuestSessionDecision:
     outcome: GuestSessionOutcome
     session: GuestSessionSnapshot | None
@@ -1110,26 +1117,127 @@ class GuestSessionService:
                 return self._decision(GuestSessionOutcome.STALE, row, False)
             return self._decision(GuestSessionOutcome.RESULT_READY, row, False)
 
+    async def pending_result_candidates(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[GuestPendingResultCandidate, ...]:
+        current = _now(now)
+        async with self.db.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        GuestDemoSession.user_id,
+                        GuestDemoSession.chat_id,
+                        GuestDemoSession.access_version,
+                    )
+                    .join(User, User.id == GuestDemoSession.user_id)
+                    .where(
+                        GuestDemoSession.status == GuestSessionStatus.RESULT_READY.value,
+                        GuestDemoSession.result_expires_at.is_not(None),
+                        GuestDemoSession.result_expires_at > current,
+                        User.access_tier == GUEST,
+                        User.access_version == GuestDemoSession.access_version,
+                    )
+                    .order_by(
+                        GuestDemoSession.user_id,
+                        GuestDemoSession.chat_id,
+                        GuestDemoSession.id,
+                    )
+                )
+            ).all()
+        return tuple(
+            GuestPendingResultCandidate(
+                user_id=int(user_id),
+                chat_id=int(chat_id),
+                access_version=int(access_version),
+            )
+            for user_id, chat_id, access_version in rows
+        )
+
+    async def cleanup_undeliverable_results(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        current = _now(now)
+        async with self.db.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        GuestDemoSession.user_id,
+                        GuestDemoSession.chat_id,
+                        GuestDemoSession.access_version,
+                    )
+                    .outerjoin(User, User.id == GuestDemoSession.user_id)
+                    .where(
+                        GuestDemoSession.status == GuestSessionStatus.RESULT_READY.value,
+                        or_(
+                            GuestDemoSession.result_expires_at <= current,
+                            User.id.is_(None),
+                            User.access_tier != GUEST,
+                            User.access_version != GuestDemoSession.access_version,
+                        ),
+                    )
+                    .order_by(
+                        GuestDemoSession.user_id,
+                        GuestDemoSession.chat_id,
+                        GuestDemoSession.id,
+                    )
+                )
+            ).all()
+        changed = 0
+        for user_id, chat_id, access_version in rows:
+            decision = await self.pending_result(
+                user_id=int(user_id),
+                chat_id=int(chat_id),
+                access_version=int(access_version),
+                now=current,
+            )
+            if decision.changed and decision.outcome in {
+                GuestSessionOutcome.EXPIRED,
+                GuestSessionOutcome.NOT_GUEST,
+            }:
+                changed += 1
+        return changed
+
     async def mark_delivered(
         self,
         *,
         user_id: int,
         chat_id: int,
+        access_version: int,
         session_version: int,
         now: datetime | None = None,
     ) -> GuestSessionDecision:
         owner_id = _positive_id(user_id, "user_id")
         target_chat = _positive_id(chat_id, "chat_id")
+        access = _positive_id(access_version, "access_version")
         expected_version = _positive_id(session_version, "session_version")
         current = _now(now)
         async with self.db.session() as session:
             await self.quota._lock_quota_day(session, current.date())
-            await self.quota._lock_user(session, owner_id)
+            user = await self.quota._lock_user(session, owner_id)
             row = await self._locked_session(session, owner_id, target_chat)
             if row is None:
                 return self._decision(GuestSessionOutcome.STALE, None, False)
+            if (
+                user is None
+                or user.access_tier != GUEST
+                or user.access_version != access
+                or row.access_version != access
+            ):
+                changed = False
+                if row.status == GuestSessionStatus.RESULT_READY.value:
+                    self._terminalize(row, GuestSessionStatus.CANCELLED, current)
+                    await session.flush()
+                    changed = True
+                return self._decision(GuestSessionOutcome.NOT_GUEST, row, changed)
             if row.status == GuestSessionStatus.COMPLETED.value:
                 return self._decision(GuestSessionOutcome.COMPLETED, row, False)
+            if self._expire_session(row, current):
+                await session.flush()
+                return self._decision(GuestSessionOutcome.EXPIRED, row, True)
             if (
                 row.status != GuestSessionStatus.RESULT_READY.value
                 or row.version != expected_version
@@ -1138,6 +1246,38 @@ class GuestSessionService:
             self._terminalize(row, GuestSessionStatus.COMPLETED, current)
             await session.flush()
             return self._decision(GuestSessionOutcome.COMPLETED, row, True)
+
+    async def cancel_unshown_awaiting(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        access_version: int,
+        session_version: int,
+        now: datetime | None = None,
+    ) -> GuestSessionDecision:
+        owner_id = _positive_id(user_id, "user_id")
+        target_chat = _positive_id(chat_id, "chat_id")
+        access = _positive_id(access_version, "access_version")
+        expected_version = _positive_id(session_version, "session_version")
+        current = _now(now)
+        async with self.db.session() as session:
+            await self.quota._lock_quota_day(session, current.date())
+            user = await self.quota._lock_user(session, owner_id)
+            row = await self._locked_session(session, owner_id, target_chat)
+            if (
+                user is None
+                or user.access_tier != GUEST
+                or user.access_version != access
+                or row is None
+                or row.access_version != access
+                or row.version != expected_version
+                or row.status != GuestSessionStatus.AWAITING_INPUT.value
+            ):
+                return self._decision(GuestSessionOutcome.STALE, row, False)
+            self._terminalize(row, GuestSessionStatus.CANCELLED, current)
+            await session.flush()
+            return self._decision(GuestSessionOutcome.CANCELLED, row, True)
 
     async def cancel(
         self,

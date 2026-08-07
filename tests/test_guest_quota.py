@@ -99,6 +99,7 @@ async def complete_demo(
     await sessions.mark_delivered(
         user_id=user_id,
         chat_id=chat_id,
+        access_version=1,
         session_version=completed.session.version,
         now=now,
     )

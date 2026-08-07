@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import warnings
@@ -63,6 +64,7 @@ from .domain import (
     normalize_display_name,
 )
 from .drafts import DraftInboxService
+from .guest_access import GuestQuotaPolicy, GuestSessionService
 from .health import (
     METRIC_LABELS,
     HealthService,
@@ -199,6 +201,9 @@ class FutureSelfBot(
         self.settings = settings
         self.db = db
         self.access_service = AccessService(db)
+        self.guest_quota_policy = GuestQuotaPolicy.from_settings(settings)
+        self.guest_session_service = GuestSessionService(db, self.guest_quota_policy)
+        self.guest_quota_service = self.guest_session_service.quota
         self._access_scope_cache = {}
         self.ai = ai
         self.transcription = transcription
@@ -293,6 +298,7 @@ class FutureSelfBot(
         )
         self.scheduler: JobQueueScheduler | None = None
         self.reminder_engine: TaskReminderEngine | None = None
+        self._guest_maintenance_task: asyncio.Task[None] | None = None
 
     @property
     def voice_enabled(self) -> bool:
@@ -303,6 +309,7 @@ class FutureSelfBot(
             Application.builder()
             .token(self.settings.telegram_bot_token)
             .post_init(self._post_init)
+            .post_stop(self._post_stop)
             .post_shutdown(self._post_shutdown)
             .build()
         )
@@ -610,10 +617,15 @@ class FutureSelfBot(
             "Из соображений приватности бот работает только в личном чате. "
             "Открой диалог с ботом напрямую."
         )
-        if update.callback_query is not None:
-            await update.callback_query.answer(message, show_alert=True)
-        elif update.effective_message is not None:
-            await update.effective_message.reply_text(message)
+        try:
+            if update.callback_query is not None:
+                await update.callback_query.answer(message, show_alert=True)
+            elif update.effective_message is not None:
+                await update.effective_message.reply_text(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_safe_failure("Private-chat notification failed", exc)
         raise ApplicationHandlerStop
 
     async def _post_init(self, app: Application) -> None:
@@ -658,6 +670,9 @@ class FutureSelfBot(
             except Exception as exc:
                 log_safe_failure("Background access check failed", exc, user_id=telegram_id)
                 return False
+
+        if isinstance(app, Application) or getattr(app, "post_stop", None) is not None:
+            self._start_guest_maintenance(app.bot)
 
         if app.job_queue is None:
             logger.warning("JobQueue is unavailable; scheduled messages are disabled")
@@ -714,8 +729,58 @@ class FutureSelfBot(
         for preference in await self.vision_companion_service.enabled_preferences():
             self.scheduler.schedule_vision_companion(preference)
 
+    def _start_guest_maintenance(self, telegram_bot: object) -> None:
+        if self._guest_maintenance_task is not None and not self._guest_maintenance_task.done():
+            return
+        maintenance = self._guest_maintenance_loop(telegram_bot)
+        try:
+            self._guest_maintenance_task = asyncio.create_task(
+                maintenance,
+                name="guest-result-maintenance",
+            )
+        except Exception as exc:
+            maintenance.close()
+            log_safe_failure("Guest maintenance scheduling failed", exc)
+
+    async def _guest_maintenance_loop(self, telegram_bot: object) -> None:
+        await self._cleanup_guest_results_safely()
+        await self._recover_guest_demo_results(telegram_bot)
+        while True:
+            await self._guest_maintenance_wait()
+            await self._cleanup_guest_results_safely()
+
+    async def _guest_maintenance_wait(self) -> None:
+        await asyncio.sleep(60)
+
+    async def _cleanup_guest_results_safely(self) -> None:
+        try:
+            await self.guest_session_service.cleanup_undeliverable_results()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_safe_failure("Guest result cleanup failed", exc)
+
+    async def _stop_guest_maintenance(self) -> None:
+        task = self._guest_maintenance_task
+        self._guest_maintenance_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log_safe_failure("Guest maintenance stop failed", exc)
+
+    async def _post_stop(self, app: Application) -> None:
+        del app
+        await self._stop_guest_maintenance()
+
     async def _post_shutdown(self, app: Application) -> None:
         del app
+        await self._stop_guest_maintenance()
         await self.image_generation.close()
 
     async def _user(self, telegram_id: int) -> User:
@@ -4934,11 +4999,16 @@ class FutureSelfBot(
         )
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if isinstance(context.error, asyncio.CancelledError):
+            raise context.error
         log_safe_failure("Unhandled Telegram update error", context.error)
         if isinstance(update, Update) and update.effective_message:
             try:
                 await update.effective_message.reply_text(
                     "Что-то пошло не так. Попробуй ещё раз немного позже."
                 )
-            except TelegramError as exc:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 log_safe_failure("Could not send safe error message", exc)
+        raise ApplicationHandlerStop

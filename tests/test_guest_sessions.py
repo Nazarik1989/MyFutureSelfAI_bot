@@ -3,7 +3,7 @@ import inspect
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from future_self.access import ADMIN, BLOCKED, SUBSCRIBER
 from future_self.db import Database
@@ -102,6 +102,47 @@ async def begin_bound_provider(
     assert decision.can_invoke_provider
     assert decision.provider_started_at == now
     return decision
+
+
+async def prepare_result_ready(
+    db,
+    *,
+    telegram_id: int,
+    chat_id: int,
+    update_id: int,
+    now: datetime,
+):
+    user_id, access_version = await create_guest(db, telegram_id)
+    service, bound, reservation = await prepare_processing(
+        db,
+        user_id=user_id,
+        chat_id=chat_id,
+        access_version=access_version,
+        update_id=update_id,
+        now=now,
+    )
+    assert bound.session is not None
+    await begin_bound_provider(
+        service,
+        reservation_token=reservation.reservation_token,
+        user_id=user_id,
+        chat_id=chat_id,
+        access_version=access_version,
+        session_version=bound.session.version,
+        now=now,
+    )
+    completion = await service.complete_with_result(
+        reservation_token=reservation.reservation_token,
+        user_id=user_id,
+        chat_id=chat_id,
+        access_version=access_version,
+        session_version=bound.session.version,
+        result_payload={"summary": f"result-{update_id}"},
+        now=now,
+    )
+    assert completion.outcome is GuestReservationOutcome.SUCCEEDED
+    assert completion.session is not None
+    return user_id, access_version, completion.session, reservation
 
 
 async def test_provider_start_is_the_only_provider_permission_and_is_idempotent(db):
@@ -667,6 +708,7 @@ async def test_cancel_state_machine_preserves_processing_and_terminal_states(db)
     delivered = await completed_service.mark_delivered(
         user_id=completed_user,
         chat_id=96027,
+        access_version=completed_access,
         session_version=result.session.version,
         now=now,
     )
@@ -855,6 +897,7 @@ async def test_completion_is_atomic_and_result_survives_delivery_failure_restart
     delivered = await GuestSessionService(db).mark_delivered(
         user_id=user_id,
         chat_id=96006,
+        access_version=access_version,
         session_version=pending.session.version,
         now=now + timedelta(minutes=1),
     )
@@ -865,6 +908,7 @@ async def test_completion_is_atomic_and_result_survives_delivery_failure_restart
     repeated = await GuestSessionService(db).mark_delivered(
         user_id=user_id,
         chat_id=96006,
+        access_version=access_version,
         session_version=delivered.session.version,
         now=now + timedelta(minutes=1),
     )
@@ -1206,3 +1250,513 @@ async def test_quota_denial_resolves_processing_session_explicitly(db):
     assert cancelled.outcome is GuestSessionOutcome.CANCELLED
     assert cancelled.session is not None
     assert cancelled.session.status is GuestSessionStatus.CANCELLED
+
+
+async def test_pending_result_candidates_are_read_only_minimal_and_deterministic(db):
+    current = datetime(2026, 8, 6, 20, tzinfo=UTC)
+    first = await prepare_result_ready(
+        db,
+        telegram_id=96101,
+        chat_id=96101,
+        update_id=201,
+        now=current,
+    )
+    second = await prepare_result_ready(
+        db,
+        telegram_id=96102,
+        chat_id=96102,
+        update_id=202,
+        now=current,
+    )
+    changed = await prepare_result_ready(
+        db,
+        telegram_id=96103,
+        chat_id=96103,
+        update_id=203,
+        now=current,
+    )
+    await prepare_result_ready(
+        db,
+        telegram_id=96104,
+        chat_id=96104,
+        update_id=204,
+        now=current - timedelta(hours=1),
+    )
+    async with db.session() as session:
+        user = await session.get(User, changed[0])
+        assert user is not None
+        user.access_tier = SUBSCRIBER
+        user.access_version += 1
+
+    statements: list[str] = []
+
+    def record_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        statements.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        candidates = await GuestSessionService(db).pending_result_candidates(now=current)
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert candidates == (
+        type(candidates[0])(first[0], 96101, first[1]),
+        type(candidates[0])(second[0], 96102, second[1]),
+    )
+    assert isinstance(candidates, tuple)
+    with pytest.raises(AttributeError):
+        candidates[0].chat_id = 1
+    normalized = [statement.strip().upper() for statement in statements]
+    assert normalized and all(statement.startswith("SELECT") for statement in normalized)
+    projection = " ".join(normalized)
+    assert "RESULT_PAYLOAD" not in projection
+    assert "RESERVATION_TOKEN" not in projection
+    assert "PROMPT_MESSAGE_ID" not in projection
+
+
+async def test_mark_delivered_rechecks_access_and_clears_stale_result(db):
+    now = datetime(2026, 8, 6, 21, tzinfo=UTC)
+    user_id, access_version, ready, reservation = await prepare_result_ready(
+        db,
+        telegram_id=96105,
+        chat_id=96105,
+        update_id=205,
+        now=now,
+    )
+    async with db.session() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.access_tier = SUBSCRIBER
+        user.access_version += 1
+
+    denied = await GuestSessionService(db).mark_delivered(
+        user_id=user_id,
+        chat_id=96105,
+        access_version=access_version,
+        session_version=ready.version,
+        now=now,
+    )
+    assert denied.outcome is GuestSessionOutcome.NOT_GUEST
+    assert denied.changed
+    assert denied.session is not None
+    assert denied.session.status is GuestSessionStatus.CANCELLED
+    assert denied.session.result_payload is None
+    repeated = await GuestSessionService(db).mark_delivered(
+        user_id=user_id,
+        chat_id=96105,
+        access_version=access_version,
+        session_version=ready.version,
+        now=now,
+    )
+    assert repeated.outcome is GuestSessionOutcome.NOT_GUEST
+    assert not repeated.changed
+    async with db.sessions() as session:
+        usage = await session.get(GuestUsageLedger, reservation.usage_id)
+        assert usage is not None
+        assert usage.status == GuestUsageStatus.SUCCEEDED.value
+
+
+async def test_concurrent_mark_delivered_is_idempotent(db):
+    now = datetime(2026, 8, 6, 22, tzinfo=UTC)
+    user_id, access_version, ready, reservation = await prepare_result_ready(
+        db,
+        telegram_id=96106,
+        chat_id=96106,
+        update_id=206,
+        now=now,
+    )
+    results = await asyncio.gather(
+        *(
+            GuestSessionService(db).mark_delivered(
+                user_id=user_id,
+                chat_id=96106,
+                access_version=access_version,
+                session_version=ready.version,
+                now=now,
+            )
+            for _ in range(2)
+        )
+    )
+    assert all(result.outcome is GuestSessionOutcome.COMPLETED for result in results)
+    assert sum(result.changed for result in results) == 1
+    async with db.sessions() as session:
+        stored = await session.get(GuestDemoSession, ready.session_id)
+        usage = await session.get(GuestUsageLedger, reservation.usage_id)
+        succeeded = await session.scalar(
+            select(func.count(GuestUsageLedger.id)).where(
+                GuestUsageLedger.user_id == user_id,
+                GuestUsageLedger.status == GuestUsageStatus.SUCCEEDED.value,
+            )
+        )
+        assert stored is not None
+        assert stored.status == GuestSessionStatus.COMPLETED.value
+        assert stored.result_payload is None
+        assert usage is not None and usage.status == GuestUsageStatus.SUCCEEDED.value
+        assert succeeded == 1
+
+
+async def test_mark_delivered_after_result_ttl_expires_without_refunding_success(db):
+    now = datetime(2026, 8, 6, 23, tzinfo=UTC)
+    user_id, access_version, ready, reservation = await prepare_result_ready(
+        db,
+        telegram_id=96107,
+        chat_id=96107,
+        update_id=207,
+        now=now,
+    )
+    assert ready.result_expires_at is not None
+    expired = await GuestSessionService(db).mark_delivered(
+        user_id=user_id,
+        chat_id=96107,
+        access_version=access_version,
+        session_version=ready.version,
+        now=ready.result_expires_at,
+    )
+    assert expired.outcome is GuestSessionOutcome.EXPIRED
+    assert expired.changed
+    assert expired.session is not None
+    assert expired.session.status is GuestSessionStatus.EXPIRED
+    assert expired.session.version == ready.version + 1
+    assert expired.session.result_payload is None
+    assert expired.session.result_expires_at is None
+    snapshot = await GuestQuotaService(db).snapshot(user_id, now=ready.result_expires_at)
+    assert snapshot.successful_lifetime_count == 1
+    assert snapshot.remaining_operations == 1
+    async with db.sessions() as session:
+        usage = await session.get(GuestUsageLedger, reservation.usage_id)
+        assert usage is not None and usage.status == GuestUsageStatus.SUCCEEDED.value
+
+
+async def test_cleanup_undeliverable_results_is_minimal_idempotent_and_access_aware(db):
+    current = datetime(2026, 8, 7, 1, tzinfo=UTC)
+    valid = await prepare_result_ready(
+        db,
+        telegram_id=96108,
+        chat_id=96108,
+        update_id=208,
+        now=current,
+    )
+    expired = await prepare_result_ready(
+        db,
+        telegram_id=96109,
+        chat_id=96109,
+        update_id=209,
+        now=current - timedelta(hours=1),
+    )
+    detached = await prepare_result_ready(
+        db,
+        telegram_id=96110,
+        chat_id=96110,
+        update_id=210,
+        now=current,
+    )
+    async with db.session() as session:
+        user = await session.get(User, detached[0])
+        assert user is not None
+        user.access_tier = SUBSCRIBER
+        user.access_version += 1
+
+    candidates = await GuestSessionService(db).pending_result_candidates(now=current)
+    assert {(item.user_id, item.chat_id) for item in candidates} == {(valid[0], 96108)}
+
+    statements: list[str] = []
+
+    def record_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        statements.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        changed = await GuestSessionService(db).cleanup_undeliverable_results(now=current)
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    assert changed == 2
+    first_select = statements[0].upper()
+    assert first_select.lstrip().startswith("SELECT")
+    assert "RESULT_PAYLOAD" not in first_select
+    assert "RESERVATION_TOKEN" not in first_select
+    assert "PROMPT_MESSAGE_ID" not in first_select
+
+    async with db.sessions() as session:
+        valid_row = await session.get(GuestDemoSession, valid[2].session_id)
+        expired_row = await session.get(GuestDemoSession, expired[2].session_id)
+        detached_row = await session.get(GuestDemoSession, detached[2].session_id)
+        succeeded = await session.scalar(
+            select(func.count(GuestUsageLedger.id)).where(
+                GuestUsageLedger.status == GuestUsageStatus.SUCCEEDED.value
+            )
+        )
+        assert valid_row is not None
+        assert valid_row.status == GuestSessionStatus.RESULT_READY.value
+        assert valid_row.result_payload is not None
+        assert expired_row is not None
+        assert expired_row.status == GuestSessionStatus.EXPIRED.value
+        assert expired_row.result_payload is None
+        assert expired_row.result_expires_at is None
+        assert detached_row is not None
+        assert detached_row.status == GuestSessionStatus.CANCELLED.value
+        assert detached_row.result_payload is None
+        assert detached_row.result_expires_at is None
+        assert succeeded == 3
+    assert await GuestSessionService(db).cleanup_undeliverable_results(now=current) == 0
+
+
+async def test_concurrent_cleanup_and_delivery_do_not_duplicate_success(db):
+    now = datetime(2026, 8, 7, 2, tzinfo=UTC)
+    user_id, access_version, ready, reservation = await prepare_result_ready(
+        db,
+        telegram_id=96111,
+        chat_id=96111,
+        update_id=211,
+        now=now,
+    )
+    assert ready.result_expires_at is not None
+    cleanup_count, delivery = await asyncio.gather(
+        GuestSessionService(db).cleanup_undeliverable_results(now=ready.result_expires_at),
+        GuestSessionService(db).mark_delivered(
+            user_id=user_id,
+            chat_id=96111,
+            access_version=access_version,
+            session_version=ready.version,
+            now=ready.result_expires_at,
+        ),
+    )
+    assert cleanup_count in {0, 1}
+    assert delivery.outcome in {GuestSessionOutcome.EXPIRED, GuestSessionOutcome.STALE}
+    async with db.sessions() as session:
+        stored = await session.get(GuestDemoSession, ready.session_id)
+        usage = await session.get(GuestUsageLedger, reservation.usage_id)
+        succeeded = await session.scalar(
+            select(func.count(GuestUsageLedger.id)).where(
+                GuestUsageLedger.user_id == user_id,
+                GuestUsageLedger.status == GuestUsageStatus.SUCCEEDED.value,
+            )
+        )
+        assert stored is not None
+        assert stored.status == GuestSessionStatus.EXPIRED.value
+        assert stored.result_payload is None
+        assert usage is not None and usage.status == GuestUsageStatus.SUCCEEDED.value
+        assert succeeded == 1
+
+
+async def test_cancel_unshown_awaiting_is_exact_and_idempotent(db):
+    now = datetime(2026, 8, 7, 3, tzinfo=UTC)
+    user_id, access_version = await create_guest(db, 96112)
+    service = GuestSessionService(db)
+    started = await service.start_session(
+        user_id=user_id,
+        chat_id=96112,
+        access_version=access_version,
+        demo_kind=GuestDemoKind.THOUGHT_BREAKDOWN,
+        prompt_message_id=212,
+        now=now,
+    )
+    assert started.session is not None
+
+    cancelled = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96112,
+        access_version=access_version,
+        session_version=started.session.version,
+        now=now,
+    )
+    assert cancelled.outcome is GuestSessionOutcome.CANCELLED
+    assert cancelled.changed
+    assert cancelled.session is not None
+    assert cancelled.session.status is GuestSessionStatus.CANCELLED
+    assert cancelled.session.version == started.session.version + 1
+    assert cancelled.session.result_payload is None
+    assert cancelled.session.result_expires_at is None
+
+    repeated = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96112,
+        access_version=access_version,
+        session_version=started.session.version,
+        now=now,
+    )
+    assert repeated.outcome is GuestSessionOutcome.STALE
+    assert not repeated.changed
+    assert repeated.session == cancelled.session
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(GuestUsageLedger.id))) == 0
+
+
+async def test_cancel_unshown_awaiting_loses_claim_race_without_touching_processing(db):
+    now = datetime(2026, 8, 7, 4, tzinfo=UTC)
+    user_id, access_version = await create_guest(db, 96113)
+    service = GuestSessionService(db)
+    started = await service.start_session(
+        user_id=user_id,
+        chat_id=96113,
+        access_version=access_version,
+        demo_kind=GuestDemoKind.FIRST_STEP,
+        prompt_message_id=213,
+        now=now,
+    )
+    assert started.session is not None
+    claimed = await service.claim_input(
+        user_id=user_id,
+        chat_id=96113,
+        access_version=access_version,
+        telegram_update_id=213,
+        telegram_message_id=1213,
+        now=now,
+    )
+    assert claimed.session is not None
+    before = claimed.session
+
+    stale = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96113,
+        access_version=access_version,
+        session_version=started.session.version,
+        now=now,
+    )
+    assert stale.outcome is GuestSessionOutcome.STALE
+    assert not stale.changed
+    assert stale.session == before
+    current_version = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96113,
+        access_version=access_version,
+        session_version=before.version,
+        now=now,
+    )
+    assert current_version.outcome is GuestSessionOutcome.STALE
+    assert not current_version.changed
+    assert current_version.session == before
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(GuestUsageLedger.id))) == 0
+
+
+async def test_cancel_unshown_awaiting_cannot_touch_result_or_completed_ledger(db):
+    now = datetime(2026, 8, 7, 5, tzinfo=UTC)
+    user_id, access_version, ready, reservation = await prepare_result_ready(
+        db,
+        telegram_id=96114,
+        chat_id=96114,
+        update_id=214,
+        now=now,
+    )
+    service = GuestSessionService(db)
+
+    result_noop = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96114,
+        access_version=access_version,
+        session_version=ready.version,
+        now=now,
+    )
+    assert result_noop.outcome is GuestSessionOutcome.STALE
+    assert not result_noop.changed
+    assert result_noop.session == ready
+
+    delivered = await service.mark_delivered(
+        user_id=user_id,
+        chat_id=96114,
+        access_version=access_version,
+        session_version=ready.version,
+        now=now,
+    )
+    assert delivered.outcome is GuestSessionOutcome.COMPLETED
+    assert delivered.session is not None
+    completed_noop = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96114,
+        access_version=access_version,
+        session_version=delivered.session.version,
+        now=now,
+    )
+    assert completed_noop.outcome is GuestSessionOutcome.STALE
+    assert not completed_noop.changed
+    assert completed_noop.session == delivered.session
+
+    snapshot = await GuestQuotaService(db).snapshot(user_id, now=now)
+    assert snapshot.successful_lifetime_count == 1
+    async with db.sessions() as session:
+        usage = await session.get(GuestUsageLedger, reservation.usage_id)
+        succeeded = await session.scalar(
+            select(func.count(GuestUsageLedger.id)).where(
+                GuestUsageLedger.user_id == user_id,
+                GuestUsageLedger.status == GuestUsageStatus.SUCCEEDED.value,
+            )
+        )
+        assert usage is not None and usage.status == GuestUsageStatus.SUCCEEDED.value
+        assert usage.reservation_token == reservation.reservation_token
+        assert usage.provider_started_at is not None
+        assert succeeded == 1
+
+
+async def test_cancel_unshown_awaiting_cannot_touch_new_version_or_access_generation(db):
+    now = datetime(2026, 8, 7, 6, tzinfo=UTC)
+    user_id, access_version = await create_guest(db, 96115)
+    service = GuestSessionService(db)
+    first = await service.start_session(
+        user_id=user_id,
+        chat_id=96115,
+        access_version=access_version,
+        demo_kind=GuestDemoKind.THOUGHT_BREAKDOWN,
+        prompt_message_id=215,
+        now=now,
+    )
+    assert first.session is not None
+    second = await service.start_session(
+        user_id=user_id,
+        chat_id=96115,
+        access_version=access_version,
+        demo_kind=GuestDemoKind.FIRST_STEP,
+        prompt_message_id=216,
+        now=now,
+    )
+    assert second.session is not None
+    stale_version = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96115,
+        access_version=access_version,
+        session_version=first.session.version,
+        now=now,
+    )
+    assert stale_version.outcome is GuestSessionOutcome.STALE
+    assert not stale_version.changed
+    assert stale_version.session == second.session
+
+    async with db.session() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.access_version += 1
+        new_access = user.access_version
+    newest = await service.start_session(
+        user_id=user_id,
+        chat_id=96115,
+        access_version=new_access,
+        demo_kind=GuestDemoKind.THOUGHT_BREAKDOWN,
+        prompt_message_id=217,
+        now=now,
+    )
+    assert newest.session is not None
+    stale_access = await service.cancel_unshown_awaiting(
+        user_id=user_id,
+        chat_id=96115,
+        access_version=access_version,
+        session_version=second.session.version,
+        now=now,
+    )
+    assert stale_access.outcome is GuestSessionOutcome.STALE
+    assert not stale_access.changed
+    assert stale_access.session == newest.session
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(GuestUsageLedger.id))) == 0

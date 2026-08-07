@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
@@ -8,6 +9,8 @@ from future_self.schemas import (
     AssistantAnswer,
     GoalProposal,
     GoalProposals,
+    GuestFirstStep,
+    GuestThoughtBreakdown,
     IntentResult,
     ParsedThought,
     RoutineProposal,
@@ -25,6 +28,27 @@ class FakeAI:
         self.conversation_contexts: list[dict[str, object]] = []
         self.timezone_calls: list[str] = []
         self.timezone_results: dict[str, TimezoneResolution] = {}
+        self.guest_thought_calls = 0
+        self.guest_first_step_calls = 0
+        self.guest_thought_result = GuestThoughtBreakdown(
+            category="idea",
+            title="Спокойная мысль",
+            essence="Краткая суть мысли",
+            next_step="Записать один небольшой шаг",
+        )
+        self.guest_first_step_result = GuestFirstStep(
+            focus="Главный фокус",
+            first_step="Уделить задаче пять минут",
+            actions=["Открыть заметки"],
+        )
+        self.guest_thought_error: Exception | None = None
+        self.guest_first_step_error: Exception | None = None
+        self.guest_thought_started = asyncio.Event()
+        self.guest_first_step_started = asyncio.Event()
+        self.guest_thought_release = asyncio.Event()
+        self.guest_first_step_release = asyncio.Event()
+        self.guest_thought_release.set()
+        self.guest_first_step_release.set()
 
     async def summarize_vision(self, answers: dict[str, str]) -> VisionSummary:
         return VisionSummary(
@@ -75,6 +99,24 @@ class FakeAI:
     async def parse_thought(self, text: str) -> ParsedThought:
         kind = "task" if "сделать" in text.lower() else "idea"
         return ParsedThought(kind=kind, title=text[:40], next_step="Выбрать первый шаг")
+
+    async def guest_thought_breakdown(self, text: str) -> GuestThoughtBreakdown:
+        del text
+        self.guest_thought_calls += 1
+        self.guest_thought_started.set()
+        await self.guest_thought_release.wait()
+        if self.guest_thought_error is not None:
+            raise self.guest_thought_error
+        return self.guest_thought_result
+
+    async def guest_first_step(self, text: str) -> GuestFirstStep:
+        del text
+        self.guest_first_step_calls += 1
+        self.guest_first_step_started.set()
+        await self.guest_first_step_release.wait()
+        if self.guest_first_step_error is not None:
+            raise self.guest_first_step_error
+        return self.guest_first_step_result
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan:
         self.last_today_context = context
