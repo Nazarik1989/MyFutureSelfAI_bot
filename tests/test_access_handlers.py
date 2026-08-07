@@ -9,14 +9,20 @@ from telegram import BotCommandScopeChat
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ApplicationHandlerStop, ConversationHandler
 
+import future_self.access_handlers as access_handlers_module
 from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER, AccessService
 from future_self.access_handlers import (
     FULL_VERSION_ALERT,
     GUEST_CALLBACK_ROUTES,
+    GUEST_DISABLED_TEXT,
     GUEST_FEATURE_TEXTS,
     GUEST_FIRST_STEP_INPUT_TEXT,
+    GUEST_GLOBAL_EXHAUSTED_TEXT,
+    GUEST_LIFETIME_EXHAUSTED_TEXT,
     GUEST_MEDIA_NOTICE,
+    GUEST_PROVIDER_ERROR_TEXT,
     GUEST_ROOT_TEXT,
+    GUEST_TEMPORARY_ERROR_TEXT,
     GUEST_THOUGHT_INPUT_TEXT,
     SERVICE_UNAVAILABLE_TEXT,
     STALE_GUEST_ALERT,
@@ -311,6 +317,64 @@ async def test_all_guest_callback_routes_answer_and_edit(db, fake_ai, route):
             else GUEST_FIRST_STEP_INPUT_TEXT
         )
         assert rendered["text"] == expected
+
+
+def test_guest_root_text_and_markup_are_exact():
+    assert (
+        GUEST_ROOT_TEXT
+        == """👋 Я — «Моя будущая версия»
+
+Личный AI-ассистент, который помогает разгружать голову, видеть главное и превращать желаемое будущее в конкретные действия.
+
+Я умею работать с мыслями, задачами, целями, картой желаний, самочувствием и подготовкой к важным событиям.
+
+В гостевом режиме доступны 2 бесплатных AI-разбора."""
+    )
+    buttons = [
+        button for row in access_handlers_module._ROOT_MARKUP.inline_keyboard for button in row
+    ]
+    assert [(button.text, button.callback_data, button.url) for button in buttons] == [
+        ("✨ Попробовать бесплатно", "guest:demos", None),
+        ("🧭 Что я умею", "guest:features", None),
+        ("⚙️ Как это работает", "guest:how", None),
+        ("💬 Подписка или свой бот", "guest:access", None),
+        ("🧩 Другие проекты", None, "https://naz-ai-lab.ru"),
+    ]
+
+
+def test_guest_limit_and_temporary_messages_are_exact():
+    assert (
+        GUEST_LIFETIME_EXHAUSTED_TEXT
+        == """🎁 Бесплатные разборы закончились
+
+Вы уже использовали оба бесплатных разбора.
+
+Чтобы получить подписку или заказать такого же собственного бота, напишите Назару Сергеевичу."""
+    )
+    assert (
+        GUEST_PROVIDER_ERROR_TEXT
+        == """Сейчас обработать запрос не получилось.
+
+Количество бесплатных разборов не изменилось. Отправьте текст ещё раз."""
+    )
+    assert (
+        GUEST_DISABLED_TEXT
+        == """AI-демонстрация временно недоступна.
+
+Количество бесплатных разборов не изменилось. Попробуйте немного позже."""
+    )
+    assert (
+        GUEST_GLOBAL_EXHAUSTED_TEXT
+        == """На сегодня общий лимит бесплатных разборов достигнут.
+
+Количество ваших бесплатных разборов не изменилось. Попробуйте позже — дневной лимит обновится автоматически."""
+    )
+    assert (
+        GUEST_TEMPORARY_ERROR_TEXT
+        == """Сервис временно недоступен.
+
+Количество бесплатных разборов не изменилось. Попробуйте ещё раз немного позже."""
+    )
 
 
 async def test_guest_features_have_medical_disclaimers_and_exact_routes(db, fake_ai):

@@ -39,13 +39,13 @@ GUEST_COMMANDS = (
 )
 BLOCKED_COMMANDS = (CommandSpec("start", "Начать"),)
 
-GUEST_ROOT_TEXT = """👋 Я — „Моя будущая версия“
+GUEST_ROOT_TEXT = """👋 Я — «Моя будущая версия»
 
 Личный AI-ассистент, который помогает разгружать голову, видеть главное и превращать желаемое будущее в конкретные действия.
 
 Я умею работать с мыслями, задачами, целями, картой желаний, самочувствием и подготовкой к важным событиям.
 
-В гостевом режиме можно бесплатно попробовать 2 AI-действия."""
+В гостевом режиме доступны 2 бесплатных AI-разбора."""
 
 GUEST_DEMOS_TEXT = """✨ Бесплатная демонстрация
 
@@ -74,25 +74,25 @@ GUEST_PROCESSING_TEXTS = {
 
 GUEST_PROVIDER_ERROR_TEXT = """Сейчас обработать запрос не получилось.
 
-Личная бесплатная операция не списана. Можно отправить текст ещё раз."""
+Количество бесплатных разборов не изменилось. Отправьте текст ещё раз."""
 
 GUEST_LIFETIME_EXHAUSTED_TEXT = """🎁 Бесплатные разборы закончились
 
-Вы уже использовали две бесплатные AI-операции.
+Вы уже использовали оба бесплатных разбора.
 
 Чтобы получить подписку или заказать такого же собственного бота, напишите Назару Сергеевичу."""
 
-GUEST_DISABLED_TEXT = """AI-демонстрация временно отключена.
+GUEST_DISABLED_TEXT = """AI-демонстрация временно недоступна.
 
-Личная бесплатная операция не списана. Попробуйте немного позже."""
+Количество бесплатных разборов не изменилось. Попробуйте немного позже."""
 
-GUEST_GLOBAL_EXHAUSTED_TEXT = """Общий лимит бесплатных разборов на сегодня достигнут.
+GUEST_GLOBAL_EXHAUSTED_TEXT = """На сегодня общий лимит бесплатных разборов достигнут.
 
-Личная бесплатная операция не списана. Попробуйте позднее или на следующий UTC-день."""
+Количество ваших бесплатных разборов не изменилось. Попробуйте позже — дневной лимит обновится автоматически."""
 
 GUEST_TEMPORARY_ERROR_TEXT = """Сервис временно недоступен.
 
-Личная бесплатная операция не списана. Попробуйте ещё раз немного позже."""
+Количество бесплатных разборов не изменилось. Попробуйте ещё раз немного позже."""
 
 GUEST_PROCESSING_ALERT = "Запрос уже обрабатывается"
 GUEST_ACCESS_CHANGED_TEXT = "Доступ изменился. Откройте /start, чтобы продолжить."
@@ -158,7 +158,7 @@ _ROOT_MARKUP = InlineKeyboardMarkup(
         [InlineKeyboardButton("✨ Попробовать бесплатно", callback_data="guest:demos")],
         [InlineKeyboardButton("🧭 Что я умею", callback_data="guest:features")],
         [InlineKeyboardButton("⚙️ Как это работает", callback_data="guest:how")],
-        [InlineKeyboardButton("💬 Получить доступ", callback_data="guest:access")],
+        [InlineKeyboardButton("💬 Подписка или свой бот", callback_data="guest:access")],
         [InlineKeyboardButton("🧩 Другие проекты", url="https://naz-ai-lab.ru")],
     ]
 )
@@ -1439,24 +1439,26 @@ class AccessHandlers:
             }
             text = (
                 "📝 Разобранная мысль\n\n"
-                f"Тип: {category_labels[result.category]}\n"
-                f"Заголовок: {result.title}\n"
-                f"Суть: {result.essence}\n"
-                f"Следующий шаг: {result.next_step}"
+                f"🏷️ Тип: {category_labels[result.category]}\n"
+                f"✏️ Заголовок: {result.title}\n"
+                f"💡 Суть: {result.essence}\n"
+                f"➡️ Следующий шаг: {result.next_step}"
             )
         else:
             if not isinstance(result, GuestFirstStep):
                 raise ValueError("guest first-step result schema mismatch")
-            text = f"🌱 Первый шаг\n\nФокус: {result.focus}\nПервый шаг: {result.first_step}"
+            text = f"🌱 Первый шаг\n\n🎯 Фокус: {result.focus}\n👣 Первый шаг: {result.first_step}"
             if result.actions:
                 actions = "\n".join(
                     f"{index}. {action}" for index, action in enumerate(result.actions, start=1)
                 )
-                text += f"\n\nДополнительные действия:\n{actions}"
-        text += f"\n\nОсталось бесплатных операций: {remaining_operations}."
-        if remaining_operations == 0:
+                text += f"\n\n📌 Дополнительные действия:\n{actions}"
+        if remaining_operations > 0:
+            text += f"\n\n🎁 Бесплатных разборов осталось: {remaining_operations}."
+        else:
             text += (
-                "\n\nЧтобы получить подписку или заказать такого же собственного бота, "
+                "\n\n🎁 Бесплатные разборы закончились.\n\n"
+                "Чтобы получить подписку или заказать такого же собственного бота, "
                 "напишите Назару Сергеевичу: @Nazar_38rus."
             )
         if len(text.encode("utf-16-le")) // 2 >= 4096:

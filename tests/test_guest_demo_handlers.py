@@ -365,6 +365,7 @@ async def test_guest_demo_happy_path_uses_one_canonical_message_and_one_ai_call(
     assert all(edit["chat_id"] == 8101 for edit in telegram.edits)
     assert all(edit["message_id"] == 501 for edit in telegram.edits)
     assert telegram.edits[0]["reply_markup"] is None
+    assert "parse_mode" not in telegram.edits[-1]
     assert result_heading in telegram.edits[-1]["text"]
     assert canonical.replies == []
     assert input_message.replies == []
@@ -2186,7 +2187,7 @@ async def test_two_successes_show_paywall_and_third_call_is_absent(db, fake_ai):
     assert fake_ai.guest_thought_calls == 1
     assert fake_ai.guest_first_step_calls == 1
     final_result = telegram.edits[-1]
-    assert "Осталось бесплатных операций: 0" in final_result["text"]
+    assert "🎁 Бесплатные разборы закончились." in final_result["text"]
     assert "@Nazar_38rus" in final_result["text"]
     urls = {
         button.url
@@ -2670,3 +2671,53 @@ def test_maximum_result_payloads_are_below_telegram_utf16_limit():
     ):
         text = FutureSelfBot._guest_result_text(result, kind, 0)
         assert len(text.encode("utf-16-le")) // 2 < 4096
+
+
+def test_guest_result_text_uses_visual_plain_text_structure():
+    thought = GuestThoughtBreakdown(
+        category="idea",
+        title="<b>Сохранить как есть</b>",
+        essence="& _без экранирования_",
+        next_step="Написать [первый] шаг",
+    )
+    assert (
+        FutureSelfBot._guest_result_text(
+            thought,
+            GuestDemoKind.THOUGHT_BREAKDOWN,
+            1,
+        )
+        == """📝 Разобранная мысль
+
+🏷️ Тип: Идея
+✏️ Заголовок: <b>Сохранить как есть</b>
+💡 Суть: & _без экранирования_
+➡️ Следующий шаг: Написать [первый] шаг
+
+🎁 Бесплатных разборов осталось: 1."""
+    )
+
+    first_step = GuestFirstStep(
+        focus="<i>Только текст</i>",
+        first_step="Сделать _сейчас_",
+        actions=["Открыть заметку", "Записать один пункт", "Закрыть лишнее"],
+    )
+    assert (
+        FutureSelfBot._guest_result_text(
+            first_step,
+            GuestDemoKind.FIRST_STEP,
+            0,
+        )
+        == """🌱 Первый шаг
+
+🎯 Фокус: <i>Только текст</i>
+👣 Первый шаг: Сделать _сейчас_
+
+📌 Дополнительные действия:
+1. Открыть заметку
+2. Записать один пункт
+3. Закрыть лишнее
+
+🎁 Бесплатные разборы закончились.
+
+Чтобы получить подписку или заказать такого же собственного бота, напишите Назару Сергеевичу: @Nazar_38rus."""
+    )
