@@ -339,15 +339,20 @@ async def test_archive_is_listable_and_restorable_and_invalid_list_callback_is_s
     assert any(text and "устарело" in text for text, _show_alert in query.answers)
 
 
-async def test_vision_navigation_exposes_every_status_and_keeps_card_context(db, fake_ai):
+async def test_vision_navigation_keeps_statuses_in_lists_and_card_context(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     menu = FakeMessage("/vision")
     await bot.vision_command(update_for(menu), None)
 
-    assert callback_from(menu, "vision:list:active:0") == "vision:list:active:0"
-    assert callback_from(menu, "vision:list:achieved:0") == "vision:list:achieved:0"
-    assert callback_from(menu, "vision:list:archived:0") == "vision:list:archived:0"
-    assert callback_from(menu, "nav:root") == "nav:root"
+    root_callbacks = {
+        button.callback_data
+        for row in menu.replies[-1]["reply_markup"].inline_keyboard
+        for button in row
+    }
+    assert "vision:list:active:0" in root_callbacks
+    assert "vision:list:achieved:0" not in root_callbacks
+    assert "vision:list:archived:0" not in root_callbacks
+    assert {"vision:refs", "vision:render", "vision:help", "nav:root"} <= root_callbacks
 
     created = await create_item(bot, "Сохранить контекст карточки")
     archived = await bot.vision_service.set_status(

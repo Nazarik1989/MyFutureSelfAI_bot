@@ -222,6 +222,8 @@ async def test_telegram_library_selects_saved_reference_only_after_explicit_choi
         settings(), db, fake_ai, ScriptedTranscription(), image_generation=generator
     )
     telegram_id, chat_id = 8201, 18201
+    await bot._user(telegram_id)
+    await bot.access_service.grant_admin(telegram_id, source="vision-test")
     owner = await bot._user(telegram_id)
     item = await add_item(db, owner.id)
 

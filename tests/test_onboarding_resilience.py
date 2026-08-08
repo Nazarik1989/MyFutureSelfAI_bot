@@ -210,7 +210,7 @@ async def test_drafts_command_cannot_escape_persisted_onboarding(db, fake_ai):
     ("phrase", "expected_text"),
     [
         ("Как пользоваться ботом?", "❓ Помощь"),
-        ("Открой меню", "Главное меню"),
+        ("Открой меню", "не завершён сценарий"),
     ],
 )
 async def test_natural_help_and_menu_do_not_become_onboarding_answers(
@@ -238,6 +238,42 @@ async def test_natural_help_and_menu_do_not_become_onboarding_answers(
     assert state.status == "in_progress"
     assert state.answers == original_answers
     assert any(expected_text in reply["text"] for reply in message.replies)
+    if phrase == "Открой меню":
+        assert not any("Главное меню" in reply["text"] for reply in message.replies)
+    assert not any("Ответ сохранён" in reply["text"] for reply in message.replies)
+    assert fake_ai.route_calls == []
+
+
+@pytest.mark.parametrize("attached", [True, False])
+async def test_section_navigation_does_not_become_a_durable_onboarding_answer_after_restart(
+    db,
+    fake_ai,
+    attached,
+):
+    bot = make_bot(db, fake_ai)
+    original_answers = {"display_name": "Назар", "timezone": "Europe/Moscow"}
+    owner_id = await seed_onboarding(
+        bot,
+        telegram_id=8825,
+        step=2,
+        answers=original_answers,
+    )
+    ctx = context()
+    if attached:
+        ctx.user_data["onboarding_user_id"] = owner_id
+    message = FakeMessage("Покажи мои записи")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(update_for(message, user_id=8825), ctx)
+
+    async with db.sessions() as session:
+        state = await OnboardingRepository(session).get(owner_id)
+        draft_count = await session.scalar(select(func.count(DraftInboxItem.id)))
+    assert state.current_step == 2
+    assert state.status == "in_progress"
+    assert state.answers == original_answers
+    assert draft_count == 0
+    assert any("не завершён сценарий" in reply["text"] for reply in message.replies)
     assert not any("Ответ сохранён" in reply["text"] for reply in message.replies)
     assert fake_ai.route_calls == []
 
@@ -274,19 +310,19 @@ async def test_help_and_menu_commands_leave_durable_onboarding_unchanged(
     assert any(expected_text in reply["text"] for reply in message.replies)
     assert not any("не завершён сценарий" in reply["text"] for reply in message.replies)
     if command == "/help":
-        assert "nav:help:registration" in callback_values(message)
+        assert "nav:help:quick" in callback_values(message)
 
 
 @pytest.mark.parametrize("attached", [True, False])
 @pytest.mark.parametrize(
-    ("phrase", "progress_text", "expected_text"),
+    ("phrase", "expected_text"),
     [
-        ("Помощь", "Голос распознан — открываю подробную помощь.", "❓ Помощь"),
-        ("Главное меню", "Голос распознан — открываю главное меню.", "Главное меню"),
+        ("Помощь", "❓ Помощь"),
+        ("Главное меню", "не завершён сценарий"),
     ],
 )
 async def test_voice_help_and_menu_do_not_become_onboarding_answers(
-    db, fake_ai, attached, phrase, progress_text, expected_text
+    db, fake_ai, attached, phrase, expected_text
 ):
     first = make_bot(db, fake_ai)
     original_answers = {"display_name": "Назар", "timezone": "Europe/Moscow"}
@@ -313,8 +349,10 @@ async def test_voice_help_and_menu_do_not_become_onboarding_answers(
     assert state.status == "in_progress"
     assert state.answers == original_answers
     assert transcription.calls == [(14, "autotest.ogg")]
-    assert progress_text in message.edits
-    assert any(expected_text in reply["text"] for reply in message.replies)
+    assert message.reply_text_calls == 1
+    assert message.replies[0]["text"] == "Расшифровываю голосовую мысль…"
+    assert len(message.edits) == 1
+    assert expected_text in message.edits[0]
     assert not any("Ответ сохранён" in reply["text"] for reply in message.replies)
     assert fake_ai.route_calls == []
 
@@ -336,14 +374,15 @@ async def test_help_callbacks_remain_usable_during_durable_onboarding(db, fake_a
         update_for(message, user_id=8823, query=help_query),
         ctx,
     )
-    assert "nav:help:registration" in callback_values(message)
+    assert help_query.edits[-1].startswith("❓ Помощь")
+    assert "nav:help:quick" in callback_values(message)
 
-    topic_query = FakeCallbackQuery("nav:help:registration", message)
+    topic_query = FakeCallbackQuery("nav:help:quick", message)
     await bot.navigation_action(
         update_for(message, user_id=8823, query=topic_query),
         ctx,
     )
-    assert any("Регистрация и профиль" in reply["text"] for reply in message.replies)
+    assert topic_query.edits[-1].startswith("🚀 Быстрый старт")
     assert "nav:help" in callback_values(message)
 
     back_query = FakeCallbackQuery("nav:help", message)
@@ -359,6 +398,8 @@ async def test_help_callbacks_remain_usable_during_durable_onboarding(db, fake_a
     assert all(
         query.answers[-1] == (None, False) for query in (help_query, topic_query, back_query)
     )
+    assert back_query.edits[-1].startswith("❓ Помощь")
+    assert message.reply_text_calls == 0
     assert not any("не завершён сценарий" in reply["text"] for reply in message.replies)
 
 
@@ -404,8 +445,9 @@ async def test_onboarding_flow_exit_is_durable_and_start_resumes_saved_step(db, 
     assert "vision_summary" not in ctx.user_data
     assert ctx.user_data["unrelated"] == "keep"
     assert await bot._active_navigation_flow(update, ctx) is None
-    assert any("Регистрация приостановлена" in reply["text"] for reply in message.replies)
-    assert any("Главное меню" in reply["text"] for reply in message.replies)
+    assert message.reply_text_calls == 1
+    assert not any("Регистрация приостановлена" in reply["text"] for reply in message.replies)
+    assert query.edits[-1].startswith("Главное меню")
 
     restarted = make_bot(db, fake_ai)
     await AccessService(db).grant_subscriber(8824, source="test")

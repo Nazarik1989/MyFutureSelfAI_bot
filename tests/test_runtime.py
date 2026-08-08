@@ -23,7 +23,7 @@ from future_self.bot import FutureSelfBot, log_safe_failure
 from future_self.config import Settings
 from future_self.doctor import run_diagnostics
 from future_self.main import create_application, format_configuration_error, run
-from future_self.models import InboxItem, OnboardingState, User
+from future_self.models import ConversationMessage, DraftInboxItem, InboxItem, OnboardingState, User
 from future_self.repositories import OnboardingRepository, UserRepository
 
 
@@ -596,6 +596,144 @@ async def test_real_application_routes_cleanup_before_persistent_onboarding(
     await application.process_update(task_update)
 
     assert sent and str(sent[-1]["text"]).startswith("✅ Задачи и напоминания")
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_heading"),
+    [
+        ("Где мои задачи?", "✅ Задачи"),
+        ("Где календарь?", "❓ Помощь"),
+    ],
+)
+async def test_real_application_stops_natural_navigation_before_downstream_content(
+    db, fake_ai, monkeypatch, caplog, phrase, expected_heading
+):
+    core = FutureSelfBot(runtime_settings(), db, fake_ai, FakeTranscription())
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712346
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    sent: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def downstream_handler(update, context):
+        del context
+        downstream.append(update.update_id)
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    application.add_handler(TypeHandler(Update, downstream_handler), group=100)
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    chat = Chat(telegram_id, "private")
+    message = Message(
+        96,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=phrase,
+    )
+    update = Update(996, message=message)
+    update.set_bot(application.bot)
+    message.set_bot(application.bot)
+
+    with caplog.at_level(logging.INFO):
+        await application.process_update(update)
+
+    assert downstream == []
+    assert sent and str(sent[-1]["text"]).startswith(expected_heading)
+    assert fake_ai.route_calls == []
+    assert phrase not in caplog.text
+    async with db.sessions() as session:
+        assert len((await session.scalars(select(InboxItem))).all()) == 0
+        assert len((await session.scalars(select(DraftInboxItem))).all()) == 0
+        assert len((await session.scalars(select(ConversationMessage))).all()) == 0
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Открой окно и проветри комнату",
+        "Покажи презентацию клиенту",
+        "Как создать привычку читать по утрам?",
+        "Как найти время на спорт?",
+        "Где поставить коробки после переезда?",
+        "Покажи фотографии дизайнеру",
+        "Открой документ после встречи",
+        "Как создать меню питания?",
+        "Как создать раздел книги?",
+        "Покажи меню врача",
+    ],
+)
+async def test_real_application_keeps_non_ui_navigation_verbs_in_content_pipeline(
+    db, fake_ai, monkeypatch, caplog, phrase
+):
+    core = FutureSelfBot(runtime_settings(), db, fake_ai, FakeTranscription())
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712347
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    sent: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def downstream_handler(update, context):
+        del context
+        downstream.append(update.update_id)
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    application.add_handler(TypeHandler(Update, downstream_handler), group=100)
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    chat = Chat(telegram_id, "private")
+    message = Message(
+        97,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=phrase,
+    )
+    update = Update(997, message=message)
+    update.set_bot(application.bot)
+    message.set_bot(application.bot)
+
+    with caplog.at_level(logging.INFO):
+        await application.process_update(update)
+
+    response_texts = [str(item.get("text", "")) for item in sent]
+    assert downstream == [997]
+    assert response_texts
+    assert not any(text.startswith("❓ Помощь") for text in response_texts)
+    assert fake_ai.route_calls or any("Такого раздела пока нет" in text for text in response_texts)
+    assert phrase not in caplog.text
 
 
 async def test_state_survives_new_repository_and_session(db):

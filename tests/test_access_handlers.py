@@ -518,8 +518,16 @@ async def test_command_scope_cache_tracks_tier_and_version(db, fake_ai):
     await AccessService(db).grant_subscriber(7080, source="test")
     await bot.access_gate(update, context(telegram))
     assert len(telegram.command_calls) == 2
-    subscriber_commands = {item.command for item in telegram.command_calls[-1][0]}
-    assert {"menu", "today", "spaces", "knowledge", "help"} <= subscriber_commands
+    subscriber_commands = [item.command for item in telegram.command_calls[-1][0]]
+    assert subscriber_commands == [
+        "menu",
+        "today",
+        "tasks",
+        "inbox",
+        "vision",
+        "health",
+        "help",
+    ]
 
     await AccessService(db).grant_admin(7080, source="test")
     await bot.access_gate(update, context(telegram))

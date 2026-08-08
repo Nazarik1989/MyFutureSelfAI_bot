@@ -4,9 +4,9 @@ from html import escape
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+from .callback_ui import edit_callback_screen
 from .collection_commands import CollectionCommand
 from .collections_service import (
     COLLECTION_KIND_LABELS,
@@ -1439,10 +1439,13 @@ class CollectionHandlers:
         *,
         parse_mode: str | None = None,
     ) -> None:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except (TelegramError, TypeError):
-            await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        await edit_callback_screen(
+            query,
+            text,
+            reply_markup,
+            parse_mode=parse_mode,
+            operation="collection",
+        )
 
 
 def re_split_once(value: str) -> tuple[str, str]:

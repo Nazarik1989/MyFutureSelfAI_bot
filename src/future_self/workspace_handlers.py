@@ -20,6 +20,7 @@ from telegram.ext import ContextTypes
 from telegram.helpers import create_deep_linked_url
 
 from .access import BLOCKED, GUEST, is_full_access_tier
+from .callback_ui import edit_callback_screen
 from .workspace_access import (
     AccessContext,
     InvitationActionResult,
@@ -2551,10 +2552,13 @@ class WorkspaceHandlers:
         *,
         parse_mode: str | None = None,
     ) -> None:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except (TelegramError, TypeError):
-            await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        await edit_callback_screen(
+            query,
+            text,
+            reply_markup,
+            parse_mode=parse_mode,
+            operation="workspace",
+        )
 
     def _workspace_enabled(self) -> bool:
         return bool(getattr(self.settings, "enable_workspace_access", False))

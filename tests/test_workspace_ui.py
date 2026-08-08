@@ -177,11 +177,12 @@ async def test_workspace_catalog_is_flag_aware_and_has_no_dead_disabled_surface(
     assert "spaces" not in {item.command for item in public_commands(False)}
     assert "spaces" not in navigation_sections(False)
     assert "spaces" not in navigation_actions(False)
-    assert disabled.natural_command_router.route("покажи мои пространства") is None
+    assert disabled.natural_command_router.route("покажи мои пространства").action == "show_spaces"
 
     validate_catalog(True)
-    assert "spaces" in {item.command for item in public_commands(True)}
-    assert "spaces" in navigation_sections(True)
+    assert "spaces" not in {item.command for item in public_commands(True)}
+    assert "spaces" not in navigation_sections(True)
+    assert "spaces" in navigation_sections(True)["sections"].actions
     assert enabled.natural_command_router.route("покажи мои пространства").action == "show_spaces"
     assert enabled.natural_command_router.route("создай совместное пространство").action == (
         "create_space"
@@ -556,7 +557,9 @@ async def test_workspace_natural_and_voice_routes_are_deterministic_without_llm(
     transcription.queue("покажи мои пространства")
     voice = FakeMessage(voice=FakeVoice())
     await bot.voice(update_for(voice), context())
-    assert any("Совместные пространства" in reply["text"] for reply in voice.replies)
+    assert voice.reply_text_calls == 1
+    assert voice.replies[0]["text"] == "Расшифровываю голосовую мысль…"
+    assert voice.edits[-1].startswith("🗂 Мои разделы")
     assert fake_ai.route_calls == []
 
 

@@ -72,6 +72,14 @@ NaturalAction = Literal[
     "show_today",
     "show_tasks",
     "show_overdue_tasks",
+    "create_task",
+    "show_vision",
+    "show_records",
+    "show_health",
+    "show_labs",
+    "prepare_doctor",
+    "show_settings",
+    "show_timezone",
     "show_collections",
     "show_spaces",
     "create_space",
@@ -90,9 +98,146 @@ class NaturalCommand:
 class NaturalCommandRouter:
     """Deterministic read-only commands routed before all content processing."""
 
+    EXPLICIT_NAVIGATION_PREFIXES = (
+        "как подготовиться",
+        "как пользоваться",
+        "как изменить",
+        "как создать",
+        "как открыть",
+        "как найти",
+        "покажи",
+        "открой",
+        "где",
+    )
+    SAFE_UI_TARGET_WORDS = frozenset(
+        {
+            "bot",
+            "button",
+            "calendar",
+            "command",
+            "feature",
+            "menu",
+            "section",
+            "settings",
+            "бот",
+            "бота",
+            "боте",
+            "ботом",
+            "календаре",
+            "календарем",
+            "календарь",
+            "календаря",
+            "кнопка",
+            "кнопке",
+            "кнопки",
+            "кнопкой",
+            "кнопку",
+            "кнопок",
+            "кнопках",
+            "команда",
+            "команде",
+            "командой",
+            "команду",
+            "команды",
+            "команд",
+            "командах",
+            "меню",
+            "настройка",
+            "настройке",
+            "настройки",
+            "настройкой",
+            "настройку",
+            "настроек",
+            "настройках",
+            "раздел",
+            "раздела",
+            "разделе",
+            "разделом",
+            "разделу",
+            "разделы",
+            "разделов",
+            "разделах",
+            "функцией",
+            "функции",
+            "функций",
+            "функция",
+            "функцию",
+            "функциях",
+        }
+    )
+    SAFE_UI_TARGET_FILLERS = frozenset(
+        {
+            "в",
+            "во",
+            "для",
+            "из",
+            "мой",
+            "моя",
+            "мое",
+            "мои",
+            "мою",
+            "на",
+            "твой",
+            "твоя",
+            "твое",
+            "твои",
+            "твою",
+            "у",
+            "эта",
+            "эти",
+            "это",
+            "эту",
+        }
+    )
+    # Capability names are matched as the whole target. This keeps ordinary
+    # objects such as a document or presentation out of navigation while still
+    # allowing a user to ask for a real bot capability in unfamiliar wording.
+    CAPABILITY_TARGETS = frozenset(
+        {
+            "активные карточки",
+            "анализы",
+            "база знаний",
+            "вечерний итог",
+            "визуализация",
+            "выполненные задачи",
+            "желания и визуализация",
+            "записи",
+            "задачи",
+            "задачи без срока",
+            "задачи и напоминания",
+            "здоровье",
+            "инбокс",
+            "карта желаний",
+            "локация",
+            "мои записи",
+            "мои задачи",
+            "мои подготовки",
+            "мои пространства",
+            "мое состояние",
+            "мой профиль",
+            "напоминания",
+            "последнее сохраненное",
+            "подготовка к врачу",
+            "подготовка к приему",
+            "помощь",
+            "предстоящие задачи",
+            "профиль",
+            "просроченные задачи",
+            "сегодня",
+            "совместные пространства",
+            "сохраненные записи",
+            "фокус дня",
+            "фокус на сегодня",
+            "часовой пояс",
+            "черновики",
+            "check in",
+            "drafts",
+            "inbox",
+        }
+    )
+
     WORKSPACE_ACTIONS = frozenset(
         {
-            "show_spaces",
             "create_space",
             "invite_space_member",
             "show_space_invitations",
@@ -142,10 +287,16 @@ class NaturalCommandRouter:
             "мой план на сегодня",
         ),
         "show_tasks": (
+            "где мои задачи",
             "покажи мои задачи",
             "открой мои задачи",
             "покажи задачи и напоминания",
             "открой задачи и напоминания",
+        ),
+        "create_task": (
+            "как создать задачу",
+            "где создать задачу",
+            "покажи как создать задачу",
         ),
         "show_overdue_tasks": (
             "покажи просроченные задачи",
@@ -153,11 +304,50 @@ class NaturalCommandRouter:
             "что у меня просрочено",
         ),
         "show_collections": (
+            "где мои разделы",
             "покажи мои разделы",
             "открой мои разделы",
             "покажи разделы",
         ),
+        "show_vision": (
+            "где визуализация",
+            "как открыть визуализацию",
+            "покажи визуализацию",
+            "открой визуализацию",
+            "где карта желаний",
+        ),
+        "show_records": (
+            "где мои записи",
+            "покажи мои записи",
+            "открой мои записи",
+        ),
+        "show_health": (
+            "где здоровье",
+            "покажи здоровье",
+            "открой здоровье",
+        ),
+        "show_labs": (
+            "где анализы",
+            "покажи анализы",
+            "открой анализы",
+        ),
+        "prepare_doctor": (
+            "как подготовиться к врачу",
+            "как подготовиться к приему",
+            "как найти врача",
+            "где подготовка к врачу",
+        ),
+        "show_settings": (
+            "где настройки",
+            "покажи настройки",
+            "открой настройки",
+        ),
+        "show_timezone": (
+            "как изменить часовой пояс",
+            "где изменить часовой пояс",
+        ),
         "show_spaces": (
+            "где совместные пространства",
             "покажи мои пространства",
             "открой мои пространства",
             "покажи совместные пространства",
@@ -196,6 +386,7 @@ class NaturalCommandRouter:
 
     def route(self, text: str) -> NaturalCommand | None:
         normalized = self._normalize(text)
+        normalized = " ".join(_trim_command_fillers(normalized.split()))
         if is_save_inbox_command(text) or any(
             pattern in normalized for pattern in self.WRITE_INBOX
         ):
@@ -203,23 +394,39 @@ class NaturalCommandRouter:
         for action, patterns in self.PATTERNS.items():
             if action in self.WORKSPACE_ACTIONS and not self.enable_workspace_access:
                 continue
-            exact_actions = {
-                "menu",
-                "help",
-                "show_spaces",
-                "create_space",
-                "invite_space_member",
-                "show_space_invitations",
-                "show_space_members",
-            }
-            matches = (
-                normalized in patterns
-                if action in exact_actions
-                else any(pattern in normalized for pattern in patterns)
-            )
-            if matches:
+            if normalized in patterns:
                 return NaturalCommand(action)
         return None
+
+    def is_explicit_navigation_request(self, text: str) -> bool:
+        """Recognize only short, unmistakable navigation questions or commands."""
+
+        normalized = self._normalize(text)
+        normalized = " ".join(_trim_command_fillers(normalized.split()))
+        tokens = normalized.split()
+        if not normalized or len(tokens) > 10:
+            return False
+        if self.route(text) is not None:
+            return True
+
+        target = next(
+            (
+                normalized.removeprefix(f"{prefix} ")
+                for prefix in self.EXPLICIT_NAVIGATION_PREFIXES
+                if normalized.startswith(f"{prefix} ")
+            ),
+            None,
+        )
+        if not target:
+            return False
+        if target in self.CAPABILITY_TARGETS:
+            return True
+        target_tokens = set(target.split())
+        allowed_tokens = self.SAFE_UI_TARGET_WORDS | self.SAFE_UI_TARGET_FILLERS
+        return (
+            not self.SAFE_UI_TARGET_WORDS.isdisjoint(target_tokens)
+            and target_tokens <= allowed_tokens
+        )
 
     @staticmethod
     def _normalize(text: str) -> str:

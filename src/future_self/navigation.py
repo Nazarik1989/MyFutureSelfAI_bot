@@ -32,23 +32,13 @@ class NavigationSection:
 
 PUBLIC_COMMANDS = (
     CommandSpec("menu", "Главное меню"),
-    CommandSpec("today", "Фокус на сегодня"),
-    CommandSpec("evening", "Вечерняя рефлексия"),
-    CommandSpec("inbox", "Сохранённые идеи и заметки"),
-    CommandSpec("tasks", "Задачи и напоминания"),
-    CommandSpec("collections", "Мои разделы"),
-    CommandSpec("vision", "Карта желаний"),
-    CommandSpec("health", "Состояние и динамика"),
-    CommandSpec("checkin", "Новый health check-in"),
-    CommandSpec("doctor", "Поиск врача и подготовка к приёму"),
-    CommandSpec("labs", "Результаты анализов"),
-    CommandSpec("location", "Личная локация"),
-    CommandSpec("help", "Помощь и примеры"),
+    CommandSpec("today", "Сегодня"),
+    CommandSpec("tasks", "Задачи"),
+    CommandSpec("inbox", "Записи"),
+    CommandSpec("vision", "Желания и визуализация"),
+    CommandSpec("health", "Здоровье"),
+    CommandSpec("help", "Помощь"),
 )
-
-WORKSPACE_PUBLIC_COMMANDS = (CommandSpec("spaces", "Совместные пространства"),)
-
-KNOWLEDGE_PUBLIC_COMMANDS = (CommandSpec("knowledge", "База знаний"),)
 
 # Existing commands remain supported, but intentionally stay outside Telegram's
 # compact native menu. Keeping this explicit lets tests detect catalog drift.
@@ -61,6 +51,12 @@ ADVANCED_COMMANDS = frozenset(
         "cancel",
         "profile",
         "timezone",
+        "evening",
+        "collections",
+        "checkin",
+        "doctor",
+        "labs",
+        "location",
         "goals",
         "drafts",
         "last_saved",
@@ -80,9 +76,9 @@ ADVANCED_COMMANDS = frozenset(
     }
 )
 
-WORKSPACE_ADVANCED_COMMANDS = frozenset({"workspaces"})
+WORKSPACE_ADVANCED_COMMANDS = frozenset({"spaces", "workspaces"})
 
-KNOWLEDGE_ADVANCED_COMMANDS = frozenset({"capture"})
+KNOWLEDGE_ADVANCED_COMMANDS = frozenset({"knowledge", "capture"})
 
 ACTIONS = {
     action.key: action
@@ -95,7 +91,7 @@ ACTIONS = {
         ),
         NavigationAction(
             "evening",
-            "Вечерняя рефлексия",
+            "Вечерний итог",
             "Пять спокойных вопросов о дне без оценок и давления.",
             "evening_start",
         ),
@@ -174,12 +170,19 @@ ACTIONS = {
             "Задача создаётся с явно указанным временем reminder.",
             example="/doctor_find_task завтра в 10:00",
         ),
-        NavigationAction(
-            "location", "Моя медицинская локация", "Город и запасной маршрут.", "location_command"
-        ),
+        NavigationAction("location", "Локация", "Город и запасной маршрут.", "location_command"),
         NavigationAction("profile", "Мой профиль", "Vision Profile и текущая локация.", "profile"),
         NavigationAction(
-            "onboarding", "Настроить профиль", "Продолжить первоначальную настройку.", "start"
+            "timezone",
+            "Часовой пояс",
+            "Местное время для сценариев и напоминаний.",
+            "timezone_command",
+        ),
+        NavigationAction(
+            "onboarding",
+            "Настроить или продолжить настройку профиля",
+            "Продолжить первоначальную настройку.",
+            "start",
         ),
     )
 }
@@ -212,99 +215,78 @@ SECTIONS = {
     section.key: section
     for section in (
         NavigationSection(
-            "day",
+            "today",
             "🌱",
-            "Мой день",
-            "Свяжи образ будущего с небольшим действием сегодня и спокойно подведи итог вечером.",
-            ("today", "evening"),
-        ),
-        NavigationSection(
-            "ideas",
-            "📝",
-            "Идеи и заметки",
-            "Сохраняй мысли через preview и управляй черновиками.",
-            ("inbox", "drafts", "last_saved"),
+            "Сегодня",
+            "Фокус, задачи на сегодня и спокойный вечерний итог.",
+            ("today", "task_today", "evening"),
         ),
         NavigationSection(
             "tasks",
             "✅",
-            "Задачи и напоминания",
-            "Задачи с раздельными временем события и напоминания.",
+            "Задачи",
+            "Создавай задачи и открывай нужный список.",
             (
+                "task_create",
                 "task_today",
                 "task_upcoming",
                 "task_overdue",
                 "task_no_due",
                 "task_completed",
-                "task_create",
-                "task_reminder_guide",
             ),
         ),
         NavigationSection(
-            "collections",
+            "records",
+            "📝",
+            "Записи",
+            "Новую мысль можно просто отправить текстом или голосом.",
+            ("inbox", "drafts", "last_saved"),
+        ),
+        NavigationSection(
+            "health",
+            "❤️",
+            "Здоровье",
+            "Состояние, check-in, врач, подготовка к приёму и анализы.",
+            (
+                "health",
+                "checkin",
+                "doctor_find",
+                "doctor_prepare",
+                "labs",
+                "doctor_preparations",
+            ),
+        ),
+        NavigationSection(
+            "sections",
             "🗂",
             "Мои разделы",
             "Сферы жизни, проекты и списки без дублирования записей.",
             ("collections",),
         ),
         NavigationSection(
-            "vision",
-            "🎯",
-            "Карта желаний",
-            "Желание → смысл → первый шаг → задача.",
-            ("vision",),
-        ),
-        NavigationSection(
-            "health",
-            "❤️",
-            "Здоровье",
-            "Субъективная динамика самочувствия — не медицинский диагноз.",
-            ("health", "checkin"),
-        ),
-        NavigationSection(
-            "doctor",
-            "🩺",
-            "Врач",
-            "Поиск врача и подготовка к приёму в одном месте.",
-            (
-                "doctor_find",
-                "doctor_prepare",
-                "doctor_preparations",
-                "labs",
-                "doctor_task_guide",
-                "location",
-            ),
-        ),
-        NavigationSection(
-            "profile",
+            "settings",
             "⚙️",
-            "Профиль и настройки",
+            "Настройки",
             "Профиль, timezone и личная локация.",
-            ("profile", "location", "onboarding"),
+            ("profile", "timezone", "location", "onboarding"),
         ),
     )
 }
 
-WORKSPACE_SECTION = NavigationSection(
-    "spaces",
-    "🤝",
-    "Совместные пространства",
-    "Отдельный защищённый контур с участниками, ролями, приглашениями и проектами.",
-    ("spaces",),
-)
+LEGACY_SECTION_ALIASES = {
+    "day": "today",
+    "ideas": "records",
+    "doctor": "health",
+    "profile": "settings",
+    "collections": "sections",
+    "spaces": "sections",
+    "organization": "sections",
+}
+
+LEGACY_ACTIONS = frozenset({"task_reminder_guide", "doctor_task_guide", "vision"})
 
 
-def _knowledge_section(enable_capture: bool) -> NavigationSection:
-    return NavigationSection(
-        "knowledge",
-        "📚",
-        "База знаний",
-        "Источники хранятся отдельно от Inbox и не используются LLM-контекстом.",
-        ("knowledge", "capture") if enable_capture else ("knowledge",),
-    )
-
-
-HELP_TOPICS = {
+_LEGACY_HELP_TOPICS = {
     "quick": (
         "🚀 Быстрый старт",
         "1. Отправь мысль обычными словами.\n"
@@ -425,23 +407,103 @@ HELP_TOPICS = {
 }
 
 
+ROOT_HELP_TOPIC_KEYS = (
+    "quick",
+    "requests",
+    "examples",
+    "privacy",
+    "troubleshooting",
+)
+
+HELP_TOPIC_LABELS = {
+    "quick": "🚀 Быстрый старт",
+    "requests": "🧭 Что можно попросить",
+    "examples": "💬 Примеры фраз",
+    "privacy": "🔒 Данные и безопасность",
+    "troubleshooting": "🧰 Если бот не понял",
+}
+
+SECTION_HELP_TOPICS = {
+    "today": "today_section",
+    "tasks": "tasks_section",
+    "records": "records_section",
+    "health": "health_section",
+    "sections": "sections_section",
+    "settings": "settings_section",
+}
+
+HELP_TOPICS = {
+    "quick": (
+        "🚀 Быстрый старт",
+        "Открой /menu и выбери раздел. Новую мысль можно просто отправить текстом или "
+        "голосом: перед сохранением бот покажет preview.",
+    ),
+    "requests": (
+        "🧭 Что можно попросить",
+        "Можно открыть задачи, записи, здоровье, настройки, свои разделы или визуализацию "
+        "обычной короткой фразой. Например: «где мои задачи?» или «покажи визуализацию».",
+    ),
+    "examples": (
+        "💬 Примеры фраз",
+        "• Где мои задачи?\n"
+        "• Как создать задачу?\n"
+        "• Где мои записи?\n"
+        "• Покажи визуализацию.\n"
+        "• Где анализы?\n"
+        "• Как изменить часовой пояс?",
+    ),
+    "privacy": (
+        "🔒 Данные и безопасность",
+        "Бот работает только в личном чате. Явные команды навигации обрабатываются "
+        "локально: они не отправляются в AI и не сохраняются как записи. Медицинские "
+        "разделы не ставят диагнозы.",
+    ),
+    "troubleshooting": (
+        "🧰 Если бот не понял",
+        "Сформулируй коротко: «где…», «как открыть…», «покажи…» или «открой…». "
+        "Если активен пошаговый сценарий, бот предложит продолжить его или выйти в меню.",
+    ),
+    "today_section": (
+        "🌱 Сегодня",
+        "«Фокус на сегодня» собирает ориентир дня, «Задачи на сегодня» открывает текущий "
+        "список, а «Вечерний итог» запускает короткую рефлексию.",
+    ),
+    "tasks_section": (
+        "✅ Задачи",
+        "Новую задачу можно написать обычной фразой. Срок и время напоминания хранятся "
+        "отдельно; перенос, завершение и отмена безопасно обновляют ожидающую доставку.",
+    ),
+    "records_section": (
+        "📝 Записи",
+        "Отправь новую мысль текстом или голосом. «Мои записи» показывает сохранённое, "
+        "«Черновики» — preview, а «Последнее сохранённое» — последнюю подтверждённую запись.",
+    ),
+    "health_section": (
+        "❤️ Здоровье",
+        "Здесь находятся состояние и check-in, поиск врача, подготовка к приёму и анализы. "
+        "Локация настраивается отдельно в «Настройках».",
+    ),
+    "sections_section": (
+        "🗂 Мои разделы",
+        "Разделы объединяют существующие записи и задачи без копирования. Совместные "
+        "пространства появляются здесь только когда функция включена.",
+    ),
+    "settings_section": (
+        "⚙️ Настройки",
+        "Здесь можно открыть профиль, проверить или изменить часовой пояс и локацию, "
+        "а также продолжить настройку профиля.",
+    ),
+}
+
+
 def public_commands(
     enable_workspace_access: bool = False,
     enable_knowledge_hub: bool = False,
 ) -> tuple[CommandSpec, ...]:
-    """Return the native command catalog without exposing disabled features."""
+    """Return the compact native catalog; advanced commands remain supported."""
 
-    if not enable_workspace_access and not enable_knowledge_hub:
-        return PUBLIC_COMMANDS
-    result: list[CommandSpec] = []
-    for item in PUBLIC_COMMANDS:
-        result.append(item)
-        if item.command == "collections":
-            if enable_workspace_access:
-                result.extend(WORKSPACE_PUBLIC_COMMANDS)
-            if enable_knowledge_hub:
-                result.extend(KNOWLEDGE_PUBLIC_COMMANDS)
-    return tuple(result)
+    del enable_workspace_access, enable_knowledge_hub
+    return PUBLIC_COMMANDS
 
 
 def advanced_commands(
@@ -478,15 +540,22 @@ def navigation_sections(
 ) -> dict[str, NavigationSection]:
     if not enable_workspace_access and not enable_knowledge_hub:
         return SECTIONS
-    result: dict[str, NavigationSection] = {}
-    for key, section in SECTIONS.items():
-        result[key] = section
-        if key == "collections":
-            if enable_workspace_access:
-                result[WORKSPACE_SECTION.key] = WORKSPACE_SECTION
-            if enable_knowledge_hub:
-                knowledge = _knowledge_section(enable_knowledge_capture)
-                result[knowledge.key] = knowledge
+    result = dict(SECTIONS)
+    section = result["sections"]
+    actions = list(section.actions)
+    if enable_workspace_access:
+        actions.append("spaces")
+    if enable_knowledge_hub:
+        actions.append("knowledge")
+        if enable_knowledge_capture:
+            actions.append("capture")
+    result["sections"] = NavigationSection(
+        key=section.key,
+        emoji=section.emoji,
+        label=section.label,
+        description=section.description,
+        actions=tuple(actions),
+    )
     return result
 
 
@@ -497,96 +566,39 @@ def help_topics(
     enable_voice: bool = True,
     enable_task_reminders: bool = True,
 ) -> dict[str, tuple[str, str]]:
-    """Build flag-aware help text while keeping the PR #22 constants stable."""
+    """Build compact root help plus contextual section topics."""
 
+    del enable_knowledge_capture
     topics = dict(HELP_TOPICS)
     if not enable_voice:
-        topics.pop("voice", None)
+        topics["quick"] = (
+            topics["quick"][0],
+            "Открой /menu и выбери раздел. Новую мысль можно просто отправить текстом: "
+            "перед сохранением бот покажет preview.",
+        )
+        topics["records_section"] = (
+            topics["records_section"][0],
+            "Отправь новую мысль текстом. «Мои записи» показывает сохранённое, "
+            "«Черновики» — preview, а «Последнее сохранённое» — последнюю "
+            "подтверждённую запись.",
+        )
     if not enable_task_reminders:
-        topics["tasks"] = (
+        topics["tasks_section"] = (
             "✅ Задачи",
-            "/tasks разделяет задачи на «Сегодня», «Предстоящие», «Просроченные», «Без срока» "
-            "и «Выполненные». Доставка Telegram-напоминаний сейчас отключена настройкой, но "
-            "сроки, перенос, завершение и история задач продолжают работать.",
+            "Задачи, сроки, перенос и история доступны. Доставка Telegram-напоминаний "
+            "сейчас отключена настройкой.",
         )
-        topics["examples"] = (
-            "💬 Примеры сообщений",
-            "Inbox — сохранённые записи; /drafts — ещё не подтверждённые preview; /tasks — "
-            "состояние и сроки задач.\n\n"
-            "• Сохрани идею: записывать одну победу дня.\n"
-            "• Покажи мои задачи.\n"
-            "• Какие задачи просрочены?\n"
-            "• Удали все неактуальные задачи.\n"
-            "• Создай проект Наз и Войд.\n"
-            "• Открой карту желаний.\n"
-            "• Хочу сделать health check-in.",
-        )
-    sections = navigation_sections(
-        enable_workspace_access,
-        enable_knowledge_hub,
-        enable_knowledge_capture,
-    )
-    feature_lines = []
-    for item in sections.values():
-        description = item.description
-        label = item.label
-        if item.key == "tasks" and not enable_task_reminders:
-            label = "Задачи"
-            description = "Задачи со сроками, состояниями, переносом и историей."
-        feature_lines.append(f"{item.emoji} {label} — {description}")
-    topics["features"] = ("🧭 Что умеет бот", "\n".join(feature_lines))
-    command_lines = []
-    for item in public_commands(enable_workspace_access, enable_knowledge_hub):
-        description = item.description
-        if item.command == "tasks" and not enable_task_reminders:
-            description = "Задачи и сроки"
-        command_lines.append(f"/{item.command} — {description}")
-    topics["commands"] = (
-        "⌨️ Основные команды",
-        "\n".join(command_lines),
-    )
-    privacy_parts = [
-        "Бот работает только в личном чате. Личные карточки, анализы, health-данные и "
-        "личные разделы не становятся общими автоматически."
-    ]
+    privacy_parts = [topics["privacy"][1]]
     if enable_workspace_access:
         privacy_parts.append(
-            "В совместном пространстве видны только явно добавленные данные и только "
-            "участникам с действующим доступом."
+            "Совместными становятся только явно добавленные данные и только для участников "
+            "с действующим доступом."
         )
     if enable_knowledge_hub:
         privacy_parts.append(
             "База знаний показывает только личные или доступные участнику источники."
         )
-    privacy_parts.append(
-        "Telegram ID не включаются в диагностические логи. Явные команды разделов "
-        "обрабатываются без LLM."
-    )
-    topics["privacy"] = (
-        "🔒 Конфиденциальность",
-        " ".join(privacy_parts),
-    )
-    if enable_workspace_access:
-        topics["spaces"] = (
-            "🤝 Совместные пространства",
-            "/spaces открывает доступные пространства, участников и проекты. Общими становятся "
-            "только явно добавленные данные. Адресная карточка предназначена выбранному "
-            "пользователю. Если бот ещё не может написать ему, появится одноразовая ссылка: "
-            "передай её лично — она закрепится за первым принявшим и имеет срок действия. "
-            "Роли определяют доступные действия.",
-        )
-    if enable_knowledge_hub:
-        capture_note = (
-            " /capture добавляет текст, документ, изображение или ссылку через preview и явное "
-            "подтверждение."
-            if enable_knowledge_capture
-            else " Добавление новых материалов сейчас отключено настройкой."
-        )
-        topics["knowledge"] = (
-            "📚 База знаний",
-            "/knowledge показывает личные и доступные совместные источники и их статус."
-            f"{capture_note} Материалы не попадают в LLM-контекст автоматически.",
-        )
+    topics["privacy"] = (topics["privacy"][0], " ".join(privacy_parts))
     return topics
 
 
@@ -677,7 +689,7 @@ def validate_catalog(
             if action not in actions:
                 raise ValueError(f"Unknown navigation action: {action}")
             used_actions.add(action)
-    if used_actions != set(actions):
+    if used_actions | LEGACY_ACTIONS != set(actions):
         raise ValueError("Unreachable navigation action")
 
 

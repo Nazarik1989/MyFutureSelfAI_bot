@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -17,11 +18,14 @@ from autotester.fakes import (
 )
 from PIL import Image, PngImagePlugin
 from sqlalchemy import func, select
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ApplicationHandlerStop
 
+from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.image_generation import (
+    DisabledImageGenerationService,
     ImageGenerationError,
     ImageReferenceInput,
     OpenRouterImageGenerationService,
@@ -36,6 +40,7 @@ from future_self.vision_images import (
     MAX_IMAGE_PIXELS,
     NormalizedVisionImage,
     TelegramImageMetadata,
+    VisionImageAccessPolicy,
     VisionImageError,
     VisionImageSessionStore,
     normalize_vision_image,
@@ -152,6 +157,34 @@ async def add_item(db, owner_id: int, wish: str = "Личное желание")
         session.add(item)
         await session.flush()
         return item
+
+
+async def grant_admin(bot: FutureSelfBot, telegram_id: int):
+    await bot._user(telegram_id)
+    await bot.access_service.grant_admin(telegram_id, source="vision-test")
+    return await bot._user(telegram_id)
+
+
+async def prepare_generation(
+    bot: FutureSelfBot,
+    db,
+    *,
+    telegram_id: int,
+    chat_id: int,
+    wish: str,
+):
+    owner = await grant_admin(bot, telegram_id)
+    item = await add_item(db, owner.id, wish)
+    card = FakeMessage()
+    await bot._vision_send_item(card, item)
+    ask, _query = callback_update(
+        callback_from(card, "vision:imagegenerateask:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(ask, None)
+    return owner, item, card, callback_from(card, "vision:imagegenerate:")
 
 
 @pytest.mark.parametrize(
@@ -278,6 +311,7 @@ async def test_generation_capability_is_owner_chat_bound_and_not_an_upload():
         11,
         mode="add",
         expected_version=None,
+        expected_access_version=7,
         prompt="exact approved prompt",
     )
     assert token is not None
@@ -286,7 +320,31 @@ async def test_generation_capability_is_owner_chat_bound_and_not_an_upload():
     capability = await store.claim_generation(token, 1, 101)
     assert capability is not None
     assert capability.prompt == "exact approved prompt"
+    assert capability.expected_access_version == 7
     assert await store.claim_generation(token, 1, 101) is None
+
+
+@pytest.mark.parametrize(
+    ("admin_only", "tier", "allowed"),
+    [
+        (True, ADMIN, True),
+        (True, SUBSCRIBER, False),
+        (True, GUEST, False),
+        (True, BLOCKED, False),
+        (False, ADMIN, True),
+        (False, SUBSCRIBER, True),
+        (False, GUEST, False),
+        (False, BLOCKED, False),
+    ],
+)
+def test_vision_image_access_policy_is_typed_and_configurable(admin_only, tier, allowed):
+    assert VisionImageAccessPolicy(admin_only=admin_only).allows(tier) is allowed
+
+
+def test_vision_image_admin_only_setting_defaults_fail_closed():
+    assert settings().vision_image_admin_only is True
+    opened = settings().model_copy(update={"vision_image_admin_only": False})
+    assert opened.vision_image_admin_only is False
 
 
 def test_vision_prompt_is_minimal_bounded_and_treats_wish_as_scene_data():
@@ -562,6 +620,853 @@ async def test_handler_photo_preview_confirm_repeat_replace_cancel_and_delete(
     assert set(tmp_path.iterdir()) == before
 
 
+async def test_admin_vision_menu_is_exact_and_disabled_provider_edits_same_message(db, fake_ai):
+    disabled = DisabledImageGenerationService(
+        model="openai/gpt-image-2",
+        quality="medium",
+        size="1024x1024",
+    )
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=disabled,
+    )
+    telegram_id, chat_id = 9341, 19341
+    await grant_admin(bot, telegram_id)
+    message = FakeMessage("/vision")
+    await bot.vision_command(update_for(message, user_id=telegram_id, chat_id=chat_id), None)
+
+    markup = message.replies[-1]["reply_markup"]
+    assert [[button.text for button in row] for row in markup.inline_keyboard] == [
+        ["➕ Добавить желание"],
+        ["✨ Создать AI-образ"],
+        ["🧩 Мои референсы"],
+        ["🗺 Мои желания", "🖼 Собрать PNG-карту"],
+        ["❓ Как это работает"],
+        ["🏠 Главное меню"],
+    ]
+    assert message.replies[-1]["text"] == (
+        "🎯 Желания и визуализация\n\nПревращай желания в понятные шаги и визуальные образы."
+    )
+
+    before_replies = len(message.replies)
+    before_reply_calls = message.reply_text_calls
+    update, query = callback_update(
+        "vision:imagepick:0",
+        message,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(update, None)
+    assert query.answers == [(None, False)]
+    assert len(query.edits) == 1
+    assert "временно недоступна" in query.edits[0]
+    assert message.reply_text_calls == before_reply_calls
+    assert len(message.replies) == before_replies + 1  # Fake records the in-place edit.
+
+
+async def test_subscriber_pilot_hides_and_denies_legacy_ai_entry(db, fake_ai):
+    generator = FakeImageGeneration(image_bytes("PNG"))
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id, chat_id = 9342, 19342
+    await bot._user(telegram_id)
+    await bot.access_service.grant_subscriber(telegram_id, source="vision-test")
+    message = FakeMessage("/vision")
+    await bot.vision_command(update_for(message, user_id=telegram_id, chat_id=chat_id), None)
+    callbacks = {
+        button.callback_data
+        for row in message.replies[-1]["reply_markup"].inline_keyboard
+        for button in row
+    }
+    assert "vision:imagepick:0" not in callbacks
+    assert {"vision:refs", "vision:render"} <= callbacks
+
+    before_replies = len(message.replies)
+    update, query = callback_update(
+        "vision:imagepick:0",
+        message,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(update, None)
+    assert query.answers == [("AI-образы пока доступны только администратору.", True)]
+    assert len(message.replies) == before_replies
+    assert generator.prompts == []
+
+
+@pytest.mark.parametrize("race", ["downgrade", "version_bounce"])
+async def test_final_access_fence_rejects_downgrade_and_version_bounce(
+    db,
+    fake_ai,
+    race,
+):
+    generator = FakeImageGeneration(image_bytes("PNG"))
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id = 9343 if race == "downgrade" else 9344
+    chat_id = telegram_id + 10_000
+    owner = await grant_admin(bot, telegram_id)
+    item = await add_item(db, owner.id, "Доступ проверяется перед provider I/O")
+    card = FakeMessage()
+    await bot._vision_send_item(card, item)
+    ask, _ = callback_update(
+        callback_from(card, "vision:imagegenerateask:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(ask, None)
+    generate_data = callback_from(card, "vision:imagegenerate:")
+
+    await bot.access_service.grant_subscriber(
+        telegram_id,
+        source="vision-race-test",
+    )
+    if race == "version_bounce":
+        await bot.access_service.grant_admin(
+            telegram_id,
+            source="vision-race-test",
+        )
+    before_reply_calls = card.reply_text_calls
+    generate, query = callback_update(
+        generate_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(generate, None)
+    assert generator.prompts == []
+    assert query.answers == [(None, False)]
+    assert "Доступ к AI-образам изменился" in query.edits[-1]
+    assert card.reply_text_calls == before_reply_calls
+    assert not await bot.vision_image_sessions.has_active(owner.id, chat_id)
+
+
+@pytest.mark.parametrize(
+    "race",
+    ["downgrade", "version_bounce", "missing_status", "status_failure"],
+)
+async def test_post_provider_access_fence_discards_output_without_preview_or_spam(
+    db,
+    fake_ai,
+    caplog,
+    monkeypatch,
+    race,
+):
+    private_output = b"PRIVATE_PROVIDER_OUTPUT_MUST_NOT_BE_USED_OR_LOGGED"
+    generator = FakeImageGeneration(private_output)
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id = {
+        "downgrade": 9345,
+        "version_bounce": 9346,
+        "missing_status": 9347,
+        "status_failure": 9348,
+    }[race]
+    chat_id = telegram_id + 10_000
+    owner, item, card, generate_data = await prepare_generation(
+        bot,
+        db,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+        wish="PRIVATE_WISH_MUST_NOT_BE_LOGGED",
+    )
+
+    real_generate = generator.generate
+
+    async def generate_after_access_race(prompt, *, references=()):
+        output = await real_generate(prompt, references=references)
+        if race in {"downgrade", "version_bounce"}:
+            await bot.access_service.grant_subscriber(
+                telegram_id,
+                source="vision-post-provider-race",
+            )
+        if race == "version_bounce":
+            await bot.access_service.grant_admin(
+                telegram_id,
+                source="vision-post-provider-race",
+            )
+        return output
+
+    generator.generate = generate_after_access_race
+    real_status = bot.access_service.status
+    status_calls = 0
+
+    async def fenced_status(target_telegram_id):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 2 and race == "missing_status":
+            return None
+        if status_calls == 2 and race == "status_failure":
+            raise RuntimeError("PRIVATE_ACCESS_ERROR_MUST_NOT_BE_LOGGED")
+        return await real_status(target_telegram_id)
+
+    bot.access_service.status = fenced_status
+    attach_preview_calls = 0
+    save_calls = 0
+    real_attach_preview = bot.vision_image_sessions.attach_preview
+    real_save = bot.vision_image_service.save
+
+    async def counted_attach_preview(*args, **kwargs):
+        nonlocal attach_preview_calls
+        attach_preview_calls += 1
+        return await real_attach_preview(*args, **kwargs)
+
+    async def counted_save(*args, **kwargs):
+        nonlocal save_calls
+        save_calls += 1
+        return await real_save(*args, **kwargs)
+
+    monkeypatch.setattr(bot.vision_image_sessions, "attach_preview", counted_attach_preview)
+    monkeypatch.setattr(bot.vision_image_service, "save", counted_save)
+    before_reply_calls = card.reply_text_calls
+    generate, query = callback_update(
+        generate_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    with caplog.at_level(logging.ERROR):
+        await bot.vision_action(generate, None)
+
+    assert status_calls == 2
+    assert len(generator.prompts) == 1
+    assert attach_preview_calls == 0
+    assert save_calls == 0
+    assert query.answers == [(None, False)]
+    assert query.edits[-1] == "Доступ к AI-образам изменился. Открой раздел визуализации заново."
+    assert card.reply_text_calls == before_reply_calls
+    assert not any(reply.get("kind") == "photo" for reply in card.replies)
+    assert await bot.vision_image_service.get(owner.id, item.id) is None
+    assert not await bot.vision_image_sessions.has_active(owner.id, chat_id)
+    assert "PRIVATE_PROVIDER_OUTPUT_MUST_NOT_BE_USED_OR_LOGGED" not in caplog.text
+    assert "PRIVATE_ACCESS_ERROR_MUST_NOT_BE_LOGGED" not in caplog.text
+    assert "PRIVATE_WISH_MUST_NOT_BE_LOGGED" not in caplog.text
+
+    replay, replay_query = callback_update(
+        generate_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(replay, None)
+    assert len(generator.prompts) == 1
+    assert len(replay_query.answers) == 1
+    assert replay_query.answers[0][1] is True
+
+
+@pytest.mark.parametrize("race", ["downgrade", "version_bounce", "status_failure"])
+async def test_post_normalization_access_fence_discards_output_before_attach(
+    db,
+    fake_ai,
+    caplog,
+    monkeypatch,
+    race,
+):
+    private_output = b"PRIVATE_NORMALIZED_PROVIDER_OUTPUT_MUST_NOT_BE_LOGGED"
+    private_wish = "PRIVATE_NORMALIZATION_WISH_MUST_NOT_BE_LOGGED"
+    private_error = "PRIVATE_NORMALIZATION_ACCESS_ERROR_MUST_NOT_BE_LOGGED"
+    normalized = normalize_vision_image(
+        image_bytes("PNG", color=(12, 34, 56)),
+        declared_mime="image/png",
+    )
+    generator = FakeImageGeneration(private_output)
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id = {
+        "downgrade": 9362,
+        "version_bounce": 9363,
+        "status_failure": 9364,
+    }[race]
+    chat_id = telegram_id + 10_000
+    owner, item, card, generate_data = await prepare_generation(
+        bot,
+        db,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+        wish=private_wish,
+    )
+    token = generate_data.removeprefix("vision:imagegenerate:")
+
+    loop = asyncio.get_running_loop()
+    normalize_calls = 0
+
+    async def change_access_during_normalization():
+        await bot.access_service.grant_subscriber(
+            telegram_id,
+            source="vision-normalization-race",
+        )
+        if race == "version_bounce":
+            await bot.access_service.grant_admin(
+                telegram_id,
+                source="vision-normalization-race",
+            )
+
+    def raced_normalize(raw, *, declared_mime):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        assert raw == private_output
+        assert declared_mime == "image/png"
+        if race in {"downgrade", "version_bounce"}:
+            mutation = asyncio.run_coroutine_threadsafe(
+                change_access_during_normalization(),
+                loop,
+            )
+            mutation.result(timeout=10)
+        return normalized
+
+    monkeypatch.setattr(
+        "future_self.vision_handlers.normalize_vision_image",
+        raced_normalize,
+    )
+
+    real_status = bot.access_service.status
+    status_calls = 0
+
+    async def fenced_status(target_telegram_id):
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 3 and race == "status_failure":
+            raise RuntimeError(private_error)
+        return await real_status(target_telegram_id)
+
+    monkeypatch.setattr(bot.access_service, "status", fenced_status)
+
+    attach_preview_calls = 0
+    cancel_calls = []
+    reply_photo_calls = 0
+    save_calls = 0
+    real_attach_preview = bot.vision_image_sessions.attach_preview
+    real_cancel = bot.vision_image_sessions.cancel
+    real_reply_photo = card.reply_photo
+    real_save = bot.vision_image_service.save
+
+    async def counted_attach_preview(*args, **kwargs):
+        nonlocal attach_preview_calls
+        attach_preview_calls += 1
+        return await real_attach_preview(*args, **kwargs)
+
+    async def counted_cancel(*args, **kwargs):
+        cancel_calls.append((args, kwargs))
+        return await real_cancel(*args, **kwargs)
+
+    async def counted_reply_photo(*args, **kwargs):
+        nonlocal reply_photo_calls
+        reply_photo_calls += 1
+        return await real_reply_photo(*args, **kwargs)
+
+    async def counted_save(*args, **kwargs):
+        nonlocal save_calls
+        save_calls += 1
+        return await real_save(*args, **kwargs)
+
+    monkeypatch.setattr(bot.vision_image_sessions, "attach_preview", counted_attach_preview)
+    monkeypatch.setattr(bot.vision_image_sessions, "cancel", counted_cancel)
+    monkeypatch.setattr(card, "reply_photo", counted_reply_photo)
+    monkeypatch.setattr(bot.vision_image_service, "save", counted_save)
+
+    before_reply_calls = card.reply_text_calls
+    generate, query = callback_update(
+        generate_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        await bot.vision_action(generate, None)
+
+    assert status_calls == 3
+    assert len(generator.prompts) == 1
+    assert normalize_calls == 1
+    assert attach_preview_calls == 0
+    assert cancel_calls == [((token, owner.id, chat_id), {})]
+    assert reply_photo_calls == 0
+    assert save_calls == 0
+    assert query.answers == [(None, False)]
+    assert query.edits[-1] == "Доступ к AI-образам изменился. Открой раздел визуализации заново."
+    assert card.reply_text_calls == before_reply_calls
+    assert not any(reply.get("kind") == "photo" for reply in card.replies)
+    assert await bot.vision_image_service.get(owner.id, item.id) is None
+    assert not await bot.vision_image_sessions.has_active(owner.id, chat_id)
+    assert await bot.vision_image_sessions.claim_confirm(token, owner.id, chat_id) is None
+    assert private_output.decode() not in caplog.text
+    assert private_wish not in caplog.text
+    assert private_error not in caplog.text
+
+
+@pytest.mark.parametrize("race", ["downgrade", "version_bounce"])
+async def test_post_attach_access_fence_cleans_preview_before_telegram_send(
+    db,
+    fake_ai,
+    caplog,
+    monkeypatch,
+    race,
+):
+    private_output = b"PRIVATE_ATTACHED_PROVIDER_OUTPUT_MUST_NOT_BE_LOGGED"
+    private_wish = "PRIVATE_ATTACH_WISH_MUST_NOT_BE_LOGGED"
+    private_error = "PRIVATE_ATTACH_ACCESS_ERROR_MUST_NOT_BE_LOGGED"
+    normalized = normalize_vision_image(
+        image_bytes("PNG", color=(65, 43, 21)),
+        declared_mime="image/png",
+    )
+    generator = FakeImageGeneration(private_output)
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id = 9365 if race == "downgrade" else 9366
+    chat_id = telegram_id + 10_000
+    owner, item, card, generate_data = await prepare_generation(
+        bot,
+        db,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+        wish=private_wish,
+    )
+    token = generate_data.removeprefix("vision:imagegenerate:")
+
+    normalize_calls = 0
+
+    def counted_normalize(raw, *, declared_mime):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        assert raw == private_output
+        assert declared_mime == "image/png"
+        return normalized
+
+    monkeypatch.setattr(
+        "future_self.vision_handlers.normalize_vision_image",
+        counted_normalize,
+    )
+
+    status_calls = 0
+    real_status = bot.access_service.status
+
+    async def counted_status(target_telegram_id):
+        nonlocal status_calls
+        status_calls += 1
+        return await real_status(target_telegram_id)
+
+    monkeypatch.setattr(bot.access_service, "status", counted_status)
+
+    attach_preview_calls = 0
+    cancel_calls = []
+    reply_photo_calls = 0
+    save_calls = 0
+    real_attach_preview = bot.vision_image_sessions.attach_preview
+    real_cancel = bot.vision_image_sessions.cancel
+    real_reply_photo = card.reply_photo
+    real_save = bot.vision_image_service.save
+
+    async def attach_then_change_access(*args, **kwargs):
+        nonlocal attach_preview_calls
+        attach_preview_calls += 1
+        attached = await real_attach_preview(*args, **kwargs)
+        assert attached is True
+        await bot.access_service.grant_subscriber(
+            telegram_id,
+            source="vision-post-attach-race",
+        )
+        if race == "version_bounce":
+            await bot.access_service.grant_admin(
+                telegram_id,
+                source="vision-post-attach-race",
+            )
+        return attached
+
+    async def counted_cancel(*args, **kwargs):
+        cancel_calls.append((args, kwargs))
+        return await real_cancel(*args, **kwargs)
+
+    async def counted_reply_photo(*args, **kwargs):
+        nonlocal reply_photo_calls
+        reply_photo_calls += 1
+        return await real_reply_photo(*args, **kwargs)
+
+    async def counted_save(*args, **kwargs):
+        nonlocal save_calls
+        save_calls += 1
+        return await real_save(*args, **kwargs)
+
+    monkeypatch.setattr(bot.vision_image_sessions, "attach_preview", attach_then_change_access)
+    monkeypatch.setattr(bot.vision_image_sessions, "cancel", counted_cancel)
+    monkeypatch.setattr(card, "reply_photo", counted_reply_photo)
+    monkeypatch.setattr(bot.vision_image_service, "save", counted_save)
+
+    before_reply_calls = card.reply_text_calls
+    generate, query = callback_update(
+        generate_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        await bot.vision_action(generate, None)
+
+    assert status_calls == 4
+    assert len(generator.prompts) == 1
+    assert normalize_calls == 1
+    assert attach_preview_calls == 1
+    assert cancel_calls == [((token, owner.id, chat_id), {})]
+    assert reply_photo_calls == 0
+    assert save_calls == 0
+    assert query.answers == [(None, False)]
+    assert query.edits[-1] == "Доступ к AI-образам изменился. Открой раздел визуализации заново."
+    assert card.reply_text_calls == before_reply_calls
+    assert not any(reply.get("kind") == "photo" for reply in card.replies)
+    assert await bot.vision_image_service.get(owner.id, item.id) is None
+    assert not await bot.vision_image_sessions.has_active(owner.id, chat_id)
+    assert await bot.vision_image_sessions.claim_confirm(token, owner.id, chat_id) is None
+    assert private_output.decode() not in caplog.text
+    assert private_wish not in caplog.text
+    assert private_error not in caplog.text
+
+    replay, replay_query = callback_update(
+        f"vision:imageconfirm:{token}",
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(replay, None)
+    assert len(replay_query.answers) == 1
+    assert replay_query.answers[0][1] is True
+    assert len(generator.prompts) == 1
+    assert normalize_calls == 1
+    assert attach_preview_calls == 1
+    assert cancel_calls == [((token, owner.id, chat_id), {})]
+    assert reply_photo_calls == 0
+    assert save_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_status_calls", "expected_attach_calls", "expected_reply_calls"),
+    [
+        ("access_status", 3, 0, 0),
+        ("normalization", 2, 0, 0),
+        ("reply_photo", 4, 1, 1),
+    ],
+)
+async def test_generation_does_not_swallow_cancelled_error(
+    db,
+    fake_ai,
+    monkeypatch,
+    phase,
+    expected_status_calls,
+    expected_attach_calls,
+    expected_reply_calls,
+):
+    generated_png = image_bytes("PNG", color=(91, 82, 73))
+    generator = FakeImageGeneration(generated_png)
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id = {
+        "access_status": 9367,
+        "normalization": 9368,
+        "reply_photo": 9369,
+    }[phase]
+    chat_id = telegram_id + 10_000
+    _owner, _item, card, generate_data = await prepare_generation(
+        bot,
+        db,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+        wish="Cancelled task must propagate",
+    )
+
+    status_calls = 0
+    normalize_calls = 0
+    attach_preview_calls = 0
+    reply_photo_calls = 0
+    real_status = bot.access_service.status
+    real_normalize = normalize_vision_image
+    real_attach_preview = bot.vision_image_sessions.attach_preview
+    real_reply_photo = card.reply_photo
+
+    async def cancelling_status(target_telegram_id):
+        nonlocal status_calls
+        status_calls += 1
+        if phase == "access_status" and status_calls == 3:
+            raise asyncio.CancelledError
+        return await real_status(target_telegram_id)
+
+    def cancelling_normalize(raw, *, declared_mime):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        if phase == "normalization":
+            raise asyncio.CancelledError
+        return real_normalize(raw, declared_mime=declared_mime)
+
+    async def counted_attach_preview(*args, **kwargs):
+        nonlocal attach_preview_calls
+        attach_preview_calls += 1
+        return await real_attach_preview(*args, **kwargs)
+
+    async def cancelling_reply_photo(*args, **kwargs):
+        nonlocal reply_photo_calls
+        reply_photo_calls += 1
+        if phase == "reply_photo":
+            raise asyncio.CancelledError
+        return await real_reply_photo(*args, **kwargs)
+
+    monkeypatch.setattr(bot.access_service, "status", cancelling_status)
+    monkeypatch.setattr(
+        "future_self.vision_handlers.normalize_vision_image",
+        cancelling_normalize,
+    )
+    monkeypatch.setattr(bot.vision_image_sessions, "attach_preview", counted_attach_preview)
+    monkeypatch.setattr(card, "reply_photo", cancelling_reply_photo)
+
+    generate, _query = callback_update(
+        generate_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await bot.vision_action(generate, None)
+
+    assert len(generator.prompts) == 1
+    assert normalize_calls == 1
+    assert status_calls == expected_status_calls
+    assert attach_preview_calls == expected_attach_calls
+    assert reply_photo_calls == expected_reply_calls
+
+
+@pytest.mark.parametrize("race", ["downgrade", "version_bounce"])
+async def test_confirm_access_fence_consumes_old_preview_and_preserves_existing_image(
+    db,
+    fake_ai,
+    race,
+):
+    generated_png = image_bytes("PNG", color=(10, 220, 130))
+    generated = normalize_vision_image(
+        generated_png,
+        declared_mime="image/png",
+    )
+    existing = normalize_vision_image(
+        image_bytes("PNG", color=(220, 30, 40)),
+        declared_mime="image/png",
+    )
+    generator = FakeImageGeneration(generated_png)
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id = 9349 if race == "downgrade" else 9352
+    chat_id = telegram_id + 10_000
+    owner = await grant_admin(bot, telegram_id)
+    item = await add_item(db, owner.id, "Confirm access fence")
+    seeded = await bot.vision_image_service.save(
+        owner.id,
+        item.id,
+        expected_version=None,
+        normalized=existing,
+    )
+    assert seeded.status == "created"
+    original_version = seeded.image.version
+    original_sha = seeded.image.sha256
+
+    card = FakeMessage()
+    await bot._vision_send_item(card, item)
+    ask, _ = callback_update(
+        callback_from(card, "vision:imagegenerateask:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(ask, None)
+    generate, generate_query = callback_update(
+        callback_from(card, "vision:imagegenerate:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(generate, None)
+    old_confirm = callback_from(card, "vision:imageconfirm:")
+    assert generate_query.answers == [(None, False)]
+    assert await bot.vision_image_sessions.has_active(owner.id, chat_id)
+
+    await bot.access_service.grant_subscriber(
+        telegram_id,
+        source="vision-confirm-race",
+    )
+    if race == "version_bounce":
+        await bot.access_service.grant_admin(
+            telegram_id,
+            source="vision-confirm-race",
+        )
+    before_reply_calls = card.reply_text_calls
+    confirm, confirm_query = callback_update(
+        old_confirm,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+        media=True,
+    )
+    await bot.vision_action(confirm, None)
+
+    preserved = await bot.vision_image_service.get(owner.id, item.id)
+    assert preserved is not None
+    assert (preserved.version, preserved.sha256) == (original_version, original_sha)
+    assert confirm_query.answers == [(None, False)]
+    assert confirm_query.caption_edits == [
+        "Доступ к AI-образам изменился. Открой раздел визуализации заново."
+    ]
+    assert card.reply_text_calls == before_reply_calls
+    assert not await bot.vision_image_sessions.has_active(owner.id, chat_id)
+
+    if race == "downgrade":
+        await bot.access_service.grant_admin(telegram_id, source="vision-confirm-race")
+    refreshed_item = await bot.vision_service.get_item(owner.id, item.id)
+    await bot._vision_send_item(card, refreshed_item)
+    second_ask, _ = callback_update(
+        callback_from(card, "vision:imagegenerateask:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(second_ask, None)
+    second_generate, _ = callback_update(
+        callback_from(card, "vision:imagegenerate:"),
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(second_generate, None)
+    new_confirm = callback_from(card, "vision:imageconfirm:")
+    assert new_confirm != old_confirm
+
+    replay_old, replay_old_query = callback_update(
+        old_confirm,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+        media=True,
+    )
+    await bot.vision_action(replay_old, None)
+    assert len(replay_old_query.answers) == 1
+    assert replay_old_query.answers[0][1] is True
+    assert await bot.vision_image_sessions.has_active(owner.id, chat_id)
+
+    confirm_new, confirm_new_query = callback_update(
+        new_confirm,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+        media=True,
+    )
+    await bot.vision_action(confirm_new, None)
+    replaced = await bot.vision_image_service.get(owner.id, item.id)
+    assert replaced is not None
+    assert (replaced.version, replaced.sha256) == (
+        original_version + 1,
+        generated.sha256,
+    )
+    assert confirm_new_query.answers == [(None, False)]
+    assert len(generator.prompts) == 2
+
+
+async def test_image_cancel_after_downgrade_bypasses_ai_reject_and_clears_session(db, fake_ai):
+    generator = FakeImageGeneration(image_bytes("PNG"))
+    bot = FutureSelfBot(
+        settings(),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+        image_generation=generator,
+    )
+    telegram_id, chat_id = 9350, 19350
+    owner, item, card, _generate_data = await prepare_generation(
+        bot,
+        db,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+        wish="Cancel survives downgrade",
+    )
+    cancel_data = callback_from(card, "vision:imagecancel:")
+    await bot.access_service.grant_subscriber(telegram_id, source="vision-cancel-race")
+    before_reply_calls = card.reply_text_calls
+
+    cancel, cancel_query = callback_update(
+        cancel_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(cancel, None)
+
+    assert cancel_query.answers == [(None, False)]
+    assert cancel_query.edits[-1] == "Действие с изображением отменено."
+    assert card.reply_text_calls == before_reply_calls
+    assert generator.prompts == []
+    assert await bot.vision_image_service.get(owner.id, item.id) is None
+    assert not await bot.vision_image_sessions.has_active(owner.id, chat_id)
+
+
+async def test_vision_callback_edit_failures_never_create_unproven_fallbacks(
+    db,
+    fake_ai,
+    caplog,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage()
+
+    class NotModifiedQuery(FakeCallbackQuery):
+        async def edit_message_text(self, text, **kwargs):
+            raise BadRequest("Message is not modified")
+
+    unchanged = NotModifiedQuery("vision:menu", message)
+    await bot._vision_edit_or_send(unchanged, message, "same", None)
+    assert message.reply_text_calls == 0
+
+    class FailedQuery(FakeCallbackQuery):
+        async def edit_message_text(self, text, **kwargs):
+            raise TelegramError("PRIVATE_TEXT_MUST_NOT_BE_LOGGED")
+
+    failed = FailedQuery("vision:menu", message)
+    with caplog.at_level(logging.WARNING):
+        await bot._vision_edit_or_send(failed, message, "PRIVATE_TEXT_MUST_NOT_BE_LOGGED", None)
+    assert message.reply_text_calls == 0
+    assert "TelegramError" in caplog.text
+    assert "PRIVATE_TEXT_MUST_NOT_BE_LOGGED" not in caplog.text
+
+
 async def test_gpt_image_2_requires_consent_previews_then_saves_once(db, fake_ai):
     generated_png = image_bytes("PNG", size=(1024, 1024), color=(70, 130, 210))
     generator = FakeImageGeneration(generated_png)
@@ -579,7 +1484,7 @@ async def test_gpt_image_2_requires_consent_previews_then_saves_once(db, fake_ai
         image_generation=generator,
     )
     telegram_id, chat_id = 9351, 19351
-    owner = await bot._user(telegram_id)
+    owner = await grant_admin(bot, telegram_id)
     async with db.session() as session:
         item = VisionItem(
             owner_id=owner.id,
@@ -611,7 +1516,7 @@ async def test_gpt_image_2_requires_consent_previews_then_saves_once(db, fake_ai
     assert "секретный первый шаг" not in disclosure
 
     generate_data = callback_from(card, "vision:imagegenerate:")
-    generate_update, _ = callback_update(
+    generate_update, generate_query = callback_update(
         generate_data,
         card,
         user_id=telegram_id,
@@ -619,6 +1524,7 @@ async def test_gpt_image_2_requires_consent_previews_then_saves_once(db, fake_ai
     )
     await bot.vision_action(generate_update, None)
     assert len(generator.prompts) == 1
+    assert generate_query.answers == [(None, False)]
     assert await bot.vision_image_service.get(owner.id, item.id) is None
     assert any(reply.get("kind") == "photo" for reply in card.replies)
 
@@ -643,7 +1549,7 @@ async def test_gpt_image_2_requires_consent_previews_then_saves_once(db, fake_ai
     assert any(show_alert for _text, show_alert in forged_query.answers)
     assert await bot.vision_image_service.get(owner.id, item.id) is None
 
-    confirm_update, _ = callback_update(
+    confirm_update, confirm_query = callback_update(
         confirm_data,
         card,
         user_id=telegram_id,
@@ -653,6 +1559,22 @@ async def test_gpt_image_2_requires_consent_previews_then_saves_once(db, fake_ai
     stored = await bot.vision_image_service.get(owner.id, item.id)
     assert stored is not None
     assert stored.mime_type == "image/jpeg"
+    assert confirm_query.answers == [(None, False)]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(VisionItemImage.id))) == 1
+
+    replay_confirm, replay_confirm_query = callback_update(
+        confirm_data,
+        card,
+        user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    await bot.vision_action(replay_confirm, None)
+    assert len(replay_confirm_query.answers) == 1
+    assert replay_confirm_query.answers[0][1] is True
+    assert len(generator.prompts) == 1
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(VisionItemImage.id))) == 1
 
 
 async def test_main_visualization_entry_picks_active_wish_without_rendering_png(db, fake_ai):
@@ -665,7 +1587,7 @@ async def test_main_visualization_entry_picks_active_wish_without_rendering_png(
         image_generation=generator,
     )
     telegram_id, chat_id = 9355, 19355
-    owner = await bot._user(telegram_id)
+    owner = await grant_admin(bot, telegram_id)
     active = await add_item(db, owner.id, "Я работаю над любимым проектом у океана")
     archived = await add_item(db, owner.id, "Устаревшее желание")
     await bot.vision_service.set_status(owner.id, archived.id, "archived")
@@ -673,11 +1595,7 @@ async def test_main_visualization_entry_picks_active_wish_without_rendering_png(
     message = FakeMessage("/vision")
     await bot.vision_command(update_for(message, user_id=telegram_id, chat_id=chat_id), None)
     picker_data = callback_from(message, "vision:imagepick:0")
-    assert not any(
-        button.callback_data == "vision:render"
-        for row in message.replies[-1]["reply_markup"].inline_keyboard
-        for button in row
-    )
+    assert callback_from(message, "vision:render") == "vision:render"
 
     picker_update, _ = callback_update(
         picker_data,
@@ -723,7 +1641,7 @@ async def test_moderation_failure_is_safe_not_retried_or_saved(db, fake_ai, capl
         image_generation=generator,
     )
     telegram_id, chat_id = 9361, 19361
-    owner = await bot._user(telegram_id)
+    owner = await grant_admin(bot, telegram_id)
     item = await add_item(db, owner.id, "Не выводить личное желание в лог")
     card = FakeMessage()
     await bot._vision_send_item(card, item)

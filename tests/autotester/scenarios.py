@@ -1488,7 +1488,7 @@ VISION_SCENARIOS = (
             ScenarioStep(
                 "vision_replay_callback",
                 "renderall",
-                reply_contains=("уже создаётся",),
+                reply_contains=("PNG-карта уже собирается",),
             ),
             ScenarioStep("vision_release_render"),
         ),
@@ -1529,7 +1529,11 @@ VISION_SCENARIOS = (
     Scenario(
         name="vision-full-voice-skip-confirm-task-idempotent-without-llm",
         steps=(
-            ScenarioStep("command", "/vision", reply_contains=("Карта желаний",)),
+            ScenarioStep(
+                "command",
+                "/vision",
+                reply_contains=("Желания и визуализация",),
+            ),
             ScenarioStep("vision_callback", "add", reply_contains=("Выбери категорию",)),
             ScenarioStep(
                 "vision_callback",
@@ -1916,17 +1920,23 @@ NAVIGATION_SCENARIOS = (
         name="navigation-every-main-section-has-real-back-path",
         steps=(
             ScenarioStep("command", "/menu"),
-            ScenarioStep("navigation_callback", "ideas", reply_contains=("Идеи и заметки",)),
+            ScenarioStep("navigation_callback", "today", reply_contains=("Сегодня",)),
             ScenarioStep("navigation_callback", "root"),
             ScenarioStep("navigation_callback", "tasks", reply_contains=("Задачи",)),
             ScenarioStep("navigation_callback", "root"),
-            ScenarioStep("navigation_callback", "vision", reply_contains=("Карта желаний",)),
+            ScenarioStep("navigation_callback", "records", reply_contains=("Записи",)),
             ScenarioStep("navigation_callback", "root"),
             ScenarioStep("navigation_callback", "health", reply_contains=("Здоровье",)),
             ScenarioStep("navigation_callback", "root"),
-            ScenarioStep("navigation_callback", "doctor", reply_contains=("Врач",)),
+            ScenarioStep(
+                "navigation_callback",
+                "vision",
+                reply_contains=("Желания и визуализация",),
+            ),
             ScenarioStep("navigation_callback", "root"),
-            ScenarioStep("navigation_callback", "profile", reply_contains=("Профиль",)),
+            ScenarioStep("navigation_callback", "sections", reply_contains=("Мои разделы",)),
+            ScenarioStep("navigation_callback", "root"),
+            ScenarioStep("navigation_callback", "settings", reply_contains=("Настройки",)),
             ScenarioStep("navigation_callback", "root"),
         ),
         expected=ExpectedState(),
@@ -1944,11 +1954,11 @@ NAVIGATION_SCENARIOS = (
     Scenario(
         name="navigation-unified-doctor-section-preserves-legacy-actions",
         steps=(
-            ScenarioStep("command", "/doctor", reply_contains=("Врач",)),
+            ScenarioStep("command", "/doctor", reply_contains=("Здоровье",)),
             ScenarioStep(
                 "navigation_callback",
                 "doctor_find",
-                reply_contains=("настрой локацию", "Навигация"),
+                reply_contains=("настрой локацию",),
             ),
         ),
         expected=ExpectedState(),
@@ -1978,9 +1988,7 @@ NAVIGATION_SCENARIOS = (
             ScenarioStep("navigation_callback", "checkin"),
             ScenarioStep("health_answer", "5"),
             ScenarioStep("text", "Главное меню", reply_contains=("не завершён сценарий",)),
-            ScenarioStep(
-                "navigation_callback", "exit", reply_contains=("остановлен", "Главное меню")
-            ),
+            ScenarioStep("navigation_callback", "exit", reply_contains=("Главное меню",)),
         ),
         expected=ExpectedState(),
     ),
@@ -1995,7 +2003,7 @@ NAVIGATION_SCENARIOS = (
             ScenarioStep("switch_user", "900002:910002"),
             ScenarioStep("navigation_replay_callback", "exit", reply_contains=("устарела",)),
             ScenarioStep("switch_user", "900001:910001"),
-            ScenarioStep("navigation_replay_callback", "exit", reply_contains=("остановлен",)),
+            ScenarioStep("navigation_replay_callback", "exit", reply_contains=("Главное меню",)),
             ScenarioStep("navigation_replay_callback", "exit", reply_contains=("устарела",)),
         ),
         expected=ExpectedState(),
@@ -2008,7 +2016,7 @@ NAVIGATION_SCENARIOS = (
                 "navigation_callback", "doctor_prepare", reply_contains=("причина обращения",)
             ),
             ScenarioStep("text", "Меню", reply_contains=("не завершён сценарий",)),
-            ScenarioStep("navigation_callback", "exit", reply_contains=("остановлен",)),
+            ScenarioStep("navigation_callback", "exit", reply_contains=("Главное меню",)),
         ),
         expected=ExpectedState(),
     ),
@@ -2064,7 +2072,7 @@ NAVIGATION_SCENARIOS = (
             ScenarioStep("command", "/menu"),
             ScenarioStep("switch_user", "900002:910002"),
             ScenarioStep("command", "/menu"),
-            ScenarioStep("navigation_callback", "ideas"),
+            ScenarioStep("navigation_callback", "records"),
             ScenarioStep("navigation_callback", "inbox", reply_contains=("Inbox",)),
         ),
         expected=ExpectedState(),
@@ -2300,7 +2308,7 @@ TASK_HUB_SCENARIOS = (
             ScenarioStep(
                 "navigation_callback",
                 "task_reminder_guide",
-                reply_contains=("Срок задачи", "явно"),
+                reply_contains=("Срок и время напоминания", "отмена безопасно"),
             ),
         ),
         expected=ExpectedState(),

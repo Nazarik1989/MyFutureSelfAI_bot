@@ -1,12 +1,94 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes, ConversationHandler
 
-from .navigation import help_topics, navigation_actions, navigation_sections
+from .navigation import (
+    HELP_TOPIC_LABELS,
+    LEGACY_SECTION_ALIASES,
+    ROOT_HELP_TOPIC_KEYS,
+    SECTION_HELP_TOPICS,
+    help_topics,
+    navigation_actions,
+    navigation_sections,
+)
+
+logger = logging.getLogger(__name__)
+
+_LEGACY_HELP_ALIASES = {
+    "day": "today_section",
+    "features": "requests",
+    "voice": "records_section",
+    "drafts": "records_section",
+    "tasks": "tasks_section",
+    "collections": "sections_section",
+    "vision": "requests",
+    "health": "health_section",
+    "doctor": "health_section",
+    "registration": "settings_section",
+    "commands": "requests",
+    "safety": "privacy",
+}
+
+
+class _ScreenUpdate:
+    def __init__(self, source: Any, message: Any):
+        self._source = source
+        self.effective_message = message
+        self.message = message
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+
+class _CallbackScreenMessage:
+    def __init__(
+        self,
+        owner: NavigationHandlers,
+        query: Any,
+        fallback_markup: InlineKeyboardMarkup,
+    ):
+        self._owner = owner
+        self._query = query
+        self._message = query.message
+        self._fallback_markup = fallback_markup
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._message, name)
+
+    async def reply_text(self, text: str, **kwargs: Any) -> Any:
+        reply_markup = kwargs.pop("reply_markup", self._fallback_markup)
+        await self._owner._edit_or_send(
+            self._query,
+            text,
+            reply_markup,
+            **kwargs,
+        )
+        return self._message
+
+
+class _EditedScreenMessage:
+    def __init__(self, message: Any):
+        self._message = message
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._message, name)
+
+    async def reply_text(self, text: str, **kwargs: Any) -> Any:
+        try:
+            await self._message.edit_text(text, **kwargs)
+        except TelegramError as exc:
+            if not NavigationHandlers._message_not_modified(exc):
+                logger.warning(
+                    "Navigation message edit failed error_type=%s",
+                    type(exc).__name__,
+                )
+        return self._message
+
 
 FLOW_LABELS = {
     "onboarding": "настройка профиля",
@@ -24,6 +106,10 @@ FLOW_LABELS = {
 
 class NavigationHandlers:
     navigation_flow_sessions: Any
+
+    @staticmethod
+    def _edited_screen_update(update: Any, message: Any) -> _ScreenUpdate:
+        return _ScreenUpdate(update, _EditedScreenMessage(message))
 
     async def navigation_public_command_gate(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -48,13 +134,21 @@ class NavigationHandlers:
         )
         if onboarding_result is not None:
             raise ApplicationHandlerStop
-        command = self.natural_command_router.route(update.effective_message.text or "")
-        if command is None or command.action not in {"menu", "help"}:
+        text = update.effective_message.text or ""
+        command = self.natural_command_router.route(text)
+        explicit_unknown = (
+            command is None and self.natural_command_router.is_explicit_navigation_request(text)
+        )
+        if explicit_unknown and self.collection_command_router.route(text) is not None:
             return
-        if command.action == "menu":
-            await self.menu_command(update, context)
+        if command is None and not explicit_unknown:
+            return
+        action = command.action if command is not None else "help"
+        flow = await self._active_navigation_flow(update, context)
+        if flow is not None and action != "help":
+            await self._prompt_navigation_flow(update.effective_message, update, flow)
         else:
-            await self.help_command(update, context)
+            await self._handle_natural_command(update, context, action)
         raise ApplicationHandlerStop
 
     async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -73,13 +167,12 @@ class NavigationHandlers:
         if flow is not None:
             await self._prompt_navigation_flow(update.effective_message, update, flow)
             return
-        await self._send_navigation_section(update.effective_message, "doctor")
+        await self._send_navigation_section(update.effective_message, "health")
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
         await update.effective_message.reply_text(
-            "❓ Помощь\n\nЗдесь есть пошаговые инструкции, примеры фраз и пояснения "
-            "по каждой возможности. Выбери тему:",
+            "❓ Помощь\n\nВыбери направление или задай короткий вопрос о навигации.",
             reply_markup=self._help_keyboard(),
         )
 
@@ -95,11 +188,11 @@ class NavigationHandlers:
         help_navigation = data == "nav:help" or data.startswith("nav:help:")
         if flow is not None and not help_navigation:
             await query.answer()
-            await self._prompt_navigation_flow(query.message, update, flow)
+            await self._prompt_navigation_flow(query.message, update, flow, query=query)
             return None
 
+        user = await self._user(update.effective_user.id)
         if hasattr(self, "collection_service"):
-            user = await self._user(update.effective_user.id)
             await self.collection_service.clear_context(user.id, update.effective_chat.id)
             await self.collection_service.cancel_input(user.id, update.effective_chat.id)
 
@@ -107,7 +200,7 @@ class NavigationHandlers:
             await query.answer()
             await self._edit_or_send(
                 query,
-                "Главное меню\n\nВыбери раздел — команды помнить не обязательно.",
+                "Главное меню\n\nЧто хочешь сделать?",
                 self._root_keyboard(),
             )
             return None
@@ -115,8 +208,7 @@ class NavigationHandlers:
             await query.answer()
             await self._edit_or_send(
                 query,
-                "❓ Помощь\n\nЗдесь есть пошаговые инструкции, примеры фраз и пояснения "
-                "по каждой возможности. Выбери тему:",
+                "❓ Помощь\n\nВыбери направление или задай короткий вопрос о навигации.",
                 self._help_keyboard(),
             )
             return None
@@ -139,6 +231,11 @@ class NavigationHandlers:
         )
         if data.startswith("nav:section:"):
             section_key = data.removeprefix("nav:section:")
+            if section_key == "vision":
+                await query.answer()
+                await self._vision_menu(query.message, user=user, query=query)
+                return None
+            section_key = LEGACY_SECTION_ALIASES.get(section_key, section_key)
             if section_key not in sections:
                 await self._navigation_stale(query)
                 return None
@@ -152,6 +249,7 @@ class NavigationHandlers:
             return None
         if data.startswith("nav:help:"):
             topic_key = data.removeprefix("nav:help:")
+            topic_key = _LEGACY_HELP_ALIASES.get(topic_key, topic_key)
             topic = topics.get(topic_key)
             if topic is None:
                 await self._navigation_stale(query)
@@ -160,7 +258,7 @@ class NavigationHandlers:
             await self._edit_or_send(
                 query,
                 f"{topic[0]}\n\n{topic[1]}",
-                self._back_keyboard("nav:help"),
+                self._back_keyboard(self._help_back_target(topic_key)),
             )
             return None
         if data.startswith("nav:action:"):
@@ -174,33 +272,46 @@ class NavigationHandlers:
             }:
                 await self._navigation_stale(query)
                 return None
+            if action_key == "vision":
+                await query.answer()
+                await self._vision_menu(query.message, user=user, query=query)
+                return None
+            if action_key == "task_reminder_guide":
+                await query.answer()
+                topic = topics["tasks_section"]
+                await self._edit_or_send(
+                    query,
+                    f"{topic[0]}\n\n{topic[1]}",
+                    self._back_keyboard("nav:section:tasks"),
+                )
+                return None
+            if action_key == "doctor_task_guide":
+                await query.answer()
+                topic = topics["health_section"]
+                await self._edit_or_send(
+                    query,
+                    f"{topic[0]}\n\n{topic[1]}",
+                    self._back_keyboard("nav:section:health"),
+                )
+                return None
             await query.answer()
+            screen = _CallbackScreenMessage(
+                self,
+                query,
+                self._back_keyboard(self._section_for_action(action_key)),
+            )
             if action.handler is None:
                 text = action.description
                 if action.example:
                     text += f"\n\nПример: {action.example}"
-                await query.message.reply_text(
-                    text,
-                    reply_markup=self._back_keyboard(self._section_for_action(action_key)),
-                )
+                await screen.reply_text(text)
                 return None
             original_args = getattr(context, "args", None)
             context.args = []
             try:
-                await getattr(self, action.handler)(update, context)
+                await getattr(self, action.handler)(_ScreenUpdate(update, screen), context)
             finally:
                 context.args = original_args or []
-            if action.handler.startswith("task_") or action.handler in {
-                "collections_command",
-                "spaces_command",
-                "knowledge_command",
-                "capture_command",
-            }:
-                return None
-            await query.message.reply_text(
-                "Навигация",
-                reply_markup=self._back_keyboard(self._section_for_action(action_key)),
-            )
             return None
         await self._navigation_stale(query)
         return None
@@ -211,10 +322,15 @@ class NavigationHandlers:
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
-            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            await self._prompt_navigation_flow(
+                update.callback_query.message, update, flow, query=update.callback_query
+            )
             return None
         await update.callback_query.answer()
-        return await self.health_checkin_start(update, context)
+        screen = _CallbackScreenMessage(
+            self, update.callback_query, self._back_keyboard("nav:section:health")
+        )
+        return await self.health_checkin_start(_ScreenUpdate(update, screen), context)
 
     async def navigation_evening_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -222,10 +338,15 @@ class NavigationHandlers:
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
-            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            await self._prompt_navigation_flow(
+                update.callback_query.message, update, flow, query=update.callback_query
+            )
             return None
         await update.callback_query.answer()
-        return await self.evening_start(update, context)
+        screen = _CallbackScreenMessage(
+            self, update.callback_query, self._back_keyboard("nav:section:today")
+        )
+        return await self.evening_start(_ScreenUpdate(update, screen), context)
 
     async def navigation_doctor_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -233,10 +354,15 @@ class NavigationHandlers:
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
-            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            await self._prompt_navigation_flow(
+                update.callback_query.message, update, flow, query=update.callback_query
+            )
             return None
         await update.callback_query.answer()
-        return await self.doctor_prepare_start(update, context)
+        screen = _CallbackScreenMessage(
+            self, update.callback_query, self._back_keyboard("nav:section:health")
+        )
+        return await self.doctor_prepare_start(_ScreenUpdate(update, screen), context)
 
     async def navigation_onboarding_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -244,10 +370,15 @@ class NavigationHandlers:
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
-            await self._prompt_navigation_flow(update.callback_query.message, update, flow)
+            await self._prompt_navigation_flow(
+                update.callback_query.message, update, flow, query=update.callback_query
+            )
             return None
         await update.callback_query.answer()
-        return await self.start(update, context)
+        screen = _CallbackScreenMessage(
+            self, update.callback_query, self._back_keyboard("nav:section:settings")
+        )
+        return await self.start(_ScreenUpdate(update, screen), context)
 
     async def _navigation_flow_action(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -295,23 +426,15 @@ class NavigationHandlers:
                 user = await self._user(update.effective_user.id)
                 draft = await self.vision_service.draft(user.id, update.effective_chat.id)
                 if draft is not None:
-                    await self._vision_prompt(query.message, draft)
+                    await self._vision_prompt(query.message, draft, query=query)
             return None
 
         await self._clear_navigation_flow(update, context, current)
-        if current == "onboarding":
-            message = (
-                "Регистрация приостановлена. Ответы и текущий шаг сохранены; "
-                "продолжить можно через /start."
-            )
-        else:
-            message = f"Сценарий «{FLOW_LABELS[current]}» остановлен. Остальные данные не изменены."
         await self._edit_or_send(
             query,
-            message,
-            None,
+            "Главное меню\n\nЧто хочешь сделать?",
+            self._root_keyboard(),
         )
-        await self._send_navigation_root(query.message)
         return ConversationHandler.END
 
     async def _active_navigation_flow(
@@ -423,24 +546,32 @@ class NavigationHandlers:
                         state.preview.version,
                     )
 
-    async def _prompt_navigation_flow(self, message: Any, update: Update, flow: str) -> None:
+    async def _prompt_navigation_flow(
+        self,
+        message: Any,
+        update: Update,
+        flow: str,
+        *,
+        query: Any | None = None,
+    ) -> None:
         token = await self.navigation_flow_sessions.issue(
             update.effective_user.id, update.effective_chat.id, flow
         )
-        await message.reply_text(
-            f"Сейчас не завершён сценарий: {FLOW_LABELS[flow]}. Что сделать?",
-            reply_markup=InlineKeyboardMarkup(
+        text = f"Сейчас не завершён сценарий: {FLOW_LABELS[flow]}. Что сделать?"
+        markup = InlineKeyboardMarkup(
+            [
                 [
-                    [
-                        InlineKeyboardButton(
-                            "Продолжить", callback_data=f"nav:flow:continue:{token}"
-                        ),
-                        InlineKeyboardButton(
-                            "Выйти в меню", callback_data=f"nav:flow:exit:{token}"
-                        ),
-                    ]
+                    InlineKeyboardButton("Продолжить", callback_data=f"nav:flow:continue:{token}"),
+                    InlineKeyboardButton("Выйти в меню", callback_data=f"nav:flow:exit:{token}"),
                 ]
-            ),
+            ]
+        )
+        if query is not None:
+            await self._edit_or_send(query, text, markup)
+            return
+        await message.reply_text(
+            text,
+            reply_markup=markup,
         )
 
     @staticmethod
@@ -449,16 +580,85 @@ class NavigationHandlers:
 
     @staticmethod
     async def _edit_or_send(
-        query: Any, text: str, reply_markup: InlineKeyboardMarkup | None
-    ) -> None:
+        query: Any,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None,
+        **kwargs: Any,
+    ) -> bool:
         try:
-            await query.edit_message_text(text, reply_markup=reply_markup)
-        except (TelegramError, TypeError):
-            await query.message.reply_text(text, reply_markup=reply_markup)
+            await query.edit_message_text(text, reply_markup=reply_markup, **kwargs)
+            return True
+        except TelegramError as exc:
+            if NavigationHandlers._message_not_modified(exc):
+                return True
+            if not NavigationHandlers._media_text_limitation(exc):
+                logger.warning(
+                    "Navigation callback edit failed operation=text error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+        except (TypeError, AttributeError) as exc:
+            logger.warning(
+                "Navigation callback edit failed operation=text error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+        edit_caption = getattr(query, "edit_message_caption", None)
+        if callable(edit_caption) and len(text) <= 1024:
+            try:
+                await edit_caption(caption=text, reply_markup=reply_markup, **kwargs)
+                return True
+            except TelegramError as exc:
+                if NavigationHandlers._message_not_modified(exc):
+                    return True
+                logger.warning(
+                    "Navigation callback edit failed operation=caption error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+            except (TypeError, AttributeError) as exc:
+                logger.warning(
+                    "Navigation callback edit failed operation=caption error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except (TelegramError, TypeError, AttributeError) as exc:
+            logger.warning(
+                "Navigation callback controls retirement failed error_type=%s",
+                type(exc).__name__,
+            )
+        try:
+            await query.message.reply_text(text, reply_markup=reply_markup, **kwargs)
+            return True
+        except (TelegramError, TypeError, AttributeError) as exc:
+            logger.warning(
+                "Navigation callback replacement failed error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    @staticmethod
+    def _message_not_modified(exc: TelegramError) -> bool:
+        return "message is not modified" in str(exc).casefold()
+
+    @staticmethod
+    def _media_text_limitation(exc: TelegramError) -> bool:
+        value = str(exc).casefold()
+        return any(
+            marker in value
+            for marker in (
+                "there is no text in the message to edit",
+                "message is not a text message",
+            )
+        )
 
     async def _send_navigation_root(self, message: Any) -> None:
         await message.reply_text(
-            "Главное меню\n\nВыбери раздел — команды помнить не обязательно.",
+            "Главное меню\n\nЧто хочешь сделать?",
             reply_markup=self._root_keyboard(),
         )
 
@@ -474,21 +674,27 @@ class NavigationHandlers:
         )
 
     def _root_keyboard(self) -> InlineKeyboardMarkup:
-        sections = navigation_sections(
-            self._workspace_enabled(),
-            self._knowledge_hub_enabled(),
-            self._knowledge_capture_enabled(),
-        )
         rows = [
             [
+                InlineKeyboardButton("🌱 Сегодня", callback_data="nav:section:today"),
+                InlineKeyboardButton("✅ Задачи", callback_data="nav:section:tasks"),
+            ],
+            [
+                InlineKeyboardButton("📝 Записи", callback_data="nav:section:records"),
+                InlineKeyboardButton("❤️ Здоровье", callback_data="nav:section:health"),
+            ],
+            [
                 InlineKeyboardButton(
-                    f"{section.emoji} {section.label}",
-                    callback_data=f"nav:section:{section.key}",
+                    "🎯 Желания и визуализация",
+                    callback_data="nav:section:vision",
                 )
-            ]
-            for section in sections.values()
+            ],
+            [
+                InlineKeyboardButton("🗂 Мои разделы", callback_data="nav:section:sections"),
+                InlineKeyboardButton("⚙️ Настройки", callback_data="nav:section:settings"),
+            ],
+            [InlineKeyboardButton("❓ Помощь", callback_data="nav:help")],
         ]
-        rows.append([InlineKeyboardButton("❓ Помощь", callback_data="nav:help")])
         return InlineKeyboardMarkup(rows)
 
     def _section_keyboard(self, section_key: str) -> InlineKeyboardMarkup:
@@ -503,10 +709,13 @@ class NavigationHandlers:
             self._knowledge_capture_enabled(),
         )
         section = sections[section_key]
+        label_overrides = {
+            ("today", "task_today"): "Задачи на сегодня",
+        }
         rows = [
             [
                 InlineKeyboardButton(
-                    actions[action].label,
+                    label_overrides.get((section_key, action), actions[action].label),
                     callback_data=f"nav:action:{action}",
                 )
             ]
@@ -514,49 +723,36 @@ class NavigationHandlers:
         ]
         rows.extend(
             [
-                [InlineKeyboardButton("← Назад", callback_data="nav:root")],
                 [
-                    InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root"),
-                    InlineKeyboardButton("❓ Помощь", callback_data="nav:help"),
+                    InlineKeyboardButton(
+                        "❓ Помощь",
+                        callback_data=f"nav:help:{SECTION_HELP_TOPICS[section_key]}",
+                    )
                 ],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
             ]
         )
         return InlineKeyboardMarkup(rows)
 
     def _help_keyboard(self) -> InlineKeyboardMarkup:
-        topics = help_topics(
-            self._workspace_enabled(),
-            self._knowledge_hub_enabled(),
-            self._knowledge_capture_enabled(),
-            self._voice_enabled(),
-            self._task_reminders_enabled(),
-        )
-        labels = {
-            "quick": "🚀 Быстрый старт",
-            "day": "🌱 Мой день",
-            "features": "🧭 Что умеет бот",
-            "voice": "🎙 Голосом",
-            "drafts": "📝 Inbox и черновики",
-            "tasks": "✅ Задачи",
-            "collections": "🗂 Мои разделы",
-            "vision": "🎯 Карта желаний",
-            "health": "❤️ Здоровье",
-            "doctor": "🩺 Врач и анализы",
-            "registration": "👤 Регистрация",
-            "examples": "💬 Примеры",
-            "commands": "⌨️ Команды",
-            "privacy": "🔒 Конфиденциальность",
-            "safety": "🛟 Безопасность",
-            "troubleshooting": "🧰 Бот не понял",
-            "spaces": "🤝 Пространства",
-            "knowledge": "📚 База знаний",
-        }
-        buttons = [
-            InlineKeyboardButton(labels[key], callback_data=f"nav:help:{key}") for key in topics
+        rows = [
+            [
+                InlineKeyboardButton(
+                    HELP_TOPIC_LABELS[key],
+                    callback_data=f"nav:help:{key}",
+                )
+            ]
+            for key in ROOT_HELP_TOPIC_KEYS
         ]
-        rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
         rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")])
         return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _help_back_target(topic_key: str) -> str:
+        for section_key, help_key in SECTION_HELP_TOPICS.items():
+            if help_key == topic_key:
+                return f"nav:section:{section_key}"
+        return "nav:help"
 
     @staticmethod
     def _back_keyboard(target: str) -> InlineKeyboardMarkup:

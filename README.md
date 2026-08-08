@@ -475,6 +475,7 @@ AI-визуализация использует существующие OpenRo
 
 ```dotenv
 ENABLE_VISION_IMAGE_GENERATION=true
+VISION_IMAGE_ADMIN_ONLY=true
 IMAGE_GENERATION_MODEL=openai/gpt-image-2
 IMAGE_GENERATION_SIZE=1024x1024
 IMAGE_GENERATION_QUALITY=medium
@@ -484,6 +485,8 @@ IMAGE_GENERATION_TIMEOUT_SECONDS=150
 `IMAGE_GENERATION_MODEL` намеренно принимает только `openai/gpt-image-2`; включённая
 функция требует `AI_PROVIDER=openrouter`. По умолчанию функция выключена, поэтому локальный
 рендер общей карты и загрузка собственных фото продолжают работать без сетевой генерации.
+Во время пилота `VISION_IMAGE_ADMIN_ONLY=true` оставляет платную AI-генерацию только
+администраторам; PNG-карта, референсы и личные фото доступны подписчикам независимо от неё.
 Пошаговая проверка интерфейса, сохранения и ошибок описана в
 [гайде по AI-визуализациям](docs/VISION_IMAGE_GUIDE.md).
 

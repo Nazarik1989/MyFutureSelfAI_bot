@@ -137,11 +137,16 @@ AI_API_KEY=ваш_существующий_OpenRouter_ключ
 AI_BASE_URL=https://openrouter.ai/api/v1
 
 ENABLE_VISION_IMAGE_GENERATION=true
+VISION_IMAGE_ADMIN_ONLY=true
 IMAGE_GENERATION_MODEL=openai/gpt-image-2
 IMAGE_GENERATION_SIZE=1024x1024
 IMAGE_GENERATION_QUALITY=medium
 IMAGE_GENERATION_TIMEOUT_SECONDS=150
 ```
+
+Безопасное значение `VISION_IMAGE_ADMIN_ONLY=true` ограничивает платные provider-вызовы
+администраторами на время пилота. Оно не отключает локальный PNG-renderer, библиотеку
+референсов или загрузку личных фотографий.
 
 Отдельный `IMAGE_GENERATION_API_KEY` не нужен. `TRANSCRIPTION_API_KEY` относится только к
 распознаванию речи и в генерации изображений не используется. Не публикуйте `.env` и не
