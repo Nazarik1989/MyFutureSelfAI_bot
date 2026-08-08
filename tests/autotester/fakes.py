@@ -157,7 +157,8 @@ class FakeMessage:
         )
         return self
 
-    async def edit_text(self, text: str) -> None:
+    async def edit_text(self, text: str, **kwargs: Any) -> None:
+        del kwargs
         self.edits.append(text)
 
     async def delete(self) -> None:

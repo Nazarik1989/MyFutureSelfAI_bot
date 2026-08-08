@@ -12,6 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
+from .callback_ui import edit_callback_screen
 from .lab_media import (
     MAX_LAB_INPUT_BYTES,
     MAX_PDF_PAGES,
@@ -627,10 +628,12 @@ class LabHandlers:
 
     @staticmethod
     async def _labs_edit_or_send(query: Any, text: str, reply_markup: InlineKeyboardMarkup) -> None:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup)
-        except (TelegramError, TypeError):
-            await query.message.reply_text(text, reply_markup=reply_markup)
+        await edit_callback_screen(
+            query,
+            text,
+            reply_markup,
+            operation="labs",
+        )
 
     @staticmethod
     def _parse_document_date(value: str) -> date | None:

@@ -7,6 +7,7 @@ from hashlib import blake2s
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -46,6 +47,7 @@ from .actions import (
     DraftActionService,
 )
 from .ai import AIService
+from .callback_ui import edit_callback_screen
 from .collection_commands import CollectionCommandRouter
 from .collection_handlers import CollectionHandlers
 from .collections_service import LifeCollectionService
@@ -327,6 +329,8 @@ class FutureSelfBot(
             group=-3,
         )
         gated_public_commands = [
+            "menu",
+            "today",
             "inbox",
             "tasks",
             "collections",
@@ -334,7 +338,15 @@ class FutureSelfBot(
             "health",
             "checkin",
             "doctor",
+            "doctor_find",
+            "doctor_prepare",
+            "doctor_preparations",
             "location",
+            "timezone",
+            "profile",
+            "drafts",
+            "last_saved",
+            "evening",
             "labs",
         ]
         if getattr(self.settings, "enable_workspace_access", False):
@@ -855,6 +867,7 @@ class FutureSelfBot(
         text: str,
         *,
         force: bool = False,
+        navigation_update: Any | None = None,
     ) -> tuple[int, str | None] | None:
         """Resume DB-backed onboarding before generic routing after a restart."""
         attached = context.user_data.get("onboarding_user_id") is not None
@@ -864,13 +877,23 @@ class FutureSelfBot(
             return None
         _user_id, step, _status, _answers = restored
         navigation = self.natural_command_router.route(text)
-        if navigation is not None and navigation.action in {"help", "menu"}:
-            if navigation.action == "help":
-                await self.help_command(update, context)
+        explicit_unknown = (
+            navigation is None and self.natural_command_router.is_explicit_navigation_request(text)
+        )
+        if navigation is not None or explicit_unknown:
+            screen_update = navigation_update or update
+            if navigation is None or navigation.action == "help":
+                await self.help_command(screen_update, context)
+                action = "help"
             else:
-                await self._send_navigation_root(update.effective_message)
+                await self._prompt_navigation_flow(
+                    screen_update.effective_message,
+                    update,
+                    "onboarding",
+                )
+                action = "flow"
             state = PROFILE_CONFIRM if step >= len(ONBOARDING_QUESTIONS) else ONBOARDING_INPUT
-            return state, navigation.action
+            return state, action
         if attached and not detached and step < len(ONBOARDING_QUESTIONS) and not force:
             return None
         if attached and not detached and step >= len(ONBOARDING_QUESTIONS):
@@ -2055,18 +2078,37 @@ class FutureSelfBot(
         if await self._try_system_action(update, context, text):
             await progress.edit_text(f"Я услышал: «{_truncate_utf16(text, 4_000)}»")
             return
+        screen_update = self._edited_screen_update(update, progress)
         onboarding_result = await self.onboarding_persistent_input(
-            update, context, text, force=True
+            update,
+            context,
+            text,
+            force=True,
+            navigation_update=screen_update,
         )
         if onboarding_result is not None:
             onboarding_state, navigation_action = onboarding_result
-            if navigation_action == "help":
-                await progress.edit_text("Голос распознан — открываю подробную помощь.")
-            elif navigation_action == "menu":
-                await progress.edit_text("Голос распознан — открываю главное меню.")
-            else:
+            if navigation_action is None:
                 await progress.edit_text("Голос распознан и обработан в регистрации.")
             return onboarding_state
+        natural_command = self.natural_command_router.route(text)
+        explicit_unknown = (
+            natural_command is None
+            and self.natural_command_router.is_explicit_navigation_request(text)
+            and self.collection_command_router.route(text) is None
+        )
+        if natural_command is not None or explicit_unknown:
+            action = natural_command.action if natural_command is not None else "help"
+            flow = await self._active_navigation_flow(update, context)
+            if flow is not None and action != "help":
+                await self._prompt_navigation_flow(
+                    screen_update.effective_message,
+                    update,
+                    flow,
+                )
+            else:
+                await self._handle_natural_command(screen_update, context, action)
+            return
         if await self.workspace_pending_text(update, text, "voice"):
             await progress.edit_text("Голос распознан и обработан в пространстве.")
             return
@@ -2076,15 +2118,10 @@ class FutureSelfBot(
         if await self.task_pending_text(update, text):
             await progress.edit_text("Голос распознан и применён к задаче.")
             return
-        heard_text = _truncate_utf16(text, 4_000)
-        natural_command = self.natural_command_router.route(text)
-        if natural_command is not None and natural_command.action in {"menu", "help"}:
-            await progress.edit_text(f"Я услышал: «{heard_text}»")
-            await self._handle_natural_command(update, context, natural_command.action)
-            return
         if await self._handle_vision_input(update, text):
             await progress.edit_text("Голос распознан и добавлен в карточку.")
             return
+        heard_text = _truncate_utf16(text, 4_000)
         await progress.edit_text(f"Я услышал: «{heard_text}»")
         await self._route_message(update, context, text, "voice")
 
@@ -2146,6 +2183,9 @@ class FutureSelfBot(
             await self._handle_natural_command(update, context, natural_command.action)
             return
         if await self.handle_collection_natural(update, context, text, source):
+            return
+        if self.natural_command_router.is_explicit_navigation_request(text):
+            await self.help_command(update, context)
             return
         user = await self._user(update.effective_user.id)
         chat_id = update.effective_chat.id
@@ -2365,6 +2405,23 @@ class FutureSelfBot(
         context: ContextTypes.DEFAULT_TYPE,
         action: NaturalAction,
     ) -> None:
+        section_actions = {
+            "create_task": "tasks",
+            "show_records": "records",
+            "show_health": "health",
+            "show_labs": "health",
+            "prepare_doctor": "health",
+            "show_settings": "settings",
+            "show_timezone": "settings",
+            "show_collections": "sections",
+            "show_spaces": "sections",
+        }
+        if section := section_actions.get(action):
+            await self._send_navigation_section(update.effective_message, section)
+            return
+        if action == "show_vision":
+            await self.vision_command(update, context)
+            return
         handlers = {
             "menu": self.menu_command,
             "show_drafts": self.drafts_command,
@@ -2374,11 +2431,9 @@ class FutureSelfBot(
             "show_today": self.today,
             "show_tasks": self.tasks_command,
             "show_overdue_tasks": self.task_overdue,
-            "show_collections": self.collections_command,
             "help": self.help_command,
         }
         if action in {
-            "show_spaces",
             "create_space",
             "invite_space_member",
             "show_space_invitations",
@@ -4374,10 +4429,12 @@ class FutureSelfBot(
         text: str,
         markup: InlineKeyboardMarkup,
     ) -> None:
-        try:
-            await query.edit_message_text(text, reply_markup=markup)
-        except (TelegramError, TypeError):
-            await query.message.reply_text(text, reply_markup=markup)
+        await edit_callback_screen(
+            query,
+            text,
+            markup,
+            operation="inbox",
+        )
 
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await self._user(update.effective_user.id)

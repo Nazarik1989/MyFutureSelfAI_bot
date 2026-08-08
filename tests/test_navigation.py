@@ -1,18 +1,37 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
-from autotester.fakes import FakeBot, FakeCallbackQuery, FakeMessage, ScriptedTranscription
+from autotester.fakes import (
+    FakeBot,
+    FakeCallbackQuery,
+    FakeMediaCallbackQuery,
+    FakeMessage,
+    FakeVoice,
+    ScriptedTranscription,
+)
 from telegram import BotCommandScopeAllPrivateChats
-from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+)
 
 from future_self.access import AccessService
 from future_self.bot import EVENING_WORKED, FutureSelfBot
+from future_self.callback_ui import edit_callback_screen
 from future_self.config import Settings
 from future_self.navigation import (
     ACTIONS,
     ADVANCED_COMMANDS,
+    HELP_TOPIC_LABELS,
     HELP_TOPICS,
+    LEGACY_ACTIONS,
     PUBLIC_COMMANDS,
+    ROOT_HELP_TOPIC_KEYS,
+    SECTION_HELP_TOPICS,
     SECTIONS,
     NavigationFlowStore,
     advanced_commands,
@@ -63,9 +82,48 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     message = FakeMessage("/menu")
     await bot.menu_command(update_for(message), context())
+    assert message.replies[-1]["text"] == "Главное меню\n\nЧто хочешь сделать?"
     markup = message.replies[-1]["reply_markup"]
-    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
-    assert callbacks == [*(f"nav:section:{key}" for key in SECTIONS), "nav:help"]
+    assert [
+        [(button.text, button.callback_data) for button in row] for row in markup.inline_keyboard
+    ] == [
+        [("🌱 Сегодня", "nav:section:today"), ("✅ Задачи", "nav:section:tasks")],
+        [("📝 Записи", "nav:section:records"), ("❤️ Здоровье", "nav:section:health")],
+        [("🎯 Желания и визуализация", "nav:section:vision")],
+        [
+            ("🗂 Мои разделы", "nav:section:sections"),
+            ("⚙️ Настройки", "nav:section:settings"),
+        ],
+        [("❓ Помощь", "nav:help")],
+    ]
+
+    expected_section_labels = {
+        "today": ["Фокус на сегодня", "Задачи на сегодня", "Вечерний итог"],
+        "tasks": [
+            "Создать задачу",
+            "Сегодня",
+            "Предстоящие",
+            "Просроченные",
+            "Без срока",
+            "Выполненные",
+        ],
+        "records": ["Мои записи", "Черновики", "Последнее сохранённое"],
+        "health": [
+            "Моё состояние",
+            "Пройти check-in",
+            "Найти врача",
+            "Подготовиться к приёму",
+            "Анализы",
+            "Мои подготовки",
+        ],
+        "sections": ["Открыть мои разделы"],
+        "settings": [
+            "Мой профиль",
+            "Часовой пояс",
+            "Локация",
+            "Настроить или продолжить настройку профиля",
+        ],
+    }
 
     for section_key, section in SECTIONS.items():
         section_message = FakeMessage()
@@ -74,11 +132,18 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
         section_callbacks = [
             button.callback_data for row in section_markup.inline_keyboard for button in row
         ]
-        assert [f"nav:action:{key}" for key in section.actions] == section_callbacks[
-            : len(section.actions)
+        primary_buttons = [
+            button
+            for row in section_markup.inline_keyboard[: len(section.actions)]
+            for button in row
         ]
+        assert [button.text for button in primary_buttons] == expected_section_labels[section_key]
+        assert [button.callback_data for button in primary_buttons] == [
+            f"nav:action:{key}" for key in section.actions
+        ]
+        assert "nav:action:task_reminder_guide" not in section_callbacks
+        assert f"nav:help:{SECTION_HELP_TOPICS[section_key]}" in section_callbacks
         assert "nav:root" in section_callbacks
-        assert "nav:help" in section_callbacks
 
     help_message = FakeMessage("/help")
     await bot.help_command(update_for(help_message), context())
@@ -87,7 +152,15 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
         for row in help_message.replies[-1]["reply_markup"].inline_keyboard
         for button in row
     ]
-    assert [f"nav:help:{key}" for key in HELP_TOPICS] == help_callbacks[:-1]
+    assert help_callbacks == [
+        *(f"nav:help:{key}" for key in ROOT_HELP_TOPIC_KEYS),
+        "nav:root",
+    ]
+    assert [
+        button.text
+        for row in help_message.replies[-1]["reply_markup"].inline_keyboard[:-1]
+        for button in row
+    ] == [HELP_TOPIC_LABELS[key] for key in ROOT_HELP_TOPIC_KEYS]
     assert fake_ai.route_calls == []
 
 
@@ -97,21 +170,16 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
     assert names == [
         "menu",
         "today",
-        "evening",
-        "inbox",
         "tasks",
-        "collections",
+        "inbox",
         "vision",
         "health",
-        "checkin",
-        "doctor",
-        "labs",
-        "location",
         "help",
     ]
     assert len(names) == len(set(names))
     assert len(ACTIONS) == len(set(ACTIONS))
-    assert {action for section in SECTIONS.values() for action in section.actions} == set(ACTIONS)
+    used_actions = {action for section in SECTIONS.values() for action in section.actions}
+    assert used_actions | LEGACY_ACTIONS == set(ACTIONS)
 
     from future_self.db import Database
 
@@ -139,11 +207,20 @@ def test_knowledge_catalog_is_flag_aware_and_capture_stays_advanced():
     disabled_public = {item.command for item in public_commands(False, False)}
     hub_public = {item.command for item in public_commands(False, True)}
     combined_public = {item.command for item in public_commands(True, True)}
-    assert "knowledge" not in disabled_public
-    assert "capture" not in disabled_public
-    assert hub_public - disabled_public == {"knowledge"}
-    assert {"spaces", "knowledge"} <= combined_public
-    assert "capture" not in combined_public
+    assert (
+        disabled_public
+        == hub_public
+        == combined_public
+        == {
+            "menu",
+            "today",
+            "tasks",
+            "inbox",
+            "vision",
+            "health",
+            "help",
+        }
+    )
 
     assert "capture" not in advanced_commands(False, False)
     assert "capture" in advanced_commands(False, True)
@@ -151,8 +228,12 @@ def test_knowledge_catalog_is_flag_aware_and_capture_stays_advanced():
 
     hub_only = navigation_sections(False, True, False)
     with_capture = navigation_sections(False, True, True)
-    assert hub_only["knowledge"].actions == ("knowledge",)
-    assert with_capture["knowledge"].actions == ("knowledge", "capture")
+    assert hub_only["sections"].actions == ("collections", "knowledge")
+    assert with_capture["sections"].actions == ("collections", "knowledge", "capture")
+    assert navigation_sections(True, False, False)["sections"].actions == (
+        "collections",
+        "spaces",
+    )
     assert set(navigation_actions(False, True, False)) - set(ACTIONS) == {"knowledge"}
     assert set(navigation_actions(False, True, True)) - set(ACTIONS) == {
         "knowledge",
@@ -168,23 +249,20 @@ def test_help_is_detailed_flag_aware_and_telegram_safe():
         enable_voice=False,
         enable_task_reminders=False,
     )
-    assert {"quick", "drafts", "tasks", "health", "registration", "troubleshooting"} <= set(
-        disabled
-    )
-    assert {"voice", "spaces", "knowledge"}.isdisjoint(disabled)
+    assert set(ROOT_HELP_TOPIC_KEYS) <= set(disabled)
+    assert set(SECTION_HELP_TOPICS.values()) <= set(disabled)
     disabled_text = "\n".join(text for _title, text in disabled.values())
     assert "/capture" not in disabled_text
     assert "/spaces" not in disabled_text
     assert "Напомни через" not in disabled_text
     assert "голос" not in disabled_text.casefold()
-    assert "скажи" not in disabled["quick"][1].casefold()
+    assert "отключена настройкой" in disabled["tasks_section"][1]
 
     enabled = help_topics(True, True, True, True, True)
-    assert {"voice", "drafts", "tasks", "spaces", "knowledge", "health"} <= set(enabled)
-    assert "/capture" in enabled["knowledge"][1]
-    assert "отдельное подтверждение" in enabled["voice"][1]
-    assert "/inbox" in enabled["drafts"][1]
-    assert "/tasks" in enabled["drafts"][1]
+    assert set(enabled) == set(HELP_TOPICS)
+    assert "Совместными становятся" in enabled["privacy"][1]
+    assert "База знаний" in enabled["privacy"][1]
+    assert "текстом или голосом" in enabled["records_section"][1]
     assert all(len(f"{title}\n\n{text}") < 4096 for title, text in enabled.values())
     assert all(len(f"nav:help:{key}".encode()) <= 64 for key in enabled)
 
@@ -239,6 +317,158 @@ def test_natural_navigation_is_exact_deterministic_and_punctuation_safe(
 @pytest.mark.parametrize(
     ("phrase", "action"),
     [
+        ("Где визуализация?", "show_vision"),
+        ("Как открыть визуализацию?", "show_vision"),
+        ("Покажи визуализацию!", "show_vision"),
+        ("Где карта желаний?", "show_vision"),
+        ("Где мои задачи?", "show_tasks"),
+        ("Как создать задачу?", "create_task"),
+        ("Где мои записи?", "show_records"),
+        ("Где здоровье?", "show_health"),
+        ("Как найти врача?", "prepare_doctor"),
+        ("Как подготовиться к врачу?", "prepare_doctor"),
+        ("Где анализы?", "show_labs"),
+        ("Где настройки?", "show_settings"),
+        ("Как изменить часовой пояс?", "show_timezone"),
+        ("Где мои разделы?", "show_collections"),
+        ("Где совместные пространства?", "show_spaces"),
+    ],
+)
+def test_stage_5a_natural_navigation_uses_one_exact_catalog(db, fake_ai, phrase, action):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    routed = bot.natural_command_router.route(phrase)
+    assert routed is not None
+    assert routed.action == action
+    assert fake_ai.route_calls == []
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    [
+        "У меня появилась задача позвонить врачу завтра",
+        "Хочу записать желание чаще видеть море",
+        "Визуализация помогла мне сформулировать идею",
+        "В заметке я размышляю, где мои задачи и почему их стало много",
+        "Добавь меню ужина в заметки",
+        "Мне нужна помощь с покупкой билетов",
+    ],
+)
+def test_natural_navigation_does_not_intercept_ordinary_narratives(db, fake_ai, narrative):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    assert bot.natural_command_router.route(narrative) is None
+    assert not bot.natural_command_router.is_explicit_navigation_request(narrative)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Открой окно и проветри комнату",
+        "Покажи презентацию клиенту",
+        "Как создать привычку читать по утрам?",
+        "Как найти время на спорт?",
+        "Где поставить коробки после переезда?",
+        "Покажи фотографии дизайнеру",
+        "Открой документ после встречи",
+        "Как создать меню питания?",
+        "Как создать раздел книги?",
+        "Покажи меню врача",
+    ],
+)
+def test_navigation_verb_without_safe_ui_target_is_content(db, fake_ai, phrase):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+
+    assert bot.natural_command_router.route(phrase) is None
+    assert not bot.natural_command_router.is_explicit_navigation_request(phrase)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Где календарь?",
+        "Покажи кнопку календаря",
+        "Как открыть раздел в боте?",
+        "Где в боте команды?",
+        "Покажи задачи",
+    ],
+)
+def test_unknown_explicit_request_requires_safe_ui_or_exact_capability(db, fake_ai, phrase):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+
+    assert bot.natural_command_router.route(phrase) is None
+    assert bot.natural_command_router.is_explicit_navigation_request(phrase)
+
+
+def test_short_explicit_unknown_navigation_is_help_but_long_narrative_is_not(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    assert bot.natural_command_router.route("Где календарь?") is None
+    assert bot.natural_command_router.is_explicit_navigation_request("Где календарь?")
+    assert not bot.natural_command_router.is_explicit_navigation_request(
+        "Где календарь, я записываю длинную мысль о планах на следующие несколько месяцев"
+    )
+
+
+@pytest.mark.parametrize(
+    ("phrase", "screen_prefix", "expected_callback"),
+    [
+        ("Покажи визуализацию", "🎯 Желания и визуализация", "vision:add"),
+        ("Как создать задачу?", "✅ Задачи", "nav:action:task_create"),
+        ("Где мои записи?", "📝 Записи", "nav:action:inbox"),
+        ("Как найти врача?", "❤️ Здоровье", "nav:action:doctor_find"),
+        ("Как изменить часовой пояс?", "⚙️ Настройки", "nav:action:timezone"),
+        ("Где календарь?", "❓ Помощь", "nav:help:quick"),
+    ],
+)
+async def test_natural_text_gate_renders_screen_and_stops_content_pipeline(
+    db,
+    fake_ai,
+    phrase,
+    screen_prefix,
+    expected_callback,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage(phrase)
+    ctx = context()
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(update_for(message), ctx)
+
+    assert message.replies[-1]["text"].startswith(screen_prefix)
+    assert callback_from(message, expected_callback) == expected_callback
+    assert message.reply_text_calls == 1
+    assert ctx.user_data == {}
+    assert fake_ai.route_calls == []
+
+
+async def test_natural_text_gate_leaves_ordinary_narrative_for_content_pipeline(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    narrative = "Хочу записать желание чаще видеть море"
+    message = FakeMessage(narrative)
+    ctx = context()
+
+    assert await bot.navigation_text_gate(update_for(message), ctx) is None
+
+    assert message.reply_text_calls == 0
+    assert ctx.user_data == {}
+    assert fake_ai.route_calls == []
+
+
+async def test_voice_navigation_uses_same_catalog_without_ai_or_extra_chat_message(db, fake_ai):
+    transcription = ScriptedTranscription()
+    transcription.queue("Где мои записи?")
+    bot = FutureSelfBot(settings(), db, fake_ai, transcription)
+    message = FakeMessage(voice=FakeVoice())
+
+    await bot.voice(update_for(message), context())
+
+    assert len(transcription.calls) == 1
+    assert message.reply_text_calls == 1  # The single progress message becomes the screen.
+    assert message.edits[-1].startswith("📝 Записи")
+    assert fake_ai.route_calls == []
+
+
+@pytest.mark.parametrize(
+    ("phrase", "action"),
+    [
         ("Покажи мои задачи", "show_tasks"),
         ("Открой задачи и напоминания", "show_tasks"),
         ("Какие задачи просрочены?", "show_overdue_tasks"),
@@ -248,6 +478,159 @@ def test_natural_navigation_is_exact_deterministic_and_punctuation_safe(
 def test_task_read_intents_are_deterministic_before_ai(db, fake_ai, phrase, action):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     assert bot.natural_command_router.route(phrase).action == action
+
+
+async def test_navigation_callbacks_edit_in_place_and_answer_exactly_once(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage()
+    query = FakeCallbackQuery("nav:section:tasks", message)
+
+    await bot.navigation_action(update_for(message, query=query), context())
+
+    assert query.answers == [(None, False)]
+    assert len(query.edits) == 1
+    assert query.edits[0].startswith("✅ Задачи")
+    assert message.reply_text_calls == 0
+    assert all(reply.get("text") != "Навигация" for reply in message.replies)
+
+
+async def test_message_not_modified_is_success_without_duplicate(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage()
+
+    class NotModifiedQuery(FakeCallbackQuery):
+        async def edit_message_text(self, text, **kwargs):
+            del text, kwargs
+            raise BadRequest("Message is not modified")
+
+    query = NotModifiedQuery("nav:root", message)
+    await bot.navigation_action(update_for(message, query=query), context())
+
+    assert query.answers == [(None, False)]
+    assert message.reply_text_calls == 0
+    assert query.markup_removed == 0
+
+
+async def test_generic_navigation_edit_error_is_type_only_logged_without_duplicate(
+    db, fake_ai, caplog
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage()
+    private_text = "PRIVATE NAVIGATION TEXT MUST NOT BE LOGGED"
+
+    class FailedQuery(FakeCallbackQuery):
+        async def edit_message_text(self, text, **kwargs):
+            del text, kwargs
+            raise TelegramError(private_text)
+
+    query = FailedQuery("nav:root", message)
+    with caplog.at_level(logging.WARNING):
+        await bot.navigation_action(update_for(message, query=query), context())
+
+    assert query.answers == [(None, False)]
+    assert message.reply_text_calls == 0
+    assert query.markup_removed == 0
+    assert "TelegramError" in caplog.text
+    assert private_text not in caplog.text
+
+
+async def test_shared_feature_callback_editor_never_duplicates_on_generic_failure(caplog):
+    message = FakeMessage()
+    private_text = "PRIVATE CALLBACK BODY MUST NOT BE LOGGED"
+
+    class FailedQuery(FakeCallbackQuery):
+        async def edit_message_text(self, text, **kwargs):
+            del text, kwargs
+            raise TelegramError(private_text)
+
+    query = FailedQuery("task:list:today:0", message)
+    with caplog.at_level(logging.WARNING):
+        changed = await edit_callback_screen(
+            query,
+            "safe screen",
+            None,
+            operation="test-feature",
+        )
+
+    assert changed is False
+    assert message.reply_text_calls == 0
+    assert query.markup_removed == 0
+    assert "TelegramError" in caplog.text
+    assert private_text not in caplog.text
+
+
+async def test_media_navigation_uses_caption_edit_and_replacement_only_for_size_limit(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage()
+    query = FakeMediaCallbackQuery("nav:root", message)
+
+    await bot.navigation_action(update_for(message, query=query), context())
+
+    assert query.answers == [(None, False)]
+    assert query.text_attempts == 1
+    assert query.caption_edits == ["Главное меню\n\nЧто хочешь сделать?"]
+    assert query.markup_removed == 0
+    assert message.reply_text_calls == 0
+
+    oversized_message = FakeMessage()
+    oversized_query = FakeMediaCallbackQuery("nav:root", oversized_message)
+    replaced = await bot._edit_or_send(
+        oversized_query,
+        "x" * 1025,
+        bot._root_keyboard(),
+    )
+    assert replaced is True
+    assert oversized_query.text_attempts == 1
+    assert oversized_query.caption_edits == []
+    assert oversized_query.markup_removed == 1
+    assert oversized_message.reply_text_calls == 1
+    assert oversized_message.deleted is False
+
+
+@pytest.mark.parametrize(
+    ("legacy_key", "expected_title"),
+    [
+        ("day", "🌱 Сегодня"),
+        ("ideas", "📝 Записи"),
+        ("doctor", "❤️ Здоровье"),
+        ("profile", "⚙️ Настройки"),
+        ("collections", "🗂 Мои разделы"),
+        ("spaces", "🗂 Мои разделы"),
+    ],
+)
+async def test_legacy_section_callbacks_redirect_safely(db, fake_ai, legacy_key, expected_title):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage()
+    query = FakeCallbackQuery(f"nav:section:{legacy_key}", message)
+
+    await bot.navigation_action(update_for(message, query=query), context())
+
+    assert query.answers == [(None, False)]
+    assert query.edits[-1].startswith(expected_title)
+    assert message.reply_text_calls == 0
+
+
+async def test_legacy_vision_callback_opens_new_menu_and_stale_root_respects_flow(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    message = FakeMessage()
+    legacy = FakeCallbackQuery("nav:action:vision", message)
+
+    await bot.navigation_action(update_for(message, query=legacy), context())
+
+    assert legacy.answers == [(None, False)]
+    assert legacy.edits[-1].startswith("🎯 Желания и визуализация")
+    assert message.reply_text_calls == 0
+
+    flow_context = context()
+    flow_context.user_data["health_checkin"] = {"energy": 4}
+    stale_root = FakeCallbackQuery("nav:section:vision", message)
+    await bot.navigation_action(
+        update_for(message, query=stale_root),
+        flow_context,
+    )
+    assert stale_root.answers == [(None, False)]
+    assert stale_root.edits[-1].startswith("Сейчас не завершён сценарий")
+    assert flow_context.user_data["health_checkin"] == {"energy": 4}
 
 
 async def test_health_flow_continue_exit_owner_binding_repeat_and_state_isolation(db, fake_ai):
@@ -276,7 +659,7 @@ async def test_health_flow_continue_exit_owner_binding_repeat_and_state_isolatio
     assert any(show_alert for _text, show_alert in repeat.answers)
 
 
-async def test_continue_keeps_flow_and_old_message_edit_falls_back_safely(db, fake_ai):
+async def test_continue_keeps_flow_and_edits_same_message_safely(db, fake_ai):
     bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
     ctx = context()
     ctx.user_data["doctor_prepare"] = {"reason": "private"}
@@ -285,11 +668,12 @@ async def test_continue_keeps_flow_and_old_message_edit_falls_back_safely(db, fa
     await bot.menu_command(update, ctx)
     data = callback_from(message, "nav:flow:continue:")
     query = FakeCallbackQuery(data, message)
-    before = len(message.replies)
+    before_reply_calls = message.reply_text_calls
     assert await bot.navigation_action(update_for(message, query=query), ctx) is None
     assert ctx.user_data["doctor_prepare"] == {"reason": "private"}
-    assert len(message.replies) == before + 1
-    assert "private" not in str(message.replies[before])
+    assert query.answers == [(None, False)]
+    assert message.reply_text_calls == before_reply_calls
+    assert "private" not in str(message.replies[-1])
 
 
 async def test_old_cross_section_entry_cannot_start_second_flow(db, fake_ai):

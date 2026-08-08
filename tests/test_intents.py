@@ -2,7 +2,9 @@ import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import func, select
+from telegram.ext import ApplicationHandlerStop
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
@@ -17,13 +19,15 @@ class FakeMessage:
         self.audio = None
         self.replies: list[dict[str, object]] = []
         self.edits: list[str] = []
+        self.edit_kwargs: list[dict[str, object]] = []
 
     async def reply_text(self, text: str, **kwargs):
         self.replies.append({"text": text, **kwargs})
         return self
 
-    async def edit_text(self, text: str):
+    async def edit_text(self, text: str, **kwargs):
         self.edits.append(text)
+        self.edit_kwargs.append(kwargs)
 
 
 class FakeCallbackQuery:
@@ -82,6 +86,18 @@ class CorrectedTranscription:
         return "нужно заниматься спортом 3 раза в неделю"
 
 
+class NavigationTranscription:
+    enabled = True
+
+    def __init__(self, text: str):
+        self.text = text
+        self.calls = 0
+
+    async def transcribe(self, audio: bytes, filename: str) -> str:
+        self.calls += 1
+        return self.text
+
+
 def settings() -> Settings:
     return Settings(
         _env_file=None,
@@ -91,6 +107,20 @@ def settings() -> Settings:
         transcription_provider="disabled",
         intent_confidence_threshold=0.70,
     )
+
+
+NON_NAVIGATION_UI_VERB_PHRASES = (
+    "Открой окно и проветри комнату",
+    "Покажи презентацию клиенту",
+    "Как создать привычку читать по утрам?",
+    "Как найти время на спорт?",
+    "Где поставить коробки после переезда?",
+    "Покажи фотографии дизайнеру",
+    "Открой документ после встречи",
+    "Как создать меню питания?",
+    "Как создать раздел книги?",
+    "Покажи меню врача",
+)
 
 
 def update_for(message: FakeMessage, user_id: int = 501):
@@ -120,6 +150,115 @@ async def inbox_count(db) -> int:
 async def draft_count(db) -> int:
     async with db.sessions() as session:
         return int(await session.scalar(select(func.count(DraftInboxItem.id))))
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_heading"),
+    [
+        ("Покажи мои записи", "📝 Записи"),
+        ("Где настройки", "⚙️ Настройки"),
+        ("Где календарь?", "❓ Помощь"),
+    ],
+)
+async def test_navigation_text_gate_consumes_known_and_explicit_unknown_requests_before_content(
+    db,
+    fake_ai,
+    phrase,
+    expected_heading,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, GreetingTranscription())
+    message = FakeMessage(phrase)
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(update_for(message, 4901), SimpleNamespace(user_data={}))
+
+    assert expected_heading in str(message.replies[-1]["text"])
+    assert fake_ai.route_calls == []
+    assert await draft_count(db) == 0
+    assert await inbox_count(db) == 0
+
+
+async def test_active_flow_fences_section_navigation_without_ai_or_content_capture(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, GreetingTranscription())
+    state = {"energy": 7}
+    context = SimpleNamespace(user_data={"health_checkin": state})
+    message = FakeMessage("Покажи мои записи")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(update_for(message, 4902), context)
+
+    assert context.user_data["health_checkin"] is state
+    assert "не завершён сценарий" in str(message.replies[-1]["text"])
+    assert fake_ai.route_calls == []
+    assert await draft_count(db) == 0
+
+
+@pytest.mark.parametrize("narrative", NON_NAVIGATION_UI_VERB_PHRASES)
+async def test_navigation_verbs_without_ui_target_continue_to_content_routing(
+    db, fake_ai, narrative
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, GreetingTranscription())
+    message = FakeMessage(narrative)
+    update = update_for(message, 4903)
+    context = SimpleNamespace(user_data={})
+
+    await bot.navigation_text_gate(update, context)
+    assert message.replies == []
+
+    await bot.text(update, context)
+
+    assert message.replies
+    assert not any(str(reply["text"]).startswith("❓ Помощь") for reply in message.replies)
+    assert fake_ai.route_calls == [] or fake_ai.route_calls[-1][0] == narrative
+    assert await inbox_count(db) == 0
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_heading"),
+    [
+        ("Где настройки", "⚙️ Настройки"),
+        ("Где календарь?", "❓ Помощь"),
+    ],
+)
+async def test_voice_navigation_reuses_progress_message_without_ai_or_content_capture(
+    db,
+    fake_ai,
+    phrase,
+    expected_heading,
+):
+    transcription = NavigationTranscription(phrase)
+    bot = FutureSelfBot(settings(), db, fake_ai, transcription)
+    message = FakeMessage(voice=FakeVoice())
+
+    await bot.voice(update_for(message, 4904), SimpleNamespace(user_data={}))
+
+    assert transcription.calls == 1
+    assert len(message.replies) == 1
+    assert message.replies[0]["text"] == "Расшифровываю голосовую мысль…"
+    assert expected_heading in message.edits[-1]
+    assert message.edit_kwargs[-1].get("reply_markup") is not None
+    assert fake_ai.route_calls == []
+    assert await draft_count(db) == 0
+    assert await inbox_count(db) == 0
+
+
+@pytest.mark.parametrize("phrase", NON_NAVIGATION_UI_VERB_PHRASES)
+async def test_voice_navigation_verbs_without_ui_target_continue_to_content_routing(
+    db,
+    fake_ai,
+    phrase,
+):
+    transcription = NavigationTranscription(phrase)
+    bot = FutureSelfBot(settings(), db, fake_ai, transcription)
+    message = FakeMessage(voice=FakeVoice())
+
+    await bot.voice(update_for(message, 4905), SimpleNamespace(user_data={}))
+
+    assert transcription.calls == 1
+    assert message.replies
+    assert not any(str(reply["text"]).startswith("❓ Помощь") for reply in message.replies)
+    assert not any(edit.startswith("❓ Помощь") for edit in message.edits)
+    assert fake_ai.route_calls == [] or fake_ai.route_calls[-1][0] == phrase
 
 
 async def test_greeting_gets_answer_and_is_not_saved(db, fake_ai):

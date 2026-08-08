@@ -7,21 +7,25 @@ from io import BytesIO
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
+from .access import AccessTier, InvalidAccessTier, require_access_tier
 from .image_generation import (
     ImageGenerationError,
     ImageReferenceInput,
     build_vision_image_prompt,
 )
+from .models import User
 from .vision import CATEGORY_META, PAGE_SIZE
 from .vision_images import (
     MAX_IMAGE_INPUT_BYTES,
     MAX_IMAGE_OUTPUT_BYTES,
     MAX_IMAGE_PIXELS,
     TelegramImageMetadata,
+    VisionImageAccessPolicy,
     VisionImageError,
     normalize_vision_image,
     validate_telegram_metadata,
@@ -34,6 +38,24 @@ from .vision_references import (
 from .vision_renderer import MAX_RENDER_ITEMS, VisionRenderItem
 
 logger = logging.getLogger(__name__)
+
+_VISION_AI_ACTIONS = frozenset(
+    {
+        "imagepick",
+        "imagepickitem",
+        "imagegenerateask",
+        "genrefs",
+        "genreftoggle",
+        "genrefdone",
+    }
+)
+_MEDIA_TEXT_EDIT_ERRORS = (
+    "there is no text in the message to edit",
+    "message to edit is not a text message",
+)
+_VISION_IMAGE_ACCESS_CHANGED_TEXT = (
+    "Доступ к AI-образам изменился. Открой раздел визуализации заново."
+)
 
 
 class VisionHandlers:
@@ -49,6 +71,56 @@ class VisionHandlers:
     vision_renderer: Any
     vision_render_sessions: Any
     vision_render_limiter: Any
+    settings: Any
+    access_service: Any
+    db: Any
+
+    @property
+    def vision_image_access_policy(self) -> VisionImageAccessPolicy:
+        return VisionImageAccessPolicy(
+            admin_only=bool(getattr(self.settings, "vision_image_admin_only", True))
+        )
+
+    def _vision_image_access_allowed(self, tier: str) -> bool:
+        try:
+            access_tier: AccessTier = require_access_tier(tier)
+        except InvalidAccessTier:
+            return False
+        return self.vision_image_access_policy.allows(access_tier)
+
+    async def _vision_image_access_allowed_for_owner(self, owner_id: int) -> bool:
+        async with self.db.sessions() as session:
+            tier = await session.scalar(select(User.access_tier).where(User.id == owner_id))
+        return isinstance(tier, str) and self._vision_image_access_allowed(tier)
+
+    async def _vision_image_access_matches(
+        self,
+        telegram_id: int,
+        expected_access_version: int | None,
+    ) -> bool:
+        if expected_access_version is None:
+            return False
+        try:
+            current = await self.access_service.status(telegram_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Access lookup failures are deliberately indistinguishable from a
+            # changed entitlement and must not expose provider/access errors.
+            return False
+        return (
+            current is not None
+            and current.access_version == expected_access_version
+            and self._vision_image_access_allowed(current.access_tier)
+        )
+
+    async def _vision_image_access_changed(self, query: Any) -> None:
+        await self._vision_edit_or_send(
+            query,
+            query.message,
+            _VISION_IMAGE_ACCESS_CHANGED_TEXT,
+            InlineKeyboardMarkup([[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]),
+        )
 
     async def vision_command_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.vision_command(update, context)
@@ -99,7 +171,7 @@ class VisionHandlers:
             )
             await self._vision_prompt(update.effective_message, draft)
             return
-        await self._vision_menu(update.effective_message)
+        await self._vision_menu(update.effective_message, user=user)
 
     @staticmethod
     async def _vision_edit_or_send(
@@ -108,7 +180,7 @@ class VisionHandlers:
         text: str,
         reply_markup: InlineKeyboardMarkup | None,
     ) -> None:
-        """Reuse a callback message when Telegram permits it; otherwise retire its buttons."""
+        """Edit callback screens without duplicating them on ordinary Telegram failures."""
         if query is not None:
             try:
                 await query.edit_message_text(text, reply_markup=reply_markup)
@@ -116,8 +188,22 @@ class VisionHandlers:
             except TelegramError as exc:
                 if "message is not modified" in str(exc).lower():
                     return
-            except (TypeError, AttributeError):
-                pass
+                media_text_mismatch = isinstance(exc, BadRequest) and any(
+                    marker in str(exc).lower() for marker in _MEDIA_TEXT_EDIT_ERRORS
+                )
+                if not media_text_mismatch:
+                    logger.warning(
+                        "Vision callback edit failed operation=edit_text error_type=%s",
+                        type(exc).__name__,
+                    )
+                    return
+            except (TypeError, AttributeError) as exc:
+                logger.warning(
+                    "Vision callback edit failed operation=edit_text error_type=%s",
+                    type(exc).__name__,
+                )
+                return
+
             edit_caption = getattr(query, "edit_message_caption", None)
             if edit_caption is not None and len(text) <= 1024:
                 try:
@@ -126,54 +212,72 @@ class VisionHandlers:
                 except TelegramError as exc:
                     if "message is not modified" in str(exc).lower():
                         return
-                except (TypeError, AttributeError):
-                    pass
+                    logger.warning(
+                        "Vision callback edit failed operation=edit_caption error_type=%s",
+                        type(exc).__name__,
+                    )
+                    return
+                except (TypeError, AttributeError) as exc:
+                    logger.warning(
+                        "Vision callback edit failed operation=edit_caption error_type=%s",
+                        type(exc).__name__,
+                    )
+                    return
+
+            # A media callback whose target cannot fit into a Telegram caption is
+            # the one proven type/size limitation where a replacement is justified.
+            delete = getattr(message, "delete", None)
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except (TelegramError, TypeError, AttributeError):
                 pass
-        await message.reply_text(text, reply_markup=reply_markup)
-        if query is not None:
-            delete = getattr(message, "delete", None)
+            try:
+                await message.reply_text(text, reply_markup=reply_markup)
+            except TelegramError as exc:
+                logger.warning(
+                    "Vision callback replacement failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return
             if delete is not None:
                 try:
                     await delete()
                 except (TelegramError, TypeError, AttributeError):
                     pass
+            return
+        await message.reply_text(text, reply_markup=reply_markup)
 
     async def _vision_menu(
         self,
         message: Any,
         *,
+        user: Any,
         query: Any | None = None,
         notice: str | None = None,
     ) -> None:
         menu_text = (
-            "Карта желаний\n\n"
-            "Желание → зачем это важно → первый шаг → действие.\n\n"
-            "Активные желания находятся в «Моей карте», завершённые — в «Достигнуто», "
-            "отложенные — в «Архиве»."
+            "🎯 Желания и визуализация\n\nПревращай желания в понятные шаги и визуальные образы."
         )
         if notice:
             menu_text = f"{notice}\n\n{menu_text}"
         rows = [[InlineKeyboardButton("➕ Добавить желание", callback_data="vision:add")]]
-        if self.image_generation.enabled:
+        if self._vision_image_access_allowed(user.access_tier):
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "✨ Создать AI-визуализацию",
+                        "✨ Создать AI-образ",
                         callback_data="vision:imagepick:0",
                     )
                 ]
             )
         rows.extend(
             [
-                [
-                    InlineKeyboardButton("🗺 Моя карта", callback_data="vision:list:active:0"),
-                    InlineKeyboardButton("✅ Достигнуто", callback_data="vision:list:achieved:0"),
-                ],
-                [InlineKeyboardButton("📦 Архив", callback_data="vision:list:archived:0")],
                 [InlineKeyboardButton("🧩 Мои референсы", callback_data="vision:refs")],
+                [
+                    InlineKeyboardButton("🗺 Мои желания", callback_data="vision:list:active:0"),
+                    InlineKeyboardButton("🖼 Собрать PNG-карту", callback_data="vision:render"),
+                ],
+                [InlineKeyboardButton("❓ Как это работает", callback_data="vision:help")],
                 [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
             ]
         )
@@ -440,20 +544,46 @@ class VisionHandlers:
         chat_id = update.effective_chat.id
         action = parts[1] if len(parts) > 1 else ""
 
+        if action in _VISION_AI_ACTIONS and not self._vision_image_access_allowed(user.access_tier):
+            await query.answer(
+                "AI-образы пока доступны только администратору.",
+                show_alert=True,
+            )
+            return
+
         if action == "add" and len(parts) == 2:
             await query.answer()
             try:
                 draft = await self.vision_service.begin(user.id, chat_id)
             except ValueError:
-                await query.message.reply_text(
-                    "Незавершённая карточка уже открыта в другом личном чате."
+                await self._vision_edit_or_send(
+                    query,
+                    query.message,
+                    "Незавершённая карточка уже открыта в другом личном чате.",
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]
+                    ),
                 )
                 return
             await self._vision_prompt(query.message, draft, query=query)
             return
         if action == "menu" and len(parts) == 2:
             await query.answer()
-            await self._vision_menu(query.message, query=query)
+            await self._vision_menu(query.message, user=user, query=query)
+            return
+        if action == "help" and len(parts) == 2:
+            await query.answer()
+            await self._vision_edit_or_send(
+                query,
+                query.message,
+                "Как работает визуализация\n\n"
+                "✨ AI-образ — отдельная картинка для одного желания.\n"
+                "🖼 PNG-карта — общая карта активных желаний, собранная локально в боте.\n"
+                "🧩 Референсы помогают задать стиль AI-образа.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]
+                ),
+            )
             return
         if action == "refs" and len(parts) == 2:
             await query.answer()
@@ -500,7 +630,7 @@ class VisionHandlers:
             except ValueError:
                 await self._vision_stale(query)
                 return
-            await self._vision_image_picker(query, user.id, page)
+            await self._vision_image_picker(query, user, page)
             return
         if action == "imagepickitem" and len(parts) == 3:
             try:
@@ -512,7 +642,7 @@ class VisionHandlers:
             if item is None or item.status != "active":
                 await self._vision_stale(query)
                 return
-            await self._vision_image_generation_ask(query, user.id, chat_id, item_id)
+            await self._vision_image_generation_ask(query, user, chat_id, item_id)
             return
         if action == "renderpick" and len(parts) == 4:
             token, category = parts[2], parts[3]
@@ -542,6 +672,7 @@ class VisionHandlers:
                 token=token,
                 as_document=False,
                 remove_source=True,
+                query=query,
             )
             return
         if action == "renderdownload" and len(parts) == 3:
@@ -566,6 +697,7 @@ class VisionHandlers:
                 token=token,
                 as_document=True,
                 remove_source=False,
+                query=query,
             )
             return
         if action == "rendercancel" and len(parts) == 3:
@@ -589,10 +721,10 @@ class VisionHandlers:
             except ValueError:
                 await self._vision_stale(query)
                 return
-            await self._vision_image_generation_ask(query, user.id, chat_id, item_id)
+            await self._vision_image_generation_ask(query, user, chat_id, item_id)
             return
         if action == "imagegenerate" and len(parts) == 3:
-            await self._vision_image_generate(query, user.id, chat_id, parts[2])
+            await self._vision_image_generate(query, user, chat_id, parts[2])
             return
         if action == "genrefs" and len(parts) == 3:
             await self._vision_generation_references_begin(query, user.id, chat_id, parts[2])
@@ -622,7 +754,7 @@ class VisionHandlers:
         ):
             await self._vision_image_capability_action(
                 query,
-                user.id,
+                user,
                 chat_id,
                 action,
                 parts[2],
@@ -778,6 +910,7 @@ class VisionHandlers:
                     return
             await self._vision_menu(
                 query.message,
+                user=user,
                 query=query,
                 notice="Создание или редактирование отменено.",
             )
@@ -941,13 +1074,20 @@ class VisionHandlers:
             InlineKeyboardMarkup(rows),
         )
 
-    async def _vision_image_picker(self, query: Any, owner_id: int, page: int) -> None:
+    async def _vision_image_picker(self, query: Any, user: Any, page: int) -> None:
         if not self.image_generation.enabled:
-            await query.answer(
-                "AI-генерация пока не подключена администратором.",
-                show_alert=True,
+            await query.answer()
+            await self._vision_edit_or_send(
+                query,
+                query.message,
+                "AI-генерация изображений временно недоступна. "
+                "Желания, личные фото, референсы и PNG-карта продолжают работать.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]
+                ),
             )
             return
+        owner_id = user.id
         items, total = await self.vision_service.page(owner_id, "active", page)
         await query.answer()
         if not items:
@@ -1010,10 +1150,16 @@ class VisionHandlers:
         token: str,
         as_document: bool,
         remove_source: bool = False,
+        query: Any | None = None,
     ) -> None:
         if not await self.vision_render_limiter.acquire(user.id):
-            await message.reply_text(
-                "Визуализация уже создаётся. Дождись завершения текущего запроса."
+            await self._vision_edit_or_send(
+                query,
+                message,
+                "PNG-карта уже собирается. Дождись завершения текущего запроса.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]
+                ),
             )
             return
         try:
@@ -1023,8 +1169,20 @@ class VisionHandlers:
                 limit=MAX_RENDER_ITEMS,
             )
             if not items:
-                await message.reply_text(
-                    "Для этого выбора активных желаний нет. Открой /vision и добавь карточку."
+                await self._vision_edit_or_send(
+                    query,
+                    message,
+                    "Для этого выбора активных желаний нет. Сначала добавь желание.",
+                    InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "➕ Добавить желание", callback_data="vision:add"
+                                )
+                            ],
+                            [InlineKeyboardButton("← Назад", callback_data="vision:menu")],
+                        ]
+                    ),
                 )
                 return
             snapshots = [
@@ -1063,33 +1221,35 @@ class VisionHandlers:
                         "доступны через /vision."
                     )
                 try:
+                    result_markup = None
+                    if page_index == len(board.pages):
+                        result_buttons = [
+                            InlineKeyboardButton(
+                                "← Меню карты",
+                                callback_data="vision:menu",
+                            )
+                        ]
+                        if not as_document:
+                            result_buttons.insert(
+                                0,
+                                InlineKeyboardButton(
+                                    "Скачать PNG",
+                                    callback_data=f"vision:renderdownload:{token}",
+                                ),
+                            )
+                        result_markup = InlineKeyboardMarkup([result_buttons])
                     if as_document:
                         await message.reply_document(
                             document=stream,
                             filename=filename,
                             caption=caption,
+                            reply_markup=result_markup,
                         )
                     else:
-                        reply_markup = None
-                        if page_index == len(board.pages):
-                            reply_markup = InlineKeyboardMarkup(
-                                [
-                                    [
-                                        InlineKeyboardButton(
-                                            "Скачать PNG",
-                                            callback_data=f"vision:renderdownload:{token}",
-                                        ),
-                                        InlineKeyboardButton(
-                                            "← Меню карты",
-                                            callback_data="vision:menu",
-                                        ),
-                                    ],
-                                ]
-                            )
                         await message.reply_photo(
                             photo=stream,
                             caption=caption,
-                            reply_markup=reply_markup,
+                            reply_markup=result_markup,
                         )
                 finally:
                     stream.close()
@@ -1102,8 +1262,13 @@ class VisionHandlers:
                         pass
         except Exception as exc:  # Telegram and Pillow adapters fail closed here.
             logger.error("Vision render failed error_type=%s", type(exc).__name__)
-            await message.reply_text(
-                "Не удалось собрать PNG-карту. Попробуй ещё раз немного позже."
+            await self._vision_edit_or_send(
+                query,
+                message,
+                "Не удалось собрать PNG-карту. Попробуй ещё раз немного позже.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]
+                ),
             )
         finally:
             await self.vision_render_limiter.release(user.id)
@@ -1822,16 +1987,23 @@ class VisionHandlers:
     async def _vision_image_generation_ask(
         self,
         query: Any,
-        owner_id: int,
+        user: Any,
         chat_id: int,
         item_id: int,
     ) -> None:
         if not self.image_generation.enabled:
-            await query.answer(
-                "Генерация пока не подключена администратором.",
-                show_alert=True,
+            await query.answer()
+            await self._vision_edit_or_send(
+                query,
+                query.message,
+                "AI-генерация изображений временно недоступна. "
+                "Можно добавить личное фото или собрать PNG-карту.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]
+                ),
             )
             return
+        owner_id = user.id
         if await self.vision_reference_sessions.has_active(owner_id, chat_id):
             await query.answer(
                 "Сначала заверши или отмени текущую операцию с референсом.",
@@ -1854,6 +2026,7 @@ class VisionHandlers:
             item_id,
             mode="replace" if image is not None else "add",
             expected_version=image.version if image is not None else None,
+            expected_access_version=user.access_version,
             prompt=prompt,
         )
         if token is None:
@@ -2065,10 +2238,11 @@ class VisionHandlers:
     async def _vision_image_generate(
         self,
         query: Any,
-        owner_id: int,
+        user: Any,
         chat_id: int,
         token: str,
     ) -> None:
+        owner_id = user.id
         capability = await self.vision_image_sessions.claim_generation(
             token,
             owner_id,
@@ -2085,6 +2259,17 @@ class VisionHandlers:
             None,
         )
         try:
+            if not self.image_generation.enabled:
+                await self.vision_image_sessions.cancel(token, owner_id, chat_id)
+                await self._vision_edit_or_send(
+                    query,
+                    query.message,
+                    "AI-генерация изображений временно недоступна. Попробуй позже.",
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("← Назад", callback_data="vision:menu")]]
+                    ),
+                )
+                return
             references = await self.vision_reference_service.get_many(
                 owner_id, capability.reference_ids
             )
@@ -2100,21 +2285,43 @@ class VisionHandlers:
                     ),
                 )
                 return
+            reference_inputs = [
+                ImageReferenceInput(
+                    image_bytes=reference.image_bytes,
+                    mime_type=reference.mime_type,
+                )
+                for reference in references
+            ]
+            if not await self._vision_image_access_matches(
+                user.telegram_id,
+                capability.expected_access_version,
+            ):
+                await self.vision_image_sessions.cancel(token, owner_id, chat_id)
+                await self._vision_image_access_changed(query)
+                return
             raw = await self.image_generation.generate(
                 capability.prompt,
-                references=[
-                    ImageReferenceInput(
-                        image_bytes=reference.image_bytes,
-                        mime_type=reference.mime_type,
-                    )
-                    for reference in references
-                ],
+                references=reference_inputs,
             )
+            if not await self._vision_image_access_matches(
+                user.telegram_id,
+                capability.expected_access_version,
+            ):
+                await self.vision_image_sessions.cancel(token, owner_id, chat_id)
+                await self._vision_image_access_changed(query)
+                return
             normalized = await asyncio.to_thread(
                 normalize_vision_image,
                 raw,
                 declared_mime="image/png",
             )
+            if not await self._vision_image_access_matches(
+                user.telegram_id,
+                capability.expected_access_version,
+            ):
+                await self.vision_image_sessions.cancel(token, owner_id, chat_id)
+                await self._vision_image_access_changed(query)
+                return
             attached = await self.vision_image_sessions.attach_preview(
                 token,
                 owner_id,
@@ -2130,6 +2337,13 @@ class VisionHandlers:
                         [[InlineKeyboardButton("← Меню карты", callback_data="vision:menu")]]
                     ),
                 )
+                return
+            if not await self._vision_image_access_matches(
+                user.telegram_id,
+                capability.expected_access_version,
+            ):
+                await self.vision_image_sessions.cancel(token, owner_id, chat_id)
+                await self._vision_image_access_changed(query)
                 return
             stream = BytesIO(normalized.image_bytes)
             stream.name = "vision-ai-preview.jpg"
@@ -2156,6 +2370,12 @@ class VisionHandlers:
                         ]
                     ),
                 )
+                delete = getattr(query.message, "delete", None)
+                if delete is not None:
+                    try:
+                        await delete()
+                    except (TelegramError, TypeError, AttributeError):
+                        pass
             finally:
                 stream.close()
         except ImageGenerationError as exc:
@@ -2222,11 +2442,12 @@ class VisionHandlers:
     async def _vision_image_capability_action(
         self,
         query: Any,
-        owner_id: int,
+        user: Any,
         chat_id: int,
         action: str,
         token: str,
     ) -> None:
+        owner_id = user.id
         if action in {"imagecancel", "imagedeletecancel"}:
             if not await self.vision_image_sessions.cancel(token, owner_id, chat_id):
                 await self._vision_stale(query)
@@ -2252,12 +2473,33 @@ class VisionHandlers:
             if capability is None or capability.image is None:
                 await self._vision_stale(query)
                 return
+            access_changed = (
+                capability.expected_access_version is not None
+                and not await self._vision_image_access_matches(
+                    user.telegram_id,
+                    capability.expected_access_version,
+                )
+            )
+            if access_changed:
+                await query.answer()
+                await self._vision_image_access_changed(query)
+                return
             result = await self.vision_image_service.save(
                 owner_id,
                 capability.item_id,
                 expected_version=capability.expected_version,
                 normalized=capability.image,
+                expected_access_version=capability.expected_access_version,
+                access_policy=(
+                    self.vision_image_access_policy
+                    if capability.expected_access_version is not None
+                    else None
+                ),
             )
+            if result.status == "access_changed":
+                await query.answer()
+                await self._vision_image_access_changed(query)
+                return
             if result.status not in {"created", "replaced", "existing"}:
                 await self._vision_stale(query)
                 return
@@ -2774,14 +3016,14 @@ class VisionHandlers:
                 ]
             ]
         )
-        if self.image_generation.enabled:
+        if await self._vision_image_access_allowed_for_owner(item.owner_id):
             image_rows.append(
                 [
                     InlineKeyboardButton(
                         (
-                            f"✨ Создать новое · {self.image_generation.model}"
+                            "✨ Создать новый AI-образ"
                             if image is not None
-                            else f"✨ Создать с AI · {self.image_generation.model}"
+                            else "✨ Создать AI-образ"
                         ),
                         callback_data=f"vision:imagegenerateask:{item.id}",
                     )

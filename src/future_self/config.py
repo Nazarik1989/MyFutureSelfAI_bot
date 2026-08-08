@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     # Image generation is intentionally isolated from text and transcription:
     # it uses OpenRouter's dedicated Images API and the existing text-provider key.
     enable_vision_image_generation: bool = False
+    vision_image_admin_only: bool = True
     image_generation_model: Literal["openai/gpt-image-2"] = "openai/gpt-image-2"
     image_generation_size: Literal["1024x1024", "1536x1024", "1024x1536"] = "1024x1024"
     image_generation_quality: Literal["low", "medium", "high", "auto"] = "medium"

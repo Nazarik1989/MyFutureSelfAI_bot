@@ -7,6 +7,7 @@ from time import monotonic
 
 from sqlalchemy import select, update
 
+from .access import ADMIN, AccessTier, is_full_access_tier
 from .db import Database
 from .models import User, VisionItem, VisionItemImage
 from .safe_media import images as safe_images
@@ -52,9 +53,20 @@ class VisionImageCapability:
     item_id: int
     mode: str
     expected_version: int | None
+    expected_access_version: int | None = None
     image: NormalizedVisionImage | None = None
     prompt: str | None = None
     reference_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class VisionImageAccessPolicy:
+    """Rollout policy for paid Vision image-provider calls."""
+
+    admin_only: bool = True
+
+    def allows(self, tier: AccessTier) -> bool:
+        return tier == ADMIN if self.admin_only else is_full_access_tier(tier)
 
 
 @dataclass(slots=True)
@@ -66,6 +78,7 @@ class _VisionImageSession:
     expected_version: int | None
     expires_at: float
     stage: str
+    expected_access_version: int | None = None
     image: NormalizedVisionImage | None = None
     prompt: str | None = None
     reference_ids: tuple[int, ...] = ()
@@ -132,6 +145,7 @@ class VisionImageSessionStore:
         *,
         mode: str,
         expected_version: int | None,
+        expected_access_version: int,
         prompt: str,
     ) -> str | None:
         if mode not in {"add", "replace"} or not prompt.strip():
@@ -142,6 +156,7 @@ class VisionImageSessionStore:
             item_id,
             mode=mode,
             expected_version=expected_version,
+            expected_access_version=expected_access_version,
             stage="generation_confirm",
             prompt=prompt,
         )
@@ -155,6 +170,7 @@ class VisionImageSessionStore:
         mode: str,
         expected_version: int | None,
         stage: str,
+        expected_access_version: int | None = None,
         prompt: str | None = None,
     ) -> str | None:
         async with self._lock:
@@ -174,6 +190,7 @@ class VisionImageSessionStore:
                 expected_version=expected_version,
                 expires_at=monotonic() + self.ttl_seconds,
                 stage=stage,
+                expected_access_version=expected_access_version,
                 prompt=prompt,
             )
             return token
@@ -364,6 +381,7 @@ class VisionImageSessionStore:
             item_id=session.item_id,
             mode=session.mode,
             expected_version=session.expected_version,
+            expected_access_version=session.expected_access_version,
             image=session.image,
             prompt=session.prompt,
             reference_ids=session.reference_ids,
@@ -399,10 +417,25 @@ class VisionImageService:
         *,
         expected_version: int | None,
         normalized: NormalizedVisionImage,
+        expected_access_version: int | None = None,
+        access_policy: VisionImageAccessPolicy | None = None,
     ) -> VisionImageMutation:
         async with self.db.session() as session:
             if not await self._lock_owner(session, owner_id):
                 return VisionImageMutation("stale")
+            if expected_access_version is not None:
+                owner_access = (
+                    await session.execute(
+                        select(User.access_tier, User.access_version).where(User.id == owner_id)
+                    )
+                ).one_or_none()
+                policy = access_policy or VisionImageAccessPolicy()
+                if (
+                    owner_access is None
+                    or owner_access.access_version != expected_access_version
+                    or not policy.allows(owner_access.access_tier)
+                ):
+                    return VisionImageMutation("access_changed")
             item = await session.scalar(
                 select(VisionItem).where(
                     VisionItem.id == item_id,
