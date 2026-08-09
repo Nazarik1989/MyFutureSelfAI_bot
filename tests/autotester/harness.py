@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 from telegram.ext import ApplicationHandlerStop, ConversationHandler
 
+from future_self.access import AccessService
 from future_self.bot import (
     DOCTOR_DURATION,
     DOCTOR_MEDICATIONS,
@@ -308,6 +309,8 @@ class BotAutotester:
         transcription = ScriptedTranscription()
         context = SimpleNamespace(user_data={}, bot=FakeBot())
         bot = FutureSelfBot(settings, database, ai, transcription)
+        await bot._user(900_001)
+        await AccessService(database).grant_subscriber(900_001, source="autotester")
         bot.lab_uploads = LabUploadSessionStore(root=sandbox / "lab-temp")
         scheduler = RecordingHealthScheduler()
         bot.scheduler = scheduler
@@ -1132,6 +1135,8 @@ class BotAutotester:
             self.doctor_state = await self.bot.navigation_doctor_entry(update, self.context)
         elif data == "nav:action:onboarding":
             await self.bot.navigation_onboarding_entry(update, self.context)
+        elif data.startswith("nova:"):
+            await self.bot.nova_callback(update, self.context)
         else:
             result = await self.bot.navigation_action(update, self.context)
             if result == ConversationHandler.END:
@@ -1148,9 +1153,10 @@ class BotAutotester:
 
     def _latest_navigation_callback(self, action: str) -> tuple[str, FakeMessage]:
         expected = {
-            "root": "nav:root",
-            "help": "nav:help",
-        }.get(action)
+            "root": frozenset({"nav:root"}),
+            "help": frozenset({"nav:help", "nova:root"}),
+            "quick": frozenset({"nav:help:quick", "nova:topic:quick"}),
+        }.get(action, frozenset())
         for message in reversed(self.messages):
             for reply in reversed(message.replies):
                 markup = reply.get("reply_markup")
@@ -1161,7 +1167,7 @@ class BotAutotester:
                         data = button.callback_data
                         if data is None:
                             continue
-                        if expected is not None and data == expected:
+                        if data in expected:
                             return data, message
                         if data == f"nav:section:{action}":
                             return data, message

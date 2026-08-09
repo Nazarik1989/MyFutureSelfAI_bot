@@ -1909,9 +1909,9 @@ NAVIGATION_SCENARIOS = (
         name="navigation-menu-help-quick-start-and-back-have-no-dead-end",
         steps=(
             ScenarioStep("command", "/menu", reply_contains=("Главное меню",)),
-            ScenarioStep("navigation_callback", "help", reply_contains=("Помощь",)),
+            ScenarioStep("navigation_callback", "help", reply_contains=("✨ Nova",)),
             ScenarioStep("navigation_callback", "quick", reply_contains=("Быстрый старт",)),
-            ScenarioStep("navigation_callback", "help", reply_contains=("Помощь",)),
+            ScenarioStep("navigation_callback", "help", reply_contains=("✨ Nova",)),
             ScenarioStep("navigation_callback", "root", reply_contains=("Главное меню",)),
         ),
         expected=ExpectedState(),
@@ -1948,7 +1948,7 @@ NAVIGATION_SCENARIOS = (
     ),
     Scenario(
         name="navigation-natural-voice-help-is-deterministic-and-read-only",
-        steps=(ScenarioStep("voice", "Как пользоваться ботом?", reply_contains=("Помощь",)),),
+        steps=(ScenarioStep("voice", "Как пользоваться ботом?", reply_contains=("✨ Nova",)),),
         expected=ExpectedState(),
     ),
     Scenario(

@@ -277,7 +277,7 @@ async def test_guest_full_commands_are_consumed_without_ai(db, fake_ai, command)
     ("command", "expected_text"),
     [
         ("/menu@FutureSelfBot", GUEST_ROOT_TEXT),
-        ("/help@FutureSelfBot", "⚙️ Как это работает"),
+        ("/help@FutureSelfBot", "✨ Nova"),
     ],
 )
 async def test_guest_safe_commands_support_bot_username(db, fake_ai, command, expected_text):

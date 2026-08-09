@@ -1,9 +1,15 @@
 from datetime import date, datetime, time
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 GuestAction = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+]
+
+NOVA_HELP_MAX_PAYLOAD_BYTES = 4 * 1024
+NovaHelpStep = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
 ]
@@ -85,6 +91,21 @@ class GuestFirstStep(BaseModel):
     focus: str = Field(min_length=1, max_length=300)
     first_step: str = Field(min_length=1, max_length=300)
     actions: list[GuestAction] = Field(min_length=0, max_length=3)
+
+
+class NovaHelpPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    response: str = Field(min_length=1, max_length=800)
+    steps: list[NovaHelpStep] = Field(default_factory=list, min_length=0, max_length=3)
+    action_id: str | None = Field(default=None, min_length=1, max_length=100)
+    kind: Literal["guide", "clarify", "unsupported"]
+
+    @model_validator(mode="after")
+    def serialized_payload_fits_limit(self) -> "NovaHelpPlan":
+        if len(self.model_dump_json().encode("utf-8")) > NOVA_HELP_MAX_PAYLOAD_BYTES:
+            raise ValueError("Nova help payload exceeds the 4 KiB limit")
+        return self
 
 
 MessageIntent = Literal[

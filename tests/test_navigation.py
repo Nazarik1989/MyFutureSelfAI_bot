@@ -26,7 +26,6 @@ from future_self.config import Settings
 from future_self.navigation import (
     ACTIONS,
     ADVANCED_COMMANDS,
-    HELP_TOPIC_LABELS,
     HELP_TOPICS,
     LEGACY_ACTIONS,
     PUBLIC_COMMANDS,
@@ -41,6 +40,7 @@ from future_self.navigation import (
     public_commands,
     validate_catalog,
 )
+from future_self.schemas import ParsedThought
 
 
 def settings() -> Settings:
@@ -145,6 +145,7 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
         assert f"nav:help:{SECTION_HELP_TOPICS[section_key]}" in section_callbacks
         assert "nav:root" in section_callbacks
 
+    await AccessService(db).grant_subscriber(101, source="test")
     help_message = FakeMessage("/help")
     await bot.help_command(update_for(help_message), context())
     help_callbacks = [
@@ -153,14 +154,210 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
         for button in row
     ]
     assert help_callbacks == [
-        *(f"nav:help:{key}" for key in ROOT_HELP_TOPIC_KEYS),
+        "nova:topic:quick",
+        "nova:topic:requests",
+        "nova:topic:examples",
+        "nova:topic:privacy",
         "nav:root",
     ]
     assert [
         button.text
         for row in help_message.replies[-1]["reply_markup"].inline_keyboard[:-1]
         for button in row
-    ] == [HELP_TOPIC_LABELS[key] for key in ROOT_HELP_TOPIC_KEYS]
+    ] == [
+        "🚀 Быстрый старт",
+        "🧭 Возможности",
+        "💬 Примеры вопросов",
+        "🔒 Данные и безопасность",
+    ]
+    assert fake_ai.route_calls == []
+
+
+async def test_help_fences_active_draft_edit_and_exit_cancels_that_edit(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 101
+    chat_id = 201
+    user = await bot._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    draft = await bot.draft_service.create(
+        user_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        source="text",
+        raw_text="PRIVATE_DRAFT_EDIT_SENTINEL",
+        parsed=ParsedThought(kind="note", title="Черновик"),
+    )
+    assert (await bot.draft_service.begin_edit(draft.id, draft.version, telegram_id, chat_id)).ok
+
+    message = FakeMessage("/help")
+    update = update_for(message, user_id=telegram_id, chat_id=chat_id)
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_public_command_gate(update, context())
+
+    assert message.replies[-1]["text"].startswith("✨ Nova")
+    assert "редактирование черновика" in message.replies[-1]["text"]
+    assert await bot.draft_service.editing(telegram_id, chat_id) is not None
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+
+    exit_callback = callback_from(message, "nav:flow:exit:")
+    query = FakeCallbackQuery(exit_callback, message)
+    await bot.navigation_action(
+        update_for(message, user_id=telegram_id, chat_id=chat_id, query=query),
+        context(),
+    )
+    assert query.answers == [(None, False)]
+    assert await bot.draft_service.editing(telegram_id, chat_id) is None
+
+
+async def _seed_durable_navigation_flow(
+    bot: FutureSelfBot,
+    flow: str,
+    *,
+    telegram_id: int,
+    chat_id: int,
+) -> None:
+    user = await bot._user(telegram_id)
+    await AccessService(bot.db).grant_subscriber(telegram_id, source="test")
+    if flow == "date_choice":
+        await bot.conversation.set_date_conflict(
+            telegram_id,
+            chat_id,
+            [{"label": "завтра", "value": "2026-08-10"}],
+        )
+        return
+    if flow == "draft_action":
+        draft = await bot.draft_service.create(
+            user_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+            source="text",
+            raw_text="SYNTHETIC_DURABLE_FLOW_DRAFT",
+            parsed=ParsedThought(kind="note", title="Тестовый черновик"),
+        )
+        await bot.conversation.set_focus(
+            telegram_id,
+            chat_id,
+            draft.id,
+            draft.version,
+            "save",
+        )
+        return
+    assert flow == "system_action"
+    await bot.conversation.begin_system_action(
+        telegram_id,
+        chat_id,
+        "archive_overdue_tasks",
+        [{"id": 1, "title": "Тестовая задача"}],
+    )
+
+
+def _assert_durable_navigation_flow(snapshot, flow: str, *, active: bool) -> None:
+    if flow == "date_choice":
+        assert bool(snapshot.pending_date_options) is active
+    elif flow == "draft_action":
+        assert bool(snapshot.pending_action or snapshot.focused_draft_id) is active
+    else:
+        assert flow == "system_action"
+        assert bool(snapshot.system_pending_action) is active
+
+
+@pytest.mark.parametrize("flow", ["date_choice", "draft_action", "system_action"])
+@pytest.mark.parametrize("phrase", ["Помощь", "Nova, где календарь?"])
+async def test_durable_flow_input_is_not_stolen_by_natural_or_explicit_nova(
+    db,
+    fake_ai,
+    flow,
+    phrase,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 301
+    chat_id = 401
+    await _seed_durable_navigation_flow(
+        bot,
+        flow,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    message = FakeMessage(phrase)
+    ctx = context()
+
+    assert (
+        await bot.navigation_text_gate(
+            update_for(message, user_id=telegram_id, chat_id=chat_id),
+            ctx,
+        )
+        is None
+    )
+
+    snapshot = await bot.conversation.get(telegram_id, chat_id)
+    _assert_durable_navigation_flow(snapshot, flow, active=True)
+    assert message.reply_text_calls == 0
+    assert fake_ai.route_calls == []
+    user = await bot._user(telegram_id)
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("flow", ["date_choice", "draft_action", "system_action"])
+async def test_help_fences_durable_flow_and_exit_clears_only_that_state(db, fake_ai, flow):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 302
+    chat_id = 402
+    await _seed_durable_navigation_flow(
+        bot,
+        flow,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    ctx = context()
+    ctx.user_data["unrelated"] = "keep"
+    message = FakeMessage("/help")
+    update = update_for(message, user_id=telegram_id, chat_id=chat_id)
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_public_command_gate(update, ctx)
+
+    assert message.replies[-1]["text"].startswith("✨ Nova")
+    assert "Сейчас не завершён сценарий" in message.replies[-1]["text"]
+    markup = message.replies[-1]["reply_markup"]
+    assert [button.text for row in markup.inline_keyboard for button in row] == [
+        "▶️ Продолжить текущий шаг",
+        "🏠 Выйти в главное меню",
+    ]
+    before_exit = await bot.conversation.get(telegram_id, chat_id)
+    _assert_durable_navigation_flow(before_exit, flow, active=True)
+
+    exit_callback = callback_from(message, "nav:flow:exit:")
+    query = FakeCallbackQuery(exit_callback, message)
+    result = await bot.navigation_action(
+        update_for(
+            message,
+            user_id=telegram_id,
+            chat_id=chat_id,
+            query=query,
+        ),
+        ctx,
+    )
+
+    assert result == ConversationHandler.END
+    assert query.answers == [(None, False)]
+    assert query.edits[-1] == "Главное меню\n\nЧто хочешь сделать?"
+    after_exit = await bot.conversation.get(telegram_id, chat_id)
+    _assert_durable_navigation_flow(after_exit, flow, active=False)
+    assert ctx.user_data == {"unrelated": "keep"}
     assert fake_ai.route_calls == []
 
 
@@ -415,7 +612,7 @@ def test_short_explicit_unknown_navigation_is_help_but_long_narrative_is_not(db,
         ("Где мои записи?", "📝 Записи", "nav:action:inbox"),
         ("Как найти врача?", "❤️ Здоровье", "nav:action:doctor_find"),
         ("Как изменить часовой пояс?", "⚙️ Настройки", "nav:action:timezone"),
-        ("Где календарь?", "❓ Помощь", "nav:help:quick"),
+        ("Где календарь?", "✨ Nova", "nova:topic:quick"),
     ],
 )
 async def test_natural_text_gate_renders_screen_and_stops_content_pipeline(

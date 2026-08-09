@@ -427,6 +427,354 @@ async def test_access_gate_returns_while_provider_is_blocked_and_next_update_is_
     assert fake_ai.guest_thought_calls == 1
 
 
+async def test_help_during_awaiting_guest_demo_preserves_flow_and_continue_is_single_use(
+    db,
+    fake_ai,
+):
+    bot = make_bot(db, fake_ai)
+    telegram = DemoTelegramBot()
+    application = DemoApplication()
+    await start_demo(
+        bot,
+        telegram,
+        application,
+        telegram_id=8190,
+        chat_id=8190,
+        route="guest:demo:thought",
+        message_id=190,
+    )
+    before = await stored_session(bot, 8190, 8190)
+
+    await run_gate(
+        bot,
+        make_update(
+            DemoMessage("/help", message_id=191),
+            telegram_id=8190,
+            chat_id=8190,
+            update_id=2,
+        ),
+        telegram,
+        application,
+    )
+
+    help_edit = telegram.edits[-1]
+    assert help_edit["message_id"] == 190
+    assert str(help_edit["text"]).startswith("✨ Nova")
+    assert "не завершён сценарий" in str(help_edit["text"])
+    callbacks = [
+        button.callback_data for row in help_edit["reply_markup"].inline_keyboard for button in row
+    ]
+    continue_callback = next(
+        value for value in callbacks if value.startswith("guest:nova:flow:continue:")
+    )
+    after_help = await stored_session(bot, 8190, 8190)
+    assert after_help.status == GuestSessionStatus.AWAITING_INPUT.value
+    assert after_help.version == before.version
+
+    canonical = DemoMessage(message_id=190)
+    continue_query = DemoQuery(continue_callback, canonical)
+    await run_gate(
+        bot,
+        make_update(
+            canonical,
+            telegram_id=8190,
+            chat_id=8190,
+            update_id=3,
+            query=continue_query,
+        ),
+        telegram,
+        application,
+    )
+    assert continue_query.answers == [(None, False)]
+    assert continue_query.edits[-1]["text"] == GUEST_THOUGHT_INPUT_TEXT
+    assert (await stored_session(bot, 8190, 8190)).version == before.version
+
+    replay = DemoQuery(continue_callback, canonical)
+    await run_gate(
+        bot,
+        make_update(
+            canonical,
+            telegram_id=8190,
+            chat_id=8190,
+            update_id=4,
+            query=replay,
+        ),
+        telegram,
+        application,
+    )
+    assert replay.answers == [(access_handlers_module.STALE_GUEST_ALERT, True)]
+    assert replay.edits == []
+
+
+async def test_help_exit_during_processing_guest_demo_cannot_cancel_provider(
+    db,
+    fake_ai,
+):
+    bot = make_bot(db, fake_ai)
+    telegram = DemoTelegramBot()
+    application = DemoApplication()
+    fake_ai.guest_thought_release.clear()
+    await start_demo(
+        bot,
+        telegram,
+        application,
+        telegram_id=8191,
+        chat_id=8191,
+        route="guest:demo:thought",
+        message_id=192,
+    )
+    await submit_text(
+        bot,
+        telegram,
+        application,
+        telegram_id=8191,
+        chat_id=8191,
+        text="Приватный запрос к демо",
+        message_id=193,
+        update_id=2,
+    )
+    await fake_ai.guest_thought_started.wait()
+    before = await stored_session(bot, 8191, 8191)
+    assert before.status == GuestSessionStatus.PROCESSING.value
+
+    await run_gate(
+        bot,
+        make_update(
+            DemoMessage("/help", message_id=194),
+            telegram_id=8191,
+            chat_id=8191,
+            update_id=3,
+        ),
+        telegram,
+        application,
+    )
+    help_edit = telegram.edits[-1]
+    exit_callback = next(
+        button.callback_data
+        for row in help_edit["reply_markup"].inline_keyboard
+        for button in row
+        if button.callback_data.startswith("guest:nova:flow:exit:")
+    )
+    exit_query = DemoQuery(exit_callback, DemoMessage(message_id=192))
+    await run_gate(
+        bot,
+        make_update(
+            exit_query.message,
+            telegram_id=8191,
+            chat_id=8191,
+            update_id=4,
+            query=exit_query,
+        ),
+        telegram,
+        application,
+    )
+    after_cancel_attempt = await stored_session(bot, 8191, 8191)
+    assert exit_query.answers == [(GUEST_PROCESSING_ALERT, True)]
+    assert after_cancel_attempt.status == GuestSessionStatus.PROCESSING.value
+    assert after_cancel_attempt.version == before.version
+
+    fake_ai.guest_thought_release.set()
+    await application.drain()
+    assert fake_ai.guest_thought_calls == 1
+    assert (await stored_session(bot, 8191, 8191)).status == GuestSessionStatus.COMPLETED.value
+
+
+@pytest.mark.parametrize("blocked_screen", ["help", "continue"])
+async def test_processing_nova_screen_race_cannot_hide_successful_guest_result(
+    db,
+    fake_ai,
+    monkeypatch,
+    blocked_screen,
+):
+    telegram_id = {"help": 8192, "continue": 8193}[blocked_screen]
+    bot = make_bot(db, fake_ai)
+    telegram = DemoTelegramBot()
+    application = DemoApplication()
+    fake_ai.guest_thought_release.clear()
+    await start_demo(
+        bot,
+        telegram,
+        application,
+        telegram_id=telegram_id,
+        chat_id=telegram_id,
+        route="guest:demo:thought",
+        message_id=telegram_id,
+    )
+    await submit_text(
+        bot,
+        telegram,
+        application,
+        telegram_id=telegram_id,
+        chat_id=telegram_id,
+        text="Приватный запрос для проверки гонки интерфейса",
+        message_id=telegram_id + 1,
+        update_id=2,
+    )
+    await fake_ai.guest_thought_started.wait()
+    before = await stored_session(bot, telegram_id, telegram_id)
+    assert before.status == GuestSessionStatus.PROCESSING.value
+
+    delivery_started = asyncio.Event()
+    original_delivery = bot._deliver_guest_result
+
+    async def signal_delivery(delivery_bot, **kwargs):
+        delivery_started.set()
+        return await original_delivery(delivery_bot, **kwargs)
+
+    monkeypatch.setattr(bot, "_deliver_guest_result", signal_delivery)
+    ui_edit_started = asyncio.Event()
+    ui_edit_release = asyncio.Event()
+
+    if blocked_screen == "help":
+
+        async def block_help_edit(kwargs):
+            if str(kwargs["text"]).startswith("✨ Nova"):
+                ui_edit_started.set()
+                await ui_edit_release.wait()
+                return True
+            return False
+
+        telegram.edit_hook = block_help_edit
+        query = DemoQuery("guest:how", DemoMessage(message_id=telegram_id))
+    else:
+        help_query = DemoQuery("guest:how", DemoMessage(message_id=telegram_id))
+        await run_gate(
+            bot,
+            make_update(
+                help_query.message,
+                telegram_id=telegram_id,
+                chat_id=telegram_id,
+                update_id=3,
+                query=help_query,
+            ),
+            telegram,
+            application,
+        )
+        assert help_query.answers == [(None, False)]
+        help_callbacks = [
+            button.callback_data
+            for row in telegram.edits[-1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        continue_callback = next(
+            value for value in help_callbacks if value.startswith("guest:nova:flow:continue:")
+        )
+        query = DemoQuery(continue_callback, DemoMessage(message_id=telegram_id))
+        original_query_edit = query.edit_message_text
+
+        async def block_continue_edit(text, **kwargs):
+            ui_edit_started.set()
+            await ui_edit_release.wait()
+            await original_query_edit(text, **kwargs)
+
+        query.edit_message_text = block_continue_edit
+
+    update_id = 3 if blocked_screen == "help" else 4
+    ui_task = asyncio.create_task(
+        run_gate(
+            bot,
+            make_update(
+                query.message,
+                telegram_id=telegram_id,
+                chat_id=telegram_id,
+                update_id=update_id,
+                query=query,
+            ),
+            telegram,
+            application,
+        )
+    )
+    await asyncio.wait_for(ui_edit_started.wait(), timeout=5)
+    assert query.answers == [(None, False)]
+    assert query.answer_calls == 1
+    during_screen = await stored_session(bot, telegram_id, telegram_id)
+    assert during_screen.status == GuestSessionStatus.PROCESSING.value
+    assert during_screen.version == before.version
+
+    fake_ai.guest_thought_release.set()
+    await asyncio.wait_for(delivery_started.wait(), timeout=5)
+    pending = await stored_session(bot, telegram_id, telegram_id)
+    assert pending.status == GuestSessionStatus.RESULT_READY.value
+
+    ui_edit_release.set()
+    await ui_task
+    await application.drain()
+
+    if blocked_screen == "help":
+        help_edit = next(edit for edit in telegram.edits if str(edit["text"]).startswith("✨ Nova"))
+        callbacks = [
+            button.callback_data
+            for row in help_edit["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        continue_callback = next(
+            value for value in callbacks if value.startswith("guest:nova:flow:continue:")
+        )
+        exit_callback = next(
+            value for value in callbacks if value.startswith("guest:nova:flow:exit:")
+        )
+        assert continue_callback.rpartition(":")[2] == exit_callback.rpartition(":")[2]
+    else:
+        assert len(query.edits) == 1
+
+    assert "Разобранная мысль" in telegram.edits[-1]["text"]
+    assert fake_ai.guest_thought_calls == 1
+    assert (await stored_session(bot, telegram_id, telegram_id)).status == (
+        GuestSessionStatus.COMPLETED.value
+    )
+    assert telegram.send_calls == []
+
+
+async def test_pending_not_guest_callback_is_answered_exactly_once(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = make_bot(db, fake_ai)
+    telegram = DemoTelegramBot()
+    application = DemoApplication()
+    await start_demo(
+        bot,
+        telegram,
+        application,
+        telegram_id=8194,
+        chat_id=8194,
+        route="guest:demo:thought",
+        message_id=194,
+    )
+    user = await bot._user(8194)
+    pending = await bot.guest_session_service.pending_result(
+        user_id=user.id,
+        chat_id=8194,
+        access_version=user.access_version,
+    )
+    assert pending.session is not None
+
+    async def not_guest(**kwargs):
+        del kwargs
+        return GuestSessionDecision(GuestSessionOutcome.NOT_GUEST, pending.session, False)
+
+    monkeypatch.setattr(bot.guest_session_service, "pending_result", not_guest)
+    query = DemoQuery("guest:demos", DemoMessage(message_id=194))
+    await run_gate(
+        bot,
+        make_update(
+            query.message,
+            telegram_id=8194,
+            chat_id=8194,
+            update_id=2,
+            query=query,
+        ),
+        telegram,
+        application,
+    )
+
+    assert query.answers == [(None, False)]
+    assert query.answer_calls == 1
+    assert telegram.edits[-1]["text"] == GUEST_ACCESS_CHANGED_TEXT
+    assert telegram.edits[-1]["reply_markup"] is None
+
+
 @pytest.mark.parametrize("invalid_text", ["   \n\t", "x" * 1201])
 async def test_invalid_guest_text_does_not_claim_reserve_or_call_provider(
     db,

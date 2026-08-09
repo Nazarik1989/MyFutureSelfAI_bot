@@ -100,6 +100,12 @@ FLOW_LABELS = {
     "labs": "загрузка результатов анализов",
     "workspace": "операция с совместным пространством",
     "knowledge_capture": "добавление материала в базу знаний",
+    "task_edit": "изменение задачи",
+    "collection_input": "операция с разделом",
+    "draft_edit": "редактирование черновика",
+    "date_choice": "выбор даты",
+    "draft_action": "подтверждение действия с черновиком",
+    "system_action": "подтверждение системного действия",
     "rename_goal": "переименование цели",
 }
 
@@ -114,8 +120,12 @@ class NavigationHandlers:
     async def navigation_public_command_gate(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        command = (update.effective_message.text or "").split(maxsplit=1)[0]
+        command = command.split("@", maxsplit=1)[0].casefold()
         flow = await self._active_navigation_flow(update, context)
         if flow is None:
+            if command != "/help":
+                await self.nova_clear_current(update)
             if hasattr(self, "collection_service"):
                 user = await self._user(update.effective_user.id)
                 await self.collection_service.clear_context(user.id, update.effective_chat.id)
@@ -123,6 +133,9 @@ class NavigationHandlers:
                 if self._workspace_enabled():
                     await self.workspace_service.cancel_input(user.id, update.effective_chat.id)
             return
+        if command == "/help":
+            await self._nova_flow_help(update.effective_message, update, flow)
+            raise ApplicationHandlerStop
         await self._prompt_navigation_flow(update.effective_message, update, flow)
         raise ApplicationHandlerStop
 
@@ -135,6 +148,8 @@ class NavigationHandlers:
         if onboarding_result is not None:
             raise ApplicationHandlerStop
         text = update.effective_message.text or ""
+        if await self.nova_text_gate(update, context):
+            raise ApplicationHandlerStop
         command = self.natural_command_router.route(text)
         explicit_unknown = (
             command is None and self.natural_command_router.is_explicit_navigation_request(text)
@@ -145,7 +160,9 @@ class NavigationHandlers:
             return
         action = command.action if command is not None else "help"
         flow = await self._active_navigation_flow(update, context)
-        if flow is not None and action != "help":
+        if flow is not None:
+            if action == "help":
+                return
             await self._prompt_navigation_flow(update.effective_message, update, flow)
         else:
             await self._handle_natural_command(update, context, action)
@@ -156,6 +173,7 @@ class NavigationHandlers:
         if flow is not None:
             await self._prompt_navigation_flow(update.effective_message, update, flow)
             return
+        await self.nova_clear_current(update)
         if hasattr(self, "collection_service"):
             user = await self._user(update.effective_user.id)
             await self.collection_service.clear_context(user.id, update.effective_chat.id)
@@ -190,6 +208,9 @@ class NavigationHandlers:
             await query.answer()
             await self._prompt_navigation_flow(query.message, update, flow, query=query)
             return None
+        if flow is not None and help_navigation:
+            await self.nova_navigation_help_callback(update, context)
+            return None
 
         user = await self._user(update.effective_user.id)
         if hasattr(self, "collection_service"):
@@ -198,6 +219,7 @@ class NavigationHandlers:
 
         if data == "nav:root":
             await query.answer()
+            await self.nova_clear_current(update)
             await self._edit_or_send(
                 query,
                 "Главное меню\n\nЧто хочешь сделать?",
@@ -205,12 +227,7 @@ class NavigationHandlers:
             )
             return None
         if data == "nav:help":
-            await query.answer()
-            await self._edit_or_send(
-                query,
-                "❓ Помощь\n\nВыбери направление или задай короткий вопрос о навигации.",
-                self._help_keyboard(),
-            )
+            await self.nova_navigation_help_callback(update, context)
             return None
         sections = navigation_sections(
             self._workspace_enabled(),
@@ -240,6 +257,7 @@ class NavigationHandlers:
                 await self._navigation_stale(query)
                 return None
             await query.answer()
+            await self.nova_clear_current(update)
             section = sections[section_key]
             await self._edit_or_send(
                 query,
@@ -250,15 +268,10 @@ class NavigationHandlers:
         if data.startswith("nav:help:"):
             topic_key = data.removeprefix("nav:help:")
             topic_key = _LEGACY_HELP_ALIASES.get(topic_key, topic_key)
-            topic = topics.get(topic_key)
-            if topic is None:
-                await self._navigation_stale(query)
-                return None
-            await query.answer()
-            await self._edit_or_send(
-                query,
-                f"{topic[0]}\n\n{topic[1]}",
-                self._back_keyboard(self._help_back_target(topic_key)),
+            await self.nova_navigation_help_callback(
+                update,
+                context,
+                topic_key=topic_key,
             )
             return None
         if data.startswith("nav:action:"):
@@ -272,6 +285,7 @@ class NavigationHandlers:
             }:
                 await self._navigation_stale(query)
                 return None
+            await self.nova_clear_current(update)
             if action_key == "vision":
                 await query.answer()
                 await self._vision_menu(query.message, user=user, query=query)
@@ -326,6 +340,7 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:health")
@@ -342,6 +357,7 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:today")
@@ -358,6 +374,7 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:health")
@@ -374,6 +391,7 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:settings")
@@ -462,6 +480,16 @@ class NavigationHandlers:
         ):
             if key in context.user_data:
                 return name
+        conversation = await self.conversation.get(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        if conversation.system_pending_action:
+            return "system_action"
+        if conversation.pending_date_options:
+            return "date_choice"
+        if conversation.pending_action or conversation.focused_draft_id:
+            return "draft_action"
         if (
             self._workspace_enabled()
             and await self.workspace_service.pending_input(user.id, update.effective_chat.id)
@@ -485,6 +513,21 @@ class NavigationHandlers:
             return "vision_image"
         if await self.vision_service.draft(user.id, update.effective_chat.id) is not None:
             return "vision"
+        if (
+            await self.draft_service.editing(
+                update.effective_user.id,
+                update.effective_chat.id,
+            )
+            is not None
+        ):
+            return "draft_edit"
+        if await self.task_service.pending_input(user.id, update.effective_chat.id) is not None:
+            return "task_edit"
+        if (
+            await self.collection_service.pending_input(user.id, update.effective_chat.id)
+            is not None
+        ):
+            return "collection_input"
         if self._knowledge_capture_enabled():
             capture = await self.knowledge_service.capture_state(user.id, update.effective_chat.id)
             if capture.preview is not None:
@@ -545,6 +588,55 @@ class NavigationHandlers:
                         state.preview.draft_public_id,
                         state.preview.version,
                     )
+            elif flow == "task_edit":
+                await self.task_service.cancel_pending_input(user.id, update.effective_chat.id)
+            elif flow == "collection_input":
+                await self.collection_service.cancel_input(user.id, update.effective_chat.id)
+            elif flow == "draft_edit":
+                await self.conversation.clear_focus(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                await self.conversation.clear_system_action(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                discarded = await self.draft_service.cancel_editing(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                if discarded:
+                    await self.conversation.set_active_draft(
+                        update.effective_user.id,
+                        update.effective_chat.id,
+                        None,
+                    )
+            elif flow == "date_choice":
+                await self.conversation.set_date_conflict(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    [],
+                )
+            elif flow == "draft_action":
+                await self.conversation.clear_focus(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+            elif flow == "system_action":
+                snapshot = await self.conversation.get(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                if snapshot.system_action_version is not None:
+                    await self.conversation.clear_system_action(
+                        update.effective_user.id,
+                        update.effective_chat.id,
+                        expected_version=snapshot.system_action_version,
+                    )
+
+    @staticmethod
+    def _nova_flow_label(flow: str) -> str:
+        return FLOW_LABELS.get(flow, "текущий шаг")
 
     async def _prompt_navigation_flow(
         self,

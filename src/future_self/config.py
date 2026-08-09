@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     ai_model: str | None = None
     openrouter_site_url: str | None = None
     openrouter_app_name: str = "MyFutureSelfAI"
+    enable_nova_ai: bool = False
+    nova_ai_admin_only: bool = True
 
     transcription_provider: Literal["openai", "local", "disabled"] = "disabled"
     transcription_api_key: str | None = Field(default=None, repr=False)

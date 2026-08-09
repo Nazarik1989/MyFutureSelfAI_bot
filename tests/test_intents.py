@@ -157,7 +157,7 @@ async def draft_count(db) -> int:
     [
         ("Покажи мои записи", "📝 Записи"),
         ("Где настройки", "⚙️ Настройки"),
-        ("Где календарь?", "❓ Помощь"),
+        ("Где календарь?", "✨ Nova"),
     ],
 )
 async def test_navigation_text_gate_consumes_known_and_explicit_unknown_requests_before_content(
@@ -209,6 +209,7 @@ async def test_navigation_verbs_without_ui_target_continue_to_content_routing(
 
     assert message.replies
     assert not any(str(reply["text"]).startswith("❓ Помощь") for reply in message.replies)
+    assert not any(str(reply["text"]).startswith("✨ Nova") for reply in message.replies)
     assert fake_ai.route_calls == [] or fake_ai.route_calls[-1][0] == narrative
     assert await inbox_count(db) == 0
 
@@ -217,7 +218,7 @@ async def test_navigation_verbs_without_ui_target_continue_to_content_routing(
     ("phrase", "expected_heading"),
     [
         ("Где настройки", "⚙️ Настройки"),
-        ("Где календарь?", "❓ Помощь"),
+        ("Где календарь?", "✨ Nova"),
     ],
 )
 async def test_voice_navigation_reuses_progress_message_without_ai_or_content_capture(
@@ -258,6 +259,8 @@ async def test_voice_navigation_verbs_without_ui_target_continue_to_content_rout
     assert message.replies
     assert not any(str(reply["text"]).startswith("❓ Помощь") for reply in message.replies)
     assert not any(edit.startswith("❓ Помощь") for edit in message.edits)
+    assert not any(str(reply["text"]).startswith("✨ Nova") for reply in message.replies)
+    assert not any(edit.startswith("✨ Nova") for edit in message.edits)
     assert fake_ai.route_calls == [] or fake_ai.route_calls[-1][0] == phrase
 
 

@@ -341,9 +341,12 @@ class KnowledgeHandlers:
     ) -> None:
         await self.workspace_other_callback_gate(update, context)
         query = update.callback_query
-        if not self._knowledge_capture_enabled() or query is None:
+        if query is None:
             return
-        if (query.data or "").startswith(("kh:", "nav:")):
+        if (query.data or "").startswith(("nav:", "nova:")):
+            return
+        await self.nova_clear_current(update)
+        if not self._knowledge_capture_enabled() or (query.data or "").startswith("kh:"):
             return
         await self.cancel_knowledge_state(update)
 

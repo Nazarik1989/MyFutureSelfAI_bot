@@ -357,7 +357,7 @@ class WorkspaceHandlers:
         del context
         if not self._workspace_enabled() or update.callback_query is None:
             return
-        if (update.callback_query.data or "").startswith(("space:", "spacei:", "nav:")):
+        if (update.callback_query.data or "").startswith(("space:", "spacei:", "nav:", "nova:")):
             return
         user = await self._user(update.effective_user.id)
         await self.workspace_service.cancel_input(user.id, update.effective_chat.id)

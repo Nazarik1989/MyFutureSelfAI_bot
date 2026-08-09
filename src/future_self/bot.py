@@ -94,6 +94,8 @@ from .models import (
 from .natural_commands import NaturalAction, NaturalCommandRouter
 from .navigation import NavigationFlowStore
 from .navigation_handlers import NavigationHandlers
+from .nova import NovaSessionStore, is_explicit_nova_invocation
+from .nova_handlers import NovaHandlers
 from .reminders import TaskReminderEngine
 from .repositories import (
     CheckInRepository,
@@ -190,6 +192,7 @@ class FutureSelfBot(
     CollectionHandlers,
     WorkspaceHandlers,
     KnowledgeHandlers,
+    NovaHandlers,
     NavigationHandlers,
 ):
     def __init__(
@@ -224,6 +227,9 @@ class FutureSelfBot(
             enable_workspace_access=getattr(settings, "enable_workspace_access", False)
         )
         self.navigation_flow_sessions = NavigationFlowStore()
+        self.nova_sessions = NovaSessionStore()
+        self._nova_ui_lock = asyncio.Lock()
+        self._nova_launch_lock = asyncio.Lock()
         self.conversation = ConversationContextService(
             db,
             settings.conversation_context_messages,
@@ -337,10 +343,13 @@ class FutureSelfBot(
             "vision",
             "health",
             "checkin",
+            "health_edit",
             "doctor",
             "doctor_find",
             "doctor_prepare",
+            "doctor_prepare_edit",
             "doctor_preparations",
+            "cleanup_drafts",
             "location",
             "timezone",
             "profile",
@@ -355,6 +364,8 @@ class FutureSelfBot(
             gated_public_commands.append("knowledge")
         if getattr(self.settings, "enable_knowledge_capture", False):
             gated_public_commands.append("capture")
+        gated_public_commands.append("help")
+        app.add_handler(CommandHandler("cancel", self.nova_cancel_gate), group=-3)
         app.add_handler(
             CommandHandler(
                 gated_public_commands,
@@ -370,6 +381,13 @@ class FutureSelfBot(
         )
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.navigation_text_gate),
+            group=-2,
+        )
+        app.add_handler(
+            MessageHandler(
+                filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO,
+                self.nova_non_text_gate,
+            ),
             group=-2,
         )
         app.add_handler(
@@ -415,6 +433,10 @@ class FutureSelfBot(
                     CommandHandler("start", self.start),
                     CommandHandler("onboarding", self.start),
                     CallbackQueryHandler(
+                        self.nova_onboarding_entry,
+                        pattern=r"^nova:action:onboarding:",
+                    ),
+                    CallbackQueryHandler(
                         self.navigation_onboarding_entry,
                         pattern=r"^nav:action:onboarding$",
                     ),
@@ -447,6 +469,10 @@ class FutureSelfBot(
             entry_points=[
                 CommandHandler("evening", self.evening_start),
                 CallbackQueryHandler(
+                    self.nova_evening_entry,
+                    pattern=r"^nova:action:evening:",
+                ),
+                CallbackQueryHandler(
                     self.navigation_evening_entry,
                     pattern=r"^nav:action:evening$",
                 ),
@@ -475,6 +501,10 @@ class FutureSelfBot(
             entry_points=[
                 CommandHandler("checkin", self.health_checkin_start),
                 CommandHandler("health_edit", self.health_checkin_start),
+                CallbackQueryHandler(
+                    self.nova_health_entry,
+                    pattern=r"^nova:action:checkin:",
+                ),
                 CallbackQueryHandler(
                     self.navigation_health_entry,
                     pattern=r"^nav:action:checkin$",
@@ -514,6 +544,10 @@ class FutureSelfBot(
             entry_points=[
                 CommandHandler("doctor_prepare", self.doctor_prepare_start),
                 CommandHandler("doctor_prepare_edit", self.doctor_prepare_start),
+                CallbackQueryHandler(
+                    self.nova_doctor_entry,
+                    pattern=r"^nova:action:doctor_prepare:",
+                ),
                 CallbackQueryHandler(
                     self.navigation_doctor_entry,
                     pattern=r"^nav:action:doctor_prepare$",
@@ -593,6 +627,7 @@ class FutureSelfBot(
             )
         )
         app.add_handler(CallbackQueryHandler(self.timezone_action, pattern=r"^timezone:update:"))
+        app.add_handler(CallbackQueryHandler(self.nova_callback, pattern=r"^nova:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -877,21 +912,14 @@ class FutureSelfBot(
             return None
         _user_id, step, _status, _answers = restored
         navigation = self.natural_command_router.route(text)
-        explicit_unknown = (
-            navigation is None and self.natural_command_router.is_explicit_navigation_request(text)
-        )
-        if navigation is not None or explicit_unknown:
+        if navigation is not None and navigation.action != "help":
             screen_update = navigation_update or update
-            if navigation is None or navigation.action == "help":
-                await self.help_command(screen_update, context)
-                action = "help"
-            else:
-                await self._prompt_navigation_flow(
-                    screen_update.effective_message,
-                    update,
-                    "onboarding",
-                )
-                action = "flow"
+            await self._prompt_navigation_flow(
+                screen_update.effective_message,
+                update,
+                "onboarding",
+            )
+            action = "flow"
             state = PROFILE_CONFIRM if step >= len(ONBOARDING_QUESTIONS) else ONBOARDING_INPUT
             return state, action
         if attached and not detached and step < len(ONBOARDING_QUESTIONS) and not force:
@@ -959,6 +987,7 @@ class FutureSelfBot(
         raise ApplicationHandlerStop
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.nova_clear_current(update)
         user = await self._user(update.effective_user.id)
         if user.access_tier == GUEST:
             await self.show_guest_root(update)
@@ -2138,6 +2167,14 @@ class FutureSelfBot(
             update.effective_user.id,
             update.effective_chat.id,
         )
+        if not snapshot.system_pending_action:
+            nova_session = await self.nova_sessions.current(
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+            )
+            if nova_session is not None or is_explicit_nova_invocation(text):
+                return False
         if snapshot.system_pending_action and self.natural_command_router.route(text) is not None:
             # An explicit navigation/read action means the user moved on. Drop
             # only the still-current preview and let normal natural routing run.

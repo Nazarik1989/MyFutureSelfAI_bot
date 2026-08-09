@@ -266,6 +266,12 @@ class AccessHandlers:
             await self._access_fail_closed(update)
             raise ApplicationHandlerStop from None
 
+        await self.nova_sync_access(
+            user,
+            chat.id,
+            context=context,
+            source_message=update.effective_message,
+        )
         await self._sync_access_commands(
             context, chat.id, user.telegram_id, tier, user.access_version
         )
@@ -340,6 +346,9 @@ class AccessHandlers:
             return
         session = pending.session
         if pending.outcome is GuestSessionOutcome.NOT_GUEST:
+            query = update.callback_query
+            if query is not None:
+                await query.answer()
             if session is not None:
                 await self._edit_guest_access_changed(
                     context.bot,
@@ -347,8 +356,27 @@ class AccessHandlers:
                     message_id=session.prompt_message_id,
                 )
             return
+        message = update.effective_message
+        text = getattr(message, "text", None) if message is not None else None
+        command = (
+            text.split(maxsplit=1)[0].partition("@")[0].casefold()
+            if isinstance(text, str) and text.startswith("/")
+            else None
+        )
+        query = update.callback_query
+        if (
+            session is not None
+            and session.status in {GuestSessionStatus.AWAITING_INPUT, GuestSessionStatus.PROCESSING}
+            and (command == "/help" or (query is not None and str(query.data or "") == "guest:how"))
+        ):
+            if query is not None:
+                await query.answer()
+            await self._guest_nova_flow_help(update, context, session)
+            return
+        if query is not None and str(query.data or "").startswith("guest:nova:flow:"):
+            await self._guest_nova_flow_action(update, context, user, session)
+            return
         if session is not None and session.status is GuestSessionStatus.RESULT_READY:
-            query = update.callback_query
             if query is not None:
                 await query.answer()
             await self._deliver_guest_result(
@@ -359,33 +387,71 @@ class AccessHandlers:
             )
             return
         if session is not None and session.status is GuestSessionStatus.PROCESSING:
-            query = update.callback_query
             if query is not None:
                 await query.answer(GUEST_PROCESSING_ALERT, show_alert=True)
             return
-        query = update.callback_query
         if query is not None:
             await self._handle_guest_callback(update, context, user, session)
             return
         if session is not None and session.status is GuestSessionStatus.AWAITING_INPUT:
             await self._handle_guest_awaiting_update(update, context, user, session)
             return
-        message = update.effective_message
         if message is None:
             return
-        text = getattr(message, "text", None)
         if isinstance(text, str) and text.startswith("/"):
-            command = text.split(maxsplit=1)[0].partition("@")[0].casefold()
             if command in {"/start", "/menu"}:
+                await self.nova_clear_bound(user.id, chat.id)
                 await self.show_guest_root(update)
             elif command == "/help":
-                await self._reply_guest_screen(update, GUEST_HOW_TEXT, _HOW_MARKUP)
+                await self._nova_open_message(message, update, user)
+            elif command == "/cancel":
+                current = await self.nova_sessions.current(
+                    owner_id=user.id,
+                    telegram_user_id=user.telegram_id,
+                    chat_id=chat.id,
+                )
+                if current is None:
+                    await self.show_guest_root(update)
+                else:
+                    async with self._nova_ui_lock:
+                        live = await self.nova_sessions.get(
+                            owner_id=current.owner_id,
+                            telegram_user_id=current.telegram_user_id,
+                            chat_id=current.chat_id,
+                            access_version=current.access_version,
+                            canonical_message_id=current.canonical_message_id,
+                            tier=current.tier,
+                            session_id=current.id,
+                        )
+                        if live is not None:
+                            await self.nova_sessions.clear(
+                                owner_id=user.id,
+                                chat_id=chat.id,
+                                session_id=live.id,
+                            )
+                            await self._nova_edit_canonical(
+                                context,
+                                live,
+                                "✨ Nova\n\nСессия завершена.",
+                                None,
+                                source_message=message,
+                            )
             else:
                 await self._reply_guest_screen(
                     update,
                     f"{GUEST_COMMAND_NOTICE}\n\n{GUEST_ROOT_TEXT}",
                     _ROOT_MARKUP,
                 )
+            return
+        if (
+            isinstance(text, str)
+            and text.strip()
+            and await self.nova_text_gate(
+                update,
+                context,
+                user=user,
+            )
+        ):
             return
         if self._has_guest_media(message):
             await self._reply_guest_screen(update, GUEST_MEDIA_NOTICE, _ROOT_MARKUP)
@@ -397,6 +463,167 @@ class AccessHandlers:
                 _ROOT_MARKUP,
             )
 
+    async def _guest_nova_flow_help(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: GuestSessionSnapshot,
+    ) -> None:
+        if session.prompt_message_id is None:
+            return
+        async with self._nova_ui_lock:
+            try:
+                pending = await self.guest_session_service.pending_result(
+                    user_id=session.user_id,
+                    chat_id=session.chat_id,
+                    access_version=session.access_version,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log_access_failure("Guest session lookup failed", exc, session.user_id)
+                return
+            live = pending.session
+            if (
+                live is None
+                or live.session_id != session.session_id
+                or live.prompt_message_id != session.prompt_message_id
+                or live.status
+                not in {GuestSessionStatus.AWAITING_INPUT, GuestSessionStatus.PROCESSING}
+            ):
+                return
+            token = await self.navigation_flow_sessions.issue(
+                update.effective_user.id,
+                update.effective_chat.id,
+                self._guest_nova_flow_key(live),
+            )
+            label = (
+                "бесплатный AI-разбор"
+                if live.status is GuestSessionStatus.PROCESSING
+                else "ввод для бесплатного AI-разбора"
+            )
+            await self._edit_canonical_message(
+                context.bot,
+                chat_id=live.chat_id,
+                message_id=live.prompt_message_id,
+                text=f"✨ Nova\n\nСейчас не завершён сценарий: {label}. Что сделать?",
+                markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "▶️ Продолжить текущий шаг",
+                                callback_data=f"guest:nova:flow:continue:{token}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🏠 Выйти в главное меню",
+                                callback_data=f"guest:nova:flow:exit:{token}",
+                            )
+                        ],
+                    ]
+                ),
+            )
+
+    async def _guest_nova_flow_action(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user: Any,
+        session: GuestSessionSnapshot | None,
+    ) -> None:
+        async with self._nova_ui_lock:
+            if session is not None:
+                try:
+                    pending = await self.guest_session_service.pending_result(
+                        user_id=session.user_id,
+                        chat_id=session.chat_id,
+                        access_version=session.access_version,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log_access_failure("Guest session lookup failed", exc, session.user_id)
+                    await update.callback_query.answer(
+                        SERVICE_UNAVAILABLE_TEXT,
+                        show_alert=True,
+                    )
+                    return
+                live = pending.session
+                session = (
+                    live
+                    if live is not None
+                    and live.session_id == session.session_id
+                    and live.prompt_message_id == session.prompt_message_id
+                    else None
+                )
+            await self._guest_nova_flow_action_locked(update, context, user, session)
+
+    async def _guest_nova_flow_action_locked(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user: Any,
+        session: GuestSessionSnapshot | None,
+    ) -> None:
+        query = update.callback_query
+        parts = str(query.data or "").split(":")
+        if len(parts) != 5 or parts[3] not in {"continue", "exit"}:
+            await query.answer(STALE_GUEST_ALERT, show_alert=True)
+            return
+        capability = await self.navigation_flow_sessions.claim(
+            parts[4],
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        message_id = getattr(query.message, "message_id", None)
+        if (
+            capability is None
+            or session is None
+            or capability.flow != self._guest_nova_flow_key(session)
+            or session.status
+            not in {GuestSessionStatus.AWAITING_INPUT, GuestSessionStatus.PROCESSING}
+            or message_id != session.prompt_message_id
+        ):
+            await query.answer(STALE_GUEST_ALERT, show_alert=True)
+            return
+        if parts[3] == "exit":
+            cancelled = await self.guest_session_service.cancel(
+                user_id=user.id,
+                chat_id=session.chat_id,
+            )
+            if cancelled.outcome is GuestSessionOutcome.IN_PROGRESS:
+                await query.answer(GUEST_PROCESSING_ALERT, show_alert=True)
+                await self._edit_guest_screen(
+                    query,
+                    GUEST_PROCESSING_TEXTS[session.demo_kind],
+                    None,
+                )
+                return
+            if cancelled.outcome is not GuestSessionOutcome.CANCELLED:
+                await query.answer(STALE_GUEST_ALERT, show_alert=True)
+                return
+            await query.answer()
+            await self._edit_guest_screen(query, GUEST_ROOT_TEXT, _ROOT_MARKUP)
+            return
+        await query.answer()
+        if session.status is GuestSessionStatus.PROCESSING:
+            await self._edit_guest_screen(
+                query,
+                GUEST_PROCESSING_TEXTS[session.demo_kind],
+                None,
+            )
+            return
+        await self._edit_guest_screen(
+            query,
+            self._demo_input_text(session.demo_kind),
+            _DEMO_INPUT_MARKUP,
+        )
+
+    @staticmethod
+    def _guest_nova_flow_key(session: GuestSessionSnapshot) -> str:
+        return f"guest_demo:{session.session_id}:{session.version}"
+
     async def _handle_guest_callback(
         self,
         update: Update,
@@ -406,6 +633,9 @@ class AccessHandlers:
     ) -> None:
         query = update.callback_query
         data = query.data if isinstance(query.data, str) else ""
+        if data.startswith("nova:"):
+            await self.nova_callback(update, context)
+            return
         if data not in GUEST_CALLBACK_ROUTES:
             if data.startswith("guest:"):
                 await query.answer(STALE_GUEST_ALERT, show_alert=True)
@@ -413,7 +643,15 @@ class AccessHandlers:
             await query.answer(FULL_VERSION_ALERT, show_alert=True)
             await self._edit_guest_screen(query, GUEST_ROOT_TEXT, _ROOT_MARKUP)
             return
+        if data == "guest:how":
+            if session is not None and session.status is GuestSessionStatus.AWAITING_INPUT:
+                await query.answer()
+                await self._guest_nova_flow_help(update, context, session)
+                return
+            await self.nova_navigation_help_callback(update, context)
+            return
         if data == "guest:demo:thought":
+            await self.nova_clear_bound(user.id, update.effective_chat.id)
             await self._start_guest_demo(
                 update,
                 context,
@@ -422,6 +660,7 @@ class AccessHandlers:
             )
             return
         if data == "guest:demo:first-step":
+            await self.nova_clear_bound(user.id, update.effective_chat.id)
             await self._start_guest_demo(
                 update,
                 context,
@@ -429,6 +668,7 @@ class AccessHandlers:
                 GuestDemoKind.FIRST_STEP,
             )
             return
+        await self.nova_clear_bound(user.id, update.effective_chat.id)
         await query.answer()
         if session is not None and session.status is GuestSessionStatus.AWAITING_INPUT:
             await self.guest_session_service.cancel(user_id=user.id, chat_id=session.chat_id)
@@ -1216,6 +1456,22 @@ class AccessHandlers:
             )
 
     async def _deliver_guest_result(
+        self,
+        bot: Any,
+        *,
+        user_id: int,
+        chat_id: int,
+        access_version: int,
+    ) -> bool:
+        async with self._nova_ui_lock:
+            return await self._deliver_guest_result_locked(
+                bot,
+                user_id=user_id,
+                chat_id=chat_id,
+                access_version=access_version,
+            )
+
+    async def _deliver_guest_result_locked(
         self,
         bot: Any,
         *,

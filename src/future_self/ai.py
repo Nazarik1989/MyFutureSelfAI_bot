@@ -1,5 +1,8 @@
+from __future__ import annotations
+
+import asyncio
 import json
-from typing import Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -12,6 +15,7 @@ from .schemas import (
     GuestFirstStep,
     GuestThoughtBreakdown,
     IntentResult,
+    NovaHelpPlan,
     ParsedThought,
     RoutineProposals,
     TimezoneResolution,
@@ -19,8 +23,13 @@ from .schemas import (
     VisionSummary,
 )
 
+if TYPE_CHECKING:
+    from .nova import NovaCatalog
+
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 GUEST_DEMO_MAX_INPUT_CHARS = 1200
+NOVA_HELP_MAX_INPUT_CHARS = 600
+NOVA_HELP_TIMEOUT_SECONDS = 30.0
 
 
 def _guest_demo_input(text: str) -> str:
@@ -34,6 +43,52 @@ def _guest_demo_input(text: str) -> str:
             f"guest demo input must not exceed {GUEST_DEMO_MAX_INPUT_CHARS} characters"
         )
     return cleaned
+
+
+def _nova_help_input(question: str) -> str:
+    if not isinstance(question, str):
+        raise ValueError("Nova help input must be a string")
+    cleaned = question.strip()
+    if not cleaned:
+        raise ValueError("Nova help input must not be empty")
+    if len(cleaned) > NOVA_HELP_MAX_INPUT_CHARS:
+        raise ValueError(f"Nova help input must not exceed {NOVA_HELP_MAX_INPUT_CHARS} characters")
+    return cleaned
+
+
+def _nova_catalog_payload(capability_catalog: NovaCatalog) -> dict[str, object]:
+    try:
+        capabilities = capability_catalog.capabilities
+        enabled_features = capability_catalog.enabled_features
+    except AttributeError as exc:
+        raise ValueError("invalid Nova capability catalog") from exc
+
+    serialized_capabilities: list[dict[str, str]] = []
+    for capability in capabilities:
+        try:
+            values = (capability.id, capability.label, capability.description)
+        except AttributeError as exc:
+            raise ValueError("invalid Nova capability") from exc
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError("invalid Nova capability")
+        serialized_capabilities.append(
+            {
+                "id": values[0].strip(),
+                "label": values[1].strip(),
+                "description": values[2].strip(),
+            }
+        )
+
+    feature_names: set[str] = set()
+    for feature in enabled_features:
+        if not isinstance(feature, str) or not feature.strip():
+            raise ValueError("invalid Nova runtime feature")
+        feature_names.add(feature.strip())
+
+    return {
+        "capabilities": serialized_capabilities,
+        "enabled_features": sorted(feature_names),
+    }
 
 
 class ProviderHealthCheck(BaseModel):
@@ -56,6 +111,8 @@ class AIService(Protocol):
     async def guest_thought_breakdown(self, text: str) -> GuestThoughtBreakdown: ...
 
     async def guest_first_step(self, text: str) -> GuestFirstStep: ...
+
+    async def nova_help(self, question: str, capability_catalog: NovaCatalog) -> NovaHelpPlan: ...
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan: ...
 
@@ -150,6 +207,31 @@ class OpenAICompatibleAIService:
             _guest_demo_input(text),
             max_retries=0,
         )
+
+    async def nova_help(self, question: str, capability_catalog: NovaCatalog) -> NovaHelpPlan:
+        cleaned_question = _nova_help_input(question)
+        payload = {
+            "question": cleaned_question,
+            **_nova_catalog_payload(capability_catalog),
+        }
+        client = self.client.with_options(max_retries=0)
+        async with asyncio.timeout(NOVA_HELP_TIMEOUT_SECONDS):
+            response = await client.responses.parse(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": prompts.NOVA_HELP_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    },
+                ],
+                text_format=NovaHelpPlan,
+                timeout=NOVA_HELP_TIMEOUT_SECONDS,
+            )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("The model returned no structured output")
+        return NovaHelpPlan.model_validate(parsed)
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan:
         return await self._parse(TodayPlan, prompts.TODAY_SYSTEM, repr(context))
