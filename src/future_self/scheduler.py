@@ -27,6 +27,10 @@ class VisionCompanionSchedule(Protocol):
     extra_times: list[str]
 
 
+class DeliverDueEngine(Protocol):
+    async def deliver_due(self) -> int: ...
+
+
 class JobQueueScheduler:
     """Small adapter around PTB JobQueue, replaceable by a worker later."""
 
@@ -125,6 +129,23 @@ class JobQueueScheduler:
             interval=interval_seconds,
             first=interval_seconds,
             name="task-reminders:persistent-outbox",
+        )
+
+    def start_recurring_task_reminders(
+        self,
+        engine: DeliverDueEngine,
+        *,
+        interval_seconds: int,
+    ) -> None:
+        async def deliver_due(context: object) -> None:
+            del context
+            await engine.deliver_due()
+
+        self.job_queue.run_repeating(
+            deliver_due,
+            interval=interval_seconds,
+            first=interval_seconds,
+            name="recurring-task-reminders:persistent-outbox",
         )
 
     def schedule_health_reminder(

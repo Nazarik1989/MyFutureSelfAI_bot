@@ -454,12 +454,18 @@ def test_help_is_detailed_flag_aware_and_telegram_safe():
     assert "Напомни через" not in disabled_text
     assert "голос" not in disabled_text.casefold()
     assert "отключена настройкой" in disabled["tasks_section"][1]
+    assert "разовых и ежедневных" in disabled["tasks_section"][1]
+    assert "каждый день" not in disabled["tasks_section"][1]
 
     enabled = help_topics(True, True, True, True, True)
     assert set(enabled) == set(HELP_TOPICS)
     assert "Совместными становятся" in enabled["privacy"][1]
     assert "База знаний" in enabled["privacy"][1]
     assert "текстом или голосом" in enabled["records_section"][1]
+    assert "каждый день" in enabled["tasks_section"][1]
+    assert "изменить время" in enabled["tasks_section"][1]
+    assert "отключить ежедневное" in enabled["tasks_section"][1]
+    assert "ежедневные напоминания" in ACTIONS["task_reminder_guide"].description
     assert all(len(f"{title}\n\n{text}") < 4096 for title, text in enabled.values())
     assert all(len(f"nav:help:{key}".encode()) <= 64 for key in enabled)
 

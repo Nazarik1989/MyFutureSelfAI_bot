@@ -6,7 +6,9 @@ from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import and_, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from .access import FULL_ACCESS_TIERS
 from .db import Database
 from .models import DraftInboxItem, InboxItem, TaskReminder, TaskState, User
 from .reminders import reminder_for_inbox_item
@@ -94,13 +96,50 @@ class DraftInboxService:
         raw_text: str,
         parsed: ParsedThought,
     ) -> DraftInboxItem:
-        now = datetime.now(UTC)
+        async with self.db.session() as session:
+            draft = await self.create_in_session(
+                session,
+                user_id=user_id,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                source=source,
+                raw_text=raw_text,
+                parsed=parsed,
+            )
+        log_transition(draft.id, telegram_user_id, "none", "preview", "create")
+        return draft
+
+    async def create_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        source: str,
+        raw_text: str,
+        parsed: ParsedThought,
+        now: datetime | None = None,
+    ) -> DraftInboxItem:
+        """Create a canonical draft without committing the caller transaction."""
+
+        owner_exists = await session.scalar(
+            select(User.id).where(
+                User.id == user_id,
+                User.telegram_id == telegram_user_id,
+            )
+        )
+        if owner_exists is None:
+            raise ValueError("Telegram user does not own this draft")
+        current = now or datetime.now(UTC)
         draft = DraftInboxItem(
             id=str(uuid4()),
             user_id=user_id,
             telegram_user_id=telegram_user_id,
             chat_id=chat_id,
             source=source,
+            # Reminder flow callers pass the normalized bounded title here,
+            # never the raw command or voice transcript.
             raw_text=raw_text,
             kind=parsed.kind,
             title=parsed.title,
@@ -113,21 +152,11 @@ class DraftInboxService:
                 else None
             ),
             status="preview",
-            expires_at=now + self.ttl,
+            expires_at=current + self.ttl,
             version=1,
         )
-        async with self.db.session() as session:
-            owner_exists = await session.scalar(
-                select(User.id).where(
-                    User.id == user_id,
-                    User.telegram_id == telegram_user_id,
-                )
-            )
-            if owner_exists is None:
-                raise ValueError("Telegram user does not own this draft")
-            session.add(draft)
-            await session.flush()
-        log_transition(draft.id, telegram_user_id, "none", "preview", "create")
+        session.add(draft)
+        await session.flush()
         return draft
 
     async def create_or_get(
@@ -564,34 +593,112 @@ class DraftInboxService:
         self, draft_id: str, version: int, telegram_user_id: int, chat_id: int
     ) -> DraftResult:
         """The sole atomic path allowed to construct an InboxItem."""
-        now = datetime.now(UTC)
         async with self.db.session() as session:
-            changed = await session.execute(
-                update(DraftInboxItem)
-                .where(
+            result = await self.confirm_in_session(
+                session,
+                draft_id,
+                version,
+                telegram_user_id,
+                chat_id,
+            )
+        if not result.ok:
+            return result
+        log_transition(
+            draft_id,
+            telegram_user_id,
+            "preview",
+            "confirmed",
+            "reuse_saved_duplicate" if result.duplicate else "save",
+            inbox_created=not result.duplicate,
+        )
+        return result
+
+    async def confirm_in_session(
+        self,
+        session: AsyncSession,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        owner_locked: bool = False,
+        allow_saved_dedup: bool = True,
+        return_existing: bool = False,
+        expected_access_version: int | None = None,
+        now: datetime | None = None,
+    ) -> DraftResult:
+        """Confirm through the canonical Inbox/Task path inside a caller transaction.
+
+        ``allow_saved_dedup=False`` is used for recurring creation because a
+        semantically equal one-shot task must never be reused as a daily task.
+        ``return_existing`` makes an exact draft replay idempotent without
+        broadening the normal preview-confirm contract.
+        """
+
+        current = now or datetime.now(UTC)
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(
+                User.access_tier.in_(FULL_ACCESS_TIERS),
+                User.access_version == expected_access_version,
+            )
+        changed = await session.execute(
+            update(DraftInboxItem)
+            .where(
+                DraftInboxItem.id == draft_id,
+                DraftInboxItem.user_id.in_(owner_filter),
+                DraftInboxItem.telegram_user_id == telegram_user_id,
+                DraftInboxItem.chat_id == chat_id,
+                DraftInboxItem.status == "preview",
+                DraftInboxItem.version == version,
+                DraftInboxItem.expires_at > current,
+            )
+            .values(status="confirmed")
+            .returning(DraftInboxItem.id)
+        )
+        if changed.scalar_one_or_none() is None:
+            if not return_existing:
+                return DraftResult(False)
+            draft = await session.scalar(
+                select(DraftInboxItem).where(
                     DraftInboxItem.id == draft_id,
-                    DraftInboxItem.user_id.in_(
-                        select(User.id).where(User.telegram_id == telegram_user_id)
-                    ),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
-                    DraftInboxItem.status == "preview",
+                    DraftInboxItem.status == "confirmed",
                     DraftInboxItem.version == version,
-                    DraftInboxItem.expires_at > now,
                 )
-                .values(status="confirmed")
-                .returning(DraftInboxItem.id)
             )
-            if changed.scalar_one_or_none() is None:
+            if draft is None:
                 return DraftResult(False)
-            draft = await session.get(DraftInboxItem, draft_id)
-            # Serialize confirmed-record deduplication per owner. A repeated
-            # preview is allowed, but confirming identical canonical content
-            # within a short window reuses the live record instead of creating
-            # a second task/reminder.
+            existing = await session.scalar(
+                select(InboxItem).where(
+                    InboxItem.draft_id == draft_id,
+                    InboxItem.user_id == draft.user_id,
+                )
+            )
+            if existing is None:
+                return DraftResult(False)
+            reminder = await session.scalar(
+                select(TaskReminder).where(TaskReminder.inbox_item_id == existing.id)
+            )
+            return DraftResult(
+                True,
+                draft=draft,
+                inbox_item=existing,
+                reminder=reminder,
+                duplicate=True,
+            )
+
+        draft = await session.get(DraftInboxItem, draft_id)
+        if draft is None:
+            return DraftResult(False)
+        if not owner_locked:
+            # Cross-dialect owner lock used by every create/confirm coordinator.
             await session.execute(
                 update(User).where(User.id == draft.user_id).values(updated_at=User.updated_at)
             )
+
+        if allow_saved_dedup:
             recent_items = (
                 await session.execute(
                     select(InboxItem, TaskState)
@@ -611,7 +718,7 @@ class DraftInboxService:
                                 InboxItem.status == "archived",
                             ),
                         ),
-                        InboxItem.created_at >= now - self.SAVED_DEDUP_WINDOW,
+                        InboxItem.created_at >= current - self.SAVED_DEDUP_WINDOW,
                     )
                     .order_by(InboxItem.id.desc())
                 )
@@ -630,14 +737,6 @@ class DraftInboxService:
                 reminder = await session.scalar(
                     select(TaskReminder).where(TaskReminder.inbox_item_id == duplicate.id)
                 )
-                log_transition(
-                    draft_id,
-                    telegram_user_id,
-                    "preview",
-                    "confirmed",
-                    "reuse_saved_duplicate",
-                    inbox_created=False,
-                )
                 return DraftResult(
                     True,
                     draft=draft,
@@ -645,46 +744,41 @@ class DraftInboxService:
                     reminder=reminder,
                     duplicate=True,
                 )
-            inbox_item = InboxItem(
-                draft_id=draft.id,
-                user_id=draft.user_id,
-                kind=draft.kind,
-                title=draft.title,
-                description=draft.description,
-                raw_text=draft.raw_text,
-                next_step=draft.next_step,
-                resolved_date=draft.resolved_date,
-                temporal_resolution=draft.temporal_resolution,
-                source=draft.source,
-                status="confirmed",
-            )
-            session.add(inbox_item)
+
+        inbox_item = InboxItem(
+            draft_id=draft.id,
+            user_id=draft.user_id,
+            kind=draft.kind,
+            title=draft.title,
+            description=draft.description,
+            raw_text=draft.raw_text,
+            next_step=draft.next_step,
+            resolved_date=draft.resolved_date,
+            temporal_resolution=draft.temporal_resolution,
+            source=draft.source,
+            status="confirmed",
+        )
+        session.add(inbox_item)
+        await session.flush()
+        reminder = reminder_for_inbox_item(
+            inbox_item,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            date_event_hour=self.task_date_event_hour,
+            lead_minutes=self.task_reminder_lead_minutes,
+        )
+        if reminder is not None:
+            session.add(reminder)
             await session.flush()
-            reminder = reminder_for_inbox_item(
-                inbox_item,
-                telegram_user_id=telegram_user_id,
-                chat_id=chat_id,
-                date_event_hour=self.task_date_event_hour,
-                lead_minutes=self.task_reminder_lead_minutes,
-            )
-            if reminder is not None:
-                session.add(reminder)
-                await session.flush()
-            owner = await session.get(User, draft.user_id)
-            await add_task_state(
-                session,
-                inbox_item,
-                owner_timezone=owner.timezone,
-                reminder=reminder,
-                date_event_hour=self.task_date_event_hour,
-            )
-        log_transition(
-            draft_id,
-            telegram_user_id,
-            "preview",
-            "confirmed",
-            "save",
-            inbox_created=True,
+        owner = await session.get(User, draft.user_id)
+        if owner is None:
+            raise RuntimeError("Draft owner disappeared during confirmation")
+        await add_task_state(
+            session,
+            inbox_item,
+            owner_timezone=owner.timezone,
+            reminder=reminder,
+            date_event_hour=self.task_date_event_hour,
         )
         return DraftResult(True, draft=draft, inbox_item=inbox_item, reminder=reminder)
 

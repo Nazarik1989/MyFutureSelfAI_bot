@@ -355,6 +355,8 @@ _NOVA_HELP_VERB_FRAGMENTS = (
     "загруз",
     "добав",
     "созда",
+    "измен",
+    "отключ",
     "перейт",
     "попаст",
     "покаж",
@@ -548,6 +550,18 @@ def resolve_nova_question(
     action_id, response, steps = rule
     if catalog.tier == GUEST:
         return _guest_full_version(catalog, response)
+    if action_id == "task_reminder_guide" and "task_reminders" not in catalog.enabled_features:
+        task_help = catalog.capability("help:tasks_section")
+        return _guide(
+            catalog,
+            action_id,
+            (
+                task_help.description
+                if task_help is not None
+                else "Доставка Telegram-напоминаний сейчас отключена настройкой."
+            ),
+            ("Открой памятку по задачам и напоминаниям.",),
+        )
     return _guide(catalog, action_id, response, steps)
 
 
@@ -602,6 +616,36 @@ def _standard_rule(normalized: str) -> tuple[str, str, tuple[str, ...]] | None:
             "Краткая памятка поможет точнее сформулировать запрос о функциях бота.",
             ("Открой памятку.",),
         )
+    if _contains(normalized, "напомин") and _contains(normalized, "ежеднев", "каждый день"):
+        if _contains(normalized, "отключ", "выключ", "останов", "убрать", "удал"):
+            return (
+                "task_reminder_guide",
+                "Ежедневное напоминание отключается в карточке задачи; сама задача остаётся.",
+                (
+                    "Открой /tasks и выбери задачу.",
+                    "Открой настройки ежедневного напоминания.",
+                    "Отключи ежедневную доставку.",
+                ),
+            )
+        if _contains(normalized, "измен", "помен", "смен", "перенес", "другое время"):
+            return (
+                "task_reminder_guide",
+                "Время ежедневного напоминания меняется в карточке сохранённой задачи.",
+                (
+                    "Открой /tasks и выбери задачу.",
+                    "Открой изменение ежедневного напоминания.",
+                    "Проверь новое время и часовой пояс перед подтверждением.",
+                ),
+            )
+        return (
+            "task_reminder_guide",
+            "Ежедневное напоминание создаётся обычной фразой и сохраняется только после preview.",
+            (
+                "Напиши, что напомнить, добавь «каждый день» и время.",
+                "Проверь время и часовой пояс в preview.",
+                "Подтверди сохранение.",
+            ),
+        )
     if _contains(normalized, "напоминан") and _contains(normalized, "задач", "дело"):
         return (
             "task_create",
@@ -615,8 +659,11 @@ def _standard_rule(normalized: str) -> tuple[str, str, tuple[str, ...]] | None:
     if _contains(normalized, "напоминан"):
         return (
             "task_reminder_guide",
-            "Напоминания настраиваются в задаче и срабатывают по её локальному времени.",
-            ("Открой памятку по напоминаниям.", "Создай или выбери задачу."),
+            "Разовые и ежедневные напоминания настраиваются для задачи в её часовом поясе.",
+            (
+                "Открой памятку по напоминаниям.",
+                "Создай задачу или открой её карточку для изменения и отключения.",
+            ),
         )
     if _contains(normalized, "создать задач", "добавить задач", "новую задач"):
         return (

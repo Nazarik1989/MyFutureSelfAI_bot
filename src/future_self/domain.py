@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from .ai import AIService
 from .db import Database
@@ -214,11 +214,25 @@ class ProfileService:
     async def create(self, user_id: int, answers: dict[str, str]) -> VisionProfile:
         summary = await self.ai.summarize_vision(answers)
         async with self.db.session() as session:
-            user = await session.get(User, user_id)
-            if user is None:
+            locked_owner_id = await session.scalar(
+                update(User)
+                .where(User.id == user_id)
+                .values(updated_at=User.updated_at)
+                .returning(User.id)
+            )
+            if locked_owner_id is None:
                 raise ValueError("User not found")
+            user = await session.get(User, locked_owner_id)
+            if user is None:
+                raise RuntimeError("Profile owner disappeared")
             if timezone := answers.get("timezone"):
-                user.timezone = canonical_timezone(timezone)
+                from .recurring_reminders import RecurringTaskReminderService
+
+                await RecurringTaskReminderService(self.db).refresh_profile_timezone_in_session(
+                    session,
+                    user.id,
+                    canonical_timezone(timezone),
+                )
             user.display_name = (
                 normalize_display_name(display_name, clip_legacy=True)
                 if (display_name := answers.get("display_name"))

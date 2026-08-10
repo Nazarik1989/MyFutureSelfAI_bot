@@ -912,6 +912,7 @@ class BotAutotester:
             "overdue": "task:list:overdue:0",
             "no-due": "task:list:no_due:0",
             "completed": "task:list:completed:0",
+            "recurring": "task:recurring:0",
         }.get(action)
         labels = {
             "open": "Открыть",

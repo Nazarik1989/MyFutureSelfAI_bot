@@ -272,6 +272,12 @@ class AccessHandlers:
             context=context,
             source_message=update.effective_message,
         )
+        await self.reminder_sync_access(
+            user,
+            chat.id,
+            context=context,
+            source_message=update.effective_message,
+        )
         await self._sync_access_commands(
             context, chat.id, user.telegram_id, tier, user.access_version
         )

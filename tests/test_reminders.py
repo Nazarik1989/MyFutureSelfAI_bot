@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import func, select
 
+import future_self.bot as bot_module
 from future_self.access import BLOCKED, GUEST, SUBSCRIBER, AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
@@ -318,6 +319,8 @@ async def test_relative_reminder_text_and_voice_route_save_and_deliver(
     if source == "text":
         await bot.text(route_update(capture, user_id, chat_id), context)
     else:
+        await bot._user(user_id)
+        await AccessService(db).grant_subscriber(user_id, source="relative-reminder-test")
         await bot.voice(route_update(capture, user_id, chat_id), context)
     assert fake_ai.route_calls == []
 
@@ -955,9 +958,10 @@ async def test_bot_startup_expires_very_old_reminder_without_telegram_delivery(d
     )
     await bot._post_init(SimpleNamespace(bot=TelegramBot(), job_queue=Queue()))
     assert sent == []
-    assert len(repeating) == 2
+    assert len(repeating) == 3
     assert {item.get("name") for item in repeating} == {
         "labs:cleanup",
+        "recurring-task-reminders:persistent-outbox",
         "task-reminders:persistent-outbox",
     }
     assert len(command_registrations) == 1
@@ -1008,8 +1012,9 @@ async def test_bot_startup_immediate_delivery_skips_guest_reminder(db, fake_ai):
     assert (stored.status, stored.attempt_count, stored.claim_token) == ("pending", 0, None)
 
 
-def test_scheduler_registers_single_persistent_outbox_poller():
+async def test_scheduler_registers_distinct_persistent_outbox_pollers():
     calls: list[dict[str, object]] = []
+    delivered: list[str] = []
 
     class FakeQueue:
         def run_repeating(self, callback, **kwargs):
@@ -1018,10 +1023,136 @@ def test_scheduler_registers_single_persistent_outbox_poller():
     async def send(chat_id: int, text: str) -> int:
         return 1
 
+    class Engine:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def deliver_due(self):
+            delivered.append(self.name)
+
     scheduler = JobQueueScheduler(FakeQueue(), send, 8, 21, 6)
-    engine = SimpleNamespace(deliver_due=None)
-    scheduler.start_task_reminders(engine, interval_seconds=15)
-    assert len(calls) == 1
-    assert calls[0]["interval"] == 15
-    assert calls[0]["first"] == 15
-    assert calls[0]["name"] == "task-reminders:persistent-outbox"
+    scheduler.start_task_reminders(Engine("one-shot"), interval_seconds=15)
+    scheduler.start_recurring_task_reminders(Engine("recurring"), interval_seconds=15)
+
+    assert len(calls) == 2
+    assert {call["name"] for call in calls} == {
+        "task-reminders:persistent-outbox",
+        "recurring-task-reminders:persistent-outbox",
+    }
+    assert {(call["interval"], call["first"]) for call in calls} == {(15, 15)}
+    for call in calls:
+        await call["callback"](SimpleNamespace())
+    assert delivered == ["one-shot", "recurring"]
+
+
+async def test_post_init_wires_recurring_startup_delivery_and_compensation(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    sent: list[dict[str, object]] = []
+    deleted: list[dict[str, int]] = []
+    repeating: list[dict[str, object]] = []
+    startup_calls = 0
+    engine_init: dict[str, object] = {}
+
+    class RecurringEngineSpy:
+        def __init__(
+            self,
+            engine_db,
+            send,
+            *,
+            delete_sent,
+            grace_minutes,
+            lease_seconds,
+        ):
+            engine_init.update(
+                {
+                    "db": engine_db,
+                    "send": send,
+                    "delete_sent": delete_sent,
+                    "grace_minutes": grace_minutes,
+                    "lease_seconds": lease_seconds,
+                }
+            )
+            self.send = send
+            self.delete_sent = delete_sent
+
+        async def deliver_due(self):
+            nonlocal startup_calls
+            startup_calls += 1
+            delivery = SimpleNamespace(
+                destination_id=98_765,
+                title="Заполнить дневник благодарностей",
+            )
+            message_id = await self.send(delivery)
+            await self.delete_sent(delivery.destination_id, message_id)
+            return 0
+
+    monkeypatch.setattr(bot_module, "RecurringTaskReminderEngine", RecurringEngineSpy)
+
+    class TelegramBot:
+        async def set_my_commands(self, commands, *, scope):
+            return None
+
+        async def set_chat_menu_button(self, *, menu_button):
+            return None
+
+        async def send_message(self, **kwargs):
+            sent.append(kwargs)
+            return SimpleNamespace(message_id=4321)
+
+        async def delete_message(self, **kwargs):
+            deleted.append(kwargs)
+
+    class Queue:
+        def run_repeating(self, callback, **kwargs):
+            repeating.append({"callback": callback, **kwargs})
+
+    settings = route_settings()
+    bot = FutureSelfBot(settings, db, fake_ai, PhraseTranscription(""))
+    await bot._post_init(SimpleNamespace(bot=TelegramBot(), job_queue=Queue()))
+
+    assert startup_calls == 1
+    assert bot.recurring_reminder_engine is not None
+    assert engine_init["db"] is db
+    assert callable(engine_init["send"])
+    assert callable(engine_init["delete_sent"])
+    assert engine_init["grace_minutes"] == settings.recurring_task_reminder_grace_minutes
+    assert engine_init["lease_seconds"] == settings.task_reminder_lease_seconds
+    assert sent == [
+        {
+            "chat_id": 98_765,
+            "text": "🔔 Ежедневное напоминание\n\nЗаполнить дневник благодарностей",
+        }
+    ]
+    assert deleted == [{"chat_id": 98_765, "message_id": 4321}]
+    assert {call["name"] for call in repeating} == {
+        "labs:cleanup",
+        "task-reminders:persistent-outbox",
+        "recurring-task-reminders:persistent-outbox",
+    }
+
+    recurring_job = next(
+        call for call in repeating if call["name"] == "recurring-task-reminders:persistent-outbox"
+    )
+    await recurring_job["callback"](SimpleNamespace())
+    assert startup_calls == 2
+    assert len(sent) == 2
+    assert len(deleted) == 2
+
+
+async def test_post_init_without_job_queue_keeps_reminder_engines_disabled(db, fake_ai):
+    class TelegramBot:
+        async def set_my_commands(self, commands, *, scope):
+            return None
+
+        async def set_chat_menu_button(self, *, menu_button):
+            return None
+
+    bot = FutureSelfBot(route_settings(), db, fake_ai, PhraseTranscription(""))
+    await bot._post_init(SimpleNamespace(bot=TelegramBot(), job_queue=None))
+
+    assert bot.scheduler is None
+    assert bot.reminder_engine is None
+    assert bot.recurring_reminder_engine is None

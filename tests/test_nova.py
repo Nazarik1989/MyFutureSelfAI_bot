@@ -34,7 +34,14 @@ def test_catalog_uses_canonical_navigation_labels_and_descriptions():
     sections = navigation_sections(True, True, True)
     topics = help_topics(True, True, True)
 
-    for action_id in ("task_create", "vision", "spaces", "knowledge", "capture"):
+    for action_id in (
+        "task_create",
+        "task_reminder_guide",
+        "vision",
+        "spaces",
+        "knowledge",
+        "capture",
+    ):
         capability = catalog.capability(action_id)
         assert capability is not None
         assert (capability.label, capability.description) == (
@@ -144,6 +151,62 @@ def test_required_known_questions_resolve_locally(question, expected_action):
     )
     assert result.cta_label == expected_cta
     assert 1 <= len(result.steps) <= 3
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_fragment"),
+    [
+        (
+            "Как в боте создать ежедневное напоминание?",
+            "создаётся обычной фразой",
+        ),
+        (
+            "Как в боте изменить время ежедневного напоминания?",
+            "меняется в карточке",
+        ),
+        (
+            "Как в боте отключить ежедневное напоминание?",
+            "сама задача остаётся",
+        ),
+    ],
+)
+def test_daily_reminder_help_stays_local_when_nova_ai_is_enabled(
+    question,
+    expected_fragment,
+):
+    catalog = build_nova_catalog(
+        SUBSCRIBER,
+        NovaRuntimeFlags(enable_nova_ai=True, nova_ai_admin_only=False),
+    )
+
+    assert "nova_ai" in catalog.enabled_features
+    assert is_nova_help_intent(question, catalog)
+    result = resolve_nova_question(question, catalog)
+
+    assert result is not None
+    assert result.kind is NovaResolutionKind.GUIDE
+    assert result.action_id == "task_reminder_guide"
+    assert expected_fragment in result.response
+    assert result.cta_label == catalog.capability("task_reminder_guide").label
+
+
+def test_daily_reminder_help_respects_disabled_delivery_flag():
+    catalog = build_nova_catalog(
+        SUBSCRIBER,
+        NovaRuntimeFlags(enable_task_reminders=False),
+    )
+
+    result = resolve_nova_question(
+        "Nova, как отключить ежедневное напоминание?",
+        catalog,
+    )
+
+    assert "task_reminders" not in catalog.enabled_features
+    assert result is not None
+    assert result.kind is NovaResolutionKind.GUIDE
+    assert result.action_id == "task_reminder_guide"
+    assert "отключена настройкой" in result.response
+    assert "сама задача остаётся" not in result.response
 
 
 def test_optional_features_resolve_only_when_enabled():
@@ -323,6 +386,7 @@ def test_shared_help_intent_requires_capability_in_current_catalog():
         "Расскажи подробнее",
         "Как это работает?",
         "Покажи, где это",
+        "Напоминай каждый день в 19:30 позвонить маме",
     ],
 )
 def test_shared_help_intent_does_not_capture_content_or_contextless_follow_up(text):

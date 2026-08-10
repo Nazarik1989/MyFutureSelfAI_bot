@@ -452,7 +452,13 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "doctor_find",
         "doctor_find_task",
     } <= commands
-    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 17
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 18
+    assert any(
+        isinstance(handler, CallbackQueryHandler)
+        and handler.callback.__name__ == "reminder_callback"
+        and getattr(handler.pattern, "pattern", None) == r"^rmd:[A-Za-z0-9_-]+$"
+        for handler in handlers
+    )
     assert any(
         isinstance(handler, CallbackQueryHandler) and handler.callback.__name__ == "nova_callback"
         for handler in handlers
@@ -699,6 +705,527 @@ async def test_real_application_stops_natural_navigation_before_downstream_conte
         assert len((await session.scalars(select(InboxItem))).all()) == 0
         assert len((await session.scalars(select(DraftInboxItem))).all()) == 0
         assert len((await session.scalars(select(ConversationMessage))).all()) == 0
+
+
+async def test_real_application_explicit_reminder_owns_text_and_callback_once(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712360
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        106,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text="Напомни завтра в 19:30 заполнить дневник благодарностей",
+    )
+    canonical_message = Message(
+        206,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="🔔 Проверь напоминание",
+    )
+    update = Update(1006, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    canonical_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    answers: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return canonical_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return canonical_message
+
+    async def fake_answer_callback_query(self, callback_query_id, *args, **kwargs):
+        del self, args
+        answers.append({"callback_query_id": callback_query_id, **kwargs})
+        return True
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def forbidden_provider(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("reminder routing must not call AI")
+
+    async def downstream_handler(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_provider)
+    monkeypatch.setattr(fake_ai, "nova_help", forbidden_provider, raising=False)
+    downstream_probe = TypeHandler(Update, downstream_handler)
+    application.add_handler(downstream_probe, group=100)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    assert len(sent) == 1
+    assert len(edits) == 1
+    assert sent[0]["text"] == "🔔 Готовлю напоминание…"
+    assert sent[0].get("reply_markup") is None
+    assert edits[0]["message_id"] == canonical_message.message_id
+    assert str(edits[0]["text"]).startswith("🔔 Проверь напоминание")
+    reminder_callbacks = [
+        str(button.callback_data)
+        for row in edits[0]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert reminder_callbacks
+    assert all(callback.startswith("rmd:") for callback in reminder_callbacks)
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat.id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == canonical_message.message_id
+    assert (
+        await core.nova_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+    application.remove_handler(downstream_probe, group=100)
+
+    cancel_data = next(
+        str(button.callback_data)
+        for row in edits[0]["reply_markup"].inline_keyboard
+        for button in row
+        if button.text == "Отмена"
+    )
+    query = CallbackQuery(
+        "runtime-reminder-cancel",
+        telegram_user,
+        "runtime-reminder-chat",
+        message=canonical_message,
+        data=cancel_data,
+    )
+    callback_update = Update(1007, callback_query=query)
+    callback_update.set_bot(application.bot)
+    query.set_bot(application.bot)
+
+    await application.process_update(callback_update)
+
+    assert len(answers) == 1
+    assert answers[0]["callback_query_id"] == query.id
+    assert len(sent) == 1
+    assert len(edits) == 2
+    assert edits[-1]["text"] == "🔔 Напоминание отменено. Ничего не сохранено."
+    assert downstream == []
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+
+
+async def test_real_application_ordinary_text_keeps_generic_pipeline(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712361
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    phrase = "Привет"
+    source_message = Message(
+        107,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=phrase,
+    )
+    bot_message = Message(
+        207,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Привет!",
+    )
+    update = Update(1008, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    bot_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return bot_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+
+    await application.process_update(update)
+
+    assert [call[0] for call in fake_ai.route_calls] == [phrase]
+    assert sent and sent[-1]["text"] == "Привет!"
+    assert all(
+        not str(button.callback_data).startswith("rmd:")
+        for item in sent
+        if item.get("reply_markup") is not None
+        for row in getattr(item["reply_markup"], "inline_keyboard", ())
+        for button in row
+    )
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+
+
+async def test_real_application_explicit_voice_reminder_reuses_progress_message(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    transcript = "Каждый день в 19:30 напоминай заполнить дневник"
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712364
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        110,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        voice=RuntimeVoice(),
+    )
+    progress_message = Message(
+        210,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…",
+    )
+    update = Update(1011, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    progress_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return progress_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return progress_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def forbidden_provider(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("voice reminder routing must not call AI")
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_provider)
+    monkeypatch.setattr(fake_ai, "nova_help", forbidden_provider, raising=False)
+
+    await application.process_update(update)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert len(sent) == 1
+    assert sent[0]["text"] == "Расшифровываю голосовую мысль…"
+    assert len(edits) == 1
+    assert edits[0]["message_id"] == progress_message.message_id
+    assert str(edits[0]["text"]).startswith("🔁 Проверь напоминание")
+    assert "Я услышал" not in str(edits[0]["text"])
+    assert all(
+        str(button.callback_data).startswith("rmd:")
+        for row in edits[0]["reply_markup"].inline_keyboard
+        for button in row
+    )
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat.id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == progress_message.message_id
+    assert transcript not in repr(current)
+    assert (
+        await core.nova_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+
+
+async def test_real_application_onboarding_owns_explicit_reminder_text(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712362
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        session.add(
+            OnboardingState(
+                user_id=owner.id,
+                current_step=2,
+                answers={"display_name": "Тест"},
+                status="in_progress",
+            )
+        )
+
+    phrase = "Напомни завтра в 19:30 заполнить дневник"
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        108,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=phrase,
+    )
+    bot_message = Message(
+        208,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Регистрация",
+    )
+    update = Update(1009, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    bot_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return bot_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+
+    await application.process_update(update)
+
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+    assert state is not None
+    assert state.current_step == 3
+    assert state.answers["future_life"] == phrase
+    assert fake_ai.route_calls == []
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+    assert all(
+        not str(button.callback_data).startswith("rmd:")
+        for item in sent
+        if item.get("reply_markup") is not None
+        for row in getattr(item["reply_markup"], "inline_keyboard", ())
+        for button in row
+    )
+
+
+async def test_real_application_onboarding_owns_explicit_reminder_voice(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    transcript = "Напомни завтра в 19:30 заполнить дневник"
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712363
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        session.add(
+            OnboardingState(
+                user_id=owner.id,
+                current_step=2,
+                answers={"display_name": "Тест"},
+                status="in_progress",
+            )
+        )
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        109,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        voice=RuntimeVoice(),
+    )
+    progress_message = Message(
+        209,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…",
+    )
+    update = Update(1010, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    progress_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return progress_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return progress_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+
+    await application.process_update(update)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+    assert state is not None
+    assert state.current_step == 3
+    assert state.answers["future_life"] == transcript
+    assert fake_ai.route_calls == []
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+    assert all(
+        not str(button.callback_data).startswith("rmd:")
+        for item in [*sent, *edits]
+        if item.get("reply_markup") is not None
+        for row in getattr(item["reply_markup"], "inline_keyboard", ())
+        for button in row
+    )
 
 
 async def test_real_application_explicit_nova_uses_one_canonical_message_and_stops_pipeline(

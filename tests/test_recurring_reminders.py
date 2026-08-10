@@ -15,6 +15,7 @@ from future_self.models import (
     User,
 )
 from future_self.recurring_reminders import (
+    RecurringFenceLost,
     RecurringScheduleConflict,
     RecurringTaskNotEligible,
     RecurringTaskReminderEngine,
@@ -205,6 +206,59 @@ async def test_create_daily_is_owner_fenced_idempotent_and_lists_active(db):
     assert await service.list_active(owner.id) == (first.schedule,)
 
 
+async def test_create_daily_in_session_uses_caller_lock_and_is_idempotent(db):
+    owner, item, _state = await create_task(db)
+    service = RecurringTaskReminderService(db)
+    now = datetime(2026, 8, 10, 15, tzinfo=UTC)
+
+    async with db.session() as session:
+        await session.execute(
+            update(User).where(User.id == owner.id).values(updated_at=User.updated_at)
+        )
+        first = await service.create_daily_in_session(
+            session,
+            owner.id,
+            item.id,
+            time(19, 30),
+            now=now,
+        )
+        repeated = await service.create_daily_in_session(
+            session,
+            owner.id,
+            item.id,
+            time(19, 30),
+            now=now,
+        )
+
+    assert first.changed is True and first.schedule is not None
+    assert repeated.changed is False
+    assert repeated.schedule == first.schedule
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 1
+
+
+async def test_create_daily_in_session_never_commits_caller_transaction(db):
+    owner, item, _state = await create_task(db)
+    service = RecurringTaskReminderService(db)
+
+    with pytest.raises(RuntimeError, match="rollback sentinel"):
+        async with db.session() as session:
+            await session.execute(
+                update(User).where(User.id == owner.id).values(updated_at=User.updated_at)
+            )
+            await service.create_daily_in_session(
+                session,
+                owner.id,
+                item.id,
+                time(19, 30),
+                now=datetime(2026, 8, 10, 15, tzinfo=UTC),
+            )
+            raise RuntimeError("rollback sentinel")
+
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
 async def test_explicit_timezone_wins_and_profile_timezone_is_authoritative(db):
     owner, item, _state = await create_task(db, timezone="Europe/Saratov")
     service = RecurringTaskReminderService(db)
@@ -239,6 +293,107 @@ async def test_explicit_timezone_wins_and_profile_timezone_is_authoritative(db):
     )
     assert profile.schedule is not None
     assert profile.schedule.timezone == "Europe/Saratov"
+
+
+async def test_profile_timezone_refresh_moves_only_active_profile_generation(db):
+    owner, profile_item, _state = await create_task(db, timezone="Europe/Moscow")
+    async with db.session() as session:
+        explicit_item = InboxItem(
+            user_id=owner.id,
+            kind="task",
+            title="Explicit timezone task",
+            raw_text="explicit timezone task",
+            source="text",
+            status="confirmed",
+        )
+        session.add(explicit_item)
+        await session.flush()
+        session.add(
+            TaskState(
+                owner_id=owner.id,
+                inbox_item_id=explicit_item.id,
+                status="active",
+                timezone="Europe/Moscow",
+            )
+        )
+        await session.flush()
+
+    service = RecurringTaskReminderService(db)
+    before_due = datetime(2026, 8, 10, 15, tzinfo=UTC)
+    due = datetime(2026, 8, 10, 16, 30, tzinfo=UTC)
+    profile = await service.create_daily(
+        owner.id,
+        profile_item.id,
+        time(19, 30),
+        now=before_due,
+    )
+    explicit = await service.create_daily(
+        owner.id,
+        explicit_item.id,
+        time(19, 30),
+        timezone="Europe/Moscow",
+        timezone_source="explicit",
+        now=before_due,
+    )
+    assert profile.schedule is not None and explicit.schedule is not None
+    assert await service.materialize_due(now=due) == 2
+
+    changed = await service.refresh_profile_timezone(
+        owner.id,
+        "Europe/Saratov",
+        now=due + timedelta(minutes=1),
+    )
+
+    assert len(changed) == 1
+    assert changed[0].id == profile.schedule.id
+    assert (changed[0].timezone, changed[0].version) == ("Europe/Saratov", 2)
+    assert changed[0].next_occurrence_at == datetime(2026, 8, 11, 15, 30, tzinfo=UTC)
+    stored_profile = await service.get(owner.id, profile_item.id)
+    stored_explicit = await service.get(owner.id, explicit_item.id)
+    assert stored_profile == changed[0]
+    assert stored_explicit == explicit.schedule
+    assert (await occurrence_for(db, profile.schedule.id)).status == "cancelled"
+    assert (await occurrence_for(db, explicit.schedule.id)).status == "pending"
+    async with db.sessions() as session:
+        stored_owner = await session.get(User, owner.id)
+    assert stored_owner is not None and stored_owner.timezone == "Europe/Saratov"
+
+
+async def test_in_session_timezone_refresh_defers_disabled_schedule_until_reenable(db):
+    owner, item, _state = await create_task(db, timezone="Europe/Moscow")
+    service = RecurringTaskReminderService(db)
+    now = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    created = await service.create_daily(owner.id, item.id, time(19, 30), now=now)
+    assert created.schedule is not None
+    disabled = await service.disable(
+        owner.id,
+        item.id,
+        expected_version=created.schedule.version,
+    )
+    assert disabled.schedule is not None
+
+    async with db.session() as session:
+        await session.execute(
+            update(User).where(User.id == owner.id).values(updated_at=User.updated_at)
+        )
+        changed = await service.refresh_profile_timezone_in_session(
+            session,
+            owner.id,
+            "Europe/Saratov",
+            now=now,
+        )
+
+    assert changed == ()
+    still_disabled = await service.get(owner.id, item.id)
+    assert still_disabled == disabled.schedule
+    reenabled = await service.reenable(
+        owner.id,
+        item.id,
+        expected_version=disabled.schedule.version,
+        now=now,
+    )
+    assert reenabled.schedule is not None
+    assert (reenabled.schedule.timezone, reenabled.schedule.version) == ("Europe/Saratov", 3)
 
 
 @pytest.mark.parametrize(
@@ -314,6 +469,81 @@ async def test_update_noop_and_version_fences_pending_occurrence(db):
     assert stored.status == "cancelled"
     assert stored.schedule_version == 1
     assert as_utc(stored.scheduled_for) == due
+
+
+async def test_mutations_reject_stale_expected_schedule_version(db):
+    service, owner, item, due = await create_due_schedule(db)
+    schedule = await service.get(owner.id, item.id)
+    assert schedule is not None
+
+    updated = await service.update_time(
+        owner.id,
+        item.id,
+        time(12),
+        expected_version=schedule.version,
+        now=due,
+    )
+    assert updated.changed is True and updated.schedule is not None
+    assert updated.schedule.version == 2
+
+    with pytest.raises(RecurringFenceLost, match="schedule version changed"):
+        await service.disable(
+            owner.id,
+            item.id,
+            expected_version=schedule.version,
+        )
+    unchanged = await service.get(owner.id, item.id)
+    assert unchanged == updated.schedule
+
+    disabled = await service.disable(
+        owner.id,
+        item.id,
+        expected_version=updated.schedule.version,
+    )
+    assert disabled.changed is True and disabled.schedule is not None
+    assert (disabled.schedule.status, disabled.schedule.version) == ("disabled", 3)
+
+    with pytest.raises(RecurringFenceLost, match="schedule version changed"):
+        await service.reenable(
+            owner.id,
+            item.id,
+            expected_version=updated.schedule.version,
+            now=due,
+        )
+    reenabled = await service.reenable(
+        owner.id,
+        item.id,
+        expected_version=disabled.schedule.version,
+        now=due,
+    )
+    assert reenabled.changed is True and reenabled.schedule is not None
+    assert (reenabled.schedule.status, reenabled.schedule.version) == ("active", 4)
+
+
+async def test_concurrent_expected_version_mutations_allow_one_generation_change(db):
+    service, owner, item, due = await create_due_schedule(db)
+    first = RecurringTaskReminderService(db)
+    second = RecurringTaskReminderService(db)
+
+    outcomes = await asyncio.gather(
+        first.update_time(
+            owner.id,
+            item.id,
+            time(12),
+            expected_version=1,
+            now=due,
+        ),
+        second.disable(owner.id, item.id, expected_version=1),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(outcome, RecurringFenceLost) for outcome in outcomes) == 1
+    mutations = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+    assert len(mutations) == 1
+    assert mutations[0].changed is True
+    stored = await service.get(owner.id, item.id)
+    assert stored is not None
+    assert stored.version == 2
 
 
 async def test_update_time_retains_existing_explicit_timezone_when_omitted(db):
@@ -785,11 +1015,10 @@ async def test_begin_delivery_atomically_skips_when_fresh_grace_expired(db):
     assert schedule.next_occurrence_at == due + timedelta(days=1)
 
 
-async def test_retry_keeps_delivery_key_and_backoff(db):
+async def test_pre_transport_retry_keeps_delivery_key_and_backoff(db):
     service, _owner, _item, due = await create_due_schedule(db)
     await service.materialize_due(now=due)
     claimed = (await service.claim_due(now=due))[0]
-    assert await service.begin_delivery(claimed, now=due)
     assert await service.release_retry(claimed, RuntimeError("private provider body"), now=due)
 
     assert await service.claim_due(now=due + timedelta(seconds=4)) == ()
@@ -798,6 +1027,7 @@ async def test_retry_keeps_delivery_key_and_backoff(db):
     async with db.sessions() as session:
         stored = await session.get(RecurringTaskReminderOccurrence, claimed.id)
     assert stored.last_error_type == "RuntimeError"
+    assert stored.delivery_started_at is None
 
 
 async def test_repeated_mark_sent_is_idempotent_and_advances_once(db):
@@ -1101,35 +1331,152 @@ async def test_task_completion_during_send_completes_schedule_and_compensates(db
     assert stored.status == "skipped_stale"
 
 
-async def test_cancelled_send_keeps_uncertainty_fence_and_propagates(db):
+async def test_transport_exception_is_uncertain_and_never_replays_occurrence(db):
     service, owner, item, due = await create_due_schedule(db)
-    calls = 0
+    calls = []
+    clock = [due]
+
+    def at(moment):
+        clock[0] = moment
+        return moment
 
     async def send(delivery):
-        nonlocal calls
-        calls += 1
-        raise asyncio.CancelledError
+        calls.append((delivery.occurrence_id, delivery.delivery_key))
+        if len(calls) == 1:
+            raise RuntimeError("transport outcome is private and uncertain")
+        return 912
 
-    with pytest.raises(asyncio.CancelledError):
-        await RecurringTaskReminderEngine(db, send).deliver_due(now=due)
-    assert (
-        await RecurringTaskReminderEngine(db, send).deliver_due(now=due + timedelta(seconds=121))
-        == 0
+    engine = RecurringTaskReminderEngine(
+        db,
+        send,
+        lease_seconds=30,
+        now_provider=lambda: clock[0],
     )
-    assert calls == 1
-
-    assert (
-        await RecurringTaskReminderEngine(db, send).deliver_due(now=due + timedelta(minutes=121))
-        == 0
-    )
-    assert calls == 1
+    assert await engine.deliver_due(now=at(due)) == 0
 
     schedule = await service.get(owner.id, item.id)
-    stored = await occurrence_for(db, schedule.id)  # type: ignore[union-attr]
+    assert schedule is not None
+    first = await occurrence_for(db, schedule.id)
+    first_key = first.delivery_key
+    assert (first.status, first.attempt_count) == ("processing", 1)
+    assert first.claim_token is not None
+    assert as_utc(first.claimed_at) == due
+    assert as_utc(first.delivery_started_at) == due
+    assert first_key == f"recurring:{schedule.id}:v1:{due.date().isoformat()}"
+
+    assert await engine.deliver_due(now=at(due + timedelta(seconds=29))) == 0
+    assert await engine.deliver_due(now=at(due + timedelta(seconds=31))) == 0
+    restarted = RecurringTaskReminderEngine(
+        db,
+        send,
+        lease_seconds=30,
+        now_provider=lambda: clock[0],
+    )
+    assert await restarted.deliver_due(now=at(due + timedelta(seconds=60))) == 0
+    assert calls == [(first.id, first_key)]
+
+    assert await restarted.deliver_due(now=at(due + timedelta(minutes=121))) == 0
+    skipped = await occurrence_for(db, schedule.id)
+    refreshed = await service.get(owner.id, item.id)
+    assert refreshed is not None
+    assert (skipped.status, skipped.attempt_count, skipped.delivery_key) == (
+        "skipped_stale",
+        1,
+        first_key,
+    )
+    assert skipped.claim_token is None
+    assert skipped.delivery_started_at is None
+    assert refreshed.next_occurrence_at == due + timedelta(days=1)
+
+    next_due = due + timedelta(days=1)
+    assert await restarted.deliver_due(now=at(next_due)) == 1
+    assert await restarted.deliver_due(now=at(next_due + timedelta(minutes=1))) == 0
+    occurrences = await occurrences_for(db, schedule.id)
+    assert len(occurrences) == 2
+    first, second = occurrences
+    assert (first.status, first.attempt_count, first.delivery_key) == (
+        "skipped_stale",
+        1,
+        first_key,
+    )
+    assert (second.status, second.attempt_count, second.telegram_message_id) == (
+        "sent",
+        1,
+        912,
+    )
+    assert second.delivery_key == f"recurring:{schedule.id}:v1:{next_due.date().isoformat()}"
+    assert calls == [
+        (first.id, first.delivery_key),
+        (second.id, second.delivery_key),
+    ]
+
+
+async def test_cancelled_send_keeps_uncertainty_fence_and_propagates(db):
+    service, owner, item, due = await create_due_schedule(db)
+    calls = []
+    clock = [due]
+
+    def at(moment):
+        clock[0] = moment
+        return moment
+
+    async def send(delivery):
+        calls.append((delivery.occurrence_id, delivery.delivery_key))
+        if len(calls) == 1:
+            raise asyncio.CancelledError
+        return 913
+
+    engine = RecurringTaskReminderEngine(
+        db,
+        send,
+        lease_seconds=30,
+        now_provider=lambda: clock[0],
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await engine.deliver_due(now=at(due))
+
+    schedule = await service.get(owner.id, item.id)
+    assert schedule is not None
+    first = await occurrence_for(db, schedule.id)
+    first_key = first.delivery_key
+    assert (first.status, first.attempt_count) == ("processing", 1)
+    assert first.claim_token is not None
+    assert as_utc(first.delivery_started_at) == due
+
+    assert await engine.deliver_due(now=at(due + timedelta(seconds=29))) == 0
+    assert await engine.deliver_due(now=at(due + timedelta(seconds=31))) == 0
+    restarted = RecurringTaskReminderEngine(
+        db,
+        send,
+        lease_seconds=30,
+        now_provider=lambda: clock[0],
+    )
+    assert await restarted.deliver_due(now=at(due + timedelta(seconds=60))) == 0
+    assert calls == [(first.id, first_key)]
+
+    assert await restarted.deliver_due(now=at(due + timedelta(minutes=121))) == 0
+    stored = await occurrence_for(db, schedule.id)
     assert stored.status == "skipped_stale"
+    assert stored.attempt_count == 1
+    assert stored.delivery_key == first_key
     assert stored.claim_token is None
     assert stored.delivery_started_at is None
-    assert schedule.next_occurrence_at == due + timedelta(days=1)
+    refreshed = await service.get(owner.id, item.id)
+    assert refreshed is not None
+    assert refreshed.next_occurrence_at == due + timedelta(days=1)
+
+    next_due = due + timedelta(days=1)
+    assert await restarted.deliver_due(now=at(next_due)) == 1
+    assert await restarted.deliver_due(now=at(next_due + timedelta(minutes=1))) == 0
+    occurrences = await occurrences_for(db, schedule.id)
+    assert [(row.status, row.attempt_count) for row in occurrences] == [
+        ("skipped_stale", 1),
+        ("sent", 1),
+    ]
+    assert calls == [
+        (occurrences[0].id, occurrences[0].delivery_key),
+        (occurrences[1].id, occurrences[1].delivery_key),
+    ]
 
 
 @pytest.mark.parametrize("stage", ["readiness", "begin"])
@@ -1211,6 +1558,11 @@ async def test_send_success_mark_failure_is_uncertain_and_not_lease_reclaimed(db
 async def test_private_command_and_transport_error_are_not_persisted_or_logged(db, caplog):
     service, owner, item, due = await create_due_schedule(db)
     sentinel = "PRIVATE_PROVIDER_RESPONSE_SENTINEL"
+    title_sentinel = "PRIVATE_TASK_TITLE_SENTINEL"
+    async with db.session() as session:
+        stored_item = await session.get(InboxItem, item.id)
+        assert stored_item is not None
+        stored_item.title = title_sentinel
 
     async def send(delivery):
         raise RuntimeError(sentinel)
@@ -1220,8 +1572,14 @@ async def test_private_command_and_transport_error_are_not_persisted_or_logged(d
 
     schedule = await service.get(owner.id, item.id)
     stored = await occurrence_for(db, schedule.id)  # type: ignore[union-attr]
-    assert stored.last_error_type == "RuntimeError"
+    assert (stored.status, stored.attempt_count) == ("processing", 1)
+    assert stored.delivery_started_at is not None
+    assert stored.last_error_type is None
+    assert f"occurrence_id={stored.id}" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
     assert sentinel not in caplog.text
+    assert title_sentinel not in caplog.text
+    assert "private recurring command sentinel" not in caplog.text
     async with db.sessions() as session:
         persisted = await session.scalar(
             select(RecurringTaskReminderSchedule).where(

@@ -124,6 +124,7 @@ class NavigationHandlers:
         command = command.split("@", maxsplit=1)[0].casefold()
         flow = await self._active_navigation_flow(update, context)
         if flow is None:
+            await self.reminder_clear_current(update)
             if command != "/help":
                 await self.nova_clear_current(update)
             if hasattr(self, "collection_service"):
@@ -133,6 +134,7 @@ class NavigationHandlers:
                 if self._workspace_enabled():
                     await self.workspace_service.cancel_input(user.id, update.effective_chat.id)
             return
+        await self.reminder_clear_current(update)
         if command == "/help":
             await self._nova_flow_help(update.effective_message, update, flow)
             raise ApplicationHandlerStop
@@ -148,6 +150,12 @@ class NavigationHandlers:
         if onboarding_result is not None:
             raise ApplicationHandlerStop
         text = update.effective_message.text or ""
+        flow = await self._active_navigation_flow(update, context)
+        if flow is None:
+            if await self.reminder_text_gate(update, context):
+                raise ApplicationHandlerStop
+        else:
+            await self.reminder_clear_current(update)
         if await self.nova_text_gate(update, context):
             raise ApplicationHandlerStop
         command = self.natural_command_router.route(text)
@@ -199,6 +207,7 @@ class NavigationHandlers:
     ) -> int | None:
         query = update.callback_query
         data = query.data or ""
+        await self.reminder_clear_current(update)
         if data.startswith("nav:flow:"):
             return await self._navigation_flow_action(update, context)
 

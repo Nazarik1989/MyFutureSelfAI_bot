@@ -206,6 +206,7 @@ class NovaHandlers:
             or getattr(message, "audio", None) is not None
         ):
             return
+        await self.reminder_clear_current(update)
         await self.nova_clear_current(update)
 
     async def nova_text_gate(
@@ -1151,6 +1152,11 @@ class NovaHandlers:
         return capability
 
     async def nova_cancel_gate(self, update: Any, context: Any) -> None:
+        flow = await self._active_navigation_flow(update, context)
+        if flow is None and await self.reminder_cancel_gate(update, context):
+            from telegram.ext import ApplicationHandlerStop
+
+            raise ApplicationHandlerStop
         user = await self._user(update.effective_user.id)
         current = await self.nova_sessions.current(
             owner_id=user.id,
@@ -1160,7 +1166,6 @@ class NovaHandlers:
         if current is None:
             return
         if require_access_tier(user.access_tier) != GUEST:
-            flow = await self._active_navigation_flow(update, context)
             if flow is not None:
                 return
         async with self._nova_ui_lock:

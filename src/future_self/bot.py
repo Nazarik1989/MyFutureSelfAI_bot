@@ -12,6 +12,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
+from sqlalchemy import update as sql_update
 from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
@@ -96,6 +97,14 @@ from .navigation import NavigationFlowStore
 from .navigation_handlers import NavigationHandlers
 from .nova import NovaSessionStore, is_explicit_nova_invocation
 from .nova_handlers import NovaHandlers
+from .recurring_reminders import (
+    RecurringReminderDelivery,
+    RecurringTaskReminderEngine,
+    RecurringTaskReminderService,
+)
+from .reminder_flow import ReminderFlowStore
+from .reminder_handlers import ReminderHandlers, ReminderVoiceGateState
+from .reminder_intent import ReminderIntentParser
 from .reminders import TaskReminderEngine
 from .repositories import (
     CheckInRepository,
@@ -192,6 +201,7 @@ class FutureSelfBot(
     CollectionHandlers,
     WorkspaceHandlers,
     KnowledgeHandlers,
+    ReminderHandlers,
     NovaHandlers,
     NavigationHandlers,
 ):
@@ -230,6 +240,10 @@ class FutureSelfBot(
         self.nova_sessions = NovaSessionStore()
         self._nova_ui_lock = asyncio.Lock()
         self._nova_launch_lock = asyncio.Lock()
+        self.reminder_sessions = ReminderFlowStore()
+        self._reminder_ui_lock = asyncio.Lock()
+        self._reminder_launch_lock = asyncio.Lock()
+        self._reminder_now_provider = lambda: datetime.now(UTC)
         self.conversation = ConversationContextService(
             db,
             settings.conversation_context_messages,
@@ -238,6 +252,12 @@ class FutureSelfBot(
             settings.system_action_ttl_minutes,
         )
         self.date_resolver = DateResolver()
+        self.reminder_intent_parser = ReminderIntentParser()
+        self.recurring_reminder_service = RecurringTaskReminderService(
+            db,
+            grace_minutes=settings.recurring_task_reminder_grace_minutes,
+            lease_seconds=settings.task_reminder_lease_seconds,
+        )
         self.task_service = TaskService(
             db,
             date_event_hour=settings.task_date_event_hour,
@@ -306,6 +326,7 @@ class FutureSelfBot(
         )
         self.scheduler: JobQueueScheduler | None = None
         self.reminder_engine: TaskReminderEngine | None = None
+        self.recurring_reminder_engine: RecurringTaskReminderEngine | None = None
         self._guest_maintenance_task: asyncio.Task[None] | None = None
 
     @property
@@ -611,6 +632,12 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("doctor_find", self.doctor_find))
         app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
+        app.add_handler(
+            CallbackQueryHandler(
+                self.reminder_callback,
+                pattern=r"^rmd:[A-Za-z0-9_-]+$",
+            )
+        )
         app.add_handler(CallbackQueryHandler(self.task_callback, pattern=r"^task:"))
         app.add_handler(CallbackQueryHandler(self.collection_callback, pattern=r"^collection:"))
         if getattr(self.settings, "enable_workspace_access", False):
@@ -708,6 +735,13 @@ class FutureSelfBot(
         async def delete_stale_reminder(telegram_id: int, message_id: int) -> None:
             await app.bot.delete_message(chat_id=telegram_id, message_id=message_id)
 
+        async def send_recurring(delivery: RecurringReminderDelivery) -> int | None:
+            message = await app.bot.send_message(
+                chat_id=delivery.destination_id,
+                text=f"🔔 Ежедневное напоминание\n\n{delivery.title}",
+            )
+            return getattr(message, "message_id", None)
+
         async def send_vision_companion(preference_id: int, moment: str) -> None:
             await self._vision_companion_notification(app.bot, preference_id, moment)
 
@@ -753,6 +787,18 @@ class FutureSelfBot(
             await self.reminder_engine.deliver_due()
             self.scheduler.start_task_reminders(
                 self.reminder_engine,
+                interval_seconds=self.settings.task_reminder_poll_seconds,
+            )
+            self.recurring_reminder_engine = RecurringTaskReminderEngine(
+                self.db,
+                send_recurring,
+                delete_sent=delete_stale_reminder,
+                grace_minutes=self.settings.recurring_task_reminder_grace_minutes,
+                lease_seconds=self.settings.task_reminder_lease_seconds,
+            )
+            await self.recurring_reminder_engine.deliver_due()
+            self.scheduler.start_recurring_task_reminders(
+                self.recurring_reminder_engine,
                 interval_seconds=self.settings.task_reminder_poll_seconds,
             )
         async with self.db.sessions() as session:
@@ -987,6 +1033,7 @@ class FutureSelfBot(
         raise ApplicationHandlerStop
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.reminder_clear_current(update)
         await self.nova_clear_current(update)
         user = await self._user(update.effective_user.id)
         if user.access_tier == GUEST:
@@ -1542,7 +1589,15 @@ class FutureSelfBot(
             return PROFILE_CONFIRM
         try:
             async with self.db.session() as session:
-                stored_user = await session.get(User, user.id)
+                locked_owner_id = await session.scalar(
+                    sql_update(User)
+                    .where(User.id == user.id)
+                    .values(updated_at=User.updated_at)
+                    .returning(User.id)
+                )
+                if locked_owner_id is None:
+                    raise RuntimeError("Onboarding owner disappeared")
+                stored_user = await session.get(User, locked_owner_id)
                 if stored_user is None:
                     raise RuntimeError("Onboarding owner disappeared")
                 from .repositories import ProfileRepository
@@ -1556,7 +1611,11 @@ class FutureSelfBot(
                 if timezone_value := answers.get("timezone"):
                     from .domain import canonical_timezone
 
-                    stored_user.timezone = canonical_timezone(timezone_value)
+                    await self.recurring_reminder_service.refresh_profile_timezone_in_session(
+                        session,
+                        stored_user.id,
+                        canonical_timezone(timezone_value),
+                    )
                 if location_value := answers.get("location"):
                     location = parse_location(location_value)
                     stored_user.location_city = location.city
@@ -1919,11 +1978,19 @@ class FutureSelfBot(
 
         health_schedule: tuple[int, time] | None = None
         companion_schedule: SimpleNamespace | None = None
+        stale_selection = False
         async with self.db.session() as session:
-            stored_user = await session.scalar(
-                select(User)
-                .where(User.id == user.id, User.telegram_id == update.effective_user.id)
-                .with_for_update()
+            locked_owner_id = await session.scalar(
+                sql_update(User)
+                .where(
+                    User.id == user.id,
+                    User.telegram_id == update.effective_user.id,
+                )
+                .values(updated_at=User.updated_at)
+                .returning(User.id)
+            )
+            stored_user = (
+                await session.get(User, locked_owner_id) if locked_owner_id is not None else None
             )
             state = await OnboardingRepository(session).get_or_create(user.id)
             latest = dict(state.answers)
@@ -1934,44 +2001,52 @@ class FutureSelfBot(
                 or not isinstance(current, dict)
                 or current.get("token") != token
             ):
-                await query.answer("Этот выбор уже обработан.", show_alert=True)
-                return
-            stored_user.timezone = timezone
-            latest["timezone"] = timezone
-            if location is not None:
-                stored_user.location_city = location.city
-                stored_user.location_fallback_city = None
-                latest["location"] = location.label
-            metadata.pop(_PENDING_TIMEZONE_UPDATE, None)
-            latest[_ONBOARDING_META_KEY] = metadata
-            state.answers = latest
+                stale_selection = True
+            else:
+                await self.recurring_reminder_service.refresh_profile_timezone_in_session(
+                    session,
+                    stored_user.id,
+                    timezone,
+                )
+                latest["timezone"] = timezone
+                if location is not None:
+                    stored_user.location_city = location.city
+                    stored_user.location_fallback_city = None
+                    latest["location"] = location.label
+                metadata.pop(_PENDING_TIMEZONE_UPDATE, None)
+                latest[_ONBOARDING_META_KEY] = metadata
+                state.answers = latest
 
-            health = await session.scalar(
-                select(HealthReminderPreference).where(
-                    HealthReminderPreference.user_id == stored_user.id
-                )
-            )
-            if health is not None:
-                health.timezone = timezone
-                if health.enabled:
-                    health_schedule = (health.user_id, health.local_time)
-            companion = await session.scalar(
-                select(VisionCompanionPreference).where(
-                    VisionCompanionPreference.owner_id == stored_user.id
-                )
-            )
-            if companion is not None:
-                companion.timezone = timezone
-                if companion.enabled:
-                    companion_schedule = SimpleNamespace(
-                        id=companion.id,
-                        owner_id=companion.owner_id,
-                        telegram_user_id=stored_user.telegram_id,
-                        timezone=timezone,
-                        morning_time=companion.morning_time,
-                        evening_time=companion.evening_time,
-                        extra_times=tuple(companion.extra_times),
+                health = await session.scalar(
+                    select(HealthReminderPreference).where(
+                        HealthReminderPreference.user_id == stored_user.id
                     )
+                )
+                if health is not None:
+                    health.timezone = timezone
+                    if health.enabled:
+                        health_schedule = (health.user_id, health.local_time)
+                companion = await session.scalar(
+                    select(VisionCompanionPreference).where(
+                        VisionCompanionPreference.owner_id == stored_user.id
+                    )
+                )
+                if companion is not None:
+                    companion.timezone = timezone
+                    if companion.enabled:
+                        companion_schedule = SimpleNamespace(
+                            id=companion.id,
+                            owner_id=companion.owner_id,
+                            telegram_user_id=stored_user.telegram_id,
+                            timezone=timezone,
+                            morning_time=companion.morning_time,
+                            evening_time=companion.evening_time,
+                            extra_times=tuple(companion.extra_times),
+                        )
+
+        if stale_selection:
+            await query.answer("Этот выбор уже обработан.", show_alert=True)
+            return
 
         if self.scheduler is not None:
             self.scheduler.schedule_user(user.telegram_id, timezone)
@@ -2099,6 +2174,12 @@ class FutureSelfBot(
             telegram_user_id=update.effective_user.id,
             chat_id=update.effective_chat.id,
         )
+        voice_reminder_session = await self.reminder_sessions.current(
+            owner_id=voice_user.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+        )
+        voice_access_version = voice_user.access_version
         progress = await update.effective_message.reply_text("Расшифровываю голосовую мысль…")
         try:
             telegram_file = await media.get_file()
@@ -2129,42 +2210,60 @@ class FutureSelfBot(
             if navigation_action is None:
                 await progress.edit_text("Голос распознан и обработан в регистрации.")
             return onboarding_state
-        natural_command = self.natural_command_router.route(text)
-        explicit_unknown = (
-            natural_command is None
-            and self.natural_command_router.is_explicit_navigation_request(text)
-            and self.collection_command_router.route(text) is None
+        voice_flow = await self._active_navigation_flow(update, context)
+        reminder_voice_state = ReminderVoiceGateState(
+            access_expected=is_full_access_tier(voice_user.access_tier)
         )
-        if natural_command is not None or explicit_unknown:
-            action = natural_command.action if natural_command is not None else "help"
-            flow = await self._active_navigation_flow(update, context)
-            if flow is not None and action == "help":
-                # Natural help words can be legitimate answers to a durable
-                # business flow. Let its existing consumer keep ownership.
-                await self.nova_clear_current(update)
-            else:
-                await self.nova_clear_current(update)
-                if flow is not None:
-                    await self._prompt_navigation_flow(
-                        screen_update.effective_message,
-                        update,
-                        flow,
-                    )
-                else:
-                    await self._handle_natural_command(screen_update, context, action)
+        if voice_flow is None:
+            if await self.reminder_voice_gate(
+                update,
+                context,
+                text,
+                progress,
+                expected_access_version=voice_access_version,
+                expected_session=voice_reminder_session,
+                voice_state=reminder_voice_state,
+            ):
                 return
-        if await self.workspace_pending_text(update, text, "voice"):
-            await progress.edit_text("Голос распознан и обработан в пространстве.")
-            return
-        if await self.collection_pending_text(update, text, "voice"):
-            await progress.edit_text("Голос распознан и обработан в разделе.")
-            return
-        if await self.task_pending_text(update, text):
-            await progress.edit_text("Голос распознан и применён к задаче.")
-            return
-        if await self._handle_vision_input(update, text):
-            await progress.edit_text("Голос распознан и добавлен в карточку.")
-            return
+        else:
+            await self.reminder_clear_current(update)
+        if not reminder_voice_state.access_failed:
+            natural_command = self.natural_command_router.route(text)
+            explicit_unknown = (
+                natural_command is None
+                and self.natural_command_router.is_explicit_navigation_request(text)
+                and self.collection_command_router.route(text) is None
+            )
+            if natural_command is not None or explicit_unknown:
+                action = natural_command.action if natural_command is not None else "help"
+                flow = await self._active_navigation_flow(update, context)
+                if flow is not None and action == "help":
+                    # Natural help words can be legitimate answers to a durable
+                    # business flow. Let its existing consumer keep ownership.
+                    await self.nova_clear_current(update)
+                else:
+                    await self.nova_clear_current(update)
+                    if flow is not None:
+                        await self._prompt_navigation_flow(
+                            screen_update.effective_message,
+                            update,
+                            flow,
+                        )
+                    else:
+                        await self._handle_natural_command(screen_update, context, action)
+                    return
+            if await self.workspace_pending_text(update, text, "voice"):
+                await progress.edit_text("Голос распознан и обработан в пространстве.")
+                return
+            if await self.collection_pending_text(update, text, "voice"):
+                await progress.edit_text("Голос распознан и обработан в разделе.")
+                return
+            if await self.task_pending_text(update, text):
+                await progress.edit_text("Голос распознан и применён к задаче.")
+                return
+            if await self._handle_vision_input(update, text):
+                await progress.edit_text("Голос распознан и добавлен в карточку.")
+                return
         if await self.nova_voice_gate(
             update,
             context,
@@ -2173,6 +2272,9 @@ class FutureSelfBot(
             user=voice_user,
             expected_session=voice_nova_session,
         ):
+            return
+        if reminder_voice_state.access_failed:
+            await self._reminder_edit_access_candidate(progress)
             return
         heard_text = _truncate_utf16(text, 4_000)
         await progress.edit_text(f"Я услышал: «{heard_text}»")
@@ -2233,6 +2335,7 @@ class FutureSelfBot(
             return False
         if route.kind == "none":
             return False
+        await self.reminder_clear_current(update)
         await self._handle_system_action_route(update, context, user, snapshot, route)
         return True
 
@@ -4519,6 +4622,7 @@ class FutureSelfBot(
         )
 
     async def evening_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.reminder_clear_current(update)
         context.user_data["evening"] = {}
         await update.effective_message.reply_text(
             "Что сегодня получилось? Даже небольшой шаг считается."
@@ -4567,6 +4671,7 @@ class FutureSelfBot(
         return ConversationHandler.END
 
     async def health_checkin_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.reminder_clear_current(update)
         user = await self._user(update.effective_user.id)
         record_id = None
         command_text = update.effective_message.text or ""
@@ -4762,6 +4867,7 @@ class FutureSelfBot(
         )
 
     async def doctor_prepare_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.reminder_clear_current(update)
         user = await self._user(update.effective_user.id)
         command = (update.effective_message.text or "").split(maxsplit=1)[0]
         command = command.split("@", maxsplit=1)[0]

@@ -15,7 +15,7 @@ from telegram.ext import ApplicationHandlerStop
 from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER, AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
-from future_self.models import Base, ConversationMessage, InboxItem
+from future_self.models import Base, ConversationMessage, DraftInboxItem, InboxItem
 from future_self.nova import NovaSessionStore
 from future_self.nova_handlers import (
     NOVA_ACCESS_CHANGED_TEXT,
@@ -25,6 +25,7 @@ from future_self.nova_handlers import (
     NOVA_ROOT_TEXT,
     NOVA_STALE_ALERT,
 )
+from future_self.reminder_handlers import REMINDER_ACCESS_CHANGED_TEXT
 from future_self.schemas import NovaHelpPlan
 
 
@@ -801,6 +802,43 @@ async def test_voice_help_access_change_during_stt_discards_result_and_context(
         is None
     )
     assert transcript not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ordinary_voice_access_bounce_during_stt_never_reaches_content_pipeline(db):
+    ai = NovaAIStub()
+    user_id = 61_077
+
+    async def bounce_access() -> None:
+        service = AccessService(db)
+        await service.set_guest(user_id, source="ordinary-voice-race")
+        await service.grant_subscriber(user_id, source="ordinary-voice-race")
+
+    transcript = "PRIVATE_ORDINARY_VOICE_TRANSCRIPT о моём обычном дне"
+    transcription = HookedNovaTranscription(transcript, bounce_access)
+    bot = make_bot(db, ai, _transcription=transcription)
+    await user_with_tier(bot, user_id, SUBSCRIBER)
+    route_message = AsyncMock()
+    bot._route_message = route_message
+    message = NovaMessage(voice=NovaVoice())
+    context = nova_context()
+
+    await bot.voice(update_for(message, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    route_message.assert_not_awaited()
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert len(message.replies) == 1
+    progress = message.replies[0]["message"]
+    assert len(progress.edits) == 1
+    assert progress.edits[0]["text"] == REMINDER_ACCESS_CHANGED_TEXT
+    assert progress.edits[0]["reply_markup"] is None
+    assert context.bot.sent == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
 
 
 @pytest.mark.asyncio

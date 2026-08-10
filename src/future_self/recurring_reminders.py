@@ -242,42 +242,80 @@ class RecurringTaskReminderService:
         source = _clean_timezone_source(timezone_source)
         current = as_utc(now or datetime.now(UTC))
         async with self.db.session() as session:
-            owner = await self._lock_owner(session, owner_id)
-            item, _state = await self._require_live_task(session, owner_id, inbox_item_id)
-            timezone_name = self._schedule_timezone(owner, timezone, source)
-            existing = await session.scalar(
-                select(RecurringTaskReminderSchedule).where(
-                    RecurringTaskReminderSchedule.inbox_item_id == item.id,
-                    RecurringTaskReminderSchedule.owner_id == owner_id,
-                )
-            )
-            if existing is not None:
-                exact = (
-                    existing.recurrence_kind == "daily"
-                    and existing.local_time == clean_time
-                    and existing.timezone == timezone_name
-                    and existing.timezone_source == source
-                )
-                if not exact:
-                    raise RecurringScheduleConflict("schedule_already_exists")
-                return RecurringScheduleMutation(self._snapshot(existing), changed=False)
-
-            first = calculate_next_daily_occurrence(clean_time, timezone_name, now=current)
-            schedule = RecurringTaskReminderSchedule(
-                owner_id=owner_id,
-                inbox_item_id=item.id,
-                recurrence_kind="daily",
-                local_time=clean_time,
-                timezone=timezone_name,
+            await self._lock_owner(session, owner_id)
+            return await self.create_daily_in_session(
+                session,
+                owner_id,
+                inbox_item_id,
+                clean_time,
+                timezone=timezone,
                 timezone_source=source,
-                start_local_date=first.local_date,
-                next_occurrence_at=first.scheduled_for,
-                status="active",
-                version=1,
+                now=current,
             )
-            session.add(schedule)
-            await session.flush()
-            return RecurringScheduleMutation(self._snapshot(schedule), changed=True)
+
+    async def create_daily_in_session(
+        self,
+        session: AsyncSession,
+        owner_id: int,
+        inbox_item_id: int,
+        local_time: time,
+        *,
+        timezone: str | None = None,
+        timezone_source: str = "profile",
+        now: datetime | None = None,
+    ) -> RecurringScheduleMutation:
+        """Create a daily schedule inside a caller-owned transaction.
+
+        The caller must already hold this owner's cross-dialect row lock. The
+        primitive never commits or reacquires that lock, allowing task
+        confirmation and schedule creation to remain one atomic operation.
+        """
+
+        owner_id = self._positive_id(owner_id, "owner_id")
+        inbox_item_id = self._positive_id(inbox_item_id, "inbox_item_id")
+        clean_time = _clean_local_time(local_time)
+        source = _clean_timezone_source(timezone_source)
+        current = as_utc(now or datetime.now(UTC))
+        owner = await session.get(User, owner_id)
+        if owner is None:
+            raise RecurringTaskNotEligible("owner_not_found")
+        item, _state = await self._require_live_task(session, owner_id, inbox_item_id)
+        timezone_name = self._schedule_timezone(owner, timezone, source)
+        existing = await session.scalar(
+            select(RecurringTaskReminderSchedule)
+            .where(
+                RecurringTaskReminderSchedule.inbox_item_id == item.id,
+                RecurringTaskReminderSchedule.owner_id == owner_id,
+            )
+            .with_for_update()
+        )
+        if existing is not None:
+            exact = (
+                existing.recurrence_kind == "daily"
+                and existing.local_time == clean_time
+                and existing.timezone == timezone_name
+                and existing.timezone_source == source
+            )
+            if not exact:
+                raise RecurringScheduleConflict("schedule_already_exists")
+            return RecurringScheduleMutation(self._snapshot(existing), changed=False)
+
+        first = calculate_next_daily_occurrence(clean_time, timezone_name, now=current)
+        schedule = RecurringTaskReminderSchedule(
+            owner_id=owner_id,
+            inbox_item_id=item.id,
+            recurrence_kind="daily",
+            local_time=clean_time,
+            timezone=timezone_name,
+            timezone_source=source,
+            start_local_date=first.local_date,
+            next_occurrence_at=first.scheduled_for,
+            status="active",
+            version=1,
+        )
+        session.add(schedule)
+        await session.flush()
+        return RecurringScheduleMutation(self._snapshot(schedule), changed=True)
 
     async def get(
         self,
@@ -310,16 +348,22 @@ class RecurringTaskReminderService:
         *,
         timezone: str | None = None,
         timezone_source: str | None = None,
+        expected_version: int | None = None,
+        expected_access_version: int | None = None,
         now: datetime | None = None,
     ) -> RecurringScheduleMutation:
         owner_id = self._positive_id(owner_id, "owner_id")
         inbox_item_id = self._positive_id(inbox_item_id, "inbox_item_id")
+        expected_version = self._optional_version(expected_version)
+        expected_access_version = self._optional_version(expected_access_version)
         clean_time = _clean_local_time(local_time)
         current = as_utc(now or datetime.now(UTC))
         async with self.db.session() as session:
             owner = await self._lock_owner(session, owner_id)
+            self._require_access_generation(owner, expected_access_version)
             await self._require_live_task(session, owner_id, inbox_item_id)
             schedule = await self._schedule_for_update(session, owner_id, inbox_item_id)
+            self._require_schedule_version(schedule, expected_version)
             source = _clean_timezone_source(timezone_source or schedule.timezone_source)
             timezone_name = self._schedule_timezone(
                 owner,
@@ -350,12 +394,19 @@ class RecurringTaskReminderService:
         self,
         owner_id: int,
         inbox_item_id: int,
+        *,
+        expected_version: int | None = None,
+        expected_access_version: int | None = None,
     ) -> RecurringScheduleMutation:
         owner_id = self._positive_id(owner_id, "owner_id")
         inbox_item_id = self._positive_id(inbox_item_id, "inbox_item_id")
+        expected_version = self._optional_version(expected_version)
+        expected_access_version = self._optional_version(expected_access_version)
         async with self.db.session() as session:
-            await self._lock_owner(session, owner_id)
+            owner = await self._lock_owner(session, owner_id)
+            self._require_access_generation(owner, expected_access_version)
             schedule = await self._schedule_for_update(session, owner_id, inbox_item_id)
+            self._require_schedule_version(schedule, expected_version)
             if schedule.status == "disabled":
                 return RecurringScheduleMutation(self._snapshot(schedule), changed=False)
             if schedule.status == "completed":
@@ -371,15 +422,21 @@ class RecurringTaskReminderService:
         owner_id: int,
         inbox_item_id: int,
         *,
+        expected_version: int | None = None,
+        expected_access_version: int | None = None,
         now: datetime | None = None,
     ) -> RecurringScheduleMutation:
         owner_id = self._positive_id(owner_id, "owner_id")
         inbox_item_id = self._positive_id(inbox_item_id, "inbox_item_id")
+        expected_version = self._optional_version(expected_version)
+        expected_access_version = self._optional_version(expected_access_version)
         current = as_utc(now or datetime.now(UTC))
         async with self.db.session() as session:
             owner = await self._lock_owner(session, owner_id)
+            self._require_access_generation(owner, expected_access_version)
             await self._require_live_task(session, owner_id, inbox_item_id)
             schedule = await self._schedule_for_update(session, owner_id, inbox_item_id)
+            self._require_schedule_version(schedule, expected_version)
             if schedule.status == "active":
                 return RecurringScheduleMutation(self._snapshot(schedule), changed=False)
             schedule.version += 1
@@ -392,6 +449,73 @@ class RecurringTaskReminderService:
             schedule.next_occurrence_at = first.scheduled_for
             await session.flush()
             return RecurringScheduleMutation(self._snapshot(schedule), changed=True)
+
+    async def refresh_profile_timezone(
+        self,
+        owner_id: int,
+        timezone: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[RecurringScheduleSnapshot, ...]:
+        """Atomically update a profile timezone and its active profile schedules."""
+
+        owner_id = self._positive_id(owner_id, "owner_id")
+        async with self.db.session() as session:
+            await self._lock_owner(session, owner_id)
+            return await self.refresh_profile_timezone_in_session(
+                session,
+                owner_id,
+                timezone,
+                now=now,
+            )
+
+    async def refresh_profile_timezone_in_session(
+        self,
+        session: AsyncSession,
+        owner_id: int,
+        timezone: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[RecurringScheduleSnapshot, ...]:
+        """Refresh profile-based schedules inside a caller-owned transaction.
+
+        The caller must already hold this owner's cross-dialect row lock. Only
+        active profile-based schedules move to a new generation; explicit,
+        disabled and completed schedules remain untouched.
+        """
+
+        owner_id = self._positive_id(owner_id, "owner_id")
+        timezone_name = canonical_timezone(timezone)
+        current = as_utc(now or datetime.now(UTC))
+        owner = await session.get(User, owner_id)
+        if owner is None:
+            raise RecurringTaskNotEligible("owner_not_found")
+        owner.timezone = timezone_name
+        schedules = (
+            await session.scalars(
+                select(RecurringTaskReminderSchedule)
+                .where(
+                    RecurringTaskReminderSchedule.owner_id == owner_id,
+                    RecurringTaskReminderSchedule.status == "active",
+                    RecurringTaskReminderSchedule.timezone_source == "profile",
+                )
+                .order_by(RecurringTaskReminderSchedule.id)
+                .with_for_update()
+            )
+        ).all()
+        changed: list[RecurringScheduleSnapshot] = []
+        for schedule in schedules:
+            if schedule.timezone == timezone_name:
+                continue
+            schedule.version += 1
+            schedule.timezone = timezone_name
+            await self._cancel_live_occurrences(session, schedule.id)
+            first = await self._prepare_generation_start(session, schedule, current)
+            schedule.start_local_date = first.local_date
+            schedule.next_occurrence_at = first.scheduled_for
+            changed.append(self._snapshot(schedule))
+        await session.flush()
+        return tuple(changed)
 
     async def complete_for_terminal_task(
         self,
@@ -1465,6 +1589,27 @@ class RecurringTaskReminderService:
         )
 
     @staticmethod
+    def _optional_version(value: int | None) -> int | None:
+        if value is None:
+            return None
+        return RecurringTaskReminderService._positive_id(value, "expected_version")
+
+    @staticmethod
+    def _require_schedule_version(
+        schedule: RecurringTaskReminderSchedule,
+        expected_version: int | None,
+    ) -> None:
+        if expected_version is not None and schedule.version != expected_version:
+            raise RecurringFenceLost("schedule version changed")
+
+    @staticmethod
+    def _require_access_generation(owner: User, expected_version: int | None) -> None:
+        if expected_version is None:
+            return
+        if not is_full_access_tier(owner.access_tier) or owner.access_version != expected_version:
+            raise RecurringFenceLost("access version changed")
+
+    @staticmethod
     def _positive_id(value: int, name: str) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
@@ -1567,7 +1712,9 @@ class RecurringTaskReminderEngine:
                 # is allowed to call the transport again.
                 raise
             except Exception as exc:
-                await self.service.release_retry(claimed, exc, now=fresh_now())
+                # No transport exception proves that Telegram rejected the
+                # message. Keep the delivery-started uncertainty fence so this
+                # calendar occurrence can never be sent automatically again.
                 logger.warning(
                     "Recurring reminder delivery failed occurrence_id=%s error_type=%s",
                     claimed.id,

@@ -9,17 +9,32 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .access import is_full_access_tier
 from .dates import DateResolver
 from .db import Database
 from .models import (
     InboxItem,
+    RecurringTaskReminderSchedule,
     TaskActionToken,
     TaskReminder,
     TaskState,
     User,
     VisionItem,
 )
-from .recurring_reminders import RecurringTaskReminderService
+from .recurring_reminders import (
+    RecurringFenceLost,
+    RecurringScheduleConflict,
+    RecurringScheduleSnapshot,
+    RecurringTaskNotEligible,
+    RecurringTaskReminderService,
+)
+from .reminder_intent import (
+    ReminderIntentParser,
+    ReminderIntentResult,
+    ReminderIntentStatus,
+    ReminderScheduleKind,
+    ReminderTimezoneSource,
+)
 from .reminders import as_utc
 
 TaskBucket = Literal["today", "upcoming", "overdue", "no_due", "completed"]
@@ -39,11 +54,20 @@ class TaskRecord:
     item: InboxItem
     reminder: TaskReminder | None
     vision_linked: bool
+    recurring: RecurringScheduleSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class TaskPage:
     bucket: TaskBucket
+    records: tuple[TaskRecord, ...]
+    page: int
+    pages: int
+    total: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecurringTaskPage:
     records: tuple[TaskRecord, ...]
     page: int
     pages: int
@@ -169,6 +193,8 @@ class TaskService:
         self.date_event_hour = date_event_hour
         self.reminder_lead_minutes = reminder_lead_minutes
         self.date_resolver = date_resolver or DateResolver()
+        self.recurring_reminders = RecurringTaskReminderService(db)
+        self.reminder_intent_parser = ReminderIntentParser()
 
     async def reconcile(self) -> int:
         """Idempotently add state only to owner-matched task inbox rows."""
@@ -321,9 +347,18 @@ class TaskService:
         async with self.db.sessions() as session:
             rows = (
                 await session.execute(
-                    select(TaskState, InboxItem, TaskReminder)
+                    select(
+                        TaskState,
+                        InboxItem,
+                        TaskReminder,
+                        RecurringTaskReminderSchedule,
+                    )
                     .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
                     .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                    .outerjoin(
+                        RecurringTaskReminderSchedule,
+                        RecurringTaskReminderSchedule.inbox_item_id == InboxItem.id,
+                    )
                     .where(
                         TaskState.owner_id == owner_id,
                         InboxItem.user_id == owner_id,
@@ -343,8 +378,18 @@ class TaskService:
                 ).all()
             )
         records = [
-            TaskRecord(state, item, reminder, item.id in vision_ids)
-            for state, item, reminder in rows
+            TaskRecord(
+                state,
+                item,
+                reminder,
+                item.id in vision_ids,
+                (
+                    RecurringTaskReminderService._snapshot(recurring)
+                    if recurring is not None
+                    else None
+                ),
+            )
+            for state, item, reminder, recurring in rows
         ]
         records = [record for record in records if self._in_bucket(record, bucket, current)]
         records.sort(key=lambda record: self._sort_key(record, bucket))
@@ -355,6 +400,73 @@ class TaskService:
         return TaskPage(
             bucket=bucket,
             records=tuple(records[start : start + self.PAGE_SIZE]),
+            page=safe_page,
+            pages=pages,
+            total=total,
+        )
+
+    async def list_recurring(self, owner_id: int, page: int) -> RecurringTaskPage:
+        """List live tasks that have a manageable daily schedule."""
+
+        async with self.db.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        TaskState,
+                        InboxItem,
+                        TaskReminder,
+                        RecurringTaskReminderSchedule,
+                    )
+                    .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
+                    .join(
+                        RecurringTaskReminderSchedule,
+                        RecurringTaskReminderSchedule.inbox_item_id == InboxItem.id,
+                    )
+                    .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                    .where(
+                        TaskState.owner_id == owner_id,
+                        TaskState.status == "active",
+                        InboxItem.user_id == owner_id,
+                        InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
+                        RecurringTaskReminderSchedule.owner_id == owner_id,
+                        RecurringTaskReminderSchedule.status.in_(
+                            ("active", "disabled", "completed")
+                        ),
+                    )
+                    .order_by(
+                        RecurringTaskReminderSchedule.status,
+                        RecurringTaskReminderSchedule.local_time,
+                        InboxItem.id,
+                    )
+                )
+            ).all()
+            vision_ids = set(
+                (
+                    await session.scalars(
+                        select(VisionItem.linked_task_id).where(
+                            VisionItem.owner_id == owner_id,
+                            VisionItem.linked_task_id.is_not(None),
+                        )
+                    )
+                ).all()
+            )
+        records = tuple(
+            TaskRecord(
+                state,
+                item,
+                reminder,
+                item.id in vision_ids,
+                RecurringTaskReminderService._snapshot(recurring),
+            )
+            for state, item, reminder, recurring in rows
+        )
+        total = len(records)
+        pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        safe_page = min(max(page, 0), pages - 1)
+        start = safe_page * self.PAGE_SIZE
+        return RecurringTaskPage(
+            records=records[start : start + self.PAGE_SIZE],
             page=safe_page,
             pages=pages,
             total=total,
@@ -383,6 +495,12 @@ class TaskService:
             )
             if state is None:
                 return {}
+            token_payload = dict(payload or {})
+            if "schedule_version" in token_payload:
+                owner = await session.get(User, owner_id)
+                if owner is None:
+                    return {}
+                token_payload["access_version"] = owner.access_version
             return {
                 action: await self._new_token(
                     session,
@@ -391,7 +509,7 @@ class TaskService:
                     inbox_item_id,
                     version,
                     action,
-                    payload=payload,
+                    payload=token_payload or None,
                 )
                 for action in actions
             }
@@ -632,6 +750,176 @@ class TaskService:
             return TaskResult(
                 "await_reminder", await self._record(session, owner_id, state.inbox_item_id)
             )
+
+    async def start_recurring_time_input(
+        self, token: str, owner_id: int, chat_id: int
+    ) -> TaskResult:
+        current = datetime.now(UTC)
+        async with self.db.session() as session:
+            await self._lock_owner(session, owner_id)
+            capability = await self._token(session, token, owner_id, chat_id)
+            if (
+                capability is None
+                or capability.action != "recurring_time_edit"
+                or capability.status != "pending"
+                or as_utc(capability.expires_at) <= current
+            ):
+                return TaskResult("stale")
+            state = await self._live_state(
+                session,
+                owner_id,
+                capability.inbox_item_id,
+                version=capability.task_version,
+            )
+            expected_version = self._schedule_version(capability)
+            expected_access_version = self._access_version(capability)
+            owner = await session.get(User, owner_id)
+            record = (
+                await self._record(session, owner_id, capability.inbox_item_id)
+                if state is not None
+                else None
+            )
+            if (
+                state is None
+                or state.status != "active"
+                or expected_version is None
+                or expected_access_version is None
+                or owner is None
+                or not is_full_access_tier(owner.access_tier)
+                or owner.access_version != expected_access_version
+                or record is None
+                or record.recurring is None
+                or record.recurring.status != "active"
+                or record.recurring.version != expected_version
+            ):
+                return TaskResult("stale")
+            await self._replace_pending_input(session, owner_id, chat_id)
+            capability.action = "recurring_time_input"
+            capability.status = "awaiting_input"
+            capability.expires_at = current + self.INPUT_TTL
+            return TaskResult("await_recurring_time", record)
+
+    async def disable_recurring(self, token: str, owner_id: int, chat_id: int) -> TaskResult:
+        claimed = await self._claim_recurring_action(
+            token,
+            owner_id,
+            chat_id,
+            action="recurring_disable",
+            statuses={"active"},
+        )
+        if claimed is None:
+            return TaskResult("stale")
+        inbox_item_id, expected_version, expected_access_version = claimed
+        try:
+            mutation = await self.recurring_reminders.disable(
+                owner_id,
+                inbox_item_id,
+                expected_version=expected_version,
+                expected_access_version=expected_access_version,
+            )
+        except (RecurringFenceLost, RecurringScheduleConflict, RecurringTaskNotEligible):
+            return TaskResult("stale")
+        return TaskResult(
+            "recurring_disabled" if mutation.changed else "recurring_already_disabled",
+            await self.record(owner_id, inbox_item_id),
+        )
+
+    async def reenable_recurring(self, token: str, owner_id: int, chat_id: int) -> TaskResult:
+        claimed = await self._claim_recurring_action(
+            token,
+            owner_id,
+            chat_id,
+            action="recurring_reenable",
+            statuses={"disabled", "completed"},
+        )
+        if claimed is None:
+            return TaskResult("stale")
+        inbox_item_id, expected_version, expected_access_version = claimed
+        try:
+            mutation = await self.recurring_reminders.reenable(
+                owner_id,
+                inbox_item_id,
+                expected_version=expected_version,
+                expected_access_version=expected_access_version,
+            )
+        except (RecurringFenceLost, RecurringScheduleConflict, RecurringTaskNotEligible):
+            return TaskResult("stale")
+        return TaskResult(
+            "recurring_reenabled" if mutation.changed else "recurring_already_active",
+            await self.record(owner_id, inbox_item_id),
+        )
+
+    def parse_recurring_time(
+        self,
+        value: str,
+        schedule: RecurringScheduleSnapshot,
+    ) -> time | None:
+        clean = value.strip() if isinstance(value, str) else ""
+        if not clean:
+            return None
+        timezone_source = (
+            ReminderTimezoneSource.EXPLICIT
+            if schedule.timezone_source == "explicit"
+            else ReminderTimezoneSource.PROFILE
+        )
+        previous = ReminderIntentResult(
+            ReminderIntentStatus.NEEDS_TIME,
+            schedule_kind=ReminderScheduleKind.DAILY,
+            title="задача",
+            timezone=schedule.timezone,
+            timezone_source=timezone_source,
+        )
+        parsed = self.reminder_intent_parser.parse(
+            f"в {clean}",
+            schedule.timezone,
+            continuation=True,
+            previous=previous,
+        )
+        if (
+            parsed.status != ReminderIntentStatus.COMPLETE
+            or parsed.local_time is None
+            or parsed.timezone != schedule.timezone
+        ):
+            return None
+        return parsed.local_time
+
+    async def submit_recurring_time(
+        self,
+        token: str,
+        owner_id: int,
+        chat_id: int,
+        local_time: time,
+    ) -> TaskResult:
+        claimed = await self._claim_recurring_action(
+            token,
+            owner_id,
+            chat_id,
+            action="recurring_time_input",
+            statuses={"active"},
+            token_status="awaiting_input",
+        )
+        if claimed is None:
+            return TaskResult("stale")
+        inbox_item_id, expected_version, expected_access_version = claimed
+        try:
+            mutation = await self.recurring_reminders.update_time(
+                owner_id,
+                inbox_item_id,
+                local_time,
+                expected_version=expected_version,
+                expected_access_version=expected_access_version,
+            )
+        except (
+            ValueError,
+            RecurringFenceLost,
+            RecurringScheduleConflict,
+            RecurringTaskNotEligible,
+        ):
+            return TaskResult("stale")
+        return TaskResult(
+            "recurring_time_changed" if mutation.changed else "recurring_time_unchanged",
+            await self.record(owner_id, inbox_item_id),
+        )
 
     async def pending_input(self, owner_id: int, chat_id: int) -> TaskActionToken | None:
         current = datetime.now(UTC)
@@ -1141,9 +1429,18 @@ class TaskService:
     ) -> TaskRecord | None:
         row = (
             await session.execute(
-                select(TaskState, InboxItem, TaskReminder)
+                select(
+                    TaskState,
+                    InboxItem,
+                    TaskReminder,
+                    RecurringTaskReminderSchedule,
+                )
                 .join(InboxItem, InboxItem.id == TaskState.inbox_item_id)
                 .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                .outerjoin(
+                    RecurringTaskReminderSchedule,
+                    RecurringTaskReminderSchedule.inbox_item_id == InboxItem.id,
+                )
                 .where(
                     TaskState.owner_id == owner_id,
                     TaskState.inbox_item_id == inbox_item_id,
@@ -1155,7 +1452,7 @@ class TaskService:
         ).one_or_none()
         if row is None:
             return None
-        state, item, reminder = row
+        state, item, reminder, recurring = row
         linked = (
             await session.scalar(
                 select(VisionItem.id).where(
@@ -1164,7 +1461,80 @@ class TaskService:
                 )
             )
         ) is not None
-        return TaskRecord(state, item, reminder, linked)
+        return TaskRecord(
+            state,
+            item,
+            reminder,
+            linked,
+            (RecurringTaskReminderService._snapshot(recurring) if recurring is not None else None),
+        )
+
+    async def _claim_recurring_action(
+        self,
+        token: str,
+        owner_id: int,
+        chat_id: int,
+        *,
+        action: str,
+        statuses: set[str],
+        token_status: str = "pending",
+    ) -> tuple[int, int, int] | None:
+        current = datetime.now(UTC)
+        async with self.db.session() as session:
+            await self._lock_owner(session, owner_id)
+            capability = await self._token(session, token, owner_id, chat_id)
+            if (
+                capability is None
+                or capability.action != action
+                or capability.status != token_status
+                or as_utc(capability.expires_at) <= current
+            ):
+                return None
+            state = await self._live_state(
+                session,
+                owner_id,
+                capability.inbox_item_id,
+                version=capability.task_version,
+            )
+            expected_version = self._schedule_version(capability)
+            expected_access_version = self._access_version(capability)
+            owner = await session.get(User, owner_id)
+            record = (
+                await self._record(session, owner_id, capability.inbox_item_id)
+                if state is not None
+                else None
+            )
+            if (
+                state is None
+                or state.status != "active"
+                or expected_version is None
+                or expected_access_version is None
+                or owner is None
+                or not is_full_access_tier(owner.access_tier)
+                or owner.access_version != expected_access_version
+                or record is None
+                or record.recurring is None
+                or record.recurring.status not in statuses
+                or record.recurring.version != expected_version
+            ):
+                return None
+            capability.status = "consumed"
+            capability.consumed_at = current
+            return capability.inbox_item_id, expected_version, expected_access_version
+
+    @staticmethod
+    def _schedule_version(capability: TaskActionToken) -> int | None:
+        value = (capability.payload or {}).get("schedule_version")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        return value
+
+    @staticmethod
+    def _access_version(capability: TaskActionToken) -> int | None:
+        value = (capability.payload or {}).get("access_version")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        return value
 
     async def _token(
         self, session: AsyncSession, token: str, owner_id: int, chat_id: int

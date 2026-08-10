@@ -2306,9 +2306,9 @@ TASK_HUB_SCENARIOS = (
             ),
             ScenarioStep("task_callback", "hub"),
             ScenarioStep(
-                "navigation_callback",
-                "task_reminder_guide",
-                reply_contains=("Срок и время напоминания", "отмена безопасно"),
+                "task_callback",
+                "recurring",
+                reply_contains=("Ежедневные напоминания", "пока нет"),
             ),
         ),
         expected=ExpectedState(),
