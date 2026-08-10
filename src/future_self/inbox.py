@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import Database
 from .models import InboxItem, TaskReminder, TaskState, User
+from .recurring_reminders import RecurringTaskReminderService
 
 InboxSnapshot = list[dict[str, object]]
 LifecycleStatus = Literal["trashed", "restored", "changed", "empty"]
@@ -144,6 +145,7 @@ class InboxLifecycleService:
                 return InboxLifecycleResult("changed")
             self._trash_rows(rows, current)
             await session.flush()
+            await self._complete_recurring_for_rows(session, owner_id, rows)
             return InboxLifecycleResult("trashed", len(rows))
 
     async def trash_command_garbage_snapshot(
@@ -175,6 +177,7 @@ class InboxLifecycleService:
                 return InboxLifecycleResult("changed")
             self._trash_rows(command_rows, current)
             await session.flush()
+            await self._complete_recurring_for_rows(session, owner_id, command_rows)
             return InboxLifecycleResult("trashed", len(command_rows))
 
     async def trash_live_item_in_session(
@@ -201,6 +204,7 @@ class InboxLifecycleService:
             return InboxLifecycleResult("changed")
         self._trash_rows(rows, self._utc(now or datetime.now(UTC)))
         await session.flush()
+        await self._complete_recurring_for_rows(session, owner_id, rows)
         return InboxLifecycleResult("trashed", 1)
 
     async def restore_snapshot(
@@ -219,9 +223,12 @@ class InboxLifecycleService:
             rows = await self._rows(session, owner_id, "trashed", set(expected))
             if not self._matches(rows, expected):
                 return InboxLifecycleResult("changed")
+            if any(
+                item.pre_trash_status not in self._LIVE_STATUSES for item, _state, _reminder in rows
+            ):
+                return InboxLifecycleResult("changed")
+            await self._complete_recurring_for_rows(session, owner_id, rows)
             for item, state, reminder in rows:
-                if item.pre_trash_status not in self._LIVE_STATUSES:
-                    return InboxLifecycleResult("changed")
                 item.status = item.pre_trash_status
                 item.pre_trash_status = None
                 item.trashed_at = None
@@ -376,6 +383,21 @@ class InboxLifecycleService:
         reminder.claim_token = None
         reminder.claimed_at = None
         reminder.next_attempt_at = None
+
+    @staticmethod
+    async def _complete_recurring_for_rows(
+        session: AsyncSession,
+        owner_id: int,
+        rows: list[tuple[InboxItem, TaskState | None, TaskReminder | None]],
+    ) -> None:
+        for item, _state, _reminder in rows:
+            if item.kind != "task":
+                continue
+            await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                session,
+                owner_id,
+                item.id,
+            )
 
     @classmethod
     def _trash_rows(

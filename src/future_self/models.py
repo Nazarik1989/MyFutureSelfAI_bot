@@ -79,6 +79,10 @@ class User(TimestampMixin, Base):
     task_states: Mapped[list[TaskState]] = relationship(
         back_populates="owner", overlaps="inbox_item,task_state"
     )
+    recurring_task_reminder_schedules: Mapped[list[RecurringTaskReminderSchedule]] = relationship(
+        back_populates="owner",
+        overlaps="inbox_item,recurring_reminder_schedule",
+    )
 
 
 class AccessTierChange(Base):
@@ -399,6 +403,12 @@ class InboxItem(TimestampMixin, Base):
     user: Mapped[User] = relationship(back_populates="inbox_items")
     reminder: Mapped[TaskReminder | None] = relationship(
         back_populates="inbox_item", uselist=False, cascade="all, delete-orphan"
+    )
+    recurring_reminder_schedule: Mapped[RecurringTaskReminderSchedule | None] = relationship(
+        back_populates="inbox_item",
+        uselist=False,
+        cascade="all, delete-orphan",
+        overlaps="owner,recurring_task_reminder_schedules",
     )
     task_state: Mapped[TaskState | None] = relationship(
         back_populates="inbox_item",
@@ -761,6 +771,177 @@ class TaskReminder(TimestampMixin, Base):
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
     last_error_type: Mapped[str | None] = mapped_column(String(120))
     inbox_item: Mapped[InboxItem] = relationship(back_populates="reminder")
+
+
+class RecurringTaskReminderSchedule(TimestampMixin, Base):
+    __tablename__ = "recurring_task_reminder_schedules"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["inbox_item_id", "owner_id"],
+            ["inbox_items.id", "inbox_items.user_id"],
+            ondelete="CASCADE",
+            name="fk_recurring_schedule_inbox_owner",
+        ),
+        UniqueConstraint(
+            "inbox_item_id",
+            name="uq_recurring_schedule_inbox_item",
+        ),
+        CheckConstraint(
+            "recurrence_kind IN ('daily')",
+            name="ck_recurring_schedule_kind",
+        ),
+        CheckConstraint(
+            "timezone_source IN ('profile', 'explicit')",
+            name="ck_recurring_schedule_timezone_source",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'completed')",
+            name="ck_recurring_schedule_status",
+        ),
+        CheckConstraint("version > 0", name="ck_recurring_schedule_version"),
+        CheckConstraint(
+            "length(timezone) BETWEEN 1 AND 64",
+            name="ck_recurring_schedule_timezone_length",
+        ),
+        Index(
+            "ix_recurring_schedule_due",
+            "status",
+            "next_occurrence_at",
+        ),
+        Index(
+            "ix_recurring_schedule_owner_status",
+            "owner_id",
+            "status",
+            "next_occurrence_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    inbox_item_id: Mapped[int] = mapped_column(Integer)
+    recurrence_kind: Mapped[str] = mapped_column(String(16), default="daily")
+    local_time: Mapped[time] = mapped_column(Time)
+    timezone: Mapped[str] = mapped_column(String(64))
+    timezone_source: Mapped[str] = mapped_column(String(16), default="profile")
+    start_local_date: Mapped[date] = mapped_column(Date)
+    next_occurrence_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    owner: Mapped[User] = relationship(
+        back_populates="recurring_task_reminder_schedules",
+        overlaps="inbox_item,recurring_reminder_schedule",
+    )
+    inbox_item: Mapped[InboxItem] = relationship(
+        back_populates="recurring_reminder_schedule",
+        overlaps="owner,recurring_task_reminder_schedules",
+    )
+    occurrences: Mapped[list[RecurringTaskReminderOccurrence]] = relationship(
+        back_populates="schedule",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="RecurringTaskReminderOccurrence.scheduled_for",
+    )
+
+
+class RecurringTaskReminderOccurrence(TimestampMixin, Base):
+    __tablename__ = "recurring_task_reminder_occurrences"
+    __table_args__ = (
+        UniqueConstraint(
+            "schedule_id",
+            "schedule_version",
+            "scheduled_for",
+            name="uq_recurring_occurrence_generation_time",
+        ),
+        UniqueConstraint(
+            "schedule_id",
+            "schedule_version",
+            "local_date",
+            name="uq_recurring_occurrence_generation_date",
+        ),
+        UniqueConstraint(
+            "delivery_key",
+            name="uq_recurring_occurrence_delivery_key",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'sent', 'skipped_stale', 'cancelled')",
+            name="ck_recurring_occurrence_status",
+        ),
+        CheckConstraint(
+            "schedule_version > 0",
+            name="ck_recurring_occurrence_schedule_version",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_recurring_occurrence_attempt_count",
+        ),
+        CheckConstraint(
+            "(status = 'processing' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL) OR "
+            "(status <> 'processing' AND claim_token IS NULL AND claimed_at IS NULL)",
+            name="ck_recurring_occurrence_claim_state",
+        ),
+        CheckConstraint(
+            "(status = 'sent' AND sent_at IS NOT NULL) OR (status <> 'sent' AND sent_at IS NULL)",
+            name="ck_recurring_occurrence_sent_state",
+        ),
+        CheckConstraint(
+            "(delivery_started_at IS NULL AND status <> 'sent') OR "
+            "(delivery_started_at IS NOT NULL AND status IN ('processing', 'sent'))",
+            name="ck_recurring_occurrence_delivery_started_state",
+        ),
+        CheckConstraint(
+            "length(delivery_key) BETWEEN 1 AND 128",
+            name="ck_recurring_occurrence_delivery_key_length",
+        ),
+        Index(
+            "ix_recurring_occurrence_due",
+            "status",
+            "scheduled_for",
+            "next_attempt_at",
+        ),
+        Index(
+            "ix_recurring_occurrence_claims",
+            "status",
+            "delivery_started_at",
+            "claimed_at",
+        ),
+        Index(
+            "ix_recurring_occurrence_schedule_history",
+            "schedule_id",
+            "created_at",
+        ),
+        Index(
+            "ix_recurring_occurrence_cleanup",
+            "status",
+            "updated_at",
+        ),
+        Index(
+            "uq_recurring_occurrence_sent_date",
+            "schedule_id",
+            "local_date",
+            unique=True,
+            sqlite_where=text("status = 'sent'"),
+            postgresql_where=text("status = 'sent'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    schedule_id: Mapped[int] = mapped_column(
+        ForeignKey("recurring_task_reminder_schedules.id", ondelete="CASCADE")
+    )
+    schedule_version: Mapped[int] = mapped_column(Integer)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    local_date: Mapped[date] = mapped_column(Date)
+    delivery_key: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    last_error_type: Mapped[str | None] = mapped_column(String(120))
+    schedule: Mapped[RecurringTaskReminderSchedule] = relationship(back_populates="occurrences")
 
 
 class LifeCollection(TimestampMixin, Base):

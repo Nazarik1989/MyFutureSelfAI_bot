@@ -19,6 +19,7 @@ from .models import (
     User,
     VisionItem,
 )
+from .recurring_reminders import RecurringTaskReminderService
 from .reminders import as_utc
 
 TaskBucket = Literal["today", "upcoming", "overdue", "no_due", "completed"]
@@ -298,6 +299,12 @@ class TaskService:
                     reminder.claimed_at = None
                     reminder.next_attempt_at = None
             await session.flush()
+            for item_id in sorted(expected):
+                await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                    session,
+                    owner_id,
+                    item_id,
+                )
             return TaskBulkResult("cancelled", len(rows))
 
     async def list_page(
@@ -429,6 +436,11 @@ class TaskService:
                     and state is not None
                     and state.status == "completed"
                 ):
+                    await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                        session,
+                        owner_id,
+                        state.inbox_item_id,
+                    )
                     return TaskResult(
                         "already_completed",
                         await self._record(session, owner_id, state.inbox_item_id),
@@ -440,6 +452,11 @@ class TaskService:
             if capability is None or state is None:
                 return TaskResult("stale")
             if state.status == "completed":
+                await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                    session,
+                    owner_id,
+                    state.inbox_item_id,
+                )
                 return TaskResult(
                     "already_completed", await self._record(session, owner_id, state.inbox_item_id)
                 )
@@ -452,6 +469,11 @@ class TaskService:
             state.version += 1
             await self._cancel_live_reminder(session, state.inbox_item_id)
             await session.flush()
+            await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                session,
+                owner_id,
+                state.inbox_item_id,
+            )
             return TaskResult(
                 "completed", await self._record(session, owner_id, state.inbox_item_id)
             )
@@ -464,6 +486,11 @@ class TaskService:
             )
             if capability is None or state is None or state.status != "completed":
                 return TaskResult("stale")
+            await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                session,
+                owner_id,
+                state.inbox_item_id,
+            )
             state.status = "active"
             state.completed_at = None
             state.cancelled_at = None
@@ -827,6 +854,11 @@ class TaskService:
             item.version += 1
             await self._cancel_live_reminder(session, item_id)
             await session.flush()
+            await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                session,
+                owner_id,
+                item_id,
+            )
             return TaskResult("trashed")
 
     def parse_datetime(

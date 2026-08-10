@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     task_reminder_lead_minutes: int = Field(default=30, ge=0, le=10080)
     task_reminder_poll_seconds: int = Field(default=15, ge=5, le=300)
     task_reminder_lease_seconds: int = Field(default=120, ge=30, le=3600)
+    recurring_task_reminder_grace_minutes: int = Field(default=120, ge=5, le=360)
     guest_ai_enabled: bool = True
     guest_operation_limit: int = Field(default=2, ge=1, le=10)
     guest_global_daily_limit: int = Field(default=50, ge=1, le=100_000)

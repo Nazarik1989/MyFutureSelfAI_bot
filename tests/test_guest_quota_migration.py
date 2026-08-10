@@ -92,7 +92,7 @@ def test_guest_quota_migration_upgrades_0023_and_enforces_sqlite_contract(tmp_pa
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260806_0024"
+        "20260810_0025"
     )
     tables = {
         row[0]
@@ -271,7 +271,7 @@ def test_guest_quota_migration_upgrades_0023_and_enforces_sqlite_contract(tmp_pa
     alembic(project_root, environment, "upgrade", "head")
     connection = sqlite3.connect(database)
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260806_0024"
+        "20260810_0025"
     )
     assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     connection.close()
@@ -284,7 +284,7 @@ def test_guest_quota_migration_upgrades_clean_sqlite_with_foreign_keys(tmp_path)
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260806_0024"
+        "20260810_0025"
     )
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -294,7 +294,7 @@ def test_guest_quota_migration_upgrades_clean_sqlite_with_foreign_keys(tmp_path)
 def test_guest_quota_migration_has_expected_head_and_no_embedded_admin_id():
     project_root = Path(__file__).parents[1]
     config = Config(str(project_root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260806_0024"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260810_0025"
     migration = project_root / "alembic/versions/20260806_0024_guest_demo_quota.py"
     source = migration.read_text(encoding="utf-8")
     assert "530129470" not in source

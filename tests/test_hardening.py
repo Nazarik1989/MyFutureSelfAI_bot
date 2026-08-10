@@ -60,6 +60,13 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.knowledge_runner_concurrency == 1
     assert configured.knowledge_external_processing_requires_consent is True
     assert configured.knowledge_default_apply_mode == "brief_reminder"
+    assert configured.recurring_task_reminder_grace_minutes == 120
+
+
+@pytest.mark.parametrize("value", [4, 361])
+def test_recurring_reminder_grace_window_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError):
+        settings(recurring_task_reminder_grace_minutes=value)
 
 
 def test_workspace_foundation_flag_is_independent_from_future_knowledge_flags() -> None:
@@ -309,7 +316,7 @@ def test_container_and_build_context_are_hardened() -> None:
 def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260806_0024"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260810_0025"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
     for access_model in (
         "Workspace",
