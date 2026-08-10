@@ -318,8 +318,79 @@ _EXPLICIT_HELP_PREFIXES = (
     ),
 )
 _EXPLICIT_COMPLETE_HELP = re.compile(
-    r"^как\s+пользоваться\s+(?:этим\s+)?ботом\s*[?.!]*$", re.IGNORECASE
+    r"^(?:"
+    r"как\s+пользоваться\s+(?:этим\s+)?ботом|"
+    r"помощь|покажи\s+помощь|"
+    r"какие\s+(?:у\s+тебя\s+)?(?:есть\s+)?команды|"
+    r"что\s+ты\s+умеешь"
+    r")\s*[?.!]*$",
+    re.IGNORECASE,
 )
+
+# Natural bot-help routing is intentionally narrower than the local resolver. A
+# capability word on its own is ordinary user content; a find/open/use cue must
+# also resolve to an enabled action in the live catalog.
+_NOVA_HELP_STRONG_CUES = (
+    "не могу найти",
+    "не могу ее найти",
+    "не знаю где",
+    "где находится",
+    "где у тебя",
+    "где мои",
+    "как найти",
+    "как открыть",
+    "как попасть",
+    "как пользоваться",
+    "как использовать",
+    "куда нажать",
+    "покажи где",
+    "подскажи где",
+)
+_NOVA_HELP_VERB_FRAGMENTS = (
+    "найт",
+    "откры",
+    "пользова",
+    "использова",
+    "настро",
+    "загруз",
+    "добав",
+    "созда",
+    "перейт",
+    "попаст",
+    "покаж",
+)
+_NOVA_HELP_CONTEXT_FRAGMENTS = (
+    "в боте",
+    "в этом боте",
+    "у тебя",
+    "в меню",
+    "в менюшк",
+    "главное меню",
+)
+_NOVA_CONTENT_NEGATIONS = (
+    "не спрашиваю",
+    "это личная мысль",
+    "обычная мысль",
+)
+_NOVA_EXTERNAL_CONTEXT_FRAGMENTS = (
+    "photoshop",
+    "excel",
+    "powerpoint",
+    "учебник",
+    "презентац",
+)
+_NOVA_EXPLICIT_BOT_CONTEXT_FRAGMENTS = ("в боте", "в этом боте", "меню бота")
+_NOVA_FOLLOW_UPS = frozenset(
+    {
+        "ладно объясни",
+        "объясни",
+        "расскажи подробнее",
+        "как это работает",
+        "покажи где это",
+        "покажи где",
+    }
+)
+_SAFE_ACTION_ID = re.compile(r"^[a-z][a-z0-9:_-]{0,99}$")
 
 
 def extract_explicit_nova_question(text: str) -> str | None:
@@ -346,7 +417,58 @@ def is_explicit_nova_invocation(text: str) -> bool:
     return extract_explicit_nova_question(text) is not None
 
 
-def resolve_nova_question(question: str, catalog: NovaCatalog) -> NovaResolution | None:
+def is_nova_help_intent(
+    text: str,
+    catalog: NovaCatalog,
+    *,
+    active_session: bool = False,
+    last_action_id: str | None = None,
+) -> bool:
+    """Classify explicit bot/interface help without capturing ordinary content."""
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if extract_explicit_nova_question(text) is not None:
+        return True
+    normalized = _normalize(text)
+    if active_session:
+        return True
+    if (
+        last_action_id is not None
+        and _is_nova_follow_up(normalized)
+        and catalog.allows(last_action_id)
+    ):
+        return True
+    if any(marker in normalized for marker in _NOVA_CONTENT_NEGATIONS):
+        return False
+    if any(marker in normalized for marker in _NOVA_EXTERNAL_CONTEXT_FRAGMENTS) and not any(
+        marker in normalized for marker in _NOVA_EXPLICIT_BOT_CONTEXT_FRAGMENTS
+    ):
+        return False
+    has_bot_context = any(fragment in normalized for fragment in _NOVA_HELP_CONTEXT_FRAGMENTS)
+    has_strong_cue = has_bot_context and any(cue in normalized for cue in _NOVA_HELP_STRONG_CUES)
+    has_owned_capability_cue = "подскажи" in normalized and "где мои" in normalized
+    has_help_lead = (
+        normalized.startswith(("как ", "где ", "куда ", "подскажи ", "помоги ", "покажи "))
+        or " подскажи" in normalized
+        or " помоги" in normalized
+    )
+    has_help_verb = any(fragment in normalized for fragment in _NOVA_HELP_VERB_FRAGMENTS)
+    if (
+        not has_strong_cue
+        and not has_owned_capability_cue
+        and not (has_help_lead and has_help_verb and has_bot_context)
+    ):
+        return False
+    return _known_local_action_id(normalized, catalog) is not None
+
+
+def resolve_nova_question(
+    question: str,
+    catalog: NovaCatalog,
+    *,
+    last_action_id: str | None = None,
+) -> NovaResolution | None:
     """Resolve known bot-capability questions locally without invoking an AI provider."""
 
     if not isinstance(question, str):
@@ -365,6 +487,20 @@ def resolve_nova_question(question: str, catalog: NovaCatalog) -> NovaResolution
         )
     if catalog.tier == BLOCKED:
         return _unsupported("Помощь Nova недоступна для текущего уровня доступа.")
+
+    if _is_nova_follow_up(normalized):
+        if last_action_id is None:
+            return NovaResolution(
+                kind=NovaResolutionKind.CLARIFY,
+                response="Уточни, о какой функции бота рассказать подробнее.",
+            )
+        capability = catalog.capability(last_action_id)
+        if capability is None:
+            return NovaResolution(
+                kind=NovaResolutionKind.CLARIFY,
+                response="Эта функция сейчас недоступна. Выбери другой раздел.",
+            )
+        return _follow_up_guide(catalog, capability)
 
     unsupported = _unsupported_question(normalized)
     if unsupported is not None:
@@ -416,6 +552,18 @@ def resolve_nova_question(question: str, catalog: NovaCatalog) -> NovaResolution
 
 
 def _standard_rule(normalized: str) -> tuple[str, str, tuple[str, ...]] | None:
+    if normalized in {"помощь", "покажи помощь"}:
+        return (
+            "help:quick",
+            "Быстрый старт показывает, как открыть раздел или отправить новую мысль.",
+            ("Открой краткую инструкцию.",),
+        )
+    if _contains(normalized, "какие команды", "какие у тебя команды"):
+        return (
+            "help:requests",
+            "Возможности собраны в локальном обзоре без отправки вопроса в AI.",
+            ("Открой обзор возможностей.",),
+        )
     if _contains(
         normalized, "как пользоваться ботом", "как пользоваться этим ботом", "быстрый старт"
     ):
@@ -454,12 +602,6 @@ def _standard_rule(normalized: str) -> tuple[str, str, tuple[str, ...]] | None:
             "Краткая памятка поможет точнее сформулировать запрос о функциях бота.",
             ("Открой памятку.",),
         )
-    if _contains(normalized, "главн меню", "главное меню", "в меню", "в начало"):
-        return (
-            "menu",
-            "Главное меню собирает все доступные разделы в одном экране.",
-            ("Открой меню.", "Выбери нужный раздел."),
-        )
     if _contains(normalized, "напоминан") and _contains(normalized, "задач", "дело"):
         return (
             "task_create",
@@ -469,6 +611,12 @@ def _standard_rule(normalized: str) -> tuple[str, str, tuple[str, ...]] | None:
                 "Укажи срок или время напоминания.",
                 "Проверь preview перед сохранением.",
             ),
+        )
+    if _contains(normalized, "напоминан"):
+        return (
+            "task_reminder_guide",
+            "Напоминания настраиваются в задаче и срабатывают по её локальному времени.",
+            ("Открой памятку по напоминаниям.", "Создай или выбери задачу."),
         )
     if _contains(normalized, "создать задач", "добавить задач", "новую задач"):
         return (
@@ -580,6 +728,19 @@ def _standard_rule(normalized: str) -> tuple[str, str, tuple[str, ...]] | None:
             "«Мои разделы» объединяют существующие записи и задачи без копирования.",
             ("Открой свои разделы.", "Выбери тему, проект или список."),
         )
+    if _contains(
+        normalized,
+        "главн меню",
+        "главное меню",
+        "где меню",
+        "открой меню",
+        "в начало",
+    ):
+        return (
+            "menu",
+            "Главное меню собирает все доступные разделы в одном экране.",
+            ("Открой меню.", "Выбери нужный раздел."),
+        )
     return None
 
 
@@ -675,8 +836,28 @@ def _guide(
         response=response,
         steps=steps[:3],
         action_id=capability.id,
-        cta_label=capability.label,
+        cta_label=("🎯 Открыть визуализацию" if capability.id == "vision" else capability.label),
         back_target=back_target,
+    )
+
+
+def _follow_up_guide(catalog: NovaCatalog, capability: NovaCapability) -> NovaResolution:
+    if capability.id == "vision":
+        return _guide(
+            catalog,
+            capability.id,
+            "Визуализация объединяет желания, личные фото, референсы и локальную PNG-карту.",
+            (
+                "Открой раздел визуализации кнопкой ниже.",
+                "Выбери желания, личные фото или референсы.",
+                "Для общей карты запусти локальную сборку PNG.",
+            ),
+        )
+    return _guide(
+        catalog,
+        capability.id,
+        capability.description,
+        ("Открой нужный раздел кнопкой ниже.", "Выбери подходящее действие."),
     )
 
 
@@ -695,8 +876,6 @@ def _unsupported_question(normalized: str) -> NovaResolution | None:
         return _unsupported(
             "Общая AI-карта будущего пока не реализована. Доступна локальная PNG-карта желаний."
         )
-    if _contains(normalized, "голос") and _contains(normalized, "nova", "нове", "вопрос"):
-        return _unsupported("Голосовые вопросы к Nova пока не поддерживаются.")
     if _contains(
         normalized,
         "выдать доступ",
@@ -720,6 +899,26 @@ def _contains(text: str, *fragments: str) -> bool:
     return any(fragment.replace("ё", "е") in text for fragment in fragments)
 
 
+def _known_local_action_id(normalized: str, catalog: NovaCatalog) -> str | None:
+    optional = (
+        ("spaces", ("пространств", "workspace")),
+        ("knowledge", ("баз знаний", "база знаний", "базу знаний", "knowledge")),
+        ("capture", ("добавить материал", "загрузить материал", "capture")),
+    )
+    for action_id, aliases in optional:
+        if catalog.allows(action_id) and any(alias in normalized for alias in aliases):
+            return action_id
+    rule = _standard_rule(normalized)
+    if rule is None:
+        return None
+    action_id = rule[0]
+    return action_id if catalog.allows(action_id) else None
+
+
+def _is_nova_follow_up(normalized: str) -> bool:
+    return normalized in _NOVA_FOLLOW_UPS
+
+
 @dataclass(frozen=True, slots=True)
 class NovaSession:
     id: str
@@ -732,6 +931,7 @@ class NovaSession:
     created_at: float
     expires_at: float
     question_in_progress: bool
+    last_action_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,6 +952,7 @@ class _StoredNovaSession:
     created_at: float
     expires_at: float
     question_in_progress: bool
+    last_action_id: str | None
     actions: dict[str, str]
 
 
@@ -855,6 +1056,7 @@ class NovaSessionStore:
                 created_at=now,
                 expires_at=now + self.ttl_seconds,
                 question_in_progress=False,
+                last_action_id=None,
                 actions={},
             )
             self._sessions[key] = stored
@@ -1010,6 +1212,37 @@ class NovaSessionStore:
             stored.question_in_progress = False
             return True
 
+    async def remember_action(
+        self,
+        *,
+        last_action_id: str | None,
+        owner_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        access_version: int,
+        canonical_message_id: int,
+        tier: AccessTier,
+        session_id: str,
+    ) -> NovaSession | None:
+        """Remember only a safe capability identifier after fenced UI delivery."""
+
+        if last_action_id is not None and _SAFE_ACTION_ID.fullmatch(last_action_id) is None:
+            raise ValueError("invalid last_action_id")
+        async with self._lock:
+            stored = self._bound_locked(
+                owner_id=owner_id,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                access_version=access_version,
+                canonical_message_id=canonical_message_id,
+                tier=tier,
+                session_id=session_id,
+            )
+            if stored is None or not stored.question_in_progress:
+                return None
+            stored.last_action_id = last_action_id
+            return self._snapshot(stored)
+
     async def issue_action(
         self,
         *,
@@ -1161,6 +1394,7 @@ class NovaSessionStore:
             created_at=stored.created_at,
             expires_at=stored.expires_at,
             question_in_progress=stored.question_in_progress,
+            last_action_id=stored.last_action_id,
         )
 
     @staticmethod

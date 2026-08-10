@@ -2090,6 +2090,15 @@ class FutureSelfBot(
         if mime and not (mime.startswith("audio/") or mime == "application/ogg"):
             await update.effective_message.reply_text("Этот формат аудио не поддерживается.")
             return
+        # Freeze the access generation before STT. A downgrade or version bounce
+        # while the transcript is being produced must not be hidden by a later
+        # repository read.
+        voice_user = await self._user(update.effective_user.id)
+        voice_nova_session = await self.nova_sessions.current(
+            owner_id=voice_user.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+        )
         progress = await update.effective_message.reply_text("Расшифровываю голосовую мысль…")
         try:
             telegram_file = await media.get_file()
@@ -2129,15 +2138,21 @@ class FutureSelfBot(
         if natural_command is not None or explicit_unknown:
             action = natural_command.action if natural_command is not None else "help"
             flow = await self._active_navigation_flow(update, context)
-            if flow is not None and action != "help":
-                await self._prompt_navigation_flow(
-                    screen_update.effective_message,
-                    update,
-                    flow,
-                )
+            if flow is not None and action == "help":
+                # Natural help words can be legitimate answers to a durable
+                # business flow. Let its existing consumer keep ownership.
+                await self.nova_clear_current(update)
             else:
-                await self._handle_natural_command(screen_update, context, action)
-            return
+                await self.nova_clear_current(update)
+                if flow is not None:
+                    await self._prompt_navigation_flow(
+                        screen_update.effective_message,
+                        update,
+                        flow,
+                    )
+                else:
+                    await self._handle_natural_command(screen_update, context, action)
+                return
         if await self.workspace_pending_text(update, text, "voice"):
             await progress.edit_text("Голос распознан и обработан в пространстве.")
             return
@@ -2149,6 +2164,15 @@ class FutureSelfBot(
             return
         if await self._handle_vision_input(update, text):
             await progress.edit_text("Голос распознан и добавлен в карточку.")
+            return
+        if await self.nova_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            user=voice_user,
+            expected_session=voice_nova_session,
+        ):
             return
         heard_text = _truncate_utf16(text, 4_000)
         await progress.edit_text(f"Я услышал: «{heard_text}»")

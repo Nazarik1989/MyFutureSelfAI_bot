@@ -8,14 +8,15 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop
 
 from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER, AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
-from future_self.models import Base
+from future_self.models import Base, ConversationMessage, InboxItem
+from future_self.nova import NovaSessionStore
 from future_self.nova_handlers import (
     NOVA_ACCESS_CHANGED_TEXT,
     NOVA_BUSY_ALERT,
@@ -73,15 +74,106 @@ class NovaAIStub:
 class NovaMessage:
     _ids = count(50_000)
 
-    def __init__(self, text: str | None = None, *, message_id: int | None = None) -> None:
+    def __init__(
+        self,
+        text: str | None = None,
+        *,
+        message_id: int | None = None,
+        voice: Any = None,
+        audio: Any = None,
+        photo: Any = None,
+        document: Any = None,
+        edit_error: BaseException | None = None,
+    ) -> None:
         self.text = text
         self.message_id = message_id if message_id is not None else next(self._ids)
+        self.voice = voice
+        self.audio = audio
+        self.photo = photo
+        self.document = document
+        self.edit_error = edit_error
+        self.reply_to_message = None
         self.replies: list[dict[str, Any]] = []
+        self.edits: list[dict[str, Any]] = []
+        self.deleted = 0
 
     async def reply_text(self, text: str, **kwargs: Any) -> NovaMessage:
-        sent = NovaMessage(text)
+        sent = NovaMessage(text, edit_error=self.edit_error)
         self.replies.append({"text": text, "message": sent, **kwargs})
         return sent
+
+    async def edit_text(self, text: str, **kwargs: Any) -> None:
+        if self.edit_error is not None:
+            raise self.edit_error
+        self.edits.append({"text": text, **kwargs})
+
+    async def delete(self) -> None:
+        self.deleted += 1
+
+
+class NovaTelegramFile:
+    async def download_as_bytearray(self) -> bytearray:
+        return bytearray(b"nova-voice")
+
+
+class NovaVoice:
+    duration = 3
+    file_size = 10
+    mime_type = "audio/ogg"
+    file_name = "voice.ogg"
+
+    async def get_file(self) -> NovaTelegramFile:
+        return NovaTelegramFile()
+
+
+class NovaTranscription:
+    enabled = True
+
+    def __init__(self, transcript: str) -> None:
+        self.transcript = transcript
+        self.calls: list[tuple[bytes, str]] = []
+
+    async def transcribe(self, audio: bytes, filename: str) -> str:
+        self.calls.append((audio, filename))
+        return self.transcript
+
+
+class HookedNovaTranscription(NovaTranscription):
+    def __init__(self, transcript: str, hook: Any) -> None:
+        super().__init__(transcript)
+        self.hook = hook
+
+    async def transcribe(self, audio: bytes, filename: str) -> str:
+        value = await super().transcribe(audio, filename)
+        await self.hook()
+        return value
+
+
+class BarrierNovaTranscription(NovaTranscription):
+    def __init__(self, transcript: str, participants: int = 2) -> None:
+        super().__init__(transcript)
+        self.participants = participants
+        self.ready = asyncio.Event()
+
+    async def transcribe(self, audio: bytes, filename: str) -> str:
+        self.calls.append((audio, filename))
+        if len(self.calls) >= self.participants:
+            self.ready.set()
+        await self.ready.wait()
+        return self.transcript
+
+
+class BlockingNovaTranscription(NovaTranscription):
+    def __init__(self, transcript: str) -> None:
+        super().__init__(transcript)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def transcribe(self, audio: bytes, filename: str) -> str:
+        self.calls.append((audio, filename))
+        self.started.set()
+        await self.release.wait()
+        return self.transcript
 
 
 class NovaQuery:
@@ -138,6 +230,7 @@ class NovaTelegramBot:
         self.caption_edits: list[dict[str, Any]] = []
         self.retired: list[tuple[int, int]] = []
         self.sent: list[dict[str, Any]] = []
+        self.deleted: list[tuple[int, int]] = []
         self.edit_error: BaseException | None = None
 
     async def edit_message_text(self, **kwargs: Any) -> None:
@@ -164,6 +257,9 @@ class NovaTelegramBot:
         sent = NovaMessage(kwargs["text"])
         self.sent.append({"message": sent, **kwargs})
         return sent
+
+    async def delete_message(self, *, chat_id: int, message_id: int) -> None:
+        self.deleted.append((chat_id, message_id))
 
 
 def nova_context(telegram: NovaTelegramBot | None = None) -> SimpleNamespace:
@@ -209,6 +305,7 @@ def callback_with_prefix(markup: Any, prefix: str) -> str:
 
 def make_bot(db: Any, ai: NovaAIStub, **overrides: Any) -> FutureSelfBot:
     knowledge_asset_root = overrides.pop("_knowledge_asset_root", None)
+    transcription = overrides.pop("_transcription", SimpleNamespace(enabled=False))
     values: dict[str, Any] = {
         "_env_file": None,
         "telegram_bot_token": "123456:test-token",
@@ -223,8 +320,15 @@ def make_bot(db: Any, ai: NovaAIStub, **overrides: Any) -> FutureSelfBot:
         settings,
         db,
         ai,
-        SimpleNamespace(enabled=False),
+        transcription,
     )
+
+
+async def content_row_counts(db: Any) -> tuple[int, int]:
+    async with db.sessions() as session:
+        conversation_messages = await session.scalar(select(func.count(ConversationMessage.id)))
+        inbox_items = await session.scalar(select(func.count(InboxItem.id)))
+    return int(conversation_messages or 0), int(inbox_items or 0)
 
 
 async def user_with_tier(bot: FutureSelfBot, telegram_id: int, tier: str) -> Any:
@@ -315,6 +419,650 @@ async def test_local_question_edits_only_the_canonical_message_and_never_calls_a
     assert edit["text"].startswith("✨ Nova\n\n")
     assert "1. " in edit["text"]
     assert callback_with_prefix(edit["reply_markup"], "nova:action:task_create:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Привет, где у тебя находится визуализация?",
+        (
+            "Просто я знаю, что в этом боте есть визуализация, но не могу её найти "
+            "в менюшке. Подскажи, пожалуйста."
+        ),
+        "Привет, где у тебя находятся желания?",
+    ],
+)
+async def test_natural_bot_help_question_routes_to_local_nova_without_content_capture(
+    db,
+    question,
+):
+    ai = NovaAIStub()
+    bot = make_bot(db, ai, enable_nova_ai=True, nova_ai_admin_only=False)
+    user_id = 61_060
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    message = NovaMessage(question)
+    context = nova_context()
+
+    assert await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert len(message.replies) == 1
+    canonical = message.replies[0]["message"]
+    assert context.bot.sent == []
+    assert len(context.bot.edits) == 1
+    edit = context.bot.edits[0]
+    assert edit["message_id"] == canonical.message_id
+    assert "визуализац" in edit["text"].casefold()
+    assert "1. " in edit["text"]
+    callback = callback_with_prefix(edit["reply_markup"], "nova:action:vision:")
+    assert any(
+        button.text == "🎯 Открыть визуализацию" and button.callback_data == callback
+        for row in edit["reply_markup"].inline_keyboard
+        for button in row
+    )
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.last_action_id == "vision"
+    assert question not in repr(current)
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_short_follow_up_reuses_visualization_context_and_canonical_message(db):
+    ai = NovaAIStub()
+    bot = make_bot(db, ai, enable_nova_ai=True, nova_ai_admin_only=False)
+    user_id = 61_061
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    first = NovaMessage("Не могу найти визуализацию в меню, подскажи")
+
+    assert await bot.nova_text_gate(
+        update_for(first, user_id=user_id),
+        context,
+        user=user,
+    )
+    canonical = first.replies[0]["message"]
+    first_edit_count = len(context.bot.edits)
+    follow_up = NovaMessage("Ладно, объясни")
+
+    assert await bot.nova_text_gate(
+        update_for(follow_up, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert follow_up.replies == []
+    assert len(context.bot.edits) == first_edit_count + 1
+    edit = context.bot.edits[-1]
+    assert edit["message_id"] == canonical.message_id
+    assert "визуализац" in edit["text"].casefold()
+    assert callback_with_prefix(edit["reply_markup"], "nova:action:vision:")
+    assert ai.calls == []
+    assert ai.other_calls == []
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.last_action_id == "vision"
+    assert all(value not in repr(current) for value in (first.text, follow_up.text))
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Сегодня я размышлял о визуализации будущего",
+        "Хочу записать идею для новой карты",
+        "Мне важно понять, где я вижу себя через год",
+        "Не могу найти время на задачу",
+        "Как найти время на задачу?",
+        "Где находится задача, которую я обещал сделать?",
+        "Где находится здоровье человека?",
+        "Как открыть референс в Photoshop?",
+        "Как в Photoshop открыть раздел референсов?",
+        "Как в меню Photoshop открыть референсы?",
+        "Как пользоваться функцией задач в Excel?",
+        (
+            "Сегодня получилась длинная личная мысль про задачу, здоровье и "
+            "визуализацию будущего; хочу спокойно сохранить её и вернуться позже."
+        ),
+        "Ладно, объясни",
+    ],
+)
+async def test_non_help_content_is_not_captured_by_nova_text_gate(db, content):
+    ai = NovaAIStub()
+    bot = make_bot(db, ai, enable_nova_ai=True, nova_ai_admin_only=False)
+    user_id = 61_062
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    message = NovaMessage(content)
+
+    assert not await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert message.replies == []
+    assert context.bot.edits == []
+    assert context.bot.sent == []
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_oversized_natural_known_help_is_consumed_as_local_clarify(db):
+    question = "Не могу найти визуализацию в меню этого бота. " + "пожалуйста " * 60
+    assert len(question) > 600
+    ai = NovaAIStub()
+    bot = make_bot(db, ai, enable_nova_ai=True, nova_ai_admin_only=False)
+    user_id = 61_077
+    user = await user_with_tier(bot, user_id, ADMIN)
+    context = nova_context()
+    message = NovaMessage(question)
+
+    assert await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert len(message.replies) == 1
+    assert len(context.bot.edits) == 1
+    assert "600" in context.bot.edits[0]["text"]
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert context.bot.sent == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Привет, где у тебя находится визуализация?",
+        (
+            "Просто я знаю, что в этом боте есть визуализация, но не могу её найти "
+            "в менюшке. Подскажи, пожалуйста."
+        ),
+        "Привет, где у тебя находятся желания?",
+    ],
+)
+async def test_voice_help_uses_stt_progress_as_local_nova_canonical_without_ai(
+    db,
+    transcript,
+):
+    ai = NovaAIStub()
+    transcription = NovaTranscription(transcript)
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_ai=True,
+        nova_ai_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = 61_063
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    message = NovaMessage(voice=NovaVoice())
+    context = nova_context()
+
+    await bot.voice(update_for(message, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert len(message.replies) == 1
+    assert message.replies[0]["text"] == "Расшифровываю голосовую мысль…"
+    canonical = message.replies[0]["message"]
+    assert context.bot.sent == []
+    assert context.bot.edits
+    assert all(edit["message_id"] == canonical.message_id for edit in context.bot.edits)
+    result = context.bot.edits[-1]
+    assert "визуализац" in result["text"].casefold()
+    assert "Я услышал" not in result["text"]
+    assert callback_with_prefix(result["reply_markup"], "nova:action:vision:")
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == canonical.message_id
+    assert current.last_action_id == "vision"
+    assert transcript not in repr(current)
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_voice_follow_up_reuses_existing_canonical_and_last_action_without_new_message(db):
+    ai = NovaAIStub()
+    transcription = NovaTranscription("Ладно, объясни")
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_ai=True,
+        nova_ai_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = 61_064
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    first = NovaMessage("Где у тебя находится визуализация?")
+    assert await bot.nova_text_gate(
+        update_for(first, user_id=user_id),
+        context,
+        user=user,
+    )
+    canonical = first.replies[0]["message"]
+    edits_before = len(context.bot.edits)
+    voice = NovaMessage(voice=NovaVoice())
+
+    await bot.voice(update_for(voice, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    assert len(voice.replies) <= 1
+    if voice.replies:
+        transient = voice.replies[0]["message"]
+        assert (
+            transient.deleted == 1
+            or (
+                user_id,
+                transient.message_id,
+            )
+            in context.bot.deleted
+        )
+    assert len(context.bot.edits) > edits_before
+    follow_up_edits = context.bot.edits[edits_before:]
+    assert all(edit["message_id"] == canonical.message_id for edit in follow_up_edits)
+    result = follow_up_edits[-1]
+    assert "визуализац" in result["text"].casefold()
+    assert callback_with_prefix(result["reply_markup"], "nova:action:vision:")
+    assert ai.calls == []
+    assert ai.other_calls == []
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == canonical.message_id
+    assert current.last_action_id == "vision"
+    assert transcription.transcript not in repr(current)
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Сегодня я размышлял о визуализации будущего",
+        "Не могу найти время на задачу",
+        "Как открыть референс в Photoshop?",
+        "Как открыть раздел здоровья в презентации?",
+    ],
+)
+async def test_non_help_voice_transcript_continues_existing_content_pipeline(db, transcript):
+    ai = NovaAIStub()
+    transcription = NovaTranscription(transcript)
+    bot = make_bot(db, ai, _transcription=transcription)
+    user_id = 61_065
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    route_message = AsyncMock()
+    bot._route_message = route_message
+    message = NovaMessage(voice=NovaVoice())
+    context = nova_context()
+
+    await bot.voice(update_for(message, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    route_message.assert_awaited_once()
+    assert route_message.await_args.args[2:] == (transcript, "voice")
+    assert message.replies[0]["message"].edits[-1]["text"].startswith("Я услышал")
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["downgrade", "version_bounce"])
+async def test_voice_help_access_change_during_stt_discards_result_and_context(
+    db,
+    caplog,
+    change,
+):
+    ai = NovaAIStub()
+    user_id = 61_066 if change == "downgrade" else 61_067
+
+    async def mutate_access() -> None:
+        service = AccessService(db)
+        await service.set_guest(user_id, source="nova-voice-race")
+        if change == "version_bounce":
+            await service.grant_subscriber(user_id, source="nova-voice-race")
+
+    transcript = "Привет, где у тебя находится визуализация? PRIVATE_VOICE_TRANSCRIPT"
+    transcription = HookedNovaTranscription(transcript, mutate_access)
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_ai=True,
+        nova_ai_admin_only=False,
+        _transcription=transcription,
+    )
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    message = NovaMessage(voice=NovaVoice())
+    context = nova_context()
+
+    with caplog.at_level(logging.WARNING, logger="future_self.nova_handlers"):
+        await bot.voice(update_for(message, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert len(message.replies) == 1
+    rendered = [edit["text"] for edit in context.bot.edits]
+    rendered.extend(edit["text"] for edit in message.replies[0]["message"].edits)
+    assert NOVA_ACCESS_CHANGED_TEXT in rendered
+    assert all("Открыть визуализацию" not in value for value in rendered)
+    assert context.bot.sent == []
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert transcript not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_voice_nova_edit_error_has_no_fallback_or_sensitive_log(db, caplog):
+    transcript = "Привет, где у тебя находится визуализация? PRIVATE_VOICE_QUESTION"
+    error = BadRequest("PRIVATE_VOICE_TELEGRAM_ERROR_BODY")
+    ai = NovaAIStub()
+    transcription = NovaTranscription(transcript)
+    bot = make_bot(db, ai, _transcription=transcription)
+    user_id = 61_068
+    await user_with_tier(bot, user_id, SUBSCRIBER)
+    message = NovaMessage(voice=NovaVoice(), edit_error=error)
+    context = nova_context()
+    context.bot.edit_error = error
+
+    with caplog.at_level(logging.WARNING):
+        await bot.voice(update_for(message, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    assert len(message.replies) == 1
+    assert context.bot.sent == []
+    assert message.replies[0]["message"].replies == []
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert transcript not in caplog.text
+    assert "PRIVATE_VOICE_TELEGRAM_ERROR_BODY" not in caplog.text
+    assert "BadRequest" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_voice_nova_message_not_modified_keeps_bound_canonical_without_replacement(db):
+    ai = NovaAIStub()
+    transcription = NovaTranscription("Привет, где у тебя находится визуализация?")
+    bot = make_bot(db, ai, _transcription=transcription)
+    user_id = 61_069
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    error = BadRequest("Message is not modified")
+    message = NovaMessage(voice=NovaVoice(), edit_error=error)
+    context = nova_context()
+    context.bot.edit_error = error
+
+    await bot.voice(update_for(message, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    assert len(message.replies) == 1
+    canonical = message.replies[0]["message"]
+    assert context.bot.sent == []
+    assert ai.calls == []
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == canonical.message_id
+    assert current.last_action_id == "vision"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_from_voice_nova_delivery_propagates_without_raw_log(db, caplog):
+    transcript = "Привет, где у тебя находится визуализация? RAW_CANCELLED_VOICE_SENTINEL"
+    ai = NovaAIStub()
+    transcription = NovaTranscription(transcript)
+    bot = make_bot(db, ai, _transcription=transcription)
+    user_id = 61_070
+    await user_with_tier(bot, user_id, SUBSCRIBER)
+    error = asyncio.CancelledError()
+    message = NovaMessage(voice=NovaVoice(), edit_error=error)
+    context = nova_context()
+    context.bot.edit_error = error
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(asyncio.CancelledError):
+            await bot.voice(update_for(message, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert context.bot.sent == []
+    assert transcript not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_voice_help_keeps_one_live_canonical(db):
+    ai = NovaAIStub()
+    transcription = BarrierNovaTranscription("Привет, где у тебя находится визуализация?")
+    bot = make_bot(db, ai, _transcription=transcription)
+    user_id = 61_071
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    first = NovaMessage(voice=NovaVoice())
+    second = NovaMessage(voice=NovaVoice())
+
+    await asyncio.gather(
+        bot.voice(update_for(first, user_id=user_id), context),
+        bot.voice(update_for(second, user_id=user_id), context),
+    )
+
+    assert len(transcription.calls) == 2
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert context.bot.sent == []
+    progresses = [reply["message"] for source in (first, second) for reply in source.replies]
+    deleted_ids = {message_id for _chat_id, message_id in context.bot.deleted}
+    live_progresses = [
+        progress
+        for progress in progresses
+        if progress.deleted == 0 and progress.message_id not in deleted_ids
+    ]
+    assert len(live_progresses) == 1
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == live_progresses[0].message_id
+    assert current.last_action_id == "vision"
+    assert all(edit["message_id"] == current.canonical_message_id for edit in context.bot.edits)
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_unknown_voice_help_calls_only_nova_provider_once(db):
+    transcript = "Nova, где находится неизвестный квантовый раздел?"
+    ai = NovaAIStub()
+    transcription = BarrierNovaTranscription(transcript)
+    bot = make_bot(db, ai, enable_nova_ai=True, _transcription=transcription)
+    user_id = 61_076
+    user = await user_with_tier(bot, user_id, ADMIN)
+    context = nova_context()
+    first = NovaMessage(voice=NovaVoice())
+    second = NovaMessage(voice=NovaVoice())
+
+    await asyncio.gather(
+        bot.voice(update_for(first, user_id=user_id), context),
+        bot.voice(update_for(second, user_id=user_id), context),
+    )
+
+    assert len(transcription.calls) == 2
+    assert len(ai.calls) == 1
+    assert ai.calls[0][0] == "где находится неизвестный квантовый раздел?"
+    assert ai.other_calls == []
+    assert context.bot.sent == []
+    progresses = [reply["message"] for source in (first, second) for reply in source.replies]
+    deleted_ids = {message_id for _chat_id, message_id in context.bot.deleted}
+    live_progresses = [
+        progress
+        for progress in progresses
+        if progress.deleted == 0 and progress.message_id not in deleted_ids
+    ]
+    assert len(live_progresses) == 1
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == live_progresses[0].message_id
+    assert current.last_action_id is None
+    assert all(edit["message_id"] == current.canonical_message_id for edit in context.bot.edits)
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", ["cancelled", "expired", "replaced"])
+async def test_stale_voice_follow_up_cannot_resurrect_or_replace_nova_session(
+    db,
+    lifecycle,
+):
+    ai = NovaAIStub()
+    transcription = BlockingNovaTranscription("Ладно, объясни")
+    bot = make_bot(db, ai, _transcription=transcription)
+    clock = [0.0]
+    if lifecycle == "expired":
+        bot.nova_sessions = NovaSessionStore(ttl_seconds=1, clock=lambda: clock[0])
+    user_id = {
+        "cancelled": 61_073,
+        "expired": 61_074,
+        "replaced": 61_075,
+    }[lifecycle]
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    first = NovaMessage("Привет, где у тебя находится визуализация?")
+    assert await bot.nova_text_gate(
+        update_for(first, user_id=user_id),
+        context,
+        user=user,
+    )
+    original = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert original is not None
+    assert original.last_action_id == "vision"
+    edits_before = len(context.bot.edits)
+    route_message = AsyncMock()
+    bot._route_message = route_message
+    voice = NovaMessage(voice=NovaVoice())
+    task = asyncio.create_task(bot.voice(update_for(voice, user_id=user_id), context))
+    await transcription.started.wait()
+
+    replacement = None
+    if lifecycle == "expired":
+        clock[0] = 2.0
+        assert (
+            await bot.nova_sessions.current(
+                owner_id=user.id,
+                telegram_user_id=user_id,
+                chat_id=user_id,
+            )
+            is None
+        )
+    elif lifecycle == "replaced":
+        replacement = await bot.nova_sessions.create(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+            access_version=user.access_version,
+            canonical_message_id=99_000 + user_id,
+            tier=SUBSCRIBER,
+        )
+    else:
+        assert await bot.nova_sessions.clear(
+            owner_id=user.id,
+            chat_id=user_id,
+            session_id=original.id,
+        )
+
+    transcription.release.set()
+    await task
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    route_message.assert_not_awaited()
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert len(voice.replies) == 1
+    transient = voice.replies[0]["message"]
+    assert (
+        transient.deleted == 1
+        or (
+            user_id,
+            transient.message_id,
+        )
+        in context.bot.deleted
+    )
+    assert len(context.bot.edits) == edits_before
+    assert context.bot.sent == []
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    if lifecycle == "replaced":
+        assert replacement is not None
+        assert current == replacement
+        assert current.last_action_id is None
+    else:
+        assert current is None
+    assert original.id not in repr(current)
+    assert await content_row_counts(db) == (0, 0)
 
 
 @pytest.mark.asyncio
@@ -417,6 +1165,19 @@ async def test_duplicate_concurrent_explicit_questions_create_one_canonical_and_
     context = nova_context()
     first = NovaMessage("Nova, неизвестный вопрос номер один")
     second = NovaMessage("Nova, неизвестный вопрос номер два")
+    original_begin_question = bot.nova_sessions.begin_question
+    second_begin_attempted = asyncio.Event()
+    begin_calls = 0
+
+    async def observed_begin_question(**kwargs: Any):
+        nonlocal begin_calls
+        begin_calls += 1
+        result = await original_begin_question(**kwargs)
+        if begin_calls == 2:
+            second_begin_attempted.set()
+        return result
+
+    bot.nova_sessions.begin_question = observed_begin_question
 
     first_task = asyncio.create_task(
         bot.nova_text_gate(update_for(first, user_id=user_id), context, user=user)
@@ -425,7 +1186,7 @@ async def test_duplicate_concurrent_explicit_questions_create_one_canonical_and_
     second_task = asyncio.create_task(
         bot.nova_text_gate(update_for(second, user_id=user_id), context, user=user)
     )
-    await asyncio.sleep(0)
+    await second_begin_attempted.wait()
 
     assert len(ai.calls) == 1
     assert len(first.replies) + len(second.replies) == 1
@@ -454,6 +1215,19 @@ async def test_blocked_canonical_edit_cannot_reset_a_concurrent_provider_session
     }[callback_data]
     user = await user_with_tier(bot, user_id, ADMIN)
     _command, canonical, context = await open_nova(bot, user_id=user_id)
+    original_begin_question = bot.nova_sessions.begin_question
+    second_begin_attempted = asyncio.Event()
+    begin_calls = 0
+
+    async def observed_begin_question(**kwargs: Any):
+        nonlocal begin_calls
+        begin_calls += 1
+        result = await original_begin_question(**kwargs)
+        if begin_calls == 2:
+            second_begin_attempted.set()
+        return result
+
+    bot.nova_sessions.begin_question = observed_begin_question
     edit_started = asyncio.Event()
     edit_release = asyncio.Event()
     query = NovaQuery(
@@ -490,7 +1264,7 @@ async def test_blocked_canonical_edit_cannot_reset_a_concurrent_provider_session
             user=user,
         )
     )
-    await asyncio.sleep(0)
+    await second_begin_attempted.wait()
     assert len(ai.calls) == 1
 
     ai.release.set()
@@ -600,6 +1374,58 @@ async def test_action_token_rejects_forged_id_then_allows_once_and_rejects_repla
     )
     assert replay_query.answers == [(NOVA_STALE_ALERT, True)]
     assert dispatch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_voice_visualization_cta_dispatches_real_menu_once_and_rejects_replay(db):
+    ai = NovaAIStub()
+    transcription = NovaTranscription("Привет, где у тебя находится визуализация?")
+    bot = make_bot(db, ai, _transcription=transcription)
+    user_id = 61_072
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    question = NovaMessage(voice=NovaVoice())
+
+    await bot.voice(update_for(question, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    canonical = question.replies[0]["message"]
+    callback = callback_with_prefix(
+        context.bot.edits[-1]["reply_markup"],
+        "nova:action:vision:",
+    )
+
+    query = NovaQuery(callback, canonical)
+    await bot.nova_callback(
+        update_for(canonical, user_id=user_id, query=query),
+        context,
+    )
+
+    assert query.answers == [(None, False)]
+    assert len(query.edits) == 1
+    assert query.edits[0]["text"].startswith("🎯 Желания и визуализация")
+    assert button_matrix(query.edits[0]["reply_markup"])[0] == [
+        ("➕ Добавить желание", "vision:add")
+    ]
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+
+    replay = NovaQuery(callback, canonical)
+    await bot.nova_callback(
+        update_for(canonical, user_id=user_id, query=replay),
+        context,
+    )
+
+    assert replay.answers == [(NOVA_STALE_ALERT, True)]
+    assert replay.edits == []
+    assert ai.calls == []
+    assert ai.other_calls == []
 
 
 @pytest.mark.asyncio
@@ -858,15 +1684,17 @@ async def test_legacy_flow_callback_clears_nova_before_lower_handler(
 
 
 @pytest.mark.asyncio
-async def test_non_text_update_leaves_nova_before_existing_media_pipeline(db):
+@pytest.mark.parametrize("media_kind", ["photo", "document"])
+async def test_photo_and_document_leave_nova_before_existing_media_pipeline(db, media_kind):
     ai = NovaAIStub()
     bot = make_bot(db, ai)
     user_id = 61_032
     user = await user_with_tier(bot, user_id, SUBSCRIBER)
     _command, _canonical, context = await open_nova(bot, user_id=user_id)
+    media = {media_kind: [object()] if media_kind == "photo" else object()}
 
     await bot.nova_non_text_gate(
-        update_for(NovaMessage(message_id=61_032), user_id=user_id),
+        update_for(NovaMessage(message_id=61_032, **media), user_id=user_id),
         context,
     )
 
@@ -878,6 +1706,37 @@ async def test_non_text_update_leaves_nova_before_existing_media_pipeline(db):
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_kind", ["voice", "audio"])
+async def test_voice_and_audio_do_not_clear_active_nova_before_stt(db, media_kind):
+    ai = NovaAIStub()
+    bot = make_bot(db, ai)
+    user_id = 61_036
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    _command, _canonical, context = await open_nova(bot, user_id=user_id)
+    before = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert before is not None
+
+    await bot.nova_non_text_gate(
+        update_for(
+            NovaMessage(message_id=61_036, **{media_kind: NovaVoice()}),
+            user_id=user_id,
+        ),
+        context,
+    )
+
+    after = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert after == before
 
 
 @pytest.mark.asyncio

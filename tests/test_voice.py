@@ -43,7 +43,11 @@ async def test_recognition_error_is_safe_for_user(db, fake_ai):
     settings = Settings(telegram_bot_token="test", ai_api_key="test", ai_model="test-model")
     bot = FutureSelfBot(settings, db, fake_ai, FailingTranscription())
     message = FakeMessage()
-    update = SimpleNamespace(effective_message=message)
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=SimpleNamespace(id=88_001),
+        effective_chat=SimpleNamespace(id=88_001),
+    )
     await bot.voice(update, SimpleNamespace(user_data={}))
     assert "Не удалось распознать" in message.progress.text
     assert "private provider detail" not in message.progress.text

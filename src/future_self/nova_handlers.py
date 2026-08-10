@@ -20,6 +20,7 @@ from .nova import (
     NovaSession,
     build_nova_catalog,
     extract_explicit_nova_question,
+    is_nova_help_intent,
     resolve_nova_question,
 )
 
@@ -196,9 +197,15 @@ class NovaHandlers:
                 )
 
     async def nova_non_text_gate(self, update: Update, context: Any) -> None:
-        """Leave Nova before voice or media continues through its existing pipeline."""
+        """Leave Nova for photo/document; voice and audio may continue the session."""
 
         del context
+        message = update.effective_message
+        if (
+            getattr(message, "voice", None) is not None
+            or getattr(message, "audio", None) is not None
+        ):
+            return
         await self.nova_clear_current(update)
 
     async def nova_text_gate(
@@ -213,6 +220,50 @@ class NovaHandlers:
         if not isinstance(text, str):
             return False
         user = user or await self._user(update.effective_user.id)
+        return await self._nova_question_gate(
+            update,
+            context,
+            text,
+            user=user,
+            candidate_message=None,
+            allow_replacement=True,
+        )
+
+    async def nova_voice_gate(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        transcript: str,
+        progress: Any,
+        *,
+        user: Any,
+        expected_session: NovaSession | None,
+    ) -> bool:
+        """Route an STT transcript through Nova while reusing one canonical message."""
+
+        return await self._nova_question_gate(
+            update,
+            context,
+            transcript,
+            user=user,
+            candidate_message=progress,
+            allow_replacement=False,
+            expected_voice_session=expected_session,
+            voice_session_fenced=True,
+        )
+
+    async def _nova_question_gate(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        *,
+        user: Any,
+        candidate_message: Any | None,
+        allow_replacement: bool,
+        expected_voice_session: NovaSession | None = None,
+        voice_session_fenced: bool = False,
+    ) -> bool:
         tier = require_access_tier(user.access_tier)
         if tier == BLOCKED:
             return False
@@ -221,14 +272,36 @@ class NovaHandlers:
             telegram_user_id=update.effective_user.id,
             chat_id=update.effective_chat.id,
         )
+        natural_router = getattr(self, "natural_command_router", None)
+        if (
+            candidate_message is None
+            and current is None
+            and natural_router is not None
+            and natural_router.route(text) is not None
+        ):
+            return False
+        catalog = self._nova_catalog(tier)
         explicit_question = extract_explicit_nova_question(text)
-        if current is None and explicit_question is None:
+        standalone_intent = is_nova_help_intent(text, catalog)
+        voice_generation_changed = voice_session_fenced and not self._nova_voice_session_matches(
+            current,
+            expected_voice_session,
+        )
+        intent_session = (
+            (expected_voice_session or current) if voice_generation_changed else current
+        )
+        if not is_nova_help_intent(
+            text,
+            catalog,
+            active_session=intent_session is not None,
+            last_action_id=(intent_session.last_action_id if intent_session is not None else None),
+        ):
             return False
         if tier != GUEST:
             flow = await self._active_navigation_flow(update, context)
             if flow is not None:
                 if current is not None:
-                    await self.nova_sessions.clear(
+                    await self.nova_clear_bound(
                         owner_id=user.id,
                         chat_id=update.effective_chat.id,
                         session_id=current.id,
@@ -239,7 +312,7 @@ class NovaHandlers:
         async with self._nova_launch_lock:
             if tier != GUEST and await self._active_navigation_flow(update, context) is not None:
                 if current is not None:
-                    await self.nova_sessions.clear(
+                    await self.nova_clear_bound(
                         owner_id=user.id,
                         chat_id=update.effective_chat.id,
                         session_id=current.id,
@@ -251,6 +324,33 @@ class NovaHandlers:
                     telegram_user_id=update.effective_user.id,
                     chat_id=update.effective_chat.id,
                 )
+                if voice_session_fenced and not self._nova_voice_session_matches(
+                    current,
+                    expected_voice_session,
+                ):
+                    live_tier = await self._nova_validate_access_values(
+                        update.effective_user.id,
+                        user.access_version,
+                        tier,
+                    )
+                    if live_tier is None:
+                        if expected_voice_session is None:
+                            await self._nova_edit_transient_access_changed(candidate_message)
+                        else:
+                            await self._nova_edit_canonical(
+                                context,
+                                expected_voice_session,
+                                NOVA_ACCESS_CHANGED_TEXT,
+                                None,
+                                source_message=update.effective_message,
+                                allow_replacement=False,
+                            )
+                            await self._nova_delete_transient(candidate_message, context)
+                    else:
+                        await self._nova_delete_transient(candidate_message, context)
+                    return True
+                if current is None and not standalone_intent:
+                    return False
                 if current is not None and (
                     current.access_version != user.access_version or current.tier != tier
                 ):
@@ -264,8 +364,11 @@ class NovaHandlers:
                         current,
                         NOVA_ACCESS_CHANGED_TEXT,
                         None,
-                        source_message=message,
+                        source_message=update.effective_message,
+                        allow_replacement=allow_replacement,
                     )
+                    if candidate_message is not None:
+                        await self._nova_delete_transient(candidate_message, context)
                     return True
                 if current is None:
                     live_tier = await self._nova_validate_access_values(
@@ -274,8 +377,14 @@ class NovaHandlers:
                         tier,
                     )
                     if live_tier is None:
+                        if candidate_message is not None:
+                            await self._nova_edit_transient_access_changed(candidate_message)
                         return True
-                    placeholder = await message.reply_text("✨ Nova\n\nРазбираю вопрос…")
+                    placeholder = candidate_message
+                    if placeholder is None:
+                        placeholder = await update.effective_message.reply_text(
+                            "✨ Nova\n\nРазбираю вопрос…"
+                        )
                     message_id = self._positive_message_id(getattr(placeholder, "message_id", None))
                     if message_id is None:
                         logger.warning(
@@ -291,6 +400,12 @@ class NovaHandlers:
                         canonical_message_id=message_id,
                         tier=live_tier,
                     )
+                elif candidate_message is not None:
+                    candidate_id = self._positive_message_id(
+                        getattr(candidate_message, "message_id", None)
+                    )
+                    if candidate_id != current.canonical_message_id:
+                        await self._nova_delete_transient(candidate_message, context)
                 started = await self.nova_sessions.begin_question(
                     owner_id=current.owner_id,
                     telegram_user_id=current.telegram_user_id,
@@ -301,8 +416,23 @@ class NovaHandlers:
                     session_id=current.id,
                 )
         if started is not None:
-            await self._nova_process_question(update, context, started, question)
+            await self._nova_process_question(
+                update,
+                context,
+                started,
+                question,
+                allow_replacement=allow_replacement,
+            )
         return True
+
+    @staticmethod
+    def _nova_voice_session_matches(
+        current: NovaSession | None,
+        expected: NovaSession | None,
+    ) -> bool:
+        if expected is None:
+            return current is None
+        return current is not None and current.id == expected.id
 
     async def _nova_process_question(
         self,
@@ -310,6 +440,8 @@ class NovaHandlers:
         context: Any,
         started: NovaSession,
         question: str,
+        *,
+        allow_replacement: bool,
     ) -> None:
         active = started
         try:
@@ -319,6 +451,7 @@ class NovaHandlers:
                     context,
                     active,
                     source_message=update.effective_message,
+                    allow_replacement=allow_replacement,
                 )
                 return
             if not question.strip() or len(question.strip()) > 600:
@@ -335,10 +468,15 @@ class NovaHandlers:
                     self._nova_catalog(live_tier),
                     resolution,
                     source_message=update.effective_message,
+                    allow_replacement=allow_replacement,
                 )
                 return
             catalog = self._nova_catalog(live_tier)
-            resolution = resolve_nova_question(question, catalog)
+            resolution = resolve_nova_question(
+                question,
+                catalog,
+                last_action_id=active.last_action_id,
+            )
             used_ai = resolution is None and self._nova_ai_allowed(live_tier)
             if resolution is None:
                 try:
@@ -348,6 +486,7 @@ class NovaHandlers:
                         context,
                         active,
                         source_message=update.effective_message,
+                        allow_replacement=allow_replacement,
                     )
                     return
             active = await self._nova_render_resolution(
@@ -357,6 +496,7 @@ class NovaHandlers:
                 resolution,
                 require_ai=used_ai,
                 source_message=update.effective_message,
+                allow_replacement=allow_replacement,
             )
         finally:
             await self.nova_sessions.finish_question(
@@ -422,6 +562,7 @@ class NovaHandlers:
         *,
         require_ai: bool = False,
         source_message: Any,
+        allow_replacement: bool = True,
     ) -> NovaSession:
         async with self._nova_ui_lock:
             live = await self.nova_sessions.get(
@@ -448,6 +589,7 @@ class NovaHandlers:
                     NOVA_ACCESS_CHANGED_TEXT,
                     None,
                     source_message=source_message,
+                    allow_replacement=allow_replacement,
                 )
                 return session
             catalog = self._nova_catalog(final_tier)
@@ -498,6 +640,7 @@ class NovaHandlers:
                     NOVA_ACCESS_CHANGED_TEXT,
                     None,
                     source_message=source_message,
+                    allow_replacement=allow_replacement,
                 )
                 return session
             text = self._nova_resolution_text(resolution)
@@ -512,8 +655,25 @@ class NovaHandlers:
                 text,
                 markup,
                 source_message=source_message,
+                allow_replacement=allow_replacement,
             )
-            return edited or live
+            if edited is None:
+                return live
+            remembered = await self.nova_sessions.remember_action(
+                last_action_id=(
+                    capability.id
+                    if capability is not None and resolution.kind is NovaResolutionKind.GUIDE
+                    else None
+                ),
+                owner_id=edited.owner_id,
+                telegram_user_id=edited.telegram_user_id,
+                chat_id=edited.chat_id,
+                access_version=edited.access_version,
+                canonical_message_id=edited.canonical_message_id,
+                tier=edited.tier,
+                session_id=edited.id,
+            )
+            return remembered or edited
 
     async def nova_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -1089,34 +1249,45 @@ class NovaHandlers:
         query: Any | None = None,
     ) -> None:
         user = await self._user(update.effective_user.id)
-        await self.nova_sessions.clear(owner_id=user.id, chat_id=update.effective_chat.id)
-        token = await self.navigation_flow_sessions.issue(
-            update.effective_user.id,
-            update.effective_chat.id,
-            flow,
-        )
-        label = getattr(self, "_nova_flow_label", lambda value: value)(flow)
-        text = f"✨ Nova\n\nСейчас не завершён сценарий: {label}. Что сделать?"
-        markup = InlineKeyboardMarkup(
-            [
+        async with self._nova_ui_lock:
+            current = await self.nova_sessions.current(
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+            )
+            if current is not None:
+                await self.nova_sessions.clear(
+                    owner_id=user.id,
+                    chat_id=update.effective_chat.id,
+                    session_id=current.id,
+                )
+            token = await self.navigation_flow_sessions.issue(
+                update.effective_user.id,
+                update.effective_chat.id,
+                flow,
+            )
+            label = getattr(self, "_nova_flow_label", lambda value: value)(flow)
+            text = f"✨ Nova\n\nСейчас не завершён сценарий: {label}. Что сделать?"
+            markup = InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "▶️ Продолжить текущий шаг",
-                        callback_data=f"nav:flow:continue:{token}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 Выйти в главное меню",
-                        callback_data=f"nav:flow:exit:{token}",
-                    )
-                ],
-            ]
-        )
-        if query is not None:
-            await self._edit_or_send(query, text, markup)
-        else:
-            await message.reply_text(text, reply_markup=markup)
+                    [
+                        InlineKeyboardButton(
+                            "▶️ Продолжить текущий шаг",
+                            callback_data=f"nav:flow:continue:{token}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🏠 Выйти в главное меню",
+                            callback_data=f"nav:flow:exit:{token}",
+                        )
+                    ],
+                ]
+            )
+            if query is not None:
+                await self._edit_or_send(query, text, markup)
+            else:
+                await message.reply_text(text, reply_markup=markup)
 
     def _nova_root_keyboard(self, tier: AccessTier) -> InlineKeyboardMarkup:
         rows = [
@@ -1270,6 +1441,7 @@ class NovaHandlers:
         reply_markup: InlineKeyboardMarkup | None,
         *,
         source_message: Any,
+        allow_replacement: bool = True,
     ) -> NovaSession | None:
         bot = context.bot
         try:
@@ -1317,6 +1489,8 @@ class NovaHandlers:
             )
             return None
 
+        if not allow_replacement:
+            return None
         try:
             await bot.edit_message_reply_markup(
                 chat_id=session.chat_id,
@@ -1370,6 +1544,7 @@ class NovaHandlers:
         session: NovaSession,
         *,
         source_message: Any,
+        allow_replacement: bool = True,
     ) -> None:
         async with self._nova_ui_lock:
             live = await self.nova_sessions.get(
@@ -1394,6 +1569,39 @@ class NovaHandlers:
                 NOVA_ACCESS_CHANGED_TEXT,
                 None,
                 source_message=source_message,
+                allow_replacement=allow_replacement,
+            )
+
+    async def _nova_edit_transient_access_changed(self, message: Any) -> None:
+        try:
+            await message.edit_text(NOVA_ACCESS_CHANGED_TEXT, reply_markup=None)
+        except asyncio.CancelledError:
+            raise
+        except (TelegramError, TypeError, AttributeError) as exc:
+            if "message is not modified" in str(exc).casefold():
+                return
+            logger.warning(
+                "Nova voice canonical edit failed operation=access error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _nova_delete_transient(self, message: Any, context: Any) -> None:
+        message_id = self._positive_message_id(getattr(message, "message_id", None))
+        try:
+            delete = getattr(message, "delete", None)
+            if callable(delete):
+                await delete()
+            elif message_id is not None:
+                await context.bot.delete_message(
+                    chat_id=getattr(message, "chat_id", None),
+                    message_id=message_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except (TelegramError, TypeError, AttributeError) as exc:
+            logger.warning(
+                "Nova voice transient cleanup failed error_type=%s",
+                type(exc).__name__,
             )
 
     @staticmethod

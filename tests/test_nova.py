@@ -18,6 +18,7 @@ from future_self.nova import (
     build_nova_catalog,
     extract_explicit_nova_question,
     is_explicit_nova_invocation,
+    is_nova_help_intent,
     resolve_nova_question,
 )
 
@@ -136,7 +137,12 @@ def test_required_known_questions_resolve_locally(question, expected_action):
     assert result is not None
     assert result.kind is NovaResolutionKind.GUIDE
     assert result.action_id == expected_action
-    assert result.cta_label == catalog.capability(expected_action).label
+    expected_cta = (
+        "🎯 Открыть визуализацию"
+        if expected_action == "vision"
+        else catalog.capability(expected_action).label
+    )
+    assert result.cta_label == expected_cta
     assert 1 <= len(result.steps) <= 3
 
 
@@ -167,7 +173,6 @@ def test_optional_features_resolve_only_when_enabled():
     [
         "Можно настроить персональное утреннее послание?",
         "Сделай общую AI-карту будущего",
-        "Можно задать голосовой вопрос Nova?",
         "Nova, дай права пользователю",
     ],
 )
@@ -239,6 +244,152 @@ def test_oversized_explicit_invocation_is_still_captured_for_local_validation():
     assert result.action_id is None
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_action"),
+    [
+        ("Привет, где у тебя находится визуализация?", "vision"),
+        (
+            "Просто я знаю, что в этом боте есть визуализация, но не могу её найти "
+            "в менюшке. Подскажи, пожалуйста.",
+            "vision",
+        ),
+        ("Не могу найти референсы в меню, подскажи, пожалуйста", "vision"),
+        ("Подскажи, где мои задачи", "section:tasks"),
+        ("Где у тебя находятся напоминания?", "task_reminder_guide"),
+        ("Как в боте настроить часовой пояс?", "timezone"),
+        ("Не могу найти настройки в меню, подскажи", "section:settings"),
+        ("Привет, где у тебя находятся желания?", "vision"),
+        ("Как в боте открыть раздел Сегодня?", "section:today"),
+        ("Подскажи, где мои записи", "inbox"),
+    ],
+)
+def test_shared_help_intent_recognizes_natural_known_capability_questions(
+    text,
+    expected_action,
+):
+    catalog = build_nova_catalog(SUBSCRIBER)
+
+    assert is_nova_help_intent(text, catalog)
+    resolution = resolve_nova_question(text, catalog)
+    assert resolution is not None
+    assert resolution.kind is NovaResolutionKind.GUIDE
+    assert resolution.action_id == expected_action
+
+
+def test_shared_help_intent_accepts_explicit_nova_and_active_session():
+    catalog = build_nova_catalog(SUBSCRIBER)
+
+    assert is_nova_help_intent("Nova, где находится неизвестная кнопка?", catalog)
+    assert is_nova_help_intent(
+        "Ладно, объясни",
+        catalog,
+        active_session=True,
+    )
+
+
+def test_shared_help_intent_requires_capability_in_current_catalog():
+    disabled = build_nova_catalog(SUBSCRIBER)
+    enabled = build_nova_catalog(
+        SUBSCRIBER,
+        NovaRuntimeFlags(enable_knowledge_hub=True),
+    )
+
+    question = "Подскажи, где в боте находится база знаний?"
+    assert not is_nova_help_intent(question, disabled)
+    assert is_nova_help_intent(question, enabled)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Сегодня я размышлял о визуализации будущего",
+        "Хочу записать идею для новой карты",
+        "Мне важно понять, где я вижу себя через год",
+        (
+            "Сегодня я долго записывал обычную мысль о том, как мои задачи, здоровье "
+            "и визуализация будущего связаны с важными для меня переменами."
+        ),
+        "Не могу найти время на задачу",
+        "Как найти время на задачу?",
+        "Где находится задача, которую я обещал сделать?",
+        "Где находится здоровье человека?",
+        "Как открыть референс в Photoshop?",
+        "Как в Photoshop открыть раздел референсов?",
+        "Как в меню Photoshop открыть референсы?",
+        "Подскажи, как открыть раздел задачи в учебнике?",
+        "Как открыть раздел здоровья в презентации?",
+        "Как пользоваться функцией задач в Excel?",
+        "Ладно, объясни",
+        "Расскажи подробнее",
+        "Как это работает?",
+        "Покажи, где это",
+    ],
+)
+def test_shared_help_intent_does_not_capture_content_or_contextless_follow_up(text):
+    assert not is_nova_help_intent(text, build_nova_catalog(SUBSCRIBER))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "НЕ МОГУ ЕЁ НАЙТИ!!! ВИЗУАЛИЗАЦИЮ В МЕНЮ???",
+        "не могу ее найти, визуализацию в меню",
+    ],
+)
+def test_shared_help_intent_normalizes_case_yo_and_punctuation(text):
+    catalog = build_nova_catalog(SUBSCRIBER)
+
+    assert is_nova_help_intent(text, catalog)
+    resolution = resolve_nova_question(text, catalog)
+    assert resolution is not None
+    assert resolution.action_id == "vision"
+
+
+def test_shared_help_intent_keeps_oversized_known_question_in_nova_for_local_clarify():
+    catalog = build_nova_catalog(SUBSCRIBER)
+    text = "Где у тебя находится визуализация в меню? " + "пожалуйста " * 70
+
+    assert len(text) > 600
+    assert is_nova_help_intent(text, catalog)
+    resolution = resolve_nova_question(text, catalog)
+    assert resolution is not None
+    assert resolution.kind is NovaResolutionKind.CLARIFY
+    assert resolution.action_id is None
+
+
+@pytest.mark.parametrize(
+    "follow_up",
+    [
+        "Ладно, объясни",
+        "Расскажи подробнее",
+        "Как это работает?",
+        "Покажи, где это",
+    ],
+)
+def test_follow_up_resolves_only_from_safe_last_action_context(follow_up):
+    catalog = build_nova_catalog(SUBSCRIBER)
+
+    contextless = resolve_nova_question(follow_up, catalog)
+    assert contextless is not None
+    assert contextless.kind is NovaResolutionKind.CLARIFY
+    assert contextless.action_id is None
+    assert is_nova_help_intent(
+        follow_up,
+        catalog,
+        active_session=True,
+        last_action_id="vision",
+    )
+    resolution = resolve_nova_question(
+        follow_up,
+        catalog,
+        last_action_id="vision",
+    )
+    assert resolution is not None
+    assert resolution.kind is NovaResolutionKind.GUIDE
+    assert resolution.action_id == "vision"
+    assert resolution.cta_label == "🎯 Открыть визуализацию"
+
+
 def _binding(**overrides):
     values = {
         "owner_id": 7,
@@ -271,9 +422,114 @@ async def test_session_has_fifteen_minute_ttl_and_stores_no_question_or_response
         "created_at",
         "expires_at",
         "question_in_progress",
+        "last_action_id",
     }
     assert "question" not in inspect.signature(store.create).parameters
+    assert "transcript" not in inspect.signature(store.create).parameters
     assert "response" not in inspect.signature(store.create).parameters
+    assert session.last_action_id is None
+
+
+@pytest.mark.asyncio
+async def test_last_action_context_is_fenced_and_contains_no_raw_content():
+    raw_transcript = "Привет, где у тебя находится визуализация? PRIVATE_TRANSCRIPT_SENTINEL"
+    catalog = build_nova_catalog(SUBSCRIBER)
+    assert is_nova_help_intent(raw_transcript, catalog)
+    resolution = resolve_nova_question(raw_transcript, catalog)
+    assert resolution is not None
+    assert resolution.action_id == "vision"
+    store = NovaSessionStore()
+    session = await store.create(**_binding())
+    assert await store.begin_question(session_id=session.id, **_binding()) is not None
+
+    remembered = await store.remember_action(
+        session_id=session.id,
+        last_action_id=resolution.action_id,
+        **_binding(),
+    )
+
+    assert remembered is not None
+    assert remembered.last_action_id == "vision"
+    current = await store.current(owner_id=7, telegram_user_id=1001, chat_id=2002)
+    assert current is not None
+    assert current.last_action_id == "vision"
+    assert raw_transcript not in repr(current)
+    assert raw_transcript not in repr(store._sessions)
+    assert "transcript" not in inspect.signature(store.remember_action).parameters
+    assert "question" not in inspect.signature(store.remember_action).parameters
+    assert "response" not in inspect.signature(store.remember_action).parameters
+
+    assert (
+        await store.remember_action(
+            session_id="wrong-session",
+            last_action_id="timezone",
+            **_binding(),
+        )
+        is None
+    )
+    unchanged = await store.current(owner_id=7, telegram_user_id=1001, chat_id=2002)
+    assert unchanged is not None
+    assert unchanged.last_action_id == "vision"
+
+    assert (
+        await store.remember_action(
+            session_id=session.id,
+            last_action_id="vision",
+            **_binding(access_version=5),
+        )
+        is None
+    )
+    assert await store.current(owner_id=7, telegram_user_id=1001, chat_id=2002) is None
+
+
+@pytest.mark.asyncio
+async def test_replacing_or_clearing_session_removes_last_action_context():
+    store = NovaSessionStore()
+    first = await store.create(**_binding())
+    assert await store.begin_question(session_id=first.id, **_binding()) is not None
+    assert (
+        await store.remember_action(
+            session_id=first.id,
+            last_action_id="vision",
+            **_binding(),
+        )
+        is not None
+    )
+
+    replacement = await store.create(**_binding(canonical_message_id=56))
+
+    assert replacement.id != first.id
+    assert replacement.last_action_id is None
+    assert await store.clear(owner_id=7, chat_id=2002, session_id=replacement.id)
+    assert await store.current(owner_id=7, telegram_user_id=1001, chat_id=2002) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_action_id",
+    [
+        "",
+        "Visual action",
+        "vision?private-question",
+        "PRIVATE_TRANSCRIPT_SENTINEL где визуализация",
+        "x" * 101,
+    ],
+)
+async def test_last_action_context_rejects_raw_or_unsafe_identifiers(unsafe_action_id):
+    store = NovaSessionStore()
+    session = await store.create(**_binding())
+    assert await store.begin_question(session_id=session.id, **_binding()) is not None
+
+    with pytest.raises(ValueError, match="action"):
+        await store.remember_action(
+            session_id=session.id,
+            last_action_id=unsafe_action_id,
+            **_binding(),
+        )
+
+    current = await store.current(owner_id=7, telegram_user_id=1001, chat_id=2002)
+    assert current is not None
+    assert current.last_action_id is None
 
 
 @pytest.mark.asyncio
@@ -356,6 +612,16 @@ async def test_expired_session_and_action_are_pruned():
     now = [10.0]
     store = NovaSessionStore(ttl_seconds=5, clock=lambda: now[0])
     session = await store.create(**_binding())
+    assert await store.begin_question(session_id=session.id, **_binding()) is not None
+    assert (
+        await store.remember_action(
+            session_id=session.id,
+            last_action_id="vision",
+            **_binding(),
+        )
+        is not None
+    )
+    assert await store.finish_question(session_id=session.id, **_binding())
     token = await store.issue_action(action_id="vision", session_id=session.id, **_binding())
 
     now[0] = 15.0

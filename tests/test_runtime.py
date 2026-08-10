@@ -34,6 +34,33 @@ class FakeTranscription:
         return "Тестовая расшифровка"
 
 
+class RuntimeTranscription:
+    enabled = True
+
+    def __init__(self, transcript: str) -> None:
+        self.transcript = transcript
+        self.calls: list[tuple[bytes, str]] = []
+
+    async def transcribe(self, audio: bytes, filename: str) -> str:
+        self.calls.append((audio, filename))
+        return self.transcript
+
+
+class RuntimeTelegramFile:
+    async def download_as_bytearray(self) -> bytearray:
+        return bytearray(b"runtime-voice")
+
+
+class RuntimeVoice:
+    duration = 3
+    file_size = 20
+    mime_type = "audio/ogg"
+    file_name = "voice.ogg"
+
+    async def get_file(self) -> RuntimeTelegramFile:
+        return RuntimeTelegramFile()
+
+
 def runtime_settings(**overrides) -> Settings:
     values = {
         "telegram_bot_token": "123456:TEST-TOKEN-FOR-LOCAL-RUNTIME",
@@ -757,6 +784,353 @@ async def test_real_application_explicit_nova_uses_one_canonical_message_and_sto
         assert len((await session.scalars(select(InboxItem))).all()) == 0
         assert len((await session.scalars(select(DraftInboxItem))).all()) == 0
         assert len((await session.scalars(select(ConversationMessage))).all()) == 0
+
+
+async def test_real_application_natural_nova_text_stops_before_generic_content(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(runtime_settings(database_url=db.url), db, fake_ai, FakeTranscription())
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712351
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    phrase = (
+        "Просто я знаю, что в этом боте есть визуализация, но не могу её найти "
+        "в менюшке. Подскажи, пожалуйста."
+    )
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        101,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=phrase,
+    )
+    canonical_message = Message(
+        201,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="✨ Nova\n\nРазбираю вопрос…",
+    )
+    update = Update(1001, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    canonical_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    downstream: list[int] = []
+    generic_answer_calls: list[str] = []
+    nova_provider_calls: list[str] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return canonical_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return canonical_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def downstream_handler(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    async def generic_answer(*args, **kwargs):
+        del args, kwargs
+        generic_answer_calls.append("answer_message")
+        return None
+
+    async def nova_provider(*args, **kwargs):
+        del args, kwargs
+        nova_provider_calls.append("nova_help")
+        return None
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    monkeypatch.setattr(fake_ai, "answer_message", generic_answer)
+    monkeypatch.setattr(fake_ai, "nova_help", nova_provider, raising=False)
+    application.add_handler(TypeHandler(Update, downstream_handler), group=100)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    assert len(sent) == 1
+    assert sent[0]["text"] == "✨ Nova\n\nРазбираю вопрос…"
+    assert edits
+    assert all(edit["message_id"] == canonical_message.message_id for edit in edits)
+    result = edits[-1]
+    assert "визуализац" in str(result["text"]).casefold()
+    assert any(
+        button.text == "🎯 Открыть визуализацию"
+        and str(button.callback_data).startswith("nova:action:vision:")
+        for row in result["reply_markup"].inline_keyboard
+        for button in row
+    )
+    assert fake_ai.route_calls == []
+    assert generic_answer_calls == []
+    assert nova_provider_calls == []
+    current = await core.nova_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat.id,
+    )
+    assert current is not None
+    assert current.last_action_id == "vision"
+    async with db.sessions() as session:
+        assert len((await session.scalars(select(InboxItem))).all()) == 0
+        assert len((await session.scalars(select(DraftInboxItem))).all()) == 0
+        assert len((await session.scalars(select(ConversationMessage))).all()) == 0
+
+
+async def test_real_application_voice_help_runs_nova_before_generic_content(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    transcript = "Привет, где у тебя находится визуализация?"
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712352
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        102,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        voice=RuntimeVoice(),
+    )
+    canonical_message = Message(
+        202,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…",
+    )
+    update = Update(1002, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    canonical_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    generic_route_calls: list[tuple[str, str]] = []
+    generic_answer_calls: list[str] = []
+    nova_provider_calls: list[str] = []
+    original_route = core._route_message
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return canonical_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return canonical_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def tracked_route(route_update, context, text, source):
+        generic_route_calls.append((text, source))
+        await original_route(route_update, context, text, source)
+
+    async def generic_answer(*args, **kwargs):
+        del args, kwargs
+        generic_answer_calls.append("answer_message")
+        return None
+
+    async def nova_provider(*args, **kwargs):
+        del args, kwargs
+        nova_provider_calls.append("nova_help")
+        return None
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    monkeypatch.setattr(core, "_route_message", tracked_route)
+    monkeypatch.setattr(fake_ai, "answer_message", generic_answer)
+    monkeypatch.setattr(fake_ai, "nova_help", nova_provider, raising=False)
+
+    await application.process_update(update)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert len(sent) == 1
+    assert sent[0]["text"] == "Расшифровываю голосовую мысль…"
+    assert edits
+    assert all(edit["message_id"] == canonical_message.message_id for edit in edits)
+    result = edits[-1]
+    assert "визуализац" in str(result["text"]).casefold()
+    assert "Я услышал" not in str(result["text"])
+    assert any(
+        button.text == "🎯 Открыть визуализацию"
+        and str(button.callback_data).startswith("nova:action:vision:")
+        for row in result["reply_markup"].inline_keyboard
+        for button in row
+    )
+    assert generic_route_calls == []
+    assert fake_ai.route_calls == []
+    assert generic_answer_calls == []
+    assert nova_provider_calls == []
+    current = await core.nova_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat.id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == canonical_message.message_id
+    assert current.last_action_id == "vision"
+    assert transcript not in repr(current)
+    async with db.sessions() as session:
+        assert len((await session.scalars(select(InboxItem))).all()) == 0
+        assert len((await session.scalars(select(DraftInboxItem))).all()) == 0
+        assert len((await session.scalars(select(ConversationMessage))).all()) == 0
+
+
+async def test_real_application_voice_help_does_not_steal_durable_onboarding_answer(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    transcript = "Привет, где у тебя находится визуализация?"
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712353
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        session.add(
+            OnboardingState(
+                user_id=owner.id,
+                current_step=2,
+                answers={"display_name": "Тест"},
+                status="in_progress",
+            )
+        )
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        103,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        voice=RuntimeVoice(),
+    )
+    canonical_message = Message(
+        203,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…",
+    )
+    update = Update(1003, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    canonical_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    generic_route_calls: list[tuple[str, str]] = []
+    nova_provider_calls: list[str] = []
+    original_route = core._route_message
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return canonical_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return canonical_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def tracked_route(route_update, context, text, source):
+        generic_route_calls.append((text, source))
+        await original_route(route_update, context, text, source)
+
+    async def nova_provider(*args, **kwargs):
+        del args, kwargs
+        nova_provider_calls.append("nova_help")
+        return None
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    monkeypatch.setattr(core, "_route_message", tracked_route)
+    monkeypatch.setattr(fake_ai, "nova_help", nova_provider, raising=False)
+
+    await application.process_update(update)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert sent
+    assert sent[0]["text"] == "Расшифровываю голосовую мысль…"
+    assert all("✨ Nova" not in str(item["text"]) for item in sent)
+    assert all("✨ Nova" not in str(edit["text"]) for edit in edits)
+    assert generic_route_calls == []
+    assert fake_ai.route_calls == []
+    assert nova_provider_calls == []
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+    assert state is not None
+    assert state.current_step == 3
+    assert state.answers["display_name"] == "Тест"
+    assert state.answers["future_life"] == transcript
+    assert (
+        await core.nova_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
 
 
 async def test_real_application_explicit_nova_cannot_open_destructive_system_action(
