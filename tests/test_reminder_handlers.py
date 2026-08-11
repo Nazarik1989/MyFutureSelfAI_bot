@@ -27,6 +27,8 @@ from future_self.reminder_intent import (
     ReminderTimezoneSource,
 )
 from future_self.repositories import UserRepository
+from future_self.schemas import ReminderTimezoneResolution
+from future_self.timezones import extract_reminder_timezone_fragment
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)  # 15:00 in Moscow
 
@@ -1773,3 +1775,1172 @@ async def test_daily_schedule_failure_rolls_back_task_in_same_transaction(
         assert await session.scalar(select(func.count(InboxItem.id))) == 0
         assert await session.scalar(select(func.count(TaskReminder.id))) == 0
         assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+async def reminder_domain_row_counts(db) -> tuple[int, int, int, int]:
+    async with db.sessions() as session:
+        return (
+            await session.scalar(select(func.count(DraftInboxItem.id))),
+            await session.scalar(select(func.count(InboxItem.id))),
+            await session.scalar(select(func.count(TaskReminder.id))),
+            await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))),
+        )
+
+
+async def change_reminder_access(db, user: User, change: str) -> None:
+    async with db.session() as session:
+        stored = await session.scalar(select(User).where(User.id == user.id))
+        assert stored is not None
+        stored.access_tier = GUEST
+        stored.access_version += 1
+        if change == "bounce":
+            stored.access_tier = SUBSCRIBER
+            stored.access_version += 1
+
+
+def reminder_rendered_texts(
+    incoming: ReminderMessage,
+    context: SimpleNamespace,
+) -> list[str]:
+    texts = [edit["text"] for edit in context.bot.edits]
+    for reply in incoming.replies:
+        texts.extend(edit["text"] for edit in reply["message"].edits)
+    return texts
+
+
+def latest_reminder_render(
+    canonical: ReminderMessage,
+    context: SimpleNamespace,
+) -> dict[str, Any]:
+    if context.bot.edits:
+        return context.bot.edits[-1]
+    assert canonical.edits
+    return canonical.edits[-1]
+
+
+def reminder_timezone_window(text: str) -> str:
+    fragment = extract_reminder_timezone_fragment(text)
+    assert fragment is not None
+    return fragment.text
+
+
+@pytest.mark.parametrize(
+    ("phrase", "timezone", "kind", "title"),
+    [
+        (
+            "Напомни завтра в 10:00 по Лондону созвониться с клиентом",
+            "Europe/London",
+            ReminderScheduleKind.ONCE,
+            "созвониться с клиентом",
+        ),
+        (
+            "Каждый день в 20:30 по времени Тбилиси заполнить дневник",
+            "Asia/Tbilisi",
+            ReminderScheduleKind.DAILY,
+            "заполнить дневник",
+        ),
+        (
+            "Напомни завтра в 10:00 по МСК проверить почту",
+            "Europe/Moscow",
+            ReminderScheduleKind.ONCE,
+            "проверить почту",
+        ),
+        (
+            "Каждый день в 20:30 по Europe/Berlin заполнить дневник",
+            "Europe/Berlin",
+            ReminderScheduleKind.DAILY,
+            "заполнить дневник",
+        ),
+        (
+            "Напомни завтра в 10:00 в часовом поясе Europe/London позвонить врачу",
+            "Europe/London",
+            ReminderScheduleKind.ONCE,
+            "позвонить врачу",
+        ),
+        (
+            "Напомни завтра в 18:00 в часовом поясе Нью-Йорка проверить почту",
+            "America/New_York",
+            ReminderScheduleKind.ONCE,
+            "проверить почту",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_known_natural_and_exact_timezones_open_preview_without_ai(
+    db,
+    fake_ai,
+    phrase,
+    timezone,
+    kind,
+    title,
+):
+    user = await subscriber(db, 6301)
+    bot = deterministic_bot(db, fake_ai)
+    incoming = ReminderMessage(phrase)
+
+    assert await bot.reminder_text_gate(
+        reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9301),
+        reminder_context(),
+    )
+
+    session = await current_session(bot, user, 9301)
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.PREVIEW
+    assert session.schedule_kind is kind
+    assert session.title == title
+    assert session.timezone == timezone
+    assert session.timezone_source is ReminderTimezoneSource.EXPLICIT
+    assert fake_ai.reminder_timezone_calls == []
+    assert fake_ai.timezone_calls == []
+    preview = incoming.replies[0]["message"].edits[-1]["text"]
+    assert timezone in preview
+    if timezone != "Europe/Moscow":
+        assert "В твоём часовом поясе:" in preview
+        assert "Europe/Moscow" in preview
+    if timezone == "Europe/London":
+        assert "11.08.2026 12:00 (Europe/Moscow)" in preview
+    elif timezone == "Asia/Tbilisi":
+        assert "10.08.2026 19:30 (Europe/Moscow)" in preview
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.asyncio
+async def test_model_timezone_flow_has_text_stt_parity_and_receives_only_bounded_fragment(
+    db,
+    fake_ai,
+    source,
+):
+    user = await subscriber(db, 6302)
+    bot = deterministic_bot(db, fake_ai)
+    phrase = "Напомни завтра в 9:00 по светогорску позвонить врачу"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по светогорску",
+        city="Светогорск",
+        country="Россия",
+    )
+    context = reminder_context()
+    incoming = ReminderMessage(phrase if source == "text" else "Расшифровываю…")
+    update = reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9302)
+
+    if source == "text":
+        handled = await bot.reminder_text_gate(update, context)
+        canonical = incoming.replies[0]["message"]
+    else:
+        handled = await bot.reminder_voice_gate(
+            update,
+            context,
+            phrase,
+            incoming,
+            expected_access_version=user.access_version,
+            expected_session=None,
+        )
+        canonical = incoming
+
+    assert handled is True
+    session = await current_session(bot, user, 9302)
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.PREVIEW
+    assert session.schedule_kind is ReminderScheduleKind.ONCE
+    assert session.local_date == date(2026, 8, 11)
+    assert session.local_time == time(9)
+    assert session.title == "позвонить врачу"
+    assert session.timezone == "Europe/Moscow"
+    assert session.timezone_source is ReminderTimezoneSource.EXPLICIT
+    assert fake_ai.reminder_timezone_calls == [fragment]
+    assert phrase not in fake_ai.reminder_timezone_calls
+    assert fake_ai.timezone_calls == []
+    final_render = latest_reminder_render(canonical, context)
+    assert "позвонить врачу" in final_render["text"]
+    callbacks = [
+        button.callback_data
+        for row in final_render["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert all(value is not None and value.startswith("rmd:") for value in callbacks)
+    assert all(fragment not in value and phrase not in value for value in callbacks)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_timezone_clarification_reuses_session_and_canonical_fields(
+    db,
+    fake_ai,
+):
+    user = await subscriber(db, 6303)
+    bot = deterministic_bot(db, fake_ai)
+    context = reminder_context()
+    phrase = "Напомни завтра в 10:00 по Сан-Хосе созвониться с клиентом"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="ambiguous",
+        matched_text="по Сан-Хосе",
+    )
+    incoming = ReminderMessage(phrase)
+
+    assert await bot.reminder_text_gate(
+        reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9303),
+        context,
+    )
+
+    ambiguous = await current_session(bot, user, 9303)
+    assert ambiguous is not None
+    assert ambiguous.phase is ReminderFlowPhase.TIMEZONE_CLARIFY
+    assert ambiguous.title == "созвониться с клиентом"
+    assert ambiguous.local_date == date(2026, 8, 11)
+    assert ambiguous.local_time == time(10)
+    assert phrase not in repr(ambiguous)
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+    canonical = incoming.replies[0]["message"]
+    assert canonical.message_id == ambiguous.canonical_message_id
+    assert (
+        latest_reminder_render(canonical, context)["text"]
+        == "Уточни город вместе со страной или регионом"
+    )
+
+    clarification = "Сан-Хосе, Калифорния, США"
+    fake_ai.reminder_timezone_results[clarification] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="America/Los_Angeles",
+        matched_text=clarification,
+        city="Сан-Хосе",
+        country="США",
+    )
+    follow_up = ReminderMessage(clarification)
+    assert await bot.reminder_text_gate(
+        reminder_update(follow_up, telegram_user_id=user.telegram_id, chat_id=9303),
+        context,
+    )
+
+    resolved = await current_session(bot, user, 9303)
+    assert resolved is not None
+    assert resolved.id == ambiguous.id
+    assert resolved.canonical_message_id == canonical.message_id
+    assert resolved.phase is ReminderFlowPhase.PREVIEW
+    assert resolved.title == ambiguous.title
+    assert resolved.local_date == ambiguous.local_date
+    assert resolved.local_time == ambiguous.local_time
+    assert resolved.timezone == "America/Los_Angeles"
+    assert resolved.timezone_source is ReminderTimezoneSource.EXPLICIT
+    assert phrase not in repr(resolved)
+    assert clarification not in repr(resolved)
+    assert fake_ai.reminder_timezone_calls == [fragment, clarification]
+    assert follow_up.replies == []
+    assert context.bot.edits[-1]["message_id"] == canonical.message_id
+    assert "America/Los_Angeles" in context.bot.edits[-1]["text"]
+    assert "В твоём часовом поясе:" in context.bot.edits[-1]["text"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "invalid_iana",
+        "bad_evidence",
+        "insufficient",
+        "provider_error",
+        "timeout",
+    ],
+)
+@pytest.mark.asyncio
+async def test_unresolved_model_timezone_is_retryable_without_domain_dml_or_private_logs(
+    db,
+    fake_ai,
+    caplog,
+    failure,
+):
+    user = await subscriber(db, 6304)
+    bot = deterministic_bot(db, fake_ai)
+    private_title = "PRIVATE_TIMEZONE_TITLE_8831"
+    private_error = "PRIVATE_TIMEZONE_ERROR_117c"
+    private_model_output = "PRIVATE_MODEL_OUTPUT_09bf"
+    phrase = f"Напомни завтра в 9:00 по Светогорску {private_title}"
+    fragment = reminder_timezone_window(phrase)
+    if failure == "invalid_iana":
+        fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+            status="resolved",
+            timezone="Ocean/Atlantis",
+            matched_text="по Светогорску",
+            city=private_model_output,
+        )
+    elif failure == "bad_evidence":
+        fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+            status="resolved",
+            timezone="Europe/London",
+            matched_text="по Лондону",
+            city=private_model_output,
+        )
+    elif failure == "insufficient":
+        fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(status=failure)
+    elif failure == "provider_error":
+        fake_ai.reminder_timezone_error = RuntimeError(private_error)
+    else:
+        fake_ai.reminder_timezone_error = TimeoutError(private_error)
+    caplog.set_level("WARNING", logger="future_self.reminder_handlers")
+    incoming = ReminderMessage(phrase)
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    context = reminder_context()
+    try:
+        assert await bot.reminder_text_gate(
+            reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9304),
+            context,
+        )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    session = await current_session(bot, user, 9304)
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.TIMEZONE_RETRY
+    assert session.title is None
+    assert session.timezone == "Europe/Moscow"
+    assert session.timezone_source is ReminderTimezoneSource.PROFILE
+    assert fake_ai.reminder_timezone_calls == [fragment]
+    canonical = incoming.replies[0]["message"]
+    final_render = latest_reminder_render(canonical, context)
+    assert "Ничего не сохранено" in final_render["text"]
+    callbacks = [
+        button.callback_data
+        for row in final_render["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert callbacks and all(value is not None and value.startswith("rmd:") for value in callbacks)
+    assert all(
+        sensitive not in value
+        for value in callbacks
+        for sensitive in (
+            phrase,
+            fragment,
+            private_title,
+            private_error,
+            private_model_output,
+        )
+    )
+    assert not any(
+        statement.lstrip().split(maxsplit=1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}
+        for statement in statements
+        if statement.strip()
+    )
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+    assert phrase not in repr(session)
+    assert fragment not in repr(session)
+    assert private_error not in repr(session)
+    assert private_model_output not in repr(session)
+    assert phrase not in caplog.text
+    assert fragment not in caplog.text
+    assert private_title not in caplog.text
+    assert private_error not in caplog.text
+    assert private_model_output not in caplog.text
+    expected_error_type = {
+        "invalid_iana": "ValueError",
+        "bad_evidence": "ValueError",
+        "provider_error": "RuntimeError",
+        "timeout": "TimeoutError",
+    }.get(failure)
+    if expected_error_type is None:
+        assert caplog.text == ""
+    else:
+        assert expected_error_type in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_weak_timezone_marker_not_mentioned_resumes_profile_flow_with_full_title(
+    db,
+    fake_ai,
+):
+    user = await subscriber(db, 6321)
+    bot = deterministic_bot(db, fake_ai)
+    phrase = "Напомни завтра в 9:00 по дороге купить лекарства"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(status="not_mentioned")
+    incoming = ReminderMessage(phrase)
+
+    assert await bot.reminder_text_gate(
+        reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9321),
+        reminder_context(),
+    )
+
+    session = await current_session(bot, user, 9321)
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.PREVIEW
+    assert session.title == "по дороге купить лекарства"
+    assert session.timezone == user.timezone
+    assert session.timezone_source is ReminderTimezoneSource.PROFILE
+    assert fake_ai.reminder_timezone_calls == [fragment]
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_timezone_provider_cancellation_propagates_and_keeps_retry_fence_without_dml(
+    db,
+    fake_ai,
+):
+    user = await subscriber(db, 6305)
+    bot = deterministic_bot(db, fake_ai)
+    phrase = "Напомни завтра в 9:00 по Светогорску позвонить врачу"
+    fake_ai.reminder_timezone_error = asyncio.CancelledError()
+    incoming = ReminderMessage(phrase)
+    context = reminder_context()
+
+    with pytest.raises(asyncio.CancelledError):
+        await bot.reminder_text_gate(
+            reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9305),
+            context,
+        )
+
+    session = await current_session(bot, user, 9305)
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.TIMEZONE_RETRY
+    assert fake_ai.reminder_timezone_calls == [reminder_timezone_window(phrase)]
+    canonical = incoming.replies[0]["message"]
+    assert "Ничего не сохранено" in latest_reminder_render(canonical, context)["text"]
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("phrase", "title"),
+    [
+        ("Напомни завтра в 19:30 по работе позвонить", "по работе позвонить"),
+        (
+            "Напомни завтра в 19:30 по проекту отправить отчёт",
+            "по проекту отправить отчёт",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_semantic_po_title_never_enters_timezone_model_flow(db, fake_ai, phrase, title):
+    user = await subscriber(db, 6306)
+    bot = deterministic_bot(db, fake_ai)
+    incoming = ReminderMessage(phrase)
+
+    assert await bot.reminder_text_gate(
+        reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9306),
+        reminder_context(),
+    )
+
+    session = await current_session(bot, user, 9306)
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.PREVIEW
+    assert session.title == title
+    assert session.timezone_source is ReminderTimezoneSource.PROFILE
+    assert fake_ai.reminder_timezone_calls == []
+
+
+@pytest.mark.parametrize("provider_outcome", ["success", "error", "cancelled"])
+@pytest.mark.asyncio
+async def test_duplicate_concurrent_timezone_input_starts_model_once_for_generation(
+    db,
+    fake_ai,
+    provider_outcome,
+):
+    user = await subscriber(db, 6307)
+    bot = deterministic_bot(db, fake_ai)
+    phrase = "Напомни завтра в 9:00 по Светогорску проверить ёлку"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по Светогорску",
+    )
+    if provider_outcome == "error":
+        fake_ai.reminder_timezone_error = RuntimeError("PRIVATE_DUPLICATE_ERROR")
+    elif provider_outcome == "cancelled":
+        fake_ai.reminder_timezone_error = asyncio.CancelledError()
+    fake_ai.reminder_timezone_release.clear()
+    first = ReminderMessage(phrase)
+    duplicate = ReminderMessage("  НАПОМНИ   ЗАВТРА В 9:00 ПО СВЕТОГОРСКУ ПРОВЕРИТЬ е\u0308лку  ")
+    context = reminder_context()
+
+    first_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(first, telegram_user_id=user.telegram_id, chat_id=9307),
+            context,
+        )
+    )
+    await fake_ai.reminder_timezone_started.wait()
+    resolving = await current_session(bot, user, 9307)
+    assert resolving is not None
+    assert resolving.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+    canonical = first.replies[0]["message"]
+    canonical_edits = list(canonical.edits)
+    bot_edits = list(context.bot.edits)
+    duplicate_result = await bot.reminder_text_gate(
+        reminder_update(duplicate, telegram_user_id=user.telegram_id, chat_id=9307),
+        context,
+    )
+    assert duplicate_result is True
+    assert await current_session(bot, user, 9307) == resolving
+    assert canonical.edits == canonical_edits
+    assert context.bot.edits == bot_edits
+    assert fake_ai.reminder_timezone_calls == [fragment]
+    assert duplicate.replies == []
+
+    fake_ai.reminder_timezone_release.set()
+    if provider_outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+    else:
+        assert await first_task is True
+    session = await current_session(bot, user, 9307)
+    assert session is not None
+    assert session.id == resolving.id
+    assert session.phase is (
+        ReminderFlowPhase.PREVIEW
+        if provider_outcome == "success"
+        else ReminderFlowPhase.TIMEZONE_RETRY
+    )
+    assert fake_ai.reminder_timezone_calls == [fragment]
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("provider_outcome", ["success", "error", "cancelled"])
+@pytest.mark.asyncio
+async def test_ordinary_input_during_timezone_resolution_is_absorbed_without_mutation(
+    db,
+    fake_ai,
+    source,
+    provider_outcome,
+):
+    user = await subscriber(db, 6315)
+    bot = deterministic_bot(db, fake_ai)
+    phrase = "Напомни завтра в 9:00 по Светогорску позвонить врачу"
+    context = reminder_context()
+    initial = ReminderMessage(phrase)
+    fake_ai.reminder_timezone_release.clear()
+    provider_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(initial, telegram_user_id=user.telegram_id, chat_id=9315),
+            context,
+        )
+    )
+    await fake_ai.reminder_timezone_started.wait()
+    provider_input = fake_ai.reminder_timezone_calls[-1]
+    fake_ai.reminder_timezone_results[provider_input] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по Светогорску",
+    )
+    if provider_outcome == "error":
+        fake_ai.reminder_timezone_error = RuntimeError("PRIVATE_TRANSPORT_DETAIL")
+    elif provider_outcome == "cancelled":
+        fake_ai.reminder_timezone_error = asyncio.CancelledError()
+
+    resolving = await current_session(bot, user, 9315)
+    assert resolving is not None
+    assert resolving.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+    canonical = initial.replies[0]["message"]
+    canonical_edits = list(canonical.edits)
+    bot_edits = list(context.bot.edits)
+    ordinary = ReminderMessage("позвонить маме после работы")
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        if source == "text":
+            handled = await bot.reminder_text_gate(
+                reminder_update(
+                    ordinary,
+                    telegram_user_id=user.telegram_id,
+                    chat_id=9315,
+                ),
+                context,
+            )
+        else:
+            handled = await bot.reminder_voice_gate(
+                reminder_update(
+                    ordinary,
+                    telegram_user_id=user.telegram_id,
+                    chat_id=9315,
+                ),
+                context,
+                "позвонить маме после работы",
+                ordinary,
+                expected_access_version=resolving.access_version,
+                expected_session=resolving,
+            )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert handled is True
+    assert await current_session(bot, user, 9315) == resolving
+    assert canonical.edits == canonical_edits
+    assert context.bot.edits == bot_edits
+    assert ordinary.replies == []
+    assert ordinary.deleted == (1 if source == "voice" else 0)
+    assert fake_ai.reminder_timezone_calls == [provider_input]
+    assert not any(
+        statement.lstrip().split(maxsplit=1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}
+        for statement in statements
+        if statement.strip()
+    )
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+    fake_ai.reminder_timezone_release.set()
+    if provider_outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await provider_task
+    else:
+        assert await provider_task is True
+    finished = await current_session(bot, user, 9315)
+    assert finished is not None
+    assert finished.id == resolving.id
+    if provider_outcome == "success":
+        assert finished.phase is ReminderFlowPhase.PREVIEW
+        assert finished.timezone == "Europe/Moscow"
+    else:
+        assert finished.phase is ReminderFlowPhase.TIMEZONE_RETRY
+    assert fake_ai.reminder_timezone_calls == [provider_input]
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("old_provider_outcome", ["success", "error", "cancelled"])
+@pytest.mark.asyncio
+async def test_distinct_explicit_command_replaces_resolving_generation_and_stales_old_result(
+    db,
+    fake_ai,
+    source,
+    old_provider_outcome,
+):
+    user = await subscriber(db, 6316)
+    bot = deterministic_bot(db, fake_ai)
+    context = reminder_context()
+    old_phrase = "Напомни завтра в 9:00 по Светогорску старый приватный заголовок"
+    old_message = ReminderMessage(old_phrase)
+    old_provider_started = asyncio.Event()
+    old_provider_release = asyncio.Event()
+    new_provider_started = asyncio.Event()
+    new_provider_release = asyncio.Event()
+
+    async def controlled_timezone_resolution(fragment: str):
+        fake_ai.reminder_timezone_calls.append(fragment)
+        call_number = len(fake_ai.reminder_timezone_calls)
+        if call_number == 1:
+            old_provider_started.set()
+            await old_provider_release.wait()
+            if old_provider_outcome == "error":
+                raise RuntimeError("PRIVATE_STALE_PROVIDER_ERROR")
+            if old_provider_outcome == "cancelled":
+                raise asyncio.CancelledError
+        elif call_number == 2:
+            new_provider_started.set()
+            await new_provider_release.wait()
+        else:
+            raise AssertionError("one provider call is allowed per reminder generation")
+        return ReminderTimezoneResolution(
+            status="resolved",
+            timezone="Europe/Moscow",
+            matched_text="по Светогорску",
+        )
+
+    fake_ai.resolve_reminder_timezone = controlled_timezone_resolution
+    old_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(old_message, telegram_user_id=user.telegram_id, chat_id=9316),
+            context,
+        )
+    )
+    await old_provider_started.wait()
+    old = await current_session(bot, user, 9316)
+    assert old is not None
+    assert old.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+
+    new_phrase = "Напомни завтра в 11:00 по Светогорску новый заголовок"
+    replacement_input = ReminderMessage(new_phrase if source == "text" else "Расшифровываю…")
+    replacement_update = reminder_update(
+        replacement_input,
+        telegram_user_id=user.telegram_id,
+        chat_id=9316,
+    )
+    if source == "text":
+        replacement_task = asyncio.create_task(bot.reminder_text_gate(replacement_update, context))
+    else:
+        replacement_task = asyncio.create_task(
+            bot.reminder_voice_gate(
+                replacement_update,
+                context,
+                new_phrase,
+                replacement_input,
+                expected_access_version=old.access_version,
+                expected_session=old,
+            )
+        )
+
+    await asyncio.wait_for(new_provider_started.wait(), timeout=1)
+    assert len(fake_ai.reminder_timezone_calls) == 2
+    replacement = await current_session(bot, user, 9316)
+    assert replacement is not None
+    assert replacement.id != old.id
+    assert replacement.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+    assert replacement.canonical_message_id == old.canonical_message_id
+    canonical = old_message.replies[0]["message"]
+    edits_before_results = len(canonical.edits) + len(context.bot.edits)
+    old_provider_input, new_provider_input = fake_ai.reminder_timezone_calls
+    new_provider_release.set()
+    assert await replacement_task is True
+    completed_replacement = await current_session(bot, user, 9316)
+    assert completed_replacement is not None
+    assert completed_replacement.id == replacement.id
+    assert completed_replacement.phase is ReminderFlowPhase.PREVIEW
+    assert completed_replacement.title == "новый заголовок"
+    assert completed_replacement.local_time == time(11)
+    assert completed_replacement.timezone == "Europe/Moscow"
+    assert len(canonical.edits) + len(context.bot.edits) == edits_before_results + 1
+    edits_after_replacement = len(canonical.edits) + len(context.bot.edits)
+
+    old_provider_release.set()
+    if old_provider_outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await old_task
+    else:
+        assert await old_task is True
+    live = await current_session(bot, user, 9316)
+    assert live == completed_replacement
+    assert len(canonical.edits) + len(context.bot.edits) == edits_after_replacement
+    assert (
+        "старый приватный заголовок"
+        not in latest_reminder_render(
+            canonical,
+            context,
+        )["text"]
+    )
+    assert fake_ai.reminder_timezone_calls == [old_provider_input, new_provider_input]
+    assert replacement_input.replies == []
+    assert replacement_input.deleted == (1 if source == "voice" else 0)
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("checkpoint", ["before", "during", "after"])
+@pytest.mark.parametrize("change", ["downgrade", "bounce"])
+@pytest.mark.asyncio
+async def test_timezone_ai_access_change_is_fail_closed_at_every_checkpoint(
+    db,
+    fake_ai,
+    monkeypatch,
+    checkpoint,
+    change,
+):
+    user = await subscriber(db, 6308)
+    bot = deterministic_bot(db, fake_ai)
+    phrase = "Напомни завтра в 9:00 по Светогорску позвонить врачу"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по Светогорску",
+    )
+    if checkpoint == "before":
+        original_store = bot._reminder_timezone_store_and_render
+
+        async def store_then_change(*args, **kwargs):
+            result = await original_store(*args, **kwargs)
+            await change_reminder_access(db, user, change)
+            return result
+
+        monkeypatch.setattr(bot, "_reminder_timezone_store_and_render", store_then_change)
+    elif checkpoint == "after":
+        original_apply = bot._reminder_timezone_apply_result
+
+        async def change_then_apply(*args, **kwargs):
+            await change_reminder_access(db, user, change)
+            return await original_apply(*args, **kwargs)
+
+        monkeypatch.setattr(bot, "_reminder_timezone_apply_result", change_then_apply)
+    else:
+        fake_ai.reminder_timezone_release.clear()
+    incoming = ReminderMessage(phrase)
+    context = reminder_context()
+    update = reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9308)
+
+    if checkpoint == "during":
+        task = asyncio.create_task(bot.reminder_text_gate(update, context))
+        await fake_ai.reminder_timezone_started.wait()
+        await change_reminder_access(db, user, change)
+        fake_ai.reminder_timezone_release.set()
+        assert await task is True
+    else:
+        assert await bot.reminder_text_gate(update, context) is True
+
+    assert len(fake_ai.reminder_timezone_calls) == (0 if checkpoint == "before" else 1)
+    assert await current_session(bot, user, 9308) is None
+    texts = reminder_rendered_texts(incoming, context)
+    assert any("Доступ изменился" in text for text in texts)
+    assert all("позвонить врачу" not in text for text in texts)
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("stale_kind", ["replacement", "canonical"])
+@pytest.mark.asyncio
+async def test_stale_timezone_result_cannot_mutate_replacement_or_rebound_canonical(
+    db,
+    fake_ai,
+    stale_kind,
+):
+    user = await subscriber(db, 6309)
+    bot = deterministic_bot(db, fake_ai)
+    context = reminder_context()
+    old_phrase = "Напомни завтра в 9:00 по Светогорску старый приватный title"
+    fragment = reminder_timezone_window(old_phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по Светогорску",
+    )
+    fake_ai.reminder_timezone_release.clear()
+    incoming = ReminderMessage(old_phrase)
+    old_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9309),
+            context,
+        )
+    )
+    await fake_ai.reminder_timezone_started.wait()
+    old = await current_session(bot, user, 9309)
+    assert old is not None
+
+    if stale_kind == "replacement":
+        replacement = await bot.reminder_sessions.create(
+            owner_id=old.owner_id,
+            telegram_user_id=old.telegram_user_id,
+            chat_id=old.chat_id,
+            access_version=old.access_version,
+            title="новое напоминание",
+            schedule_kind=ReminderScheduleKind.ONCE,
+            local_date=date(2026, 8, 11),
+            local_time=time(11),
+            timezone="Europe/London",
+            timezone_source=ReminderTimezoneSource.EXPLICIT,
+            phase=ReminderFlowPhase.PREVIEW,
+            canonical_message_id=old.canonical_message_id,
+            profile_timezone=old.profile_timezone,
+        )
+        assert replacement.id != old.id
+    else:
+        replacement = await bot.reminder_sessions.update(
+            old,
+            canonical_message_id=(old.canonical_message_id or 0) + 10,
+        )
+        assert replacement is not None
+
+    fake_ai.reminder_timezone_release.set()
+    assert await old_task is True
+    live = await current_session(bot, user, 9309)
+    assert live is not None
+    assert live.id == replacement.id
+    assert live.version == replacement.version
+    assert live.canonical_message_id == replacement.canonical_message_id
+    if stale_kind == "replacement":
+        assert live.title == "новое напоминание"
+        assert live.local_time == time(11)
+        assert live.timezone == "Europe/London"
+    else:
+        assert live.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+        assert live.timezone == "Europe/Moscow"
+    assert fake_ai.reminder_timezone_calls == [fragment]
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Напомни завтра в 10:00 по времени Лондона в часовом поясе Берлина позвонить врачу",
+        "Напомни завтра в 10:00 по Europe/London в часовом поясе Берлина позвонить врачу",
+        "Напомни завтра в 10:00 Europe/London в часовом поясе Берлина позвонить врачу",
+        "Напомни завтра в 10:00 МСК в часовом поясе Берлина позвонить врачу",
+        "Напомни завтра в 10:00 Europe/London в часовом поясе Europe/London позвонить врачу",
+        "Напомни завтра в 10:00 по Светогорску позвонить Europe/London",
+    ],
+)
+@pytest.mark.asyncio
+async def test_multiple_explicit_timezone_markers_fail_closed_without_ai_or_dml(
+    db,
+    fake_ai,
+    phrase,
+):
+    user = await subscriber(db, 6310)
+    bot = deterministic_bot(db, fake_ai)
+    incoming = ReminderMessage(phrase)
+    context = reminder_context()
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        assert await bot.reminder_text_gate(
+            reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9310),
+            context,
+        )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    session = await current_session(bot, user, 9310)
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.TIMEZONE_RETRY
+    assert session.title is None
+    assert phrase not in repr(session)
+    assert fake_ai.reminder_timezone_calls == []
+    assert fake_ai.timezone_calls == []
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+    assert not any(
+        statement.lstrip().split(maxsplit=1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}
+        for statement in statements
+        if statement.strip()
+    )
+    canonical = incoming.replies[0]["message"]
+    final_render = latest_reminder_render(canonical, context)
+    assert "Не удалось надёжно определить часовой пояс" in final_render["text"]
+    assert "Проверь напоминание" not in final_render["text"]
+    assert "Europe/Moscow" not in final_render["text"]
+    assert phrase not in final_render["text"]
+
+
+@pytest.mark.parametrize(
+    ("relative_day", "local_time", "expected_date"),
+    [
+        ("сегодня", "23:59", date(2026, 8, 10)),
+        ("завтра", "10:00", date(2026, 8, 11)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_model_timezone_relative_date_is_anchored_when_provider_crosses_midnight(
+    db,
+    fake_ai,
+    relative_day,
+    local_time,
+    expected_date,
+):
+    user = await subscriber(db, 6311)
+    initial = datetime(2026, 8, 10, 22, 58, tzinfo=UTC)  # 23:58 in London
+    clock = [initial]
+    bot = deterministic_bot(db, fake_ai)
+    bot.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: clock[0])
+    bot._reminder_now_provider = lambda: clock[0]
+    timezone_expression = "по времени Нортгемптону"
+    phrase = f"Напомни {relative_day} в {local_time} {timezone_expression} позвонить врачу"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/London",
+        matched_text=timezone_expression,
+        city="Нортгемптон",
+        country="Великобритания",
+    )
+    fake_ai.reminder_timezone_release.clear()
+    incoming = ReminderMessage(phrase)
+
+    task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9311),
+            reminder_context(),
+        )
+    )
+    await fake_ai.reminder_timezone_started.wait()
+    pending = await current_session(bot, user, 9311)
+    assert pending is not None
+    assert pending.calendar_anchor_utc == initial
+    clock[0] = datetime(2026, 8, 10, 23, 1, tzinfo=UTC)  # 00:01 next day in London
+    fake_ai.reminder_timezone_release.set()
+    assert await task is True
+
+    session = await current_session(bot, user, 9311)
+    assert session is not None
+    assert session.local_date == expected_date
+    assert session.timezone == "Europe/London"
+    assert session.timezone_source is ReminderTimezoneSource.EXPLICIT
+    assert session.calendar_anchor_utc == initial
+    assert fake_ai.reminder_timezone_calls == [fragment]
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_bare_timezone_clarification_is_single_flight_and_keeps_session(
+    db,
+    fake_ai,
+):
+    user = await subscriber(db, 6312)
+    bot = deterministic_bot(db, fake_ai)
+    context = reminder_context()
+    initial_phrase = "Напомни завтра в 10:00 по Сан-Хосе созвониться с клиентом"
+    fragment = reminder_timezone_window(initial_phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="ambiguous",
+        matched_text="по Сан-Хосе",
+    )
+    incoming = ReminderMessage(initial_phrase)
+    assert await bot.reminder_text_gate(
+        reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9312),
+        context,
+    )
+    clarify = await current_session(bot, user, 9312)
+    assert clarify is not None
+    assert clarify.phase is ReminderFlowPhase.TIMEZONE_CLARIFY
+
+    answer = "Сан-Хосе, Калифорния, США"
+    fake_ai.reminder_timezone_results[answer] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="America/Los_Angeles",
+        matched_text=answer,
+        city="Сан-Хосе",
+        country="США",
+    )
+    fake_ai.reminder_timezone_started.clear()
+    fake_ai.reminder_timezone_release.clear()
+    first_answer = ReminderMessage(answer)
+    first_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(first_answer, telegram_user_id=user.telegram_id, chat_id=9312),
+            context,
+        )
+    )
+    await fake_ai.reminder_timezone_started.wait()
+    resolving = await current_session(bot, user, 9312)
+    assert resolving is not None
+    assert resolving.id == clarify.id
+    assert resolving.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+
+    duplicate = ReminderMessage(answer)
+    duplicate_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(duplicate, telegram_user_id=user.telegram_id, chat_id=9312),
+            context,
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.shield(duplicate_task), timeout=1) is True
+        during_duplicate = await current_session(bot, user, 9312)
+        assert during_duplicate is not None
+        assert during_duplicate.id == resolving.id
+        assert during_duplicate.version == resolving.version
+        assert during_duplicate.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+        assert fake_ai.reminder_timezone_calls == [fragment, answer]
+        assert duplicate.replies == []
+    finally:
+        fake_ai.reminder_timezone_release.set()
+        await asyncio.gather(first_task, duplicate_task, return_exceptions=True)
+
+    resolved = await current_session(bot, user, 9312)
+    assert resolved is not None
+    assert resolved.id == clarify.id
+    assert resolved.phase is ReminderFlowPhase.PREVIEW
+    assert resolved.title == clarify.title
+    assert resolved.local_date == clarify.local_date
+    assert resolved.local_time == clarify.local_time
+    assert resolved.timezone == "America/Los_Angeles"
+    assert fake_ai.reminder_timezone_calls == [fragment, answer]
+
+
+@pytest.mark.parametrize("change", ["downgrade", "bounce"])
+@pytest.mark.asyncio
+async def test_access_change_during_preview_capability_issue_is_neutralized_before_edit(
+    db,
+    fake_ai,
+    monkeypatch,
+    change,
+):
+    user = await subscriber(db, 6313)
+    bot = deterministic_bot(db, fake_ai)
+    private_title = "PRIVATE_PRE_EDIT_TITLE_6a42"
+    phrase = f"Напомни завтра в 9:00 по Светогорску {private_title}"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по Светогорску",
+    )
+    original_issue = bot.reminder_sessions.issue
+    changed = False
+
+    async def issue_then_change(session, actions, **kwargs):
+        nonlocal changed
+        tokens = await original_issue(session, actions, **kwargs)
+        if actions == ("confirm", "edit", "cancel") and not changed:
+            changed = True
+            await change_reminder_access(db, user, change)
+        return tokens
+
+    monkeypatch.setattr(bot.reminder_sessions, "issue", issue_then_change)
+    incoming = ReminderMessage(phrase)
+    context = reminder_context()
+
+    assert await bot.reminder_text_gate(
+        reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9313),
+        context,
+    )
+
+    assert changed is True
+    assert fake_ai.reminder_timezone_calls == [fragment]
+    assert await current_session(bot, user, 9313) is None
+    texts = reminder_rendered_texts(incoming, context)
+    assert any("Доступ изменился" in text for text in texts)
+    assert all(private_title not in text for text in texts)
+    assert all("Проверь напоминание" not in text for text in texts)
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("change", ["downgrade", "bounce"])
+@pytest.mark.asyncio
+async def test_access_change_during_pre_provider_exact_check_prevents_model_call(
+    db,
+    fake_ai,
+    monkeypatch,
+    change,
+):
+    user = await subscriber(db, 6314)
+    bot = deterministic_bot(db, fake_ai)
+    private_title = "PRIVATE_PRE_PROVIDER_TITLE_729b"
+    phrase = f"Напомни завтра в 9:00 по Светогорску {private_title}"
+    fragment = reminder_timezone_window(phrase)
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по Светогорску",
+    )
+    original_get_exact = bot.reminder_sessions.get_exact
+    exact_calls = 0
+    exact_waiting = asyncio.Event()
+    exact_release = asyncio.Event()
+
+    async def pause_pre_provider_resolving_exact(session, **kwargs):
+        nonlocal exact_calls
+        result = await original_get_exact(session, **kwargs)
+        if session.phase is ReminderFlowPhase.TIMEZONE_RESOLVING:
+            exact_calls += 1
+            if exact_calls == 4:
+                exact_waiting.set()
+                await exact_release.wait()
+        return result
+
+    monkeypatch.setattr(
+        bot.reminder_sessions,
+        "get_exact",
+        pause_pre_provider_resolving_exact,
+    )
+    incoming = ReminderMessage(phrase)
+    context = reminder_context()
+    task = asyncio.create_task(
+        bot.reminder_text_gate(
+            reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9314),
+            context,
+        )
+    )
+    await exact_waiting.wait()
+    await change_reminder_access(db, user, change)
+    exact_release.set()
+    assert await task is True
+
+    assert exact_calls >= 4
+    assert fake_ai.reminder_timezone_calls == []
+    assert await current_session(bot, user, 9314) is None
+    texts = reminder_rendered_texts(incoming, context)
+    assert any("Доступ изменился" in text for text in texts)
+    assert all(private_title not in text for text in texts)
+    assert await reminder_domain_row_counts(db) == (0, 0, 0, 0)

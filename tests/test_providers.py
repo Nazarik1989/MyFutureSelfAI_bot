@@ -5,10 +5,16 @@ import httpx
 import pytest
 from openai import AuthenticationError, BadRequestError
 
-from future_self.ai import OpenAICompatibleAIService, ProviderHealthCheck, create_ai_service
+from future_self.ai import (
+    REMINDER_TIMEZONE_MAX_INPUT_CHARS,
+    REMINDER_TIMEZONE_TIMEOUT_SECONDS,
+    OpenAICompatibleAIService,
+    ProviderHealthCheck,
+    create_ai_service,
+)
 from future_self.config import LegacyConfigurationWarning, Settings, resolve_env_file
 from future_self.doctor import DoctorReport, duplicate_env_keys, run_provider_check
-from future_self.schemas import TimezoneResolution
+from future_self.schemas import ReminderTimezoneResolution, TimezoneResolution
 from future_self.transcription import (
     DisabledTranscriptionService,
     create_transcription_service,
@@ -173,6 +179,114 @@ async def test_timezone_resolution_uses_structured_output_on_text_provider():
     assert result.timezone == "Europe/Lisbon"
     assert responses.parse_kwargs["text_format"] is TimezoneResolution
     assert responses.parse_kwargs["input"][1]["content"] == "живу в Лиссабоне"
+
+
+async def test_reminder_timezone_resolution_uses_only_bounded_fragment_without_retries():
+    class Responses:
+        def __init__(self):
+            self.parse_kwargs = None
+
+        async def parse(self, **kwargs):
+            self.parse_kwargs = kwargs
+            return SimpleNamespace(
+                output_parsed=ReminderTimezoneResolution(
+                    status="resolved",
+                    timezone="Europe/Moscow",
+                    matched_text="по Светогорску",
+                    city="Светогорск",
+                    country="Россия",
+                )
+            )
+
+    class Client:
+        def __init__(self):
+            self.responses = Responses()
+            self.option_calls = []
+
+        def with_options(self, **kwargs):
+            self.option_calls.append(kwargs)
+            return self
+
+    client = Client()
+    service = OpenAICompatibleAIService(client, "openai/gpt-5.4-mini")
+
+    result = await service.resolve_reminder_timezone("  по   Светогорску  ")
+
+    assert result.timezone == "Europe/Moscow"
+    assert client.option_calls == [{"max_retries": 0}]
+    assert client.responses.parse_kwargs["text_format"] is ReminderTimezoneResolution
+    assert client.responses.parse_kwargs["input"][1] == {
+        "role": "user",
+        "content": "по Светогорску",
+    }
+    assert client.responses.parse_kwargs["timeout"] == REMINDER_TIMEZONE_TIMEOUT_SECONDS
+    assert "Напомни" not in repr(client.responses.parse_kwargs["input"])
+
+
+@pytest.mark.parametrize("value", ["", "   ", "x" * (REMINDER_TIMEZONE_MAX_INPUT_CHARS + 1)])
+async def test_reminder_timezone_resolution_rejects_unbounded_or_empty_input(value):
+    class Client:
+        def with_options(self, **kwargs):
+            raise AssertionError("provider must not be prepared for invalid input")
+
+    service = OpenAICompatibleAIService(Client(), "test-model")
+
+    with pytest.raises(ValueError, match="reminder timezone fragment"):
+        await service.resolve_reminder_timezone(value)
+
+
+async def test_reminder_timezone_resolution_has_a_fixed_timeout(monkeypatch):
+    class Responses:
+        async def parse(self, **kwargs):
+            del kwargs
+            await asyncio.sleep(1)
+
+    class Client:
+        responses = Responses()
+
+        def with_options(self, **kwargs):
+            assert kwargs == {"max_retries": 0}
+            return self
+
+    monkeypatch.setattr("future_self.ai.REMINDER_TIMEZONE_TIMEOUT_SECONDS", 0.001)
+    service = OpenAICompatibleAIService(Client(), "test-model")
+
+    with pytest.raises(TimeoutError):
+        await service.resolve_reminder_timezone("по Светогорску")
+
+
+@pytest.mark.parametrize("status", ["not_mentioned", "insufficient"])
+def test_unresolved_reminder_timezone_statuses_cannot_smuggle_resolution_fields(status):
+    clean = ReminderTimezoneResolution(status=status)
+
+    assert clean.timezone is None
+    assert clean.matched_text is None
+    with pytest.raises(ValueError, match="unresolved reminder timezone"):
+        ReminderTimezoneResolution(
+            status=status,
+            timezone="Europe/Moscow",
+            matched_text="Москва",
+        )
+
+
+def test_resolved_reminder_timezone_requires_iana_and_evidence_fields():
+    with pytest.raises(ValueError, match="requires timezone and matched_text"):
+        ReminderTimezoneResolution(status="resolved", timezone="Europe/Moscow")
+
+
+def test_ambiguous_reminder_timezone_requires_evidence_but_forbids_timezone():
+    clean = ReminderTimezoneResolution(status="ambiguous", matched_text="по Сан-Хосе")
+
+    assert clean.matched_text == "по Сан-Хосе"
+    assert clean.timezone is None
+    with pytest.raises(ValueError, match="requires matched_text only"):
+        ReminderTimezoneResolution(status="ambiguous")
+    with pytest.raises(ValueError, match="requires matched_text only"):
+        ReminderTimezoneResolution(
+            status="ambiguous",
+            timezone="America/Los_Angeles",
+            matched_text="по Сан-Хосе",
+        )
 
 
 async def test_doctor_bad_request_is_safe_and_includes_status():

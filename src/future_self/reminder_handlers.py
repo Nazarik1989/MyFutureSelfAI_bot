@@ -27,16 +27,31 @@ from .reminder_intent import (
     ReminderIntentResult,
     ReminderIntentStatus,
     ReminderScheduleKind,
+    ReminderTimezoneHint,
     ReminderTimezoneSource,
     calculate_daily_occurrence,
     first_daily_occurrence_utc,
+    reminder_explicit_timezone_spans,
+    reminder_relative_day_offset,
 )
 from .schemas import ParsedThought, TemporalResolution
+from .timezones import (
+    ReminderTimezoneFragment,
+    ReminderTimezoneStatus,
+    extract_reminder_timezone_fragment,
+    reminder_timezone_reply_fragment,
+)
 
 logger = logging.getLogger(__name__)
 
 REMINDER_ACCESS_CHANGED_TEXT = "🔔 Напоминание\n\nДоступ изменился. Ничего не сохранено — повтори команду после проверки доступа."
 REMINDER_STALE_TEXT = "Эта карточка уже неактуальна. Повтори команду напоминания."
+REMINDER_TIMEZONE_RESOLVING_TEXT = "🔔 Определяю часовой пояс…"
+REMINDER_TIMEZONE_CLARIFY_TEXT = "Уточни город вместе со страной или регионом"
+REMINDER_TIMEZONE_RETRY_TEXT = (
+    "Не удалось надёжно определить часовой пояс. Ничего не сохранено. "
+    "Уточни город или попробуй ещё раз."
+)
 
 _TIME_ONLY = re.compile(
     r"^\s*(?:в\s+)?(?:[01]?\d|2[0-3])(?:\s*[:.]\s*[0-5]\d|\s+час(?:а|ов)?(?:\s+[0-5]?\d\s+минут(?:у|ы)?)?)"
@@ -53,6 +68,17 @@ _UNSUPPORTED_RECURRENCE = re.compile(
 
 class _ReminderPastAtSave(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class _PendingReminderTimezone:
+    session: ReminderFlowSession
+    fragment: ReminderTimezoneFragment
+    text: str
+    continuation: bool
+    previous: ReminderIntentResult | None
+    clarification: bool
+    source_message: Any | None
 
 
 @dataclass(slots=True)
@@ -151,6 +177,18 @@ class ReminderHandlers:
         user = binding
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+
+        if await self._reminder_timezone_question_gate(
+            update,
+            context,
+            text,
+            user=user,
+            candidate_message=candidate_message,
+            expected_access_version=expected_access_version,
+            expected_session=expected_session,
+            voice_fenced=voice_fenced,
+        ):
+            return True
 
         async with self._reminder_launch_lock:
             current = await self.reminder_sessions.current(
@@ -274,6 +312,7 @@ class ReminderHandlers:
                 timezone_source=result.timezone_source or ReminderTimezoneSource.PROFILE,
                 phase=phase,
                 canonical_message_id=canonical_message_id,
+                profile_timezone=user.timezone,
             )
             delivery_binding = await self._reminder_access(update)
             if (
@@ -346,6 +385,835 @@ class ReminderHandlers:
                         source_message=candidate_message or update.effective_message,
                     )
             return True
+
+    async def _reminder_timezone_question_gate(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        *,
+        user: User,
+        candidate_message: Any | None,
+        expected_access_version: int | None,
+        expected_session: ReminderFlowSession | None,
+        voice_fenced: bool,
+    ) -> bool:
+        pending: _PendingReminderTimezone | None = None
+        async with self._reminder_launch_lock:
+            current = await self.reminder_sessions.current(
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+            )
+            fresh = self.reminder_intent_parser.parse(text, user.timezone)
+            invalid_marker = False
+            resolving_duplicate = False
+            natural_exact_timezone = False
+            resolving = bool(
+                current is not None and current.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+            )
+            if voice_fenced and not self._reminder_expected_session_matches(
+                current,
+                expected_session,
+            ):
+                await self._reminder_retire_voice_candidate(candidate_message)
+                return True
+            fresh_user = await self._reminder_access(update)
+            if (
+                fresh_user is None
+                or fresh_user.id != user.id
+                or fresh_user.access_version != user.access_version
+                or (
+                    expected_access_version is not None
+                    and fresh_user.access_version != expected_access_version
+                )
+            ):
+                if (
+                    current is None
+                    and expected_session is None
+                    and fresh.status is ReminderIntentStatus.NOT_REMINDER
+                ):
+                    return False
+                if current is not None:
+                    await self._reminder_retire_voice_candidate(candidate_message)
+                    await self._reminder_access_changed(
+                        context,
+                        current,
+                        source_message=candidate_message or update.effective_message,
+                    )
+                elif voice_fenced:
+                    await self._reminder_edit_access_candidate(candidate_message)
+                return True
+            user = fresh_user
+            clarification = bool(
+                current is not None
+                and current.phase
+                in {
+                    ReminderFlowPhase.TIMEZONE_CLARIFY,
+                    ReminderFlowPhase.TIMEZONE_RETRY,
+                }
+                and fresh.status is ReminderIntentStatus.NOT_REMINDER
+            )
+            if clarification:
+                try:
+                    fragment = reminder_timezone_reply_fragment(text)
+                except ValueError:
+                    await self._reminder_retire_voice_candidate(candidate_message)
+                    updated = await self.reminder_sessions.update(
+                        current,
+                        phase=ReminderFlowPhase.TIMEZONE_RETRY,
+                    )
+                    if updated is not None:
+                        async with self._reminder_ui_lock:
+                            await self._reminder_timezone_edit_fenced_locked(
+                                update,
+                                context,
+                                updated,
+                                source_message=update.effective_message,
+                            )
+                    return True
+            else:
+                try:
+                    fragment = extract_reminder_timezone_fragment(text)
+                except ValueError:
+                    fragment = None
+                    invalid_marker = True
+                if (
+                    not invalid_marker
+                    and fragment is not None
+                    and fresh.timezone_source is ReminderTimezoneSource.EXPLICIT
+                ):
+                    explicit_spans = reminder_explicit_timezone_spans(text)
+                    marker_start = fragment.span[0]
+                    location_start = marker_start + len(fragment.text) - len(fragment.location_text)
+                    if len(explicit_spans) != 1 or explicit_spans[0][0] not in {
+                        marker_start,
+                        location_start,
+                    }:
+                        fragment = None
+                        invalid_marker = True
+                    else:
+                        natural_exact_timezone = explicit_spans[0][0] == location_start
+                if _UNSUPPORTED_RECURRENCE.search(text) or (
+                    not invalid_marker
+                    and (
+                        (
+                            fresh.timezone_source is ReminderTimezoneSource.EXPLICIT
+                            and not natural_exact_timezone
+                        )
+                        or fresh.error_code is ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE
+                    )
+                ):
+                    if resolving and fresh.status is not ReminderIntentStatus.COMPLETE:
+                        await self._reminder_retire_voice_candidate(candidate_message)
+                        return True
+                    return False
+                if fragment is None:
+                    if (
+                        not invalid_marker
+                        and resolving
+                        and current.timezone_fragment_fingerprint is not None
+                    ):
+                        try:
+                            reply_fragment = reminder_timezone_reply_fragment(text)
+                            resolving_duplicate = (
+                                self.reminder_sessions.timezone_fragment_fingerprint(
+                                    reply_fragment.text
+                                )
+                                == current.timezone_fragment_fingerprint
+                            )
+                        except ValueError:
+                            resolving_duplicate = False
+                    if (
+                        not invalid_marker
+                        and not resolving_duplicate
+                        and resolving
+                        and fresh.status is not ReminderIntentStatus.COMPLETE
+                    ):
+                        await self._reminder_retire_voice_candidate(candidate_message)
+                        return True
+                    if not invalid_marker and not resolving_duplicate:
+                        return False
+                if current is None and fresh.status is ReminderIntentStatus.NOT_REMINDER:
+                    return False
+
+            if resolving_duplicate:
+                await self._reminder_retire_voice_candidate(candidate_message)
+                return True
+            if resolving and fresh.status is not ReminderIntentStatus.COMPLETE:
+                await self._reminder_retire_voice_candidate(candidate_message)
+                return True
+            if invalid_marker:
+                replace_invalid = bool(
+                    current is not None and fresh.status is not ReminderIntentStatus.NOT_REMINDER
+                )
+                if current is not None and not replace_invalid:
+                    retry_result = current.parser_state()
+                else:
+                    retry_result = self._reminder_timezone_pending_result(
+                        fresh,
+                        preserved_title=None,
+                    )
+                await self._reminder_timezone_store_and_render(
+                    update,
+                    context,
+                    user,
+                    retry_result,
+                    current=current,
+                    candidate_message=candidate_message,
+                    phase=ReminderFlowPhase.TIMEZONE_RETRY,
+                    preserve_session=current is not None and not replace_invalid,
+                    timezone_fragment_fingerprint=None,
+                    relative_day_offset=(
+                        current.relative_day_offset
+                        if current is not None and not replace_invalid
+                        else reminder_relative_day_offset(text)
+                    ),
+                    calendar_anchor_utc=(
+                        current.calendar_anchor_utc
+                        if current is not None and not replace_invalid
+                        else self._reminder_now()
+                    ),
+                )
+                return True
+
+            fingerprint = self.reminder_sessions.timezone_fragment_fingerprint(text)
+            if (
+                current is not None
+                and current.phase is ReminderFlowPhase.TIMEZONE_RESOLVING
+                and current.timezone_fragment_fingerprint == fingerprint
+            ):
+                await self._reminder_retire_voice_candidate(candidate_message)
+                return True
+            replacement = bool(
+                current is not None and fresh.status is not ReminderIntentStatus.NOT_REMINDER
+            )
+            previous = current.parser_state() if current is not None and not replacement else None
+            if clarification:
+                preliminary = current.parser_state()
+            elif previous is not None:
+                parsed = self.reminder_intent_parser.parse(
+                    text,
+                    user.timezone,
+                    continuation=True,
+                    previous=previous,
+                )
+                preliminary = self._reminder_timezone_pending_result(
+                    parsed,
+                    preserved_title=previous.title,
+                )
+            else:
+                preliminary = self._reminder_timezone_pending_result(
+                    fresh,
+                    preserved_title=None,
+                )
+
+            local_outcome = self.timezone_resolver.resolve_reminder_locally(fragment)
+            if local_outcome is not None:
+                if (
+                    local_outcome.candidate is None
+                    or local_outcome.evidence_text is None
+                    or local_outcome.evidence_span is None
+                ):
+                    raise RuntimeError("local reminder timezone outcome is incomplete")
+                result = self._reminder_timezone_result(
+                    preliminary,
+                    timezone=local_outcome.candidate.timezone,
+                    text=text,
+                    evidence_text=local_outcome.evidence_text,
+                    evidence_span=local_outcome.evidence_span,
+                    profile_timezone=user.timezone,
+                    previous=previous,
+                    continuation=previous is not None,
+                    clarification=clarification,
+                    current=current if not replacement else None,
+                )
+                await self._reminder_timezone_store_and_render(
+                    update,
+                    context,
+                    user,
+                    result,
+                    current=current,
+                    candidate_message=candidate_message,
+                    phase=self._reminder_phase(result),
+                    preserve_session=clarification,
+                    timezone_fragment_fingerprint=None,
+                    relative_day_offset=(
+                        current.relative_day_offset
+                        if clarification and current is not None
+                        else reminder_relative_day_offset(text)
+                    ),
+                    calendar_anchor_utc=(
+                        current.calendar_anchor_utc
+                        if clarification and current is not None
+                        else self._reminder_now()
+                    ),
+                )
+                return True
+
+            relative_offset = (
+                current.relative_day_offset
+                if clarification and current is not None
+                else reminder_relative_day_offset(text)
+            )
+            anchor = (
+                current.calendar_anchor_utc
+                if clarification and current is not None
+                else self._reminder_now()
+            )
+            stored = await self._reminder_timezone_store_and_render(
+                update,
+                context,
+                user,
+                preliminary,
+                current=current,
+                candidate_message=candidate_message,
+                phase=ReminderFlowPhase.TIMEZONE_RESOLVING,
+                preserve_session=clarification,
+                timezone_fragment_fingerprint=fingerprint,
+                relative_day_offset=relative_offset,
+                calendar_anchor_utc=anchor,
+            )
+            if stored is None:
+                return True
+            session, source_message = stored
+            pending = _PendingReminderTimezone(
+                session=session,
+                fragment=fragment,
+                text=text,
+                continuation=previous is not None,
+                previous=previous,
+                clarification=clarification,
+                source_message=source_message,
+            )
+
+        async with self._reminder_launch_lock:
+            if await self.reminder_sessions.get_exact(pending.session) is None:
+                return True
+            pre_provider = await self._reminder_access(update)
+            if (
+                pre_provider is None
+                or pre_provider.id != pending.session.owner_id
+                or pre_provider.access_version != pending.session.access_version
+            ):
+                await self._reminder_access_changed(
+                    context,
+                    pending.session,
+                    source_message=pending.source_message,
+                )
+                return True
+
+        try:
+            outcome = await self.timezone_resolver.resolve_reminder(pending.fragment)
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(
+                self._reminder_timezone_transition(
+                    update,
+                    context,
+                    pending.session,
+                    ReminderFlowPhase.TIMEZONE_RETRY,
+                    source_message=pending.source_message,
+                )
+            )
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Reminder timezone resolution failed error_type=%s",
+                type(exc).__name__,
+            )
+            await self._reminder_timezone_transition(
+                update,
+                context,
+                pending.session,
+                ReminderFlowPhase.TIMEZONE_RETRY,
+                source_message=pending.source_message,
+            )
+            return True
+
+        if outcome.status is ReminderTimezoneStatus.AMBIGUOUS:
+            if pending.clarification:
+                await self._reminder_timezone_transition(
+                    update,
+                    context,
+                    pending.session,
+                    ReminderFlowPhase.TIMEZONE_CLARIFY,
+                    source_message=pending.source_message,
+                )
+                return True
+            if outcome.evidence_text is None or outcome.evidence_span is None:
+                await self._reminder_timezone_transition(
+                    update,
+                    context,
+                    pending.session,
+                    ReminderFlowPhase.TIMEZONE_RETRY,
+                    source_message=pending.source_message,
+                )
+                return True
+            ambiguous = self._reminder_timezone_evidence_result(
+                text=pending.text,
+                evidence_text=outcome.evidence_text,
+                evidence_span=outcome.evidence_span,
+                profile_timezone=pending.session.profile_timezone,
+                previous=pending.previous,
+                continuation=pending.continuation,
+                current=pending.session,
+            )
+            await self._reminder_timezone_apply_ambiguous(
+                update,
+                context,
+                pending.session,
+                ambiguous,
+                source_message=pending.source_message,
+            )
+            return True
+        if (
+            outcome.status is ReminderTimezoneStatus.NOT_MENTIONED
+            and not pending.fragment.is_strong
+        ):
+            ordinary = self.reminder_intent_parser.parse(
+                pending.text,
+                pending.session.profile_timezone,
+                now=pending.session.calendar_anchor_utc or self._reminder_now(),
+                continuation=pending.continuation,
+                previous=pending.previous,
+            )
+            await self._reminder_timezone_apply_result(
+                update,
+                context,
+                pending.session,
+                ordinary,
+                source_message=pending.source_message,
+                explicit=False,
+            )
+            return True
+        if outcome.status is not ReminderTimezoneStatus.RESOLVED or outcome.candidate is None:
+            await self._reminder_timezone_transition(
+                update,
+                context,
+                pending.session,
+                ReminderFlowPhase.TIMEZONE_RETRY,
+                source_message=pending.source_message,
+            )
+            return True
+
+        if outcome.evidence_text is None or outcome.evidence_span is None:
+            await self._reminder_timezone_transition(
+                update,
+                context,
+                pending.session,
+                ReminderFlowPhase.TIMEZONE_RETRY,
+                source_message=pending.source_message,
+            )
+            return True
+        result = self._reminder_timezone_result(
+            pending.session.parser_state(),
+            timezone=outcome.candidate.timezone,
+            text=pending.text,
+            evidence_text=outcome.evidence_text,
+            evidence_span=outcome.evidence_span,
+            profile_timezone=pending.session.profile_timezone,
+            previous=pending.previous,
+            continuation=pending.continuation,
+            clarification=pending.clarification,
+            current=pending.session,
+        )
+        await self._reminder_timezone_apply_result(
+            update,
+            context,
+            pending.session,
+            result,
+            source_message=pending.source_message,
+        )
+        return True
+
+    async def _reminder_timezone_store_and_render(
+        self,
+        update: Update,
+        context: Any,
+        user: User,
+        result: ReminderIntentResult,
+        *,
+        current: ReminderFlowSession | None,
+        candidate_message: Any | None,
+        phase: ReminderFlowPhase,
+        preserve_session: bool,
+        timezone_fragment_fingerprint: str | None,
+        relative_day_offset: int | None,
+        calendar_anchor_utc: datetime | None,
+    ) -> tuple[ReminderFlowSession, Any | None] | None:
+        await self.nova_clear_bound(user.id, update.effective_chat.id)
+        canonical_message_id = current.canonical_message_id if current is not None else None
+        if candidate_message is not None:
+            candidate_id = getattr(candidate_message, "message_id", None)
+            if current is None and isinstance(candidate_id, int):
+                canonical_message_id = candidate_id
+            elif current is not None:
+                await self._reminder_retire_voice_candidate(candidate_message)
+
+        if preserve_session and current is not None:
+            session = await self.reminder_sessions.update(
+                current,
+                title=result.title,
+                schedule_kind=result.schedule_kind,
+                local_date=result.local_date,
+                local_time=result.local_time,
+                timezone=result.timezone or current.timezone,
+                timezone_source=result.timezone_source or current.timezone_source,
+                phase=phase,
+                timezone_fragment_fingerprint=timezone_fragment_fingerprint,
+                relative_day_offset=relative_day_offset,
+                calendar_anchor_utc=calendar_anchor_utc,
+            )
+        else:
+            session = await self.reminder_sessions.create(
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+                access_version=user.access_version,
+                title=result.title,
+                schedule_kind=result.schedule_kind,
+                local_date=result.local_date,
+                local_time=result.local_time,
+                timezone=result.timezone or user.timezone,
+                timezone_source=result.timezone_source or ReminderTimezoneSource.PROFILE,
+                phase=phase,
+                canonical_message_id=canonical_message_id,
+                profile_timezone=user.timezone,
+                timezone_fragment_fingerprint=timezone_fragment_fingerprint,
+                relative_day_offset=relative_day_offset,
+                calendar_anchor_utc=calendar_anchor_utc,
+            )
+        if session is None:
+            return None
+        delivery_user = await self._reminder_access(update)
+        if (
+            delivery_user is None
+            or delivery_user.id != session.owner_id
+            or delivery_user.access_version != session.access_version
+        ):
+            await self._reminder_access_changed(
+                context,
+                session,
+                source_message=candidate_message or update.effective_message,
+            )
+            return None
+        async with self._reminder_ui_lock:
+            live = await self.reminder_sessions.get_exact(session)
+            if live is None:
+                return None
+            source_message = candidate_message or update.effective_message
+            if live.canonical_message_id is None:
+                sent = await update.effective_message.reply_text("🔔 Готовлю напоминание…")
+                message_id = getattr(sent, "message_id", None)
+                if not isinstance(message_id, int):
+                    await self.reminder_sessions.clear(
+                        owner_id=live.owner_id,
+                        telegram_user_id=live.telegram_user_id,
+                        chat_id=live.chat_id,
+                        session_id=live.id,
+                    )
+                    return None
+                bound = await self.reminder_sessions.update(
+                    live,
+                    canonical_message_id=message_id,
+                )
+                if bound is None:
+                    await self._reminder_retire_voice_candidate(sent)
+                    return None
+                live = bound
+                source_message = sent
+            delivered = await self._reminder_timezone_edit_fenced_locked(
+                update,
+                context,
+                live,
+                source_message=source_message,
+            )
+            if delivered is None:
+                return None
+            return delivered, source_message
+
+    @staticmethod
+    def _reminder_timezone_pending_result(
+        parsed: ReminderIntentResult,
+        *,
+        preserved_title: str | None,
+    ) -> ReminderIntentResult:
+        return ReminderIntentResult(
+            status=parsed.status,
+            schedule_kind=parsed.schedule_kind,
+            title=preserved_title,
+            local_time=parsed.local_time,
+            local_date=parsed.local_date,
+            timezone=parsed.timezone,
+            timezone_source=parsed.timezone_source,
+            scheduled_for=parsed.scheduled_for,
+            error_code=parsed.error_code,
+        )
+
+    def _reminder_timezone_evidence_result(
+        self,
+        *,
+        text: str,
+        evidence_text: str,
+        evidence_span: tuple[int, int],
+        profile_timezone: str,
+        previous: ReminderIntentResult | None,
+        continuation: bool,
+        current: ReminderFlowSession | None,
+        timezone: str | None = None,
+    ) -> ReminderIntentResult:
+        return self.reminder_intent_parser.parse(
+            text,
+            profile_timezone,
+            now=(
+                current.calendar_anchor_utc
+                if current is not None and current.calendar_anchor_utc is not None
+                else self._reminder_now()
+            ),
+            continuation=continuation,
+            previous=previous,
+            timezone_hint=ReminderTimezoneHint(
+                evidence_text,
+                timezone,
+                evidence_span,
+            ),
+        )
+
+    def _reminder_timezone_result(
+        self,
+        preliminary: ReminderIntentResult,
+        *,
+        timezone: str,
+        text: str,
+        evidence_text: str,
+        evidence_span: tuple[int, int],
+        profile_timezone: str,
+        previous: ReminderIntentResult | None,
+        continuation: bool,
+        clarification: bool,
+        current: ReminderFlowSession | None,
+    ) -> ReminderIntentResult:
+        if not clarification:
+            return self._reminder_timezone_evidence_result(
+                text=text,
+                evidence_text=evidence_text,
+                evidence_span=evidence_span,
+                profile_timezone=profile_timezone,
+                previous=previous,
+                continuation=continuation,
+                current=current,
+                timezone=timezone,
+            )
+        local_date = preliminary.local_date
+        if (
+            current is not None
+            and current.relative_day_offset is not None
+            and current.calendar_anchor_utc is not None
+        ):
+            local_date = current.calendar_anchor_utc.astimezone(
+                ZoneInfo(timezone)
+            ).date() + timedelta(days=current.relative_day_offset)
+        return ReminderIntentResult(
+            status=ReminderIntentStatus.COMPLETE,
+            schedule_kind=preliminary.schedule_kind,
+            title=preliminary.title,
+            local_time=preliminary.local_time,
+            local_date=local_date,
+            timezone=timezone,
+            timezone_source=ReminderTimezoneSource.EXPLICIT,
+        )
+
+    async def _reminder_timezone_apply_ambiguous(
+        self,
+        update: Update,
+        context: Any,
+        session: ReminderFlowSession,
+        result: ReminderIntentResult,
+        *,
+        source_message: Any | None,
+    ) -> None:
+        async with self._reminder_launch_lock:
+            live = await self.reminder_sessions.get_exact(session)
+            if live is None:
+                return
+            user = await self._reminder_access(update)
+            if (
+                user is None
+                or user.id != live.owner_id
+                or user.access_version != live.access_version
+            ):
+                await self._reminder_access_changed(
+                    context,
+                    live,
+                    source_message=source_message,
+                )
+                return
+            updated = await self.reminder_sessions.update(
+                live,
+                title=result.title,
+                schedule_kind=result.schedule_kind,
+                local_date=result.local_date,
+                local_time=result.local_time,
+                phase=ReminderFlowPhase.TIMEZONE_CLARIFY,
+                timezone_fragment_fingerprint=None,
+            )
+            if updated is None:
+                return
+            async with self._reminder_ui_lock:
+                await self._reminder_timezone_edit_fenced_locked(
+                    update,
+                    context,
+                    updated,
+                    source_message=source_message,
+                )
+
+    async def _reminder_timezone_apply_result(
+        self,
+        update: Update,
+        context: Any,
+        session: ReminderFlowSession,
+        result: ReminderIntentResult,
+        *,
+        source_message: Any | None,
+        explicit: bool = True,
+    ) -> None:
+        async with self._reminder_launch_lock:
+            live = await self.reminder_sessions.get_exact(session)
+            if live is None:
+                return
+            user = await self._reminder_access(update)
+            if (
+                user is None
+                or user.id != live.owner_id
+                or user.access_version != live.access_version
+            ):
+                await self._reminder_access_changed(
+                    context,
+                    live,
+                    source_message=source_message,
+                )
+                return
+            updated = await self.reminder_sessions.update(
+                live,
+                title=result.title,
+                schedule_kind=result.schedule_kind,
+                local_date=result.local_date,
+                local_time=result.local_time,
+                timezone=result.timezone or live.timezone,
+                timezone_source=(
+                    ReminderTimezoneSource.EXPLICIT
+                    if explicit
+                    else result.timezone_source or live.timezone_source
+                ),
+                phase=self._reminder_phase(result),
+                timezone_fragment_fingerprint=None,
+            )
+            if updated is None:
+                return
+            final_access = await self._reminder_access(update)
+            if (
+                final_access is None
+                or final_access.id != updated.owner_id
+                or final_access.access_version != updated.access_version
+            ):
+                await self._reminder_access_changed(
+                    context,
+                    updated,
+                    source_message=source_message,
+                )
+                return
+            async with self._reminder_ui_lock:
+                await self._reminder_timezone_edit_fenced_locked(
+                    update,
+                    context,
+                    updated,
+                    source_message=source_message,
+                )
+
+    async def _reminder_timezone_transition(
+        self,
+        update: Update,
+        context: Any,
+        session: ReminderFlowSession,
+        phase: ReminderFlowPhase,
+        *,
+        source_message: Any | None,
+    ) -> None:
+        async with self._reminder_launch_lock:
+            live = await self.reminder_sessions.get_exact(session)
+            if live is None:
+                return
+            user = await self._reminder_access(update)
+            if (
+                user is None
+                or user.id != live.owner_id
+                or user.access_version != live.access_version
+            ):
+                await self._reminder_access_changed(
+                    context,
+                    live,
+                    source_message=source_message,
+                )
+                return
+            updated = await self.reminder_sessions.update(live, phase=phase)
+            if updated is None:
+                return
+            async with self._reminder_ui_lock:
+                await self._reminder_timezone_edit_fenced_locked(
+                    update,
+                    context,
+                    updated,
+                    source_message=source_message,
+                )
+
+    async def _reminder_timezone_edit_fenced_locked(
+        self,
+        update: Update,
+        context: Any,
+        session: ReminderFlowSession,
+        *,
+        source_message: Any | None,
+    ) -> ReminderFlowSession | None:
+        exact = await self.reminder_sessions.get_exact(session)
+        if exact is None:
+            return None
+        text_value, markup = await self._reminder_screen(exact)
+        delivery = await self.reminder_sessions.get_exact(exact)
+        if delivery is None:
+            return None
+        final_access = await self._reminder_access(update)
+        if (
+            final_access is None
+            or final_access.id != delivery.owner_id
+            or final_access.access_version != delivery.access_version
+        ):
+            cleared = await self.reminder_sessions.clear(
+                owner_id=delivery.owner_id,
+                telegram_user_id=delivery.telegram_user_id,
+                chat_id=delivery.chat_id,
+                session_id=delivery.id,
+            )
+            if cleared:
+                await self._reminder_edit_text(
+                    context,
+                    delivery,
+                    REMINDER_ACCESS_CHANGED_TEXT,
+                    None,
+                    source_message=source_message,
+                )
+            return None
+        await self._reminder_edit_text(
+            context,
+            delivery,
+            text_value,
+            markup,
+            source_message=source_message,
+        )
+        return delivery
 
     async def reminder_callback(
         self,
@@ -477,6 +1345,11 @@ class ReminderHandlers:
                 session,
                 title=None,
                 phase=ReminderFlowPhase.TITLE,
+            )
+        if action == "retry_timezone":
+            return await self.reminder_sessions.update(
+                session,
+                phase=ReminderFlowPhase.TIMEZONE_CLARIFY,
             )
         return None
 
@@ -853,6 +1726,42 @@ class ReminderHandlers:
         session: ReminderFlowSession,
     ) -> tuple[str, InlineKeyboardMarkup | None]:
         phase = session.phase
+        if phase is ReminderFlowPhase.TIMEZONE_RESOLVING:
+            tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            return (
+                REMINDER_TIMEZONE_RESOLVING_TEXT,
+                self._cancel_keyboard(tokens["cancel"]),
+            )
+        if phase is ReminderFlowPhase.TIMEZONE_CLARIFY:
+            tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            return (
+                REMINDER_TIMEZONE_CLARIFY_TEXT,
+                self._cancel_keyboard(tokens["cancel"]),
+            )
+        if phase is ReminderFlowPhase.TIMEZONE_RETRY:
+            tokens = await self.reminder_sessions.issue(
+                session,
+                ("retry_timezone", "cancel"),
+            )
+            return (
+                REMINDER_TIMEZONE_RETRY_TEXT,
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Уточнить город",
+                                callback_data=f"rmd:{tokens['retry_timezone']}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "Отмена",
+                                callback_data=f"rmd:{tokens['cancel']}",
+                            )
+                        ],
+                    ]
+                ),
+            )
         if phase in {ReminderFlowPhase.WHEN, ReminderFlowPhase.PAST}:
             tokens = await self.reminder_sessions.issue(
                 session,
@@ -949,17 +1858,24 @@ class ReminderHandlers:
             text_value = (
                 "🔁 Проверь напоминание\n\n"
                 f"Что: {title}\n"
-                f"Когда: каждый день в {session.local_time.strftime('%H:%M')}\n"
+                f"Когда: каждый день в {session.local_time.strftime('%H:%M')} "
+                f"({session.timezone})\n"
                 f"Первый раз: {first_label}"
             )
             confirm_label = "✅ Включить"
         else:
+            first = self._reminder_scheduled_for(session)
             text_value = (
                 "🔔 Проверь напоминание\n\n"
                 f"Что: {title}\n"
                 f"Когда: {self._reminder_once_label(session)}"
             )
             confirm_label = "✅ Создать"
+        if session.profile_timezone != session.timezone:
+            text_value += (
+                "\nВ твоём часовом поясе: "
+                f"{self._reminder_datetime_label(first, session.profile_timezone)}"
+            )
         return (
             text_value,
             InlineKeyboardMarkup(

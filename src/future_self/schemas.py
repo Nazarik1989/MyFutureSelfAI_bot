@@ -1,5 +1,5 @@
 from datetime import date, datetime, time
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -28,6 +28,28 @@ class TimezoneResolution(BaseModel):
     city: str | None = Field(default=None, max_length=120)
     country: str | None = Field(default=None, max_length=120)
     ambiguous: bool = False
+
+
+class ReminderTimezoneResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    status: Literal["resolved", "not_mentioned", "ambiguous", "insufficient"]
+    timezone: str | None = Field(default=None, max_length=64)
+    matched_text: str | None = Field(default=None, max_length=120)
+    city: str | None = Field(default=None, max_length=120)
+    country: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> Self:
+        if self.status == "resolved":
+            if not self.timezone or not self.matched_text:
+                raise ValueError("resolved reminder timezone requires timezone and matched_text")
+        elif self.status == "ambiguous":
+            if self.timezone is not None or not self.matched_text:
+                raise ValueError("ambiguous reminder timezone requires matched_text only")
+        elif self.timezone is not None or self.matched_text is not None:
+            raise ValueError("unresolved reminder timezone must not include resolution fields")
+        return self
 
 
 class GoalProposal(BaseModel):

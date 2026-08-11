@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import secrets
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
@@ -24,6 +26,7 @@ ReminderFlowAction = Literal[
     "edit_time",
     "edit_title",
     "confirm",
+    "retry_timezone",
     "cancel",
 ]
 
@@ -37,6 +40,9 @@ class ReminderFlowPhase(StrEnum):
     EDIT = "edit"
     PAST = "past"
     INVALID = "invalid"
+    TIMEZONE_RESOLVING = "timezone_resolving"
+    TIMEZONE_CLARIFY = "timezone_clarify"
+    TIMEZONE_RETRY = "timezone_retry"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +62,10 @@ class ReminderFlowSession:
     timezone_source: ReminderTimezoneSource
     phase: ReminderFlowPhase
     expires_at: datetime
+    profile_timezone: str = "Europe/Moscow"
+    timezone_fragment_fingerprint: str | None = None
+    relative_day_offset: int | None = None
+    calendar_anchor_utc: datetime | None = None
 
     def parser_state(self) -> ReminderIntentResult:
         if self.phase is ReminderFlowPhase.WHEN:
@@ -110,6 +120,7 @@ class ReminderFlowStore:
         self._sessions: dict[tuple[int, int, int], ReminderFlowSession] = {}
         self._capabilities: dict[str, ReminderFlowCapability] = {}
         self._lock = asyncio.Lock()
+        self._fingerprint_key = secrets.token_bytes(32)
 
     async def create(
         self,
@@ -126,6 +137,10 @@ class ReminderFlowStore:
         timezone_source: ReminderTimezoneSource,
         phase: ReminderFlowPhase,
         canonical_message_id: int | None = None,
+        profile_timezone: str | None = None,
+        timezone_fragment_fingerprint: str | None = None,
+        relative_day_offset: int | None = None,
+        calendar_anchor_utc: datetime | None = None,
         now: datetime | None = None,
     ) -> ReminderFlowSession:
         current = self._utc(now)
@@ -155,6 +170,12 @@ class ReminderFlowStore:
                 timezone_source=timezone_source,
                 phase=phase,
                 expires_at=current + self.ttl,
+                profile_timezone=profile_timezone or timezone,
+                timezone_fragment_fingerprint=timezone_fragment_fingerprint,
+                relative_day_offset=relative_day_offset,
+                calendar_anchor_utc=self._utc(calendar_anchor_utc)
+                if calendar_anchor_utc is not None
+                else None,
             )
             self._sessions[key] = session
             return session
@@ -198,6 +219,9 @@ class ReminderFlowStore:
         timezone_source: ReminderTimezoneSource | object = ...,
         phase: ReminderFlowPhase | object = ...,
         canonical_message_id: int | None | object = ...,
+        timezone_fragment_fingerprint: str | None | object = ...,
+        relative_day_offset: int | None | object = ...,
+        calendar_anchor_utc: datetime | None | object = ...,
         now: datetime | None = None,
     ) -> ReminderFlowSession | None:
         current = self._utc(now)
@@ -229,6 +253,16 @@ class ReminderFlowStore:
                 values["phase"] = phase
             if canonical_message_id is not ...:
                 values["canonical_message_id"] = canonical_message_id
+            if timezone_fragment_fingerprint is not ...:
+                values["timezone_fragment_fingerprint"] = timezone_fragment_fingerprint
+            if relative_day_offset is not ...:
+                values["relative_day_offset"] = relative_day_offset
+            if calendar_anchor_utc is not ...:
+                values["calendar_anchor_utc"] = (
+                    self._utc(calendar_anchor_utc)
+                    if isinstance(calendar_anchor_utc, datetime)
+                    else None
+                )
             updated = replace(live, **values)
             self._sessions[key] = updated
             self._drop_capabilities_locked(live.id)
@@ -327,6 +361,17 @@ class ReminderFlowStore:
             before = len(self._sessions)
             self._cleanup_locked(current)
             return before - len(self._sessions)
+
+    def timezone_fragment_fingerprint(self, value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value)
+        clean = " ".join(normalized.casefold().replace("ё", "е").split())
+        if not clean:
+            raise ValueError("timezone fragment must not be empty")
+        return hashlib.blake2b(
+            clean.encode("utf-8"),
+            key=self._fingerprint_key,
+            digest_size=16,
+        ).hexdigest()
 
     def _cleanup_locked(self, now: datetime) -> None:
         for key, session in tuple(self._sessions.items()):

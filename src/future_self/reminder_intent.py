@@ -67,6 +67,21 @@ class ReminderIntentResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ReminderTimezoneHint:
+    fragment: str
+    timezone: str | None = None
+    span: tuple[int, int] | None = None
+
+
+def reminder_relative_day_offset(text: str) -> int | None:
+    normalized = _normalize(text) if isinstance(text, str) else ""
+    matches = tuple(_RELATIVE_DATE_PATTERN.finditer(normalized.casefold().replace("ё", "е")))
+    if len(matches) != 1:
+        return None
+    return 0 if matches[0].group("relative") == "сегодня" else 1
+
+
+@dataclass(frozen=True, slots=True)
 class DailyOccurrence:
     local_date: date
     scheduled_for: datetime
@@ -309,7 +324,31 @@ def _has_explicit_intent(lowered: str) -> bool:
     if any(pattern.match(lowered) for pattern in _COMMAND_PATTERNS):
         return True
     daily = _DAILY_PATTERN.match(lowered)
-    return daily is not None and _IMPERATIVE_REMINDER_PATTERN.search(lowered) is not None
+    if daily is None:
+        return False
+    remainder = lowered[daily.end() :].lstrip()
+    if _IMPERATIVE_REMINDER_PATTERN.search(lowered) is not None:
+        return True
+    time_match = next(
+        (
+            match
+            for pattern in (
+                _CLOCK_TIME_PATTERN,
+                _HOUR_WORD_TIME_PATTERN,
+                _SPACED_TIME_PATTERN,
+            )
+            if (match := pattern.match(remainder)) is not None
+        ),
+        None,
+    )
+    if time_match is None:
+        return False
+    tail = remainder[time_match.end() :].lstrip()
+    return bool(
+        re.match(r"^(?:по\s+времени|в\s+часовом\s+поясе)\b", tail)
+        or _MOSCOW_TIMEZONE_PATTERN.match(tail)
+        or _IANA_TIMEZONE_PATTERN.match(tail)
+    )
 
 
 def _intent_spans(lowered: str) -> tuple[tuple[int, int], ...]:
@@ -349,6 +388,13 @@ def _extract_timezone(text: str) -> _TimezoneExtraction:
             ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE,
         )
     return _TimezoneExtraction(next(iter(unique)) if unique else None, tuple(spans))
+
+
+def reminder_explicit_timezone_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return exact deterministic timezone spans in normalized reminder text."""
+
+    normalized = _normalize(text) if isinstance(text, str) else ""
+    return _extract_timezone(normalized).spans if normalized else ()
 
 
 def _extract_date(text: str, today: date) -> _DateExtraction:
@@ -490,6 +536,7 @@ class ReminderIntentParser:
         now: datetime | None = None,
         continuation: bool = False,
         previous: ReminderIntentResult | None = None,
+        timezone_hint: ReminderTimezoneHint | None = None,
     ) -> ReminderIntentResult:
         normalized = _normalize(text) if isinstance(text, str) else ""
         lowered = normalized.lower().replace("ё", "е")
@@ -502,6 +549,56 @@ class ReminderIntentParser:
 
         current = _as_utc(now or self._now_provider())
         timezone_extraction = _extract_timezone(normalized)
+        if timezone_hint is not None:
+            fragment = _normalize(timezone_hint.fragment)
+            haystack = normalized.casefold().replace("ё", "е")
+            needle = fragment.casefold().replace("ё", "е")
+            if timezone_hint.span is None:
+                start = haystack.find(needle) if needle else -1
+                valid_evidence = start >= 0 and haystack.find(needle, start + len(needle)) < 0
+                stop = start + len(needle)
+            else:
+                start, stop = timezone_hint.span
+                valid_evidence = bool(
+                    needle
+                    and 0 <= start < stop <= len(normalized)
+                    and normalized[start:stop] == fragment
+                )
+            if not valid_evidence:
+                timezone_extraction = _TimezoneExtraction(
+                    None,
+                    timezone_extraction.spans,
+                    ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE,
+                )
+            elif timezone_hint.timezone is None:
+                timezone_extraction = _TimezoneExtraction(
+                    timezone_extraction.value,
+                    (*timezone_extraction.spans, (start, stop)),
+                    timezone_extraction.error,
+                )
+            else:
+                try:
+                    hinted_timezone = _zone(timezone_hint.timezone).key
+                except (TypeError, ValueError):
+                    timezone_extraction = _TimezoneExtraction(
+                        None,
+                        (*timezone_extraction.spans, (start, stop)),
+                        ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE,
+                    )
+                else:
+                    conflict = (
+                        timezone_extraction.value is not None
+                        and timezone_extraction.value != hinted_timezone
+                    )
+                    timezone_extraction = _TimezoneExtraction(
+                        None if conflict else hinted_timezone,
+                        (*timezone_extraction.spans, (start, stop)),
+                        (
+                            ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE
+                            if conflict
+                            else timezone_extraction.error
+                        ),
+                    )
         timezone: str | None = None
         timezone_source: ReminderTimezoneSource | None = None
         timezone_error = timezone_extraction.error
@@ -653,6 +750,7 @@ def parse_reminder_intent(
     now: datetime | None = None,
     continuation: bool = False,
     previous: ReminderIntentResult | None = None,
+    timezone_hint: ReminderTimezoneHint | None = None,
 ) -> ReminderIntentResult:
     return ReminderIntentParser().parse(
         text,
@@ -660,6 +758,7 @@ def parse_reminder_intent(
         now=now,
         continuation=continuation,
         previous=previous,
+        timezone_hint=timezone_hint,
     )
 
 
@@ -672,10 +771,13 @@ __all__ = [
     "ReminderIntentStatus",
     "ReminderScheduleKind",
     "ReminderTimezoneSource",
+    "ReminderTimezoneHint",
     "calculate_daily_occurrence",
     "first_daily_occurrence_utc",
     "format_schedule_time",
     "next_daily_occurrence_utc",
     "parse_reminder_intent",
     "present_schedule_time",
+    "reminder_explicit_timezone_spans",
+    "reminder_relative_day_offset",
 ]

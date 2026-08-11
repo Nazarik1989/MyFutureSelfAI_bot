@@ -13,6 +13,7 @@ from future_self.schemas import (
     GuestThoughtBreakdown,
     IntentResult,
     ParsedThought,
+    ReminderTimezoneResolution,
     RoutineProposal,
     RoutineProposals,
     TimezoneResolution,
@@ -28,6 +29,12 @@ class FakeAI:
         self.conversation_contexts: list[dict[str, object]] = []
         self.timezone_calls: list[str] = []
         self.timezone_results: dict[str, TimezoneResolution] = {}
+        self.reminder_timezone_calls: list[str] = []
+        self.reminder_timezone_results: dict[str, ReminderTimezoneResolution] = {}
+        self.reminder_timezone_error: BaseException | None = None
+        self.reminder_timezone_started = asyncio.Event()
+        self.reminder_timezone_release = asyncio.Event()
+        self.reminder_timezone_release.set()
         self.guest_thought_calls = 0
         self.guest_first_step_calls = 0
         self.guest_thought_result = GuestThoughtBreakdown(
@@ -64,6 +71,20 @@ class FakeAI:
         return self.timezone_results.get(
             location_text,
             TimezoneResolution(timezone=None, city=None, country=None, ambiguous=True),
+        )
+
+    async def resolve_reminder_timezone(
+        self,
+        timezone_fragment: str,
+    ) -> ReminderTimezoneResolution:
+        self.reminder_timezone_calls.append(timezone_fragment)
+        self.reminder_timezone_started.set()
+        await self.reminder_timezone_release.wait()
+        if self.reminder_timezone_error is not None:
+            raise self.reminder_timezone_error
+        return self.reminder_timezone_results.get(
+            timezone_fragment,
+            ReminderTimezoneResolution(status="insufficient"),
         )
 
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals:

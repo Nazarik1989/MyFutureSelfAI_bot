@@ -17,6 +17,7 @@ from .schemas import (
     IntentResult,
     NovaHelpPlan,
     ParsedThought,
+    ReminderTimezoneResolution,
     RoutineProposals,
     TimezoneResolution,
     TodayPlan,
@@ -30,6 +31,8 @@ SchemaT = TypeVar("SchemaT", bound=BaseModel)
 GUEST_DEMO_MAX_INPUT_CHARS = 1200
 NOVA_HELP_MAX_INPUT_CHARS = 600
 NOVA_HELP_TIMEOUT_SECONDS = 30.0
+REMINDER_TIMEZONE_MAX_INPUT_CHARS = 120
+REMINDER_TIMEZONE_TIMEOUT_SECONDS = 20.0
 
 
 def _guest_demo_input(text: str) -> str:
@@ -53,6 +56,20 @@ def _nova_help_input(question: str) -> str:
         raise ValueError("Nova help input must not be empty")
     if len(cleaned) > NOVA_HELP_MAX_INPUT_CHARS:
         raise ValueError(f"Nova help input must not exceed {NOVA_HELP_MAX_INPUT_CHARS} characters")
+    return cleaned
+
+
+def _reminder_timezone_input(fragment: str) -> str:
+    if not isinstance(fragment, str):
+        raise ValueError("reminder timezone fragment must be a string")
+    cleaned = " ".join(fragment.split())
+    if not cleaned:
+        raise ValueError("reminder timezone fragment must not be empty")
+    if len(cleaned) > REMINDER_TIMEZONE_MAX_INPUT_CHARS:
+        raise ValueError(
+            "reminder timezone fragment must not exceed "
+            f"{REMINDER_TIMEZONE_MAX_INPUT_CHARS} characters"
+        )
     return cleaned
 
 
@@ -101,6 +118,11 @@ class AIService(Protocol):
     async def summarize_vision(self, answers: dict[str, str]) -> VisionSummary: ...
 
     async def resolve_timezone(self, location_text: str) -> TimezoneResolution: ...
+
+    async def resolve_reminder_timezone(
+        self,
+        timezone_fragment: str,
+    ) -> ReminderTimezoneResolution: ...
 
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals: ...
 
@@ -175,6 +197,30 @@ class OpenAICompatibleAIService:
 
     async def resolve_timezone(self, location_text: str) -> TimezoneResolution:
         return await self._parse(TimezoneResolution, prompts.TIMEZONE_SYSTEM, location_text)
+
+    async def resolve_reminder_timezone(
+        self,
+        timezone_fragment: str,
+    ) -> ReminderTimezoneResolution:
+        fragment = _reminder_timezone_input(timezone_fragment)
+        client = self.client.with_options(max_retries=0)
+        async with asyncio.timeout(REMINDER_TIMEZONE_TIMEOUT_SECONDS):
+            response = await client.responses.parse(
+                model=self.model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": f"{prompts.REMINDER_TIMEZONE_SYSTEM}\nСтиль ответа: {self.tone}.",
+                    },
+                    {"role": "user", "content": fragment},
+                ],
+                text_format=ReminderTimezoneResolution,
+                timeout=REMINDER_TIMEZONE_TIMEOUT_SECONDS,
+            )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("The model returned no structured output")
+        return ReminderTimezoneResolution.model_validate(parsed)
 
     async def health_check(self) -> ProviderHealthCheck:
         return await self._parse(

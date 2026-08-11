@@ -26,7 +26,9 @@ from future_self.main import create_application, format_configuration_error, run
 from future_self.models import ConversationMessage, DraftInboxItem, InboxItem, OnboardingState, User
 from future_self.nova_handlers import NOVA_ROOT_TEXT
 from future_self.repositories import OnboardingRepository, UserRepository
+from future_self.schemas import ReminderTimezoneResolution
 from future_self.tasks import add_task_state
+from future_self.timezones import extract_reminder_timezone_fragment
 
 
 class FakeTranscription:
@@ -1037,6 +1039,331 @@ async def test_real_application_explicit_voice_reminder_reuses_progress_message(
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "telegram_id", "phrase", "fragment", "timezone", "provider_calls"),
+    [
+        (
+            "text",
+            712_365,
+            "Напомни завтра в 9:00 по Светогорску позвонить врачу",
+            "по Светогорску",
+            "Europe/Moscow",
+            1,
+        ),
+        (
+            "voice",
+            712_366,
+            "Напомни завтра в 9:00 по Светогорску позвонить врачу",
+            "по Светогорску",
+            "Europe/Moscow",
+            1,
+        ),
+        (
+            "voice",
+            712_367,
+            "Напомни завтра в 10:00 по Лондону созвониться с клиентом",
+            "по Лондону",
+            "Europe/London",
+            0,
+        ),
+        (
+            "text",
+            712_370,
+            "Напомни завтра в 10:00 по МСК созвониться с клиентом",
+            "по МСК",
+            "Europe/Moscow",
+            0,
+        ),
+        (
+            "voice",
+            712_371,
+            "Напомни завтра в 10:00 по Europe/London созвониться с клиентом",
+            "по Europe/London",
+            "Europe/London",
+            0,
+        ),
+    ],
+)
+async def test_real_application_natural_timezone_reminder_has_text_stt_parity(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    telegram_id,
+    phrase,
+    fragment,
+    timezone,
+    provider_calls,
+):
+    provider_fragment = None
+    if provider_calls:
+        extracted = extract_reminder_timezone_fragment(phrase)
+        assert extracted is not None
+        provider_fragment = extracted.text
+        fake_ai.reminder_timezone_results[provider_fragment] = ReminderTimezoneResolution(
+            status="resolved",
+            timezone=timezone,
+            matched_text=fragment,
+            city="Светогорск",
+            country="Россия",
+        )
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    message_kwargs = {"text": phrase} if source == "text" else {"voice": RuntimeVoice()}
+    source_message = Message(
+        111,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        **message_kwargs,
+    )
+    canonical_message = Message(
+        211,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…" if source == "voice" else "🔔 Готовлю напоминание…",
+    )
+    update = Update(1012, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    canonical_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return canonical_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return canonical_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def forbidden_assistant(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("reminder timezone routing must not enter generic AI or Nova")
+
+    async def downstream_handler(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_assistant)
+    monkeypatch.setattr(fake_ai, "nova_help", forbidden_assistant, raising=False)
+    downstream_probe = TypeHandler(Update, downstream_handler)
+    application.add_handler(downstream_probe, group=100)
+
+    await application.process_update(update)
+
+    assert downstream == ([] if source == "text" else [update.update_id])
+    assert len(sent) == 1
+    assert len(edits) == (2 if provider_calls else 1)
+    assert all(edit["message_id"] == canonical_message.message_id for edit in edits)
+    assert str(edits[-1]["text"]).startswith("🔔 Проверь напоминание")
+    assert timezone in str(edits[-1]["text"])
+    assert fake_ai.reminder_timezone_calls == [provider_fragment] * provider_calls
+    assert fake_ai.route_calls == []
+    if source == "voice":
+        assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+        assert sent[0]["text"] == "Расшифровываю голосовую мысль…"
+        assert "Я услышал" not in str(edits[-1]["text"])
+    else:
+        assert transcription.calls == []
+        assert sent[0]["text"] == "🔔 Готовлю напоминание…"
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat.id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == canonical_message.message_id
+    assert current.timezone == timezone
+    assert current.timezone_source == "explicit"
+    assert phrase not in repr(current)
+    assert (
+        await core.nova_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(("checkpoint", "telegram_id"), [("stt", 712_368), ("provider", 712_369)])
+async def test_real_application_voice_timezone_access_version_bounce_is_fail_closed(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+    checkpoint,
+    telegram_id,
+):
+    phrase = "Напомни завтра в 9:00 по Светогорску позвонить врачу"
+    timezone_expression = "по Светогорску"
+    extracted = extract_reminder_timezone_fragment(phrase)
+    assert extracted is not None
+    fragment = extracted.text
+    access = AccessService(db)
+
+    async def bounce_access() -> None:
+        await access.set_guest(telegram_id, source="test-bounce")
+        await access.grant_subscriber(telegram_id, source="test-bounce")
+
+    class BouncingTranscription(RuntimeTranscription):
+        async def transcribe(self, audio: bytes, filename: str) -> str:
+            self.calls.append((audio, filename))
+            await bounce_access()
+            return self.transcript
+
+    transcription = (
+        BouncingTranscription(phrase) if checkpoint == "stt" else RuntimeTranscription(phrase)
+    )
+    fake_ai.reminder_timezone_results[fragment] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text=timezone_expression,
+        city="Светогорск",
+        country="Россия",
+    )
+    if checkpoint == "provider":
+        fake_ai.reminder_timezone_release.clear()
+
+    core = FutureSelfBot(
+        runtime_settings(database_url=db.url),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await core._user(telegram_id)
+    await access.grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+    initial = await access.status(telegram_id)
+    assert initial is not None
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        112,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        voice=RuntimeVoice(),
+    )
+    progress_message = Message(
+        212,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…",
+    )
+    update = Update(1013, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    progress_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return progress_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return progress_message
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    async def forbidden_assistant(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("stale reminder input must not enter generic AI or Nova")
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_assistant)
+    monkeypatch.setattr(fake_ai, "nova_help", forbidden_assistant, raising=False)
+
+    with caplog.at_level(logging.INFO):
+        processing = asyncio.create_task(application.process_update(update))
+        if checkpoint == "provider":
+            await asyncio.wait_for(fake_ai.reminder_timezone_started.wait(), timeout=5)
+            await bounce_access()
+            fake_ai.reminder_timezone_release.set()
+        await asyncio.wait_for(processing, timeout=10)
+
+    current_status = await access.status(telegram_id)
+    assert current_status is not None
+    assert current_status.access_tier == "subscriber"
+    assert current_status.access_version == initial.access_version + 2
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert len(sent) == 1
+    assert sent[0]["text"] == "Расшифровываю голосовую мысль…"
+    assert edits
+    assert edits[-1]["message_id"] == progress_message.message_id
+    assert "Доступ изменился" in str(edits[-1]["text"])
+    assert all("Проверь напоминание" not in str(edit["text"]) for edit in edits)
+    assert fake_ai.reminder_timezone_calls == ([fragment] if checkpoint == "provider" else [])
+    assert fake_ai.route_calls == []
+    assert phrase not in caplog.text
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+    assert (
+        await core.nova_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+    async with db.sessions() as session:
+        assert len((await session.scalars(select(InboxItem))).all()) == 0
+        assert len((await session.scalars(select(DraftInboxItem))).all()) == 0
+        assert len((await session.scalars(select(ConversationMessage))).all()) == 0
 
 
 async def test_real_application_onboarding_owns_explicit_reminder_text(

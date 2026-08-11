@@ -8,6 +8,7 @@ from future_self.reminder_intent import (
     ReminderIntentParser,
     ReminderIntentStatus,
     ReminderScheduleKind,
+    ReminderTimezoneHint,
     ReminderTimezoneSource,
     calculate_daily_occurrence,
     first_daily_occurrence_utc,
@@ -144,6 +145,151 @@ def test_semantic_leading_prepositions_are_preserved(phrase, expected_title):
     result = parse_reminder_intent(phrase, "Europe/Moscow", now=NOW)
 
     assert result.status == ReminderIntentStatus.COMPLETE
+    assert result.title == expected_title
+
+
+@pytest.mark.parametrize(
+    ("phrase", "fragment", "timezone", "expected_title"),
+    [
+        (
+            "Напомни завтра в 10:00 по Лондону созвониться с клиентом",
+            "по Лондону",
+            "Europe/London",
+            "созвониться с клиентом",
+        ),
+        (
+            "Каждый день в 20:30 по времени Тбилиси заполнить дневник",
+            "по времени Тбилиси",
+            "Asia/Tbilisi",
+            "заполнить дневник",
+        ),
+        (
+            "Напомни в 18:00 в часовом поясе Нью-Йорка проверить почту",
+            "в часовом поясе Нью-Йорка",
+            "America/New_York",
+            "проверить почту",
+        ),
+    ],
+)
+def test_validated_timezone_hint_masks_only_proven_span(
+    phrase,
+    fragment,
+    timezone,
+    expected_title,
+):
+    result = parse_reminder_intent(
+        phrase,
+        "Europe/Moscow",
+        now=NOW,
+        timezone_hint=ReminderTimezoneHint(fragment=fragment, timezone=timezone),
+    )
+
+    assert result.status in {
+        ReminderIntentStatus.COMPLETE,
+        ReminderIntentStatus.NEEDS_WHEN,
+    }
+    assert result.title == expected_title
+    assert result.timezone == timezone
+    assert result.timezone_source is ReminderTimezoneSource.EXPLICIT
+    assert fragment.casefold() not in result.title.casefold()
+
+
+def test_validated_timezone_hint_uses_exact_span_without_masking_same_title_text():
+    phrase = "Напомни завтра в 10:00 по Лондону обсудить фразу по Лондону"
+    evidence = "по Лондону"
+    start = phrase.index(evidence)
+
+    result = parse_reminder_intent(
+        phrase,
+        "Europe/Moscow",
+        now=NOW,
+        timezone_hint=ReminderTimezoneHint(
+            evidence,
+            "Europe/London",
+            (start, start + len(evidence)),
+        ),
+    )
+
+    assert result.status is ReminderIntentStatus.COMPLETE
+    assert result.timezone == "Europe/London"
+    assert result.title == "обсудить фразу по Лондону"
+
+
+def test_timezone_hint_rejects_evidence_that_does_not_match_its_exact_span():
+    phrase = "Напомни завтра в 10:00 по Лондону созвониться"
+    evidence = "по Лондону"
+
+    result = parse_reminder_intent(
+        phrase,
+        "Europe/Moscow",
+        now=NOW,
+        timezone_hint=ReminderTimezoneHint(
+            evidence,
+            "Europe/London",
+            (0, len(evidence)),
+        ),
+    )
+
+    assert result.status is ReminderIntentStatus.INVALID
+    assert result.error_code is ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE
+
+
+def test_unresolved_timezone_hint_masks_marker_but_preserves_safe_parsed_fields():
+    result = parse_reminder_intent(
+        "Напомни завтра в 9:00 по Светогорску позвонить врачу",
+        "Europe/Saratov",
+        now=NOW,
+        timezone_hint=ReminderTimezoneHint(fragment="по Светогорску"),
+    )
+
+    assert result.status is ReminderIntentStatus.COMPLETE
+    assert result.title == "позвонить врачу"
+    assert result.local_date == date(2026, 8, 11)
+    assert result.local_time == time(9)
+    assert result.timezone == "Europe/Saratov"
+    assert result.timezone_source is ReminderTimezoneSource.PROFILE
+
+
+def test_timezone_hint_without_exact_unique_evidence_is_fail_closed():
+    absent = parse_reminder_intent(
+        "Напомни завтра в 10:00 созвониться",
+        now=NOW,
+        timezone_hint=ReminderTimezoneHint("по Лондону", "Europe/London"),
+    )
+    repeated = parse_reminder_intent(
+        "Напомни завтра в 10:00 по Лондону и по Лондону созвониться",
+        now=NOW,
+        timezone_hint=ReminderTimezoneHint("по Лондону", "Europe/London"),
+    )
+
+    assert absent.status is ReminderIntentStatus.INVALID
+    assert absent.error_code is ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE
+    assert repeated.status is ReminderIntentStatus.INVALID
+    assert repeated.error_code is ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE
+
+
+def test_model_timezone_hint_cannot_override_conflicting_exact_iana():
+    result = parse_reminder_intent(
+        "Напомни завтра в 10:00 по Europe/Berlin по Лондону созвониться",
+        now=NOW,
+        timezone_hint=ReminderTimezoneHint("по Лондону", "Europe/London"),
+    )
+
+    assert result.status is ReminderIntentStatus.INVALID
+    assert result.error_code is ReminderIntentCode.INVALID_EXPLICIT_TIMEZONE
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_title"),
+    [
+        ("Напомни завтра в 19:30 по работе позвонить", "по работе позвонить"),
+        ("Напомни завтра в 19:30 по проекту отправить отчёт", "по проекту отправить отчёт"),
+    ],
+)
+def test_semantic_po_title_is_untouched_without_timezone_hint(phrase, expected_title):
+    result = parse_reminder_intent(phrase, now=NOW)
+
+    assert result.status is ReminderIntentStatus.COMPLETE
     assert result.title == expected_title
 
 
@@ -338,6 +484,9 @@ def test_datetime_boundary_returns_typed_invalid_instead_of_raising():
         "Эта песня напомнила мне Москву",
         "Меня это напомнило о школе",
         "Каждый день я заполняю дневник в 19:30",
+        "Каждый день в 19:30 я заполняю дневник",
+        "Каждый день в 19:30 по дороге домой я слушаю музыку",
+        "Каждый день в 19:30 тренировка",
         "Каждый день задача занимает много времени",
         "Время летит, а Москва меняется",
         "Москва напомнила о себе дождём",
