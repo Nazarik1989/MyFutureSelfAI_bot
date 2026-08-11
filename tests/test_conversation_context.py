@@ -1,15 +1,48 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import func, select
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.conversation import ConversationContextService
 from future_self.dates import DateResolver
+from future_self.db import Database
 from future_self.models import ConversationMessage, ConversationSession, DraftInboxItem, InboxItem
+
+
+class CommitGateDatabase(Database):
+    """Hold a successful transaction immediately before its real database commit."""
+
+    def __init__(self, url: str):
+        super().__init__(url)
+        self.before_commit = asyncio.Event()
+        self.allow_commit = asyncio.Event()
+
+    @asynccontextmanager
+    async def session(self):
+        async with super().session() as session:
+            yield session
+            self.before_commit.set()
+            await self.allow_commit.wait()
+
+
+class SessionObservedDatabase(Database):
+    """Expose that a second database instance has entered its transaction."""
+
+    def __init__(self, url: str):
+        super().__init__(url)
+        self.session_started = asyncio.Event()
+
+    @asynccontextmanager
+    async def session(self):
+        async with super().session() as session:
+            self.session_started.set()
+            yield session
 
 
 class FakeMessage:
@@ -109,6 +142,216 @@ async def test_context_ttl_excludes_expired_messages(db):
         conversation = await session.scalar(select(ConversationSession))
         conversation.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     assert not (await service.get(100, 200)).messages
+
+
+async def test_expired_context_purge_is_bounded_and_preserves_active_session(db, caplog):
+    service = ConversationContextService(db, 12, 24)
+    private = "PRIVATE_CONVERSATION_PURGE_SENTINEL"
+    for telegram_user_id in range(501, 505):
+        await service.append(
+            telegram_user_id,
+            600,
+            role="user",
+            content=f"{private}:{telegram_user_id}",
+            source="text",
+            intent="conversation",
+        )
+
+    current = datetime.now(UTC)
+    async with db.session() as session:
+        rows = list(
+            (
+                await session.scalars(select(ConversationSession).order_by(ConversationSession.id))
+            ).all()
+        )
+        for offset, row in enumerate(rows[:3], start=1):
+            row.expires_at = current - timedelta(minutes=offset)
+        rows[3].expires_at = current + timedelta(hours=1)
+
+    with caplog.at_level(logging.INFO):
+        result = await service.purge_expired(batch_size=2, now=current)
+    assert result == 2
+    assert type(result) is int
+    assert private not in repr(result)
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationSession.id))) == 2
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 2
+
+    assert await service.purge_expired(batch_size=2, now=current) == 1
+    assert await service.purge_expired(batch_size=2, now=current) == 0
+    assert await service.purge_expired(batch_size=100, now=current) == 0
+    active = await service.get(504, 600)
+    assert len(active.messages) == 1
+    assert private not in caplog.text
+
+
+async def test_expired_context_purge_is_concurrent_and_idempotent(db):
+    service = ConversationContextService(db, 12, 24)
+    current = datetime.now(UTC)
+    for telegram_user_id in range(511, 516):
+        await service.append(
+            telegram_user_id,
+            610,
+            role="user",
+            content="expired",
+            source="text",
+            intent="conversation",
+        )
+    async with db.session() as session:
+        rows = list((await session.scalars(select(ConversationSession))).all())
+        for row in rows:
+            row.expires_at = current - timedelta(seconds=1)
+
+    deleted = await asyncio.gather(
+        service.purge_expired(batch_size=5, now=current),
+        service.purge_expired(batch_size=5, now=current),
+    )
+    assert sum(deleted) == 5
+    assert await service.purge_expired(batch_size=5, now=current) == 0
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationSession.id))) == 0
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+
+
+async def test_append_refresh_wins_purge_race_across_database_instances(db):
+    telegram_user_id = 521
+    chat_id = 620
+    initial = ConversationContextService(db, 12, 24)
+    original_session_id = await initial.append(
+        telegram_user_id,
+        chat_id,
+        role="user",
+        content="old expired message",
+        source="text",
+        intent="conversation",
+    )
+    current = datetime.now(UTC)
+    async with db.session() as session:
+        conversation = await session.get(ConversationSession, original_session_id)
+        assert conversation is not None
+        conversation.expires_at = current - timedelta(seconds=1)
+
+    append_db = CommitGateDatabase(db.url)
+    purge_db = SessionObservedDatabase(db.url)
+    async with append_db.engine.connect() as connection:
+        await connection.execute(select(1))
+    async with purge_db.engine.connect() as connection:
+        await connection.execute(select(1))
+    appender = ConversationContextService(append_db, 12, 24)
+    purger = ConversationContextService(purge_db, 12, 24)
+    append_task = asyncio.create_task(
+        appender.append(
+            telegram_user_id,
+            chat_id,
+            role="user",
+            content="fresh message",
+            source="text",
+            intent="conversation",
+        )
+    )
+    purge_task = None
+    try:
+        await asyncio.wait_for(append_db.before_commit.wait(), timeout=5)
+        purge_task = asyncio.create_task(purger.purge_expired(batch_size=1, now=current))
+        await asyncio.wait_for(purge_db.session_started.wait(), timeout=5)
+        append_db.allow_commit.set()
+
+        assert await asyncio.wait_for(append_task, timeout=5) == original_session_id
+        assert await asyncio.wait_for(purge_task, timeout=5) == 0
+    finally:
+        append_db.allow_commit.set()
+        if not append_task.done():
+            append_task.cancel()
+            await asyncio.gather(append_task, return_exceptions=True)
+        if purge_task is not None and not purge_task.done():
+            purge_task.cancel()
+            await asyncio.gather(purge_task, return_exceptions=True)
+        await append_db.dispose()
+        await purge_db.dispose()
+
+    async with db.sessions() as session:
+        conversations = list((await session.scalars(select(ConversationSession))).all())
+        messages = list((await session.scalars(select(ConversationMessage))).all())
+    assert len(conversations) == 1
+    assert conversations[0].id == original_session_id
+    assert not ConversationContextService._is_expired(conversations[0].expires_at, current)
+    assert [message.content for message in messages] == ["fresh message"]
+
+
+async def test_purge_wins_race_then_append_recreates_once_across_database_instances(db):
+    telegram_user_id = 531
+    chat_id = 630
+    initial = ConversationContextService(db, 12, 24)
+    original_session_id = await initial.append(
+        telegram_user_id,
+        chat_id,
+        role="user",
+        content="old expired message",
+        source="text",
+        intent="conversation",
+    )
+    current = datetime.now(UTC)
+    async with db.session() as session:
+        conversation = await session.get(ConversationSession, original_session_id)
+        assert conversation is not None
+        conversation.expires_at = current - timedelta(seconds=1)
+
+    purge_db = CommitGateDatabase(db.url)
+    append_db = SessionObservedDatabase(db.url)
+    async with purge_db.engine.connect() as connection:
+        await connection.execute(select(1))
+    async with append_db.engine.connect() as connection:
+        await connection.execute(select(1))
+    purger = ConversationContextService(purge_db, 12, 24)
+    appender = ConversationContextService(append_db, 12, 24)
+    purge_task = asyncio.create_task(purger.purge_expired(batch_size=1, now=current))
+    append_task = None
+    try:
+        await asyncio.wait_for(purge_db.before_commit.wait(), timeout=5)
+        append_task = asyncio.create_task(
+            appender.append(
+                telegram_user_id,
+                chat_id,
+                role="user",
+                content="fresh message",
+                source="text",
+                intent="conversation",
+            )
+        )
+        await asyncio.wait_for(append_db.session_started.wait(), timeout=5)
+        purge_db.allow_commit.set()
+
+        assert await asyncio.wait_for(purge_task, timeout=5) == 1
+        recreated_session_id = await asyncio.wait_for(append_task, timeout=5)
+    finally:
+        purge_db.allow_commit.set()
+        if not purge_task.done():
+            purge_task.cancel()
+            await asyncio.gather(purge_task, return_exceptions=True)
+        if append_task is not None and not append_task.done():
+            append_task.cancel()
+            await asyncio.gather(append_task, return_exceptions=True)
+        await purge_db.dispose()
+        await append_db.dispose()
+
+    async with db.sessions() as session:
+        conversations = list((await session.scalars(select(ConversationSession))).all())
+        messages = list((await session.scalars(select(ConversationMessage))).all())
+    assert len(conversations) == 1
+    assert conversations[0].id == recreated_session_id
+    # SQLite may reuse an integer primary key after hard deletion; the purge
+    # outcome above proves that this is a newly inserted row either way.
+    assert not ConversationContextService._is_expired(conversations[0].expires_at, current)
+    assert len(messages) == 1
+    assert messages[0].session_id == recreated_session_id
+    assert messages[0].content == "fresh message"
+
+
+@pytest.mark.parametrize("batch_size", [True, 0, 101])
+async def test_expired_context_purge_rejects_unbounded_batch(db, batch_size):
+    service = ConversationContextService(db, 12, 24)
+    with pytest.raises(ValueError, match="batch_size"):
+        await service.purge_expired(batch_size=batch_size)
 
 
 async def test_system_action_begin_uses_unique_atomic_versions(db):

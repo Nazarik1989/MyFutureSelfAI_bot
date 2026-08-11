@@ -386,6 +386,30 @@ default `NOVA_AI_ADMIN_ONLY=true` он доступен только tier `admin
 не запускает destructive/admin actions и не предлагает ещё не реализованные функции.
 Подробный контракт: [docs/NOVA_HELP_GUIDE.md](docs/NOVA_HELP_GUIDE.md).
 
+### Stage 7A: durable foundation for My Nova
+
+Stage 7A adds only the owner-scoped data/domain foundation for future explicit Nova
+memory. It is not user-visible yet: there is no Telegram menu, no automatic extraction
+from conversation history and no memory injection into AI prompts. A later UI must show
+an explicit preview and require confirmation before creating a memory item.
+
+The rollout gates are fail-closed and independent:
+
+```dotenv
+ENABLE_NOVA_MEMORY=false
+NOVA_MEMORY_ADMIN_ONLY=true
+ENABLE_NOVA_MEMORY_APPLICATION=false
+NOVA_MEMORY_MAX_ITEMS=100
+```
+
+`ENABLE_NOVA_MEMORY_APPLICATION` is a separate future kill switch for using confirmed
+items in prompts; enabling CRUD alone must not apply memory. The Telegram `admin` tier
+does not grant cross-user browsing or mutation: admins, like subscribers, can access
+only their own items. Deleting an item hard-deletes its content from the active database,
+while separately retained backups can still contain an older copy until their retention
+period expires. The bounded conversation-expiry purge exists only as a service contract
+in Stage 7A; no periodic runtime job is wired before Stage 7B.
+
 `/collections` и `/spaces` не взаимозаменяемы. «Мои разделы» организуют только личные
 записи владельца, а workspace является отдельной границей доступа. Создатель получает
 роль owner; owner управляет участниками и приглашениями, owner/editor — проектами,

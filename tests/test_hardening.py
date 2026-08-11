@@ -61,6 +61,24 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.knowledge_external_processing_requires_consent is True
     assert configured.knowledge_default_apply_mode == "brief_reminder"
     assert configured.recurring_task_reminder_grace_minutes == 120
+    assert configured.enable_nova_memory is False
+    assert configured.nova_memory_admin_only is True
+    assert configured.enable_nova_memory_application is False
+    assert configured.nova_memory_max_items == 100
+
+
+def test_nova_memory_gates_are_independent_and_item_limit_is_bounded() -> None:
+    crud_only = settings(enable_nova_memory=True)
+    assert crud_only.enable_nova_memory is True
+    assert crud_only.enable_nova_memory_application is False
+
+    application_only = settings(enable_nova_memory_application=True)
+    assert application_only.enable_nova_memory is False
+    assert application_only.enable_nova_memory_application is True
+
+    for value in (0, 101):
+        with pytest.raises(ValidationError):
+            settings(nova_memory_max_items=value)
 
 
 @pytest.mark.parametrize("value", [4, 361])
@@ -311,12 +329,19 @@ def test_container_and_build_context_are_hardened() -> None:
         "/data/backups,readonly",
     ):
         assert control in runbook
+    for nova_memory_control in (
+        "--env ENABLE_NOVA_MEMORY=false",
+        "--env NOVA_MEMORY_ADMIN_ONLY=true",
+        "--env ENABLE_NOVA_MEMORY_APPLICATION=false",
+        "--env NOVA_MEMORY_MAX_ITEMS=100",
+    ):
+        assert nova_memory_control in runbook
 
 
 def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260810_0025"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260811_0026"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
     for access_model in (
         "Workspace",

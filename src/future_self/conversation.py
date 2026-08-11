@@ -50,6 +50,8 @@ class SystemActionClaim:
 
 
 class ConversationContextService:
+    MAX_PURGE_BATCH_SIZE = 100
+
     def __init__(
         self,
         db: Database,
@@ -180,6 +182,23 @@ class ConversationContextService:
     ) -> int:
         now = datetime.now(UTC)
         async with self.db.session() as session:
+            # Take the database write/row lock before reading the session.  PostgreSQL
+            # serializes the no-op UPDATE with a concurrent DELETE on this row, while
+            # SQLite serializes the writers at the database level.  Consequently the
+            # SELECT below observes either the still-current row or its committed
+            # deletion, even when append and retention use different processes.
+            await session.execute(
+                update(ConversationSession)
+                .where(
+                    ConversationSession.telegram_user_id == telegram_user_id,
+                    ConversationSession.chat_id == chat_id,
+                )
+                .values(
+                    expires_at=ConversationSession.expires_at,
+                    updated_at=ConversationSession.updated_at,
+                )
+                .execution_options(synchronize_session=False)
+            )
             conversation = await session.scalar(
                 select(ConversationSession).where(
                     ConversationSession.telegram_user_id == telegram_user_id,
@@ -616,6 +635,48 @@ class ConversationContextService:
                     ConversationSession.chat_id == chat_id,
                 )
             )
+
+    async def purge_expired(
+        self,
+        batch_size: int = MAX_PURGE_BATCH_SIZE,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Hard-delete one bounded batch of expired conversation sessions.
+
+        Conversation messages are removed by the existing database cascade. The
+        return value intentionally contains only an aggregate session count.
+        """
+
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or not 1 <= batch_size <= self.MAX_PURGE_BATCH_SIZE
+        ):
+            raise ValueError(f"batch_size must be between 1 and {self.MAX_PURGE_BATCH_SIZE}")
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        else:
+            current = current.astimezone(UTC)
+
+        expired_ids = (
+            select(ConversationSession.id)
+            .where(ConversationSession.expires_at <= current)
+            .order_by(ConversationSession.expires_at, ConversationSession.id)
+            .limit(batch_size)
+        )
+        async with self.db.session() as session:
+            deleted = await session.execute(
+                delete(ConversationSession)
+                .where(
+                    ConversationSession.id.in_(expired_ids),
+                    ConversationSession.expires_at <= current,
+                )
+                .returning(ConversationSession.id)
+                .execution_options(synchronize_session=False)
+            )
+            return len(deleted.scalars().all())
 
     @staticmethod
     def reference_candidate(snapshot: ConversationSnapshot) -> str | None:

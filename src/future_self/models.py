@@ -83,6 +83,127 @@ class User(TimestampMixin, Base):
         back_populates="owner",
         overlaps="inbox_item,recurring_reminder_schedule",
     )
+    nova_memory_items: Mapped[list[NovaMemoryItem]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    nova_memory_changes: Mapped[list[NovaMemoryChange]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class NovaMemoryItem(TimestampMixin, Base):
+    __tablename__ = "nova_memory_items"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_nova_memory_items_public_id"),
+        UniqueConstraint(
+            "owner_id",
+            "content_fingerprint",
+            name="uq_nova_memory_items_owner_fingerprint",
+        ),
+        CheckConstraint(
+            "category IN ('about_me', 'interaction', 'orientation')",
+            name="ck_nova_memory_items_category",
+        ),
+        CheckConstraint(
+            "length(content) BETWEEN 1 AND 500",
+            name="ck_nova_memory_items_content_length",
+        ),
+        CheckConstraint(
+            "length(content_fingerprint) = 64",
+            name="ck_nova_memory_items_fingerprint_length",
+        ),
+        CheckConstraint("version > 0", name="ck_nova_memory_items_version"),
+        Index(
+            "ix_nova_memory_items_owner_list",
+            "owner_id",
+            "important",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "ix_nova_memory_items_owner_category_list",
+            "owner_id",
+            "category",
+            "important",
+            "updated_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    category: Mapped[str] = mapped_column(String(24))
+    content: Mapped[str] = mapped_column(Text)
+    content_fingerprint: Mapped[str] = mapped_column(String(64))
+    important: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    owner: Mapped[User] = relationship(back_populates="nova_memory_items")
+
+
+class NovaMemoryChange(Base):
+    __tablename__ = "nova_memory_changes"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('created', 'updated', 'importance_changed', 'deleted', 'deleted_all')",
+            name="ck_nova_memory_changes_operation",
+        ),
+        CheckConstraint(
+            "category IS NULL OR category IN ('about_me', 'interaction', 'orientation')",
+            name="ck_nova_memory_changes_category",
+        ),
+        CheckConstraint(
+            "memory_public_id IS NULL OR length(memory_public_id) = 36",
+            name="ck_nova_memory_changes_public_id_length",
+        ),
+        CheckConstraint(
+            "resulting_version IS NULL OR resulting_version > 0",
+            name="ck_nova_memory_changes_resulting_version",
+        ),
+        CheckConstraint("affected_count > 0", name="ck_nova_memory_changes_affected_count"),
+        CheckConstraint(
+            "(operation IN ('created', 'updated', 'importance_changed') "
+            "AND memory_public_id IS NOT NULL AND category IS NOT NULL "
+            "AND resulting_version IS NOT NULL AND affected_count = 1) OR "
+            "(operation = 'deleted' AND memory_public_id IS NOT NULL "
+            "AND category IS NOT NULL AND resulting_version IS NULL "
+            "AND affected_count = 1) OR "
+            "(operation = 'deleted_all' AND memory_public_id IS NULL "
+            "AND category IS NULL AND resulting_version IS NULL)",
+            name="ck_nova_memory_changes_shape",
+        ),
+        Index(
+            "ix_nova_memory_changes_owner_created",
+            "owner_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_nova_memory_changes_item_history",
+            "owner_id",
+            "memory_public_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    memory_public_id: Mapped[str | None] = mapped_column(String(36))
+    operation: Mapped[str] = mapped_column(String(24))
+    category: Mapped[str | None] = mapped_column(String(24))
+    resulting_version: Mapped[int | None] = mapped_column(Integer)
+    affected_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    owner: Mapped[User] = relationship(back_populates="nova_memory_changes")
 
 
 class AccessTierChange(Base):

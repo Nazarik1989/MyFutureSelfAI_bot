@@ -57,7 +57,7 @@ offsite retention and secret rotation remain host-operator responsibilities.
    override it with a local process/SQLite check compatible with the retained revision:
 
    ```bash
-   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\",\"20260805_0023\",\"20260806_0024\",\"20260810_0025\"} else 1)'" \
+   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\",\"20260805_0023\",\"20260806_0024\",\"20260810_0025\",\"20260811_0026\"} else 1)'" \
    --health-interval=60s --health-timeout=20s --health-start-period=30s \
    --health-retries=3
    ```
@@ -100,6 +100,10 @@ docker run -d \
   --env ENABLE_COUNCIL=false \
   --env ENABLE_SCHEDULED_COUNCIL=false \
   --env ENABLE_KNOWLEDGE_EXPORT=false \
+  --env ENABLE_NOVA_MEMORY=false \
+  --env NOVA_MEMORY_ADMIN_ONLY=true \
+  --env ENABLE_NOVA_MEMORY_APPLICATION=false \
+  --env NOVA_MEMORY_MAX_ITEMS=100 \
   --mount type=bind,src=/opt/myfutureselfai/data,dst=/data \
   --mount type=bind,src=/opt/myfutureselfai/data/backups,dst=/data/backups,readonly \
   myfutureselfai-bot:<FINAL_SHA>
@@ -146,6 +150,29 @@ files stay root-owned `0700/0600`.
   the `trashed` lifecycle. If it is non-empty, keep the lifecycle-aware image or restore the
   rows explicitly before rollback; migration `20260725_0020` intentionally refuses to
   downgrade while recoverable trash exists.
+
+## Stage 7A Nova memory and conversation retention
+
+Stage 7A is a data/domain foundation and is not user-visible. Keep
+`ENABLE_NOVA_MEMORY=false`, `NOVA_MEMORY_ADMIN_ONLY=true` and
+`ENABLE_NOVA_MEMORY_APPLICATION=false` until the separately reviewed Telegram flow is
+available. `NOVA_MEMORY_MAX_ITEMS=100` is the hard configuration ceiling. The future UI
+must create memory only after an explicit preview and confirmation; it must not import
+conversation history, onboarding answers or Vision data automatically.
+
+The application kill switch is independent from CRUD so confirmed records can be
+managed without being injected into prompts. Telegram tier `admin` never authorizes
+cross-user browsing or mutation. Item deletion removes content from the active database,
+but historical backups remain subject to the separate backup-retention policy and must
+not be described as immediately erased. The bounded expired-conversation purge is not
+wired to a periodic runtime job until Stage 7B.
+
+Migration downgrade from `20260811_0026` drops both `nova_memory_items` and
+`nova_memory_changes`, destroying Nova memory in the active database. An application or
+image rollback must therefore keep schema revision `20260811_0026`; rolling back an image
+must never run an automatic Alembic downgrade. Downgrade is permitted only while the bot
+is stopped and an explicit incident decision accepts the data loss, or as part of restoring
+a verified pre-`0026` backup.
 
 ## PR #24 Knowledge rollout gate
 
