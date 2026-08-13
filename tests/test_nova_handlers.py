@@ -15,7 +15,7 @@ from telegram.ext import ApplicationHandlerStop
 from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER, AccessService
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
-from future_self.models import Base, ConversationMessage, DraftInboxItem, InboxItem
+from future_self.models import Base, ConversationMessage, DraftInboxItem, Goal, InboxItem
 from future_self.nova import NovaSessionStore
 from future_self.nova_handlers import (
     NOVA_ACCESS_CHANGED_TEXT,
@@ -25,8 +25,13 @@ from future_self.nova_handlers import (
     NOVA_ROOT_TEXT,
     NOVA_STALE_ALERT,
 )
-from future_self.reminder_handlers import REMINDER_ACCESS_CHANGED_TEXT
+from future_self.nova_memory_flow import NovaMemoryFlowPhase
+from future_self.nova_memory_handlers import (
+    NOVA_MEMORY_ACCESS_CHANGED_TEXT,
+    NOVA_MEMORY_VOICE_ACCESS_CHANGED_TEXT,
+)
 from future_self.schemas import NovaHelpPlan
+from future_self.transcription import TranscriptionError
 
 
 class NovaAIStub:
@@ -112,6 +117,18 @@ class NovaMessage:
         self.deleted += 1
 
 
+class BlockingReplyNovaMessage(NovaMessage):
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.reply_started = asyncio.Event()
+        self.reply_release = asyncio.Event()
+
+    async def reply_text(self, text: str, **kwargs: Any) -> NovaMessage:
+        self.reply_started.set()
+        await self.reply_release.wait()
+        return await super().reply_text(text, **kwargs)
+
+
 class NovaTelegramFile:
     async def download_as_bytearray(self) -> bytearray:
         return bytearray(b"nova-voice")
@@ -175,6 +192,12 @@ class BlockingNovaTranscription(NovaTranscription):
         self.started.set()
         await self.release.wait()
         return self.transcript
+
+
+class FailingNovaTranscription(NovaTranscription):
+    async def transcribe(self, audio: bytes, filename: str) -> str:
+        self.calls.append((audio, filename))
+        raise TranscriptionError("PRIVATE_TRANSCRIPTION_ERROR")
 
 
 class NovaQuery:
@@ -359,6 +382,25 @@ async def open_nova(
     return command, command.replies[0]["message"], actual_context
 
 
+async def seed_memory_flow(
+    bot: FutureSelfBot,
+    user: Any,
+    *,
+    chat_id: int,
+    canonical_message_id: int,
+    phase: NovaMemoryFlowPhase = NovaMemoryFlowPhase.ROOT,
+) -> Any:
+    return await bot.nova_memory_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=chat_id,
+        tier=user.access_tier,
+        access_version=user.access_version,
+        canonical_message_id=canonical_message_id,
+        phase=phase,
+    )
+
+
 @pytest.mark.asyncio
 async def test_help_command_and_navigation_help_open_the_exact_same_nova_root(db):
     ai = NovaAIStub()
@@ -420,6 +462,724 @@ async def test_local_question_edits_only_the_canonical_message_and_never_calls_a
     assert edit["text"].startswith("✨ Nova\n\n")
     assert "1. " in edit["text"]
     assert callback_with_prefix(edit["reply_markup"], "nova:action:task_create:")
+
+
+@pytest.mark.asyncio
+async def test_guided_nova_question_clears_only_the_exact_memory_flow(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_081
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    exact = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=81_001,
+    )
+    other = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id + 1,
+        canonical_message_id=81_002,
+    )
+    message = NovaMessage("Nova, как добавить задачу с напоминанием?")
+
+    assert await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        nova_context(),
+        user=user,
+    )
+
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id + 1,
+        )
+        == other
+    )
+    assert exact.id != other.id
+    assert ai.calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_memory_intent_clears_guided_nova_and_reminder_flows(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_082
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    reminder_message = NovaMessage("Каждый день напоминай в 20:30 заполнить дневник")
+    assert await bot.reminder_text_gate(
+        update_for(reminder_message, user_id=user_id),
+        context,
+    )
+    reminder = await bot.reminder_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert reminder is not None
+    guided = await bot.nova_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+        access_version=user.access_version,
+        canonical_message_id=82_001,
+        tier=SUBSCRIBER,
+    )
+
+    memory_message = NovaMessage("Nova, запомни: Я предпочитаю короткие ответы")
+    assert await bot.nova_memory_text_gate(
+        update_for(memory_message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert (
+        await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    memory = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert memory is not None
+    assert memory.phase is NovaMemoryFlowPhase.CREATE_PREVIEW
+    assert guided.id not in repr(memory)
+
+
+@pytest.mark.asyncio
+async def test_navigation_routes_memory_before_reminder_nova_and_generic(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_091
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    reminder_gate = AsyncMock(return_value=False)
+    nova_gate = AsyncMock(return_value=False)
+    generic = AsyncMock()
+    bot.reminder_text_gate = reminder_gate
+    bot.nova_text_gate = nova_gate
+    bot._route_message = generic
+    message = NovaMessage("Nova, запомни: Я люблю проверяемые планы")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(
+            update_for(message, user_id=user_id),
+            nova_context(),
+        )
+
+    reminder_gate.assert_not_awaited()
+    nova_gate.assert_not_awaited()
+    generic.assert_not_awaited()
+    current = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.phase is NovaMemoryFlowPhase.CREATE_PREVIEW
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_memory_and_reminder_launch_leave_one_current_owner(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_093
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    memory_message = BlockingReplyNovaMessage("Nova, запомни: Я предпочитаю точные ответы")
+    memory_update = update_for(memory_message, user_id=user_id)
+    memory_task = asyncio.create_task(bot.nova_memory_text_gate(memory_update, context, user=user))
+    await memory_message.reply_started.wait()
+
+    reminder_message = NovaMessage("Каждый день напоминай в 20:30 заполнить дневник")
+    reminder_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            update_for(reminder_message, user_id=user_id),
+            context,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not reminder_task.done()
+
+    memory_message.reply_release.set()
+    assert await memory_task
+    assert await reminder_task
+
+    memory = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    reminder = await bot.reminder_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert memory is None
+    assert reminder is not None
+    assert reminder.canonical_message_id == reminder_message.replies[0]["message"].message_id
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_memory_and_guided_nova_launch_leave_one_current_owner(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_094
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    memory_message = BlockingReplyNovaMessage("Nova, запомни: Я предпочитаю точные ответы")
+    memory_update = update_for(memory_message, user_id=user_id)
+    memory_task = asyncio.create_task(bot.nova_memory_text_gate(memory_update, context, user=user))
+    await memory_message.reply_started.wait()
+
+    guided_message = NovaMessage("Nova, как добавить задачу с напоминанием?")
+    guided_task = asyncio.create_task(
+        bot.nova_text_gate(
+            update_for(guided_message, user_id=user_id),
+            context,
+            user=user,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not guided_task.done()
+
+    memory_message.reply_release.set()
+    assert await memory_task
+    assert await guided_task
+
+    memory = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    guided = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert memory is None
+    assert guided is not None
+    assert guided.canonical_message_id == guided_message.replies[0]["message"].message_id
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_reverse_concurrent_guided_then_memory_launch_keeps_last_publisher(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_095
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    guided_pre_clear_done = asyncio.Event()
+    allow_guided_publish = asyncio.Event()
+    guided_post_clear_started = asyncio.Event()
+    original_memory_clear = bot.nova_memory_clear_current
+    original_guided_cleanup = bot._nova_memory_clear_if_guided_current
+    clear_calls = 0
+    cleanup_calls = 0
+
+    async def controlled_memory_clear(update: Any) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            await original_memory_clear(update)
+            guided_pre_clear_done.set()
+            await allow_guided_publish.wait()
+            return
+        await original_memory_clear(update)
+
+    async def controlled_guided_cleanup(session: Any) -> bool:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        guided_post_clear_started.set()
+        return await original_guided_cleanup(session)
+
+    bot.nova_memory_clear_current = controlled_memory_clear
+    bot._nova_memory_clear_if_guided_current = controlled_guided_cleanup
+    guided_message = NovaMessage("Nova, как добавить задачу с напоминанием?")
+    guided_task = asyncio.create_task(
+        bot.nova_text_gate(
+            update_for(guided_message, user_id=user_id),
+            context,
+            user=user,
+        )
+    )
+    await guided_pre_clear_done.wait()
+
+    memory_message = BlockingReplyNovaMessage("Nova, запомни: Я предпочитаю точные ответы")
+    memory_task = asyncio.create_task(
+        bot.nova_memory_text_gate(
+            update_for(memory_message, user_id=user_id),
+            context,
+            user=user,
+        )
+    )
+    await memory_message.reply_started.wait()
+    allow_guided_publish.set()
+    await guided_post_clear_started.wait()
+    memory_message.reply_release.set()
+
+    assert await memory_task
+    assert await guided_task
+    memory = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    guided = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert memory is not None
+    assert guided is None
+    assert memory.canonical_message_id == memory_message.replies[0]["message"].message_id
+    assert clear_calls == 1
+    assert cleanup_calls == 1
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_reverse_concurrent_reminder_then_memory_launch_keeps_last_publisher(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_096
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    reminder_pre_clear_done = asyncio.Event()
+    allow_reminder_publish = asyncio.Event()
+    reminder_post_clear_started = asyncio.Event()
+    original_memory_clear = bot.nova_memory_clear_current
+    original_reminder_cleanup = bot._nova_memory_clear_if_reminder_current
+    clear_calls = 0
+    cleanup_calls = 0
+
+    async def controlled_memory_clear(update: Any) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            await original_memory_clear(update)
+            reminder_pre_clear_done.set()
+            await allow_reminder_publish.wait()
+            return
+        await original_memory_clear(update)
+
+    async def controlled_reminder_cleanup(session: Any) -> bool:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        reminder_post_clear_started.set()
+        return await original_reminder_cleanup(session)
+
+    bot.nova_memory_clear_current = controlled_memory_clear
+    bot._nova_memory_clear_if_reminder_current = controlled_reminder_cleanup
+    reminder_message = NovaMessage("Каждый день напоминай в 20:30 заполнить дневник")
+    reminder_task = asyncio.create_task(
+        bot.reminder_text_gate(
+            update_for(reminder_message, user_id=user_id),
+            context,
+        )
+    )
+    await reminder_pre_clear_done.wait()
+
+    memory_message = BlockingReplyNovaMessage("Nova, запомни: Я предпочитаю точные ответы")
+    memory_task = asyncio.create_task(
+        bot.nova_memory_text_gate(
+            update_for(memory_message, user_id=user_id),
+            context,
+            user=user,
+        )
+    )
+    await memory_message.reply_started.wait()
+    allow_reminder_publish.set()
+    await reminder_post_clear_started.wait()
+    memory_message.reply_release.set()
+
+    assert await memory_task
+    assert await reminder_task
+    memory = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    reminder = await bot.reminder_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert memory is not None
+    assert reminder is None
+    assert memory.canonical_message_id == memory_message.replies[0]["message"].message_id
+    assert clear_calls == 1
+    assert cleanup_calls == 1
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_durable_flow_keeps_ownership_over_explicit_memory_text(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_092
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    context.user_data["evening"] = {}
+    memory_gate = AsyncMock(return_value=True)
+    reminder_gate = AsyncMock(return_value=True)
+    nova_gate = AsyncMock(return_value=True)
+    bot.nova_memory_text_gate = memory_gate
+    bot.reminder_text_gate = reminder_gate
+    bot.nova_text_gate = nova_gate
+    message = NovaMessage("Nova, запомни: Не потерять активный сценарий")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(
+            update_for(message, user_id=user_id),
+            context,
+        )
+
+    memory_gate.assert_not_awaited()
+    reminder_gate.assert_not_awaited()
+    nova_gate.assert_not_awaited()
+    assert message.replies
+    assert "не завершён сценарий" in message.replies[-1]["text"]
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_unlisted_goals_command_is_contained_by_active_memory_preview(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_097
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    command = NovaMessage("Nova, запомни: Я предпочитаю точные ответы")
+    assert await bot.nova_memory_text_gate(
+        update_for(command, user_id=user_id),
+        context,
+        user=user,
+    )
+    before = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert before is not None and before.phase is NovaMemoryFlowPhase.CREATE_PREVIEW
+    canonical = command.replies[0]["message"]
+    goals_handler = AsyncMock()
+    bot.goals_command = goals_handler
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.onboarding_command_gate(
+            update_for(NovaMessage("/goals"), user_id=user_id),
+            context,
+        )
+
+    goals_handler.assert_not_awaited()
+    after = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert after is not None
+    assert after.id == before.id
+    assert after.version > before.version
+    assert after.phase is NovaMemoryFlowPhase.CREATE_PREVIEW
+    prompt = context.bot.edits[-1]
+    assert prompt["message_id"] == canonical.message_id
+    assert "не завершено действие с памятью" in prompt["text"]
+    matrix = button_matrix(prompt["reply_markup"])
+    assert [[label for label, _callback in row] for row in matrix] == [
+        ["▶️ Продолжить"],
+        ["🏠 Выйти в главное меню"],
+    ]
+    callbacks = [callback for row in matrix for _label, callback in row]
+    assert all(
+        callback is not None and callback.startswith("nmem:") and len(callback.encode()) <= 64
+        for callback in callbacks
+    )
+    assert len(set(callbacks)) == 2
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(Goal.id))) == 0
+    assert ai.calls == []
+    assert ai.other_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unlisted_goals_command_clears_browsing_memory_and_falls_through(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_098
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    root = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=98_001,
+    )
+    context = nova_context()
+
+    await bot.onboarding_command_gate(
+        update_for(NovaMessage("/goals"), user_id=user_id),
+        context,
+    )
+
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert root.phase is NovaMemoryFlowPhase.ROOT
+    assert context.bot.edits == []
+    assert ai.calls == []
+    assert ai.other_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_keeps_durable_flow_owner_and_retires_memory(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_099
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    memory = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=99_001,
+        phase=NovaMemoryFlowPhase.CREATE_PREVIEW,
+    )
+    context = nova_context()
+    context.user_data["evening"] = {}
+    message = NovaMessage("/cancel")
+
+    await bot.onboarding_command_gate(
+        update_for(message, user_id=user_id),
+        context,
+    )
+
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert memory.phase is NovaMemoryFlowPhase.CREATE_PREVIEW
+    assert message.replies == []
+    assert context.bot.edits == []
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_nmem_callback_bypasses_workspace_and_knowledge_cleanup(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_workspace_access=True,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    workspace_cancel = AsyncMock()
+    reminder_clear = AsyncMock()
+    guided_clear = AsyncMock()
+    knowledge_cancel = AsyncMock()
+    bot.workspace_service.cancel_input = workspace_cancel
+    bot.reminder_clear_current = reminder_clear
+    bot.nova_clear_current = guided_clear
+    bot.cancel_knowledge_state = knowledge_cancel
+    message = NovaMessage("memory callback")
+    query = NovaQuery("nmem:opaque_capability", message)
+
+    await bot.knowledge_other_callback_gate(
+        update_for(message, user_id=61_100, query=query),
+        nova_context(),
+    )
+
+    workspace_cancel.assert_not_awaited()
+    reminder_clear.assert_not_awaited()
+    guided_clear.assert_not_awaited()
+    knowledge_cancel.assert_not_awaited()
+    assert query.answers == []
+    assert query.edits == []
+    assert ai.calls == []
+    assert ai.other_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_stops_memory_before_reminder_and_guided_nova(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_083
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    reminder_message = NovaMessage("Каждый день напоминай в 20:30 заполнить дневник")
+    assert await bot.reminder_text_gate(
+        update_for(reminder_message, user_id=user_id),
+        context,
+    )
+    reminder = await bot.reminder_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert reminder is not None
+    guided = await bot.nova_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+        access_version=user.access_version,
+        canonical_message_id=83_001,
+        tier=SUBSCRIBER,
+    )
+    memory = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=83_002,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.nova_cancel_gate(
+            update_for(NovaMessage("/cancel"), user_id=user_id),
+            context,
+        )
+
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert (
+        await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        == reminder
+    )
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        == guided
+    )
+    assert memory.id not in repr(reminder)
 
 
 @pytest.mark.asyncio
@@ -714,6 +1474,544 @@ async def test_voice_follow_up_reuses_existing_canonical_and_last_action_without
 
 
 @pytest.mark.asyncio
+async def test_active_memory_voice_reuses_old_canonical_and_deletes_stt_progress(db):
+    ai = NovaAIStub()
+    transcript = "Я предпочитаю короткие практические ответы"
+    transcription = NovaTranscription(transcript)
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = 61_086
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    command = NovaMessage("Nova, запомни")
+    assert await bot.nova_memory_text_gate(
+        update_for(command, user_id=user_id),
+        context,
+        user=user,
+    )
+    canonical = command.replies[0]["message"]
+    awaiting = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert awaiting is not None
+    assert awaiting.phase is NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT
+    assert awaiting.canonical_message_id == canonical.message_id
+    edits_before = len(context.bot.edits)
+    route_message = AsyncMock()
+    bot._route_message = route_message
+    voice = NovaMessage(voice=NovaVoice())
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.voice(update_for(voice, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    route_message.assert_not_awaited()
+    assert len(voice.replies) == 1
+    transient = voice.replies[0]["message"]
+    assert (
+        transient.deleted == 1
+        or (
+            user_id,
+            transient.message_id,
+        )
+        in context.bot.deleted
+    )
+    memory_edits = context.bot.edits[edits_before:]
+    assert memory_edits
+    assert all(edit["message_id"] == canonical.message_id for edit in memory_edits)
+    assert transcript in memory_edits[-1]["text"]
+    current = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+    assert current.phase is NovaMemoryFlowPhase.CREATE_PREVIEW
+    assert current.canonical_message_id == canonical.message_id
+    assert transcript not in repr(current)
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_active_memory_transcription_error_reuses_canonical_and_retires_progress(db):
+    ai = NovaAIStub()
+    transcription = FailingNovaTranscription("unused")
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = 61_101
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    command = NovaMessage("Nova, запомни")
+    assert await bot.nova_memory_text_gate(
+        update_for(command, user_id=user_id),
+        context,
+        user=user,
+    )
+    canonical = command.replies[0]["message"]
+    before = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert before is not None
+    system_action = AsyncMock(return_value=True)
+    route_message = AsyncMock()
+    bot._try_system_action = system_action
+    bot._route_message = route_message
+    edits_before = len(context.bot.edits)
+    voice = NovaMessage(voice=NovaVoice())
+
+    await bot.voice(update_for(voice, user_id=user_id), context)
+
+    assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    system_action.assert_not_awaited()
+    route_message.assert_not_awaited()
+    assert len(voice.replies) == 1
+    transient = voice.replies[0]["message"]
+    assert transient.deleted == 1 or (user_id, transient.message_id) in context.bot.deleted
+    error_edits = context.bot.edits[edits_before:]
+    assert len(error_edits) == 1
+    assert error_edits[0]["message_id"] == canonical.message_id
+    assert "Не удалось распознать голосовое" in error_edits[0]["text"]
+    callbacks = [
+        str(button.callback_data)
+        for row in error_edits[0]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert len(callbacks) == 1 and callbacks[0].startswith("nmem:")
+    after = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert after is not None
+    assert after.id == before.id
+    assert after.version > before.version
+    assert after.phase is NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_active_memory_voice_disabled_edits_only_existing_canonical(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_102
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    command = NovaMessage("Nova, запомни")
+    assert await bot.nova_memory_text_gate(
+        update_for(command, user_id=user_id),
+        context,
+        user=user,
+    )
+    canonical = command.replies[0]["message"]
+    edits_before = len(context.bot.edits)
+    voice = NovaMessage(voice=NovaVoice())
+
+    await bot.voice(update_for(voice, user_id=user_id), context)
+
+    assert voice.replies == []
+    error_edits = context.bot.edits[edits_before:]
+    assert len(error_edits) == 1
+    assert error_edits[0]["message_id"] == canonical.message_id
+    assert "Распознавание голосовых временно не настроено" in error_edits[0]["text"]
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_memory_created_during_stt_fences_destructive_downstream_route(db):
+    ai = NovaAIStub()
+    transcription = BlockingNovaTranscription("удали все задачи")
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = 61_103
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    system_action = AsyncMock(return_value=True)
+    route_message = AsyncMock()
+    bot._try_system_action = system_action
+    bot._route_message = route_message
+    voice = NovaMessage(voice=NovaVoice())
+    task = asyncio.create_task(bot.voice(update_for(voice, user_id=user_id), context))
+    await transcription.started.wait()
+
+    replacement = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=103_001,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+    transcription.release.set()
+    with pytest.raises(ApplicationHandlerStop):
+        await task
+
+    system_action.assert_not_awaited()
+    route_message.assert_not_awaited()
+    assert len(voice.replies) == 1
+    transient = voice.replies[0]["message"]
+    assert transient.deleted == 1 or (user_id, transient.message_id) in context.bot.deleted
+    assert await bot.nova_memory_sessions.get_exact(replacement) == replacement
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_memory_published_during_post_stt_access_check_fences_system_route(db):
+    ai = NovaAIStub()
+    transcription = NovaTranscription("удали все задачи")
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = 61_104
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    original_access = bot._nova_memory_access
+    replacement = None
+
+    async def publish_during_access(update):
+        nonlocal replacement
+        if replacement is None:
+            replacement = await seed_memory_flow(
+                bot,
+                user,
+                chat_id=user_id,
+                canonical_message_id=104_001,
+                phase=NovaMemoryFlowPhase.ROOT,
+            )
+        return await original_access(update)
+
+    bot._nova_memory_access = publish_during_access
+    system_action = AsyncMock(return_value=True)
+    route_message = AsyncMock()
+    bot._try_system_action = system_action
+    bot._route_message = route_message
+    voice = NovaMessage(voice=NovaVoice())
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.voice(update_for(voice, user_id=user_id), context)
+
+    system_action.assert_not_awaited()
+    route_message.assert_not_awaited()
+    assert replacement is not None
+    assert await bot.nova_memory_sessions.get_exact(replacement) == replacement
+    transient = voice.replies[0]["message"]
+    assert transient.deleted == 1 or (user_id, transient.message_id) in context.bot.deleted
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_second_voice_access_version_bounce_cannot_create_first_memory_session(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_105
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    message = NovaMessage(voice=NovaVoice())
+    update = update_for(message, user_id=user_id)
+    fence = await bot.nova_memory_voice_fence(update, user=user)
+    assert fence is not None and fence.session is None
+    original_access = bot._nova_memory_access
+    calls = 0
+
+    async def bounce_on_second_access(late_update):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            service = AccessService(db)
+            await service.set_guest(user_id, source="memory-second-voice-access")
+            await service.grant_subscriber(user_id, source="memory-second-voice-access")
+        return await original_access(late_update)
+
+    bot._nova_memory_access = bounce_on_second_access
+    progress = NovaMessage("Расшифровываю…")
+
+    assert await bot.nova_memory_voice_gate(
+        update,
+        context,
+        "Nova, запомни: PRIVATE_SECOND_ACCESS_CONTENT",
+        progress,
+        user=user,
+        fence=fence,
+    )
+
+    assert calls == 3
+    assert progress.edits[-1]["text"] == NOVA_MEMORY_VOICE_ACCESS_CHANGED_TEXT
+    assert await bot.nova_memory_sessions.count() == 0
+    assert await content_row_counts(db) == (0, 0)
+    assert ai.calls == []
+    assert ai.other_calls == []
+
+
+@pytest.mark.asyncio
+async def test_second_voice_access_downgrade_neutralizes_active_memory_canonical(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_106
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    session = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=106_001,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+    message = NovaMessage(voice=NovaVoice())
+    update = update_for(message, user_id=user_id)
+    fence = await bot.nova_memory_voice_fence(update, user=user)
+    assert fence is not None and fence.session == session
+    original_access = bot._nova_memory_access
+    calls = 0
+
+    async def downgrade_on_second_access(late_update):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await AccessService(db).set_guest(
+                user_id,
+                source="memory-second-voice-access",
+            )
+        return await original_access(late_update)
+
+    bot._nova_memory_access = downgrade_on_second_access
+    progress = NovaMessage("Расшифровываю…")
+
+    assert await bot.nova_memory_voice_gate(
+        update,
+        context,
+        "Nova, запомни: PRIVATE_REPLACEMENT_CONTENT",
+        progress,
+        user=user,
+        fence=fence,
+    )
+
+    assert calls == 3
+    assert progress.deleted == 1
+    assert await bot.nova_memory_sessions.count() == 0
+    assert context.bot.edits[-1]["message_id"] == session.canonical_message_id
+    assert context.bot.edits[-1]["text"] == NOVA_MEMORY_ACCESS_CHANGED_TEXT
+    assert "PRIVATE_REPLACEMENT_CONTENT" not in str(context.bot.edits)
+    assert await content_row_counts(db) == (0, 0)
+    assert ai.calls == []
+    assert ai.other_calls == []
+
+
+@pytest.mark.asyncio
+async def test_voice_access_bounce_during_session_read_is_caught_by_final_fence(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_107
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    message = NovaMessage(voice=NovaVoice())
+    update = update_for(message, user_id=user_id)
+    fence = await bot.nova_memory_voice_fence(update, user=user)
+    assert fence is not None and fence.session is None
+    original_current = bot.nova_memory_sessions.current
+    current_calls = 0
+
+    async def bounce_during_first_session_read(**kwargs):
+        nonlocal current_calls
+        current_calls += 1
+        if current_calls == 1:
+            service = AccessService(db)
+            await service.set_guest(user_id, source="memory-voice-session-read")
+            await service.grant_subscriber(user_id, source="memory-voice-session-read")
+        return await original_current(**kwargs)
+
+    bot.nova_memory_sessions.current = bounce_during_first_session_read
+    progress = NovaMessage("Расшифровываю…")
+
+    assert await bot.nova_memory_voice_pre_route(
+        update,
+        context,
+        progress,
+        fence=fence,
+    )
+
+    assert current_calls == 2
+    assert progress.edits[-1]["text"] == NOVA_MEMORY_VOICE_ACCESS_CHANGED_TEXT
+    assert await bot.nova_memory_sessions.count() == 0
+    assert await content_row_counts(db) == (0, 0)
+    assert ai.calls == []
+    assert ai.other_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", ["cleared", "replaced", "access_bounce"])
+async def test_stale_memory_voice_is_consumed_without_generic_fallback(db, lifecycle):
+    ai = NovaAIStub()
+    transcript = "Новый способ общения"
+    transcription = BlockingNovaTranscription(transcript)
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = {
+        "cleared": 61_087,
+        "replaced": 61_088,
+        "access_bounce": 61_089,
+    }[lifecycle]
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    command = NovaMessage("Nova, запомни")
+    assert await bot.nova_memory_text_gate(
+        update_for(command, user_id=user_id),
+        context,
+        user=user,
+    )
+    original = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert original is not None
+    system_action = AsyncMock(return_value=True)
+    bot._try_system_action = system_action
+    route_message = AsyncMock()
+    bot._route_message = route_message
+    voice = NovaMessage(voice=NovaVoice())
+    task = asyncio.create_task(bot.voice(update_for(voice, user_id=user_id), context))
+    await transcription.started.wait()
+
+    replacement = None
+    if lifecycle == "cleared":
+        assert await bot.nova_memory_sessions.clear(
+            owner_id=original.owner_id,
+            telegram_user_id=original.telegram_user_id,
+            chat_id=original.chat_id,
+            session_id=original.id,
+        )
+    elif lifecycle == "replaced":
+        replacement = await seed_memory_flow(
+            bot,
+            user,
+            chat_id=user_id,
+            canonical_message_id=89_001,
+            phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+        )
+    else:
+        service = AccessService(db)
+        await service.set_guest(user_id, source="memory-voice-race")
+        await service.grant_subscriber(user_id, source="memory-voice-race")
+
+    transcription.release.set()
+    with pytest.raises(ApplicationHandlerStop):
+        await task
+
+    system_action.assert_not_awaited()
+    route_message.assert_not_awaited()
+    assert len(voice.replies) == 1
+    transient = voice.replies[0]["message"]
+    assert (
+        transient.deleted == 1
+        or (
+            user_id,
+            transient.message_id,
+        )
+        in context.bot.deleted
+    )
+    live = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    if replacement is not None:
+        assert live == replacement
+    else:
+        assert live is None
+    assert original.id not in repr(live)
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_memory_negative_voice_falls_through_to_generic_pipeline(db):
+    ai = NovaAIStub()
+    transcript = "Сегодня я спокойно работал над обычными делами"
+    transcription = NovaTranscription(transcript)
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+        _transcription=transcription,
+    )
+    user_id = 61_090
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    route_message = AsyncMock()
+    bot._route_message = route_message
+    message = NovaMessage(voice=NovaVoice())
+
+    await bot.voice(update_for(message, user_id=user_id), nova_context())
+
+    route_message.assert_awaited_once()
+    assert route_message.await_args.args[2:] == (transcript, "voice")
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert await content_row_counts(db) == (0, 0)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "transcript",
     [
@@ -816,23 +2114,33 @@ async def test_ordinary_voice_access_bounce_during_stt_never_reaches_content_pip
 
     transcript = "PRIVATE_ORDINARY_VOICE_TRANSCRIPT о моём обычном дне"
     transcription = HookedNovaTranscription(transcript, bounce_access)
-    bot = make_bot(db, ai, _transcription=transcription)
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+        _transcription=transcription,
+    )
     await user_with_tier(bot, user_id, SUBSCRIBER)
+    system_action = AsyncMock(return_value=True)
+    bot._try_system_action = system_action
     route_message = AsyncMock()
     bot._route_message = route_message
     message = NovaMessage(voice=NovaVoice())
     context = nova_context()
 
-    await bot.voice(update_for(message, user_id=user_id), context)
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.voice(update_for(message, user_id=user_id), context)
 
     assert transcription.calls == [(b"nova-voice", "voice.ogg")]
+    system_action.assert_not_awaited()
     route_message.assert_not_awaited()
     assert ai.calls == []
     assert ai.other_calls == []
     assert len(message.replies) == 1
     progress = message.replies[0]["message"]
     assert len(progress.edits) == 1
-    assert progress.edits[0]["text"] == REMINDER_ACCESS_CHANGED_TEXT
+    assert progress.edits[0]["text"] == NOVA_MEMORY_VOICE_ACCESS_CHANGED_TEXT
     assert progress.edits[0]["reply_markup"] is None
     assert context.bot.sent == []
     async with db.sessions() as session:
@@ -1747,6 +3055,49 @@ async def test_photo_and_document_leave_nova_before_existing_media_pipeline(db, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("media_kind", ["photo", "document"])
+async def test_photo_and_document_are_contained_by_awaiting_memory_flow(db, media_kind):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_084
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    memory = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=84_001,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+    bot.reminder_clear_current = AsyncMock()
+    bot.nova_clear_current = AsyncMock()
+    payload = [object()] if media_kind == "photo" else object()
+    message = NovaMessage(**{media_kind: payload})
+    context = nova_context()
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.nova_non_text_gate(
+            update_for(message, user_id=user_id),
+            context,
+        )
+
+    live = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert live is not None and live.id == memory.id
+    assert context.bot.edits[-1]["message_id"] == memory.canonical_message_id
+    assert context.bot.edits[-1]["text"].endswith("Пришли текст или голосовое сообщение.")
+    bot.reminder_clear_current.assert_not_awaited()
+    bot.nova_clear_current.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("media_kind", ["voice", "audio"])
 async def test_voice_and_audio_do_not_clear_active_nova_before_stt(db, media_kind):
     ai = NovaAIStub()
@@ -1775,6 +3126,48 @@ async def test_voice_and_audio_do_not_clear_active_nova_before_stt(db, media_kin
         chat_id=user_id,
     )
     assert after == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_kind", ["voice", "audio"])
+async def test_voice_and_audio_leave_awaiting_memory_for_stt(db, media_kind):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    user_id = 61_085
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    memory = await seed_memory_flow(
+        bot,
+        user,
+        chat_id=user_id,
+        canonical_message_id=85_001,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+    bot.reminder_clear_current = AsyncMock()
+    bot.nova_clear_current = AsyncMock()
+
+    await bot.nova_non_text_gate(
+        update_for(
+            NovaMessage(**{media_kind: NovaVoice()}),
+            user_id=user_id,
+        ),
+        nova_context(),
+    )
+
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        == memory
+    )
+    bot.reminder_clear_current.assert_not_awaited()
+    bot.nova_clear_current.assert_not_awaited()
 
 
 @pytest.mark.asyncio

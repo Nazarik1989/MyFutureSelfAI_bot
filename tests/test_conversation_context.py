@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
-from future_self.conversation import ConversationContextService
+from future_self.conversation import ConversationContextService, ConversationSnapshot
 from future_self.dates import DateResolver
 from future_self.db import Database
 from future_self.models import ConversationMessage, ConversationSession, DraftInboxItem, InboxItem
@@ -574,3 +574,65 @@ async def test_context_logging_does_not_include_private_message(db, caplog):
             intent="reflection",
         )
     assert private not in caplog.text
+
+
+def test_latest_nova_memory_candidate_uses_only_latest_bounded_user_reply():
+    snapshot = ConversationSnapshot(
+        messages=[
+            {
+                "role": "user",
+                "content": "  Я предпочитаю короткие ответы  ",
+                "source": "voice",
+                "intent": "conversation",
+            },
+            {
+                "role": "assistant",
+                "content": "Поняла.",
+                "source": "text",
+                "intent": "conversation",
+            },
+        ]
+    )
+
+    assert (
+        ConversationContextService.latest_nova_memory_candidate(snapshot)
+        == "Я предпочитаю короткие ответы"
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "source", "intent"),
+    [
+        ("Nova, запомни: отвечай кратко", "text", "conversation"),
+        ("обычная последняя реплика", "photo", "conversation"),
+        ("обычная последняя реплика", "text", "navigation"),
+        ("Напомни завтра позвонить", "text", "relative_reminder"),
+        ("Выбираю первый вариант", "text", "confirm_date"),
+        ("Сохрани это", "text", "explicit_capture"),
+        ("текст с\x00управляющим символом", "text", "conversation"),
+        ("x" * 501, "voice", "conversation"),
+    ],
+)
+def test_latest_nova_memory_candidate_fails_closed_without_older_fallback(
+    content,
+    source,
+    intent,
+):
+    snapshot = ConversationSnapshot(
+        messages=[
+            {
+                "role": "user",
+                "content": "старую подходящую реплику нельзя подставлять",
+                "source": "text",
+                "intent": "conversation",
+            },
+            {
+                "role": "user",
+                "content": content,
+                "source": source,
+                "intent": intent,
+            },
+        ]
+    )
+
+    assert ConversationContextService.latest_nova_memory_candidate(snapshot) is None

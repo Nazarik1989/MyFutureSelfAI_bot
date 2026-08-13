@@ -23,10 +23,19 @@ from future_self.bot import FutureSelfBot, log_safe_failure
 from future_self.config import Settings
 from future_self.doctor import run_diagnostics
 from future_self.main import create_application, format_configuration_error, run
-from future_self.models import ConversationMessage, DraftInboxItem, InboxItem, OnboardingState, User
+from future_self.models import (
+    ConversationMessage,
+    DraftInboxItem,
+    InboxItem,
+    NovaMemoryChange,
+    NovaMemoryItem,
+    OnboardingState,
+    User,
+)
 from future_self.nova_handlers import NOVA_ROOT_TEXT
+from future_self.nova_memory_flow import NovaMemoryFlowPhase
 from future_self.repositories import OnboardingRepository, UserRepository
-from future_self.schemas import ReminderTimezoneResolution
+from future_self.schemas import ParsedThought, ReminderTimezoneResolution
 from future_self.tasks import add_task_state
 from future_self.timezones import extract_reminder_timezone_fragment
 
@@ -72,6 +81,143 @@ def runtime_settings(**overrides) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+async def _runtime_subscriber(
+    core: FutureSelfBot,
+    db,
+    telegram_id: int,
+    *,
+    onboarding_completed: bool,
+):
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = onboarding_completed
+    return await core._user(telegram_id)
+
+
+async def _runtime_active_memory(core: FutureSelfBot, owner, telegram_id: int, chat_id: int):
+    return await core.nova_memory_sessions.create(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        tier=owner.access_tier,
+        access_version=owner.access_version,
+        canonical_message_id=9_001,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+
+
+def _runtime_voice_update(
+    application,
+    telegram_id: int,
+    *,
+    update_id: int,
+    source_message_id: int,
+    progress_message_id: int,
+):
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        source_message_id,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        voice=RuntimeVoice(),
+    )
+    progress_message = Message(
+        progress_message_id,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…",
+    )
+    update = Update(update_id, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    progress_message.set_bot(application.bot)
+    return update, progress_message
+
+
+def _patch_runtime_voice_transport(monkeypatch, progress_message):
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return progress_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return progress_message
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    return sent, edits
+
+
+def _patch_runtime_voice_priority_spies(core: FutureSelfBot, fake_ai, monkeypatch):
+    calls: list[str] = []
+
+    async def memory_gate(*args, **kwargs):
+        del args, kwargs
+        calls.append("memory")
+        return False
+
+    async def reminder_gate(*args, **kwargs):
+        del args, kwargs
+        calls.append("reminder")
+        return False
+
+    async def nova_gate(*args, **kwargs):
+        del args, kwargs
+        calls.append("nova")
+        return False
+
+    async def generic_route(*args, **kwargs):
+        del args, kwargs
+        calls.append("generic")
+
+    async def forbidden_provider(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("durable voice owner must stop provider routing")
+
+    monkeypatch.setattr(core, "nova_memory_voice_gate", memory_gate)
+    monkeypatch.setattr(core, "reminder_voice_gate", reminder_gate)
+    monkeypatch.setattr(core, "nova_voice_gate", nova_gate)
+    monkeypatch.setattr(core, "_route_message", generic_route)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_provider)
+    monkeypatch.setattr(fake_ai, "answer_message", forbidden_provider)
+    monkeypatch.setattr(fake_ai, "nova_help", forbidden_provider, raising=False)
+    return calls
+
+
+async def _assert_runtime_voice_memory_untouched(db) -> None:
+    async with db.sessions() as session:
+        assert list((await session.scalars(select(NovaMemoryItem))).all()) == []
+        assert list((await session.scalars(select(NovaMemoryChange))).all()) == []
+
+
+def _assert_runtime_voice_canonical(
+    sent: list[dict[str, object]],
+    edits: list[dict[str, object]],
+    progress_message_id: int,
+) -> None:
+    assert [entry["text"] for entry in sent] == ["Расшифровываю голосовую мысль…"]
+    assert edits
+    assert all(entry["message_id"] == progress_message_id for entry in edits)
+    assert all(
+        not str(button.callback_data).startswith("nmem:")
+        for entry in (*sent, *edits)
+        if entry.get("reply_markup") is not None
+        for row in getattr(entry["reply_markup"], "inline_keyboard", ())
+        for button in row
+    )
 
 
 def test_missing_environment_variables_are_reported_without_values(monkeypatch, tmp_path):
@@ -435,6 +581,7 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "profile",
         "location",
         "timezone",
+        "mynova",
         "goals",
         "inbox",
         "tasks",
@@ -454,7 +601,13 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "doctor_find",
         "doctor_find_task",
     } <= commands
-    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 18
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 19
+    assert any(
+        isinstance(handler, CallbackQueryHandler)
+        and handler.callback.__name__ == "nova_memory_callback"
+        and getattr(handler.pattern, "pattern", None) == r"^nmem:[A-Za-z0-9_-]+$"
+        for handler in handlers
+    )
     assert any(
         isinstance(handler, CallbackQueryHandler)
         and handler.callback.__name__ == "reminder_callback"
@@ -860,6 +1013,115 @@ async def test_real_application_explicit_reminder_owns_text_and_callback_once(
     )
 
 
+async def test_real_application_explicit_memory_stops_every_downstream_pipeline_before_confirm(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    settings = runtime_settings(
+        database_url=db.url,
+        enable_nova_memory=True,
+        nova_memory_admin_only=False,
+    )
+    core = FutureSelfBot(settings, db, fake_ai, FakeTranscription())
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712365
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    private_content = "PRIVATE_MEMORY_RUNTIME_SENTINEL"
+    source_message = Message(
+        116,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        text=f"Nova, запомни: {private_content}",
+    )
+    canonical_message = Message(
+        216,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="🧬 Моя Nova",
+    )
+    update = Update(1016, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    canonical_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return canonical_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return canonical_message
+
+    async def forbidden_provider(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("memory CRUD routing must not call AI")
+
+    async def downstream_handler(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_provider)
+    monkeypatch.setattr(fake_ai, "nova_help", forbidden_provider, raising=False)
+    application.add_handler(TypeHandler(Update, downstream_handler), group=100)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    assert [entry["text"] for entry in sent] == ["🧬 Моя Nova\n\nОткрываю…"]
+    assert len(edits) == 1
+    assert edits[0]["message_id"] == canonical_message.message_id
+    assert private_content in str(edits[0]["text"])
+    callbacks = [
+        str(button.callback_data)
+        for row in edits[0]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert callbacks and all(callback.startswith("nmem:") for callback in callbacks)
+    assert all(private_content not in callback for callback in callbacks)
+    assert fake_ai.route_calls == []
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+    assert (
+        await core.nova_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat.id,
+        )
+        is None
+    )
+    async with db.sessions() as session:
+        assert list((await session.scalars(select(NovaMemoryItem))).all()) == []
+        assert list((await session.scalars(select(NovaMemoryChange))).all()) == []
+        assert list((await session.scalars(select(DraftInboxItem))).all()) == []
+        assert list((await session.scalars(select(InboxItem))).all()) == []
+
+
 async def test_real_application_ordinary_text_keeps_generic_pipeline(
     db,
     fake_ai,
@@ -1039,6 +1301,112 @@ async def test_real_application_explicit_voice_reminder_reuses_progress_message(
         )
         is None
     )
+
+
+async def test_real_application_explicit_voice_memory_reuses_progress_and_stops_generic(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    private_content = "PRIVATE_VOICE_MEMORY_SENTINEL"
+    transcript = f"Nova, запомни: {private_content}"
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    telegram_id = 712374
+    owner = await core._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    async with db.session() as session:
+        stored = await session.get(User, owner.id)
+        stored.onboarding_completed = True
+
+    telegram_user = TelegramUser(telegram_id, False, "Тест")
+    bot_user = TelegramUser(123456, True, "Future Self")
+    chat = Chat(telegram_id, "private")
+    source_message = Message(
+        117,
+        datetime.now(UTC),
+        chat,
+        from_user=telegram_user,
+        voice=RuntimeVoice(),
+    )
+    progress_message = Message(
+        217,
+        datetime.now(UTC),
+        chat,
+        from_user=bot_user,
+        text="Расшифровываю голосовую мысль…",
+    )
+    update = Update(1017, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    progress_message.set_bot(application.bot)
+
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(kwargs)
+        return progress_message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(kwargs)
+        return progress_message
+
+    async def forbidden_provider(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("voice memory routing must not call AI")
+
+    async def downstream_handler(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_provider)
+    monkeypatch.setattr(fake_ai, "nova_help", forbidden_provider, raising=False)
+    application.add_handler(TypeHandler(Update, downstream_handler), group=100)
+
+    await application.process_update(update)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert downstream == []
+    assert [entry["text"] for entry in sent] == ["Расшифровываю голосовую мысль…"]
+    assert len(edits) == 1
+    assert edits[0]["message_id"] == progress_message.message_id
+    assert private_content in str(edits[0]["text"])
+    assert "Я услышал" not in str(edits[0]["text"])
+    callbacks = [
+        str(button.callback_data)
+        for row in edits[0]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert callbacks and all(callback.startswith("nmem:") for callback in callbacks)
+    current = await core.nova_memory_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat.id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == progress_message.message_id
+    assert private_content not in repr(current)
+    assert fake_ai.route_calls == []
+    async with db.sessions() as session:
+        assert list((await session.scalars(select(NovaMemoryItem))).all()) == []
+        assert list((await session.scalars(select(NovaMemoryChange))).all()) == []
 
 
 @pytest.mark.parametrize(
@@ -2290,3 +2658,545 @@ def test_safe_error_logging_omits_exception_message(caplog):
         log_safe_failure("Voice processing failed", RuntimeError(secret), user_id=42)
     assert "Voice processing failed" in caplog.text
     assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("transcript", "telegram_id", "consumed"),
+    [
+        ("Я хочу жить у моря и больше путешествовать", 713_001, True),
+        ("Nova, запомни: PRIVATE_ONBOARDING_MEMORY_SENTINEL", 713_002, False),
+    ],
+    ids=("ordinary", "explicit_memory"),
+)
+async def test_real_application_persisted_onboarding_owns_active_memory_voice(
+    db,
+    fake_ai,
+    monkeypatch,
+    transcript,
+    telegram_id,
+    consumed,
+):
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=False,
+    )
+    async with db.session() as session:
+        session.add(
+            OnboardingState(
+                user_id=owner.id,
+                current_step=2,
+                answers={"display_name": "Тест"},
+                status="in_progress",
+            )
+        )
+    memory = await _runtime_active_memory(core, owner, telegram_id, telegram_id)
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=20_001 + telegram_id,
+        source_message_id=301,
+        progress_message_id=401,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    downstream = _patch_runtime_voice_priority_spies(core, fake_ai, monkeypatch)
+
+    await application.process_update(update)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert downstream == []
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(OnboardingState).where(OnboardingState.user_id == owner.id)
+        )
+    assert state is not None
+    assert state.current_step == (3 if consumed else 2)
+    assert (state.answers.get("future_life") == transcript) is consumed
+    assert (
+        await core.nova_memory_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    assert memory.phase is NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT
+    await _assert_runtime_voice_memory_untouched(db)
+    _assert_runtime_voice_canonical(sent, edits, progress.message_id)
+
+
+@pytest.mark.parametrize(
+    ("transcript", "telegram_id", "consumed"),
+    [
+        ("16", 713_003, True),
+        ("Nova, запомни: PRIVATE_DATE_MEMORY_SENTINEL", 713_004, False),
+    ],
+    ids=("ordinary", "explicit_memory"),
+)
+async def test_real_application_pending_date_choice_owns_active_memory_voice(
+    db,
+    fake_ai,
+    monkeypatch,
+    transcript,
+    telegram_id,
+    consumed,
+):
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    await core.conversation.set_date_conflict(
+        telegram_id,
+        telegram_id,
+        [
+            {"value": "2026-08-16", "weekday": "воскресенье"},
+            {"value": "2026-08-23", "weekday": "воскресенье"},
+        ],
+    )
+    await core.conversation.append(
+        telegram_id,
+        telegram_id,
+        role="user",
+        content="Напомни 16 августа позвонить врачу",
+        source="text",
+        intent="date_conflict",
+    )
+    memory = await _runtime_active_memory(core, owner, telegram_id, telegram_id)
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=20_001 + telegram_id,
+        source_message_id=302,
+        progress_message_id=402,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    downstream = _patch_runtime_voice_priority_spies(core, fake_ai, monkeypatch)
+    original_route = FutureSelfBot._route_message.__get__(core, FutureSelfBot)
+
+    async def date_choice_route(route_update, context, text, source):
+        return await original_route(route_update, context, text, source)
+
+    if consumed:
+        monkeypatch.setattr(core, "_route_message", date_choice_route)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    snapshot = await core.conversation.get(telegram_id, telegram_id)
+    drafts = await core.draft_service.active_previews(telegram_id, telegram_id)
+    assert bool(drafts) is consumed
+    assert bool(snapshot.pending_date_options) is not consumed
+    assert (
+        await core.nova_memory_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    assert memory.phase is NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT
+    await _assert_runtime_voice_memory_untouched(db)
+    _assert_runtime_voice_canonical(sent, edits, progress.message_id)
+
+
+async def test_real_application_pending_system_confirmation_owns_active_memory_voice(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 713_005
+    transcription = RuntimeTranscription("да, удалить")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    draft = await core.draft_service.create(
+        user_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+        source="text",
+        raw_text="Удаляемый черновик",
+        parsed=ParsedThought(kind="note", title="Удаляемый черновик"),
+    )
+    await core.conversation.begin_system_action(
+        telegram_id,
+        telegram_id,
+        "discard_all_active_drafts",
+        [
+            {
+                "id": draft.id,
+                "version": draft.version,
+                "affected": True,
+                "preview_message_id": None,
+            }
+        ],
+    )
+    await _runtime_active_memory(core, owner, telegram_id, telegram_id)
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=20_001 + telegram_id,
+        source_message_id=303,
+        progress_message_id=403,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    downstream = _patch_runtime_voice_priority_spies(core, fake_ai, monkeypatch)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    assert (await core.draft_service.get(draft.id)).status == "discarded"
+    assert (await core.conversation.get(telegram_id, telegram_id)).system_pending_action is None
+    assert (
+        await core.nova_memory_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    await _assert_runtime_voice_memory_untouched(db)
+    _assert_runtime_voice_canonical(sent, edits, progress.message_id)
+
+
+@pytest.mark.parametrize(
+    ("flow", "telegram_id", "transcript"),
+    [
+        ("workspace", 713_006, "Наш дом"),
+        ("collection", 713_007, "Путешествия"),
+        ("task", 713_008, "завтра в 18:00"),
+        ("vision", 713_009, "Побывать у океана"),
+    ],
+)
+async def test_real_application_durable_business_flow_owns_active_memory_voice(
+    db,
+    fake_ai,
+    monkeypatch,
+    flow,
+    telegram_id,
+    transcript,
+):
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+            enable_workspace_access=True,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    item_id = None
+    if flow == "workspace":
+        await core.workspace_service.begin_input(
+            owner.id,
+            telegram_id,
+            "create_name",
+            payload={"character": "family"},
+        )
+    elif flow == "collection":
+        await core.collection_service.issue_action(
+            owner.id,
+            telegram_id,
+            "input_create",
+            payload={"kind": "topic"},
+            status="awaiting_input",
+        )
+    elif flow == "task":
+        async with db.session() as session:
+            item = InboxItem(
+                user_id=owner.id,
+                kind="task",
+                title="Позвонить врачу",
+                raw_text="Позвонить врачу",
+                source="text",
+                status="confirmed",
+                version=1,
+            )
+            session.add(item)
+            await session.flush()
+            await add_task_state(session, item, owner_timezone="Europe/Moscow")
+            item_id = item.id
+        actions = await core.task_service.issue_actions(
+            owner.id,
+            telegram_id,
+            item_id,
+            1,
+            ("reminder_edit",),
+        )
+        started = await core.task_service.start_reminder_input(
+            actions["reminder_edit"],
+            owner.id,
+            telegram_id,
+        )
+        assert started.status == "await_reminder"
+    else:
+        draft = await core.vision_service.begin(owner.id, telegram_id)
+        selected = await core.vision_service.choose_category(
+            owner.id,
+            telegram_id,
+            "other",
+            draft_id=draft.id,
+        )
+        assert selected.status == "advanced"
+    await _runtime_active_memory(core, owner, telegram_id, telegram_id)
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=20_001 + telegram_id,
+        source_message_id=304,
+        progress_message_id=404,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    downstream = _patch_runtime_voice_priority_spies(core, fake_ai, monkeypatch)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    if flow == "workspace":
+        pending = await core.workspace_service.pending_input(owner.id, telegram_id)
+        assert pending is not None
+        assert pending.action == "input:create_description"
+        assert pending.payload["name"] == transcript
+    elif flow == "collection":
+        assert await core.collection_service.pending_input(owner.id, telegram_id) is None
+        assert (await core.collection_service.resolve(owner.id, transcript)).match is not None
+    elif flow == "task":
+        assert await core.task_service.pending_input(owner.id, telegram_id) is None
+        record = await core.task_service.record(owner.id, item_id)
+        assert record is not None and record.reminder is not None
+    else:
+        draft = await core.vision_service.draft(owner.id, telegram_id)
+        assert draft is not None
+        assert draft.wish_text == transcript
+        assert draft.step == "why"
+    assert (
+        await core.nova_memory_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    await _assert_runtime_voice_memory_untouched(db)
+    _assert_runtime_voice_canonical(sent, edits, progress.message_id)
+
+
+async def test_real_application_voice_durable_owner_clears_only_frozen_memory_generation(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 713_010
+    transcription = RuntimeTranscription("Nova, запомни: PRIVATE_REPLACEMENT_SENTINEL")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    await core.conversation.set_date_conflict(
+        telegram_id,
+        telegram_id,
+        [{"value": "2026-08-16", "weekday": "воскресенье"}],
+    )
+    frozen = await _runtime_active_memory(core, owner, telegram_id, telegram_id)
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=20_001 + telegram_id,
+        source_message_id=305,
+        progress_message_id=405,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    downstream = _patch_runtime_voice_priority_spies(core, fake_ai, monkeypatch)
+    original_active_flow = core._active_navigation_flow
+    replacement = None
+
+    async def replace_during_ownership_check(route_update, context):
+        nonlocal replacement
+        active = await original_active_flow(route_update, context)
+        if replacement is None:
+            replacement = await core.nova_memory_sessions.create(
+                owner_id=owner.id,
+                telegram_user_id=telegram_id,
+                chat_id=telegram_id,
+                tier=owner.access_tier,
+                access_version=owner.access_version,
+                canonical_message_id=9_002,
+                phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+            )
+        return active
+
+    monkeypatch.setattr(core, "_active_navigation_flow", replace_during_ownership_check)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    current = await core.nova_memory_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert replacement is not None
+    assert current == replacement
+    assert current.id != frozen.id
+    assert current.phase is NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT
+    assert (await core.conversation.get(telegram_id, telegram_id)).pending_date_options
+    await _assert_runtime_voice_memory_untouched(db)
+    assert [entry["text"] for entry in sent] == ["Расшифровываю голосовую мысль…"]
+    assert all(entry["message_id"] == progress.message_id for entry in edits)
+
+
+async def test_real_application_voice_bound_clear_preserves_replacement_generation(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 713_011
+    transcription = RuntimeTranscription("Nova, запомни: PRIVATE_BOUND_CLEAR_SENTINEL")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    await core.conversation.set_date_conflict(
+        telegram_id,
+        telegram_id,
+        [{"value": "2026-08-16", "weekday": "воскресенье"}],
+    )
+    frozen = await _runtime_active_memory(core, owner, telegram_id, telegram_id)
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=20_001 + telegram_id,
+        source_message_id=306,
+        progress_message_id=406,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    downstream = _patch_runtime_voice_priority_spies(core, fake_ai, monkeypatch)
+    original_clear_bound = core.nova_memory_clear_bound
+    replacement = None
+    clear_session_ids: list[str | None] = []
+
+    async def replace_during_bound_clear(
+        owner_id,
+        telegram_user_id,
+        chat_id,
+        *,
+        session_id=None,
+    ):
+        nonlocal replacement
+        clear_session_ids.append(session_id)
+        replacement = await core.nova_memory_sessions.create(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+            tier=owner.access_tier,
+            access_version=owner.access_version,
+            canonical_message_id=9_003,
+            phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+        )
+        return await original_clear_bound(
+            owner_id,
+            telegram_user_id,
+            chat_id,
+            session_id=session_id,
+        )
+
+    monkeypatch.setattr(core, "nova_memory_clear_bound", replace_during_bound_clear)
+
+    await application.process_update(update)
+
+    assert downstream == []
+    assert clear_session_ids == [frozen.id]
+    current = await core.nova_memory_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert replacement is not None
+    assert current == replacement
+    assert current.id != frozen.id
+    assert current.phase is NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT
+    assert (await core.conversation.get(telegram_id, telegram_id)).pending_date_options
+    await _assert_runtime_voice_memory_untouched(db)
+    _assert_runtime_voice_canonical(sent, edits, progress.message_id)

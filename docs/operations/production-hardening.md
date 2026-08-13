@@ -151,21 +151,22 @@ files stay root-owned `0700/0600`.
   rows explicitly before rollback; migration `20260725_0020` intentionally refuses to
   downgrade while recoverable trash exists.
 
-## Stage 7A Nova memory and conversation retention
+## Stage 7A/7B.1 Nova memory and conversation retention
 
-Stage 7A is a data/domain foundation and is not user-visible. Keep
-`ENABLE_NOVA_MEMORY=false`, `NOVA_MEMORY_ADMIN_ONLY=true` and
-`ENABLE_NOVA_MEMORY_APPLICATION=false` until the separately reviewed Telegram flow is
-available. `NOVA_MEMORY_MAX_ITEMS=100` is the hard configuration ceiling. The future UI
-must create memory only after an explicit preview and confirmation; it must not import
+Stage 7A is the data/domain foundation. Stage 7B.1 adds the separately reviewed Telegram
+CRUD flow. Keep `NOVA_MEMORY_ADMIN_ONLY=true` for an admin-only pilot when enabling
+`ENABLE_NOVA_MEMORY=true`. The application flag remains independent and must stay
+`ENABLE_NOVA_MEMORY_APPLICATION=false`: enabling CRUD must not inject confirmed items
+into AI prompts. `NOVA_MEMORY_MAX_ITEMS=100` is the hard configuration ceiling. The UI
+creates memory only after an explicit preview and confirmation; it must not import
 conversation history, onboarding answers or Vision data automatically.
 
 The application kill switch is independent from CRUD so confirmed records can be
 managed without being injected into prompts. Telegram tier `admin` never authorizes
 cross-user browsing or mutation. Item deletion removes content from the active database,
 but historical backups remain subject to the separate backup-retention policy and must
-not be described as immediately erased. The bounded expired-conversation purge is not
-wired to a periodic runtime job until Stage 7B.
+not be described as immediately erased. The bounded expired-conversation purge remains
+unwired in Stage 7B.1; enabling memory CRUD does not register a periodic runtime job.
 
 Migration downgrade from `20260811_0026` drops both `nova_memory_items` and
 `nova_memory_changes`, destroying Nova memory in the active database. An application or

@@ -386,12 +386,13 @@ default `NOVA_AI_ADMIN_ONLY=true` он доступен только tier `admin
 не запускает destructive/admin actions и не предлагает ещё не реализованные функции.
 Подробный контракт: [docs/NOVA_HELP_GUIDE.md](docs/NOVA_HELP_GUIDE.md).
 
-### Stage 7A: durable foundation for My Nova
+### Stage 7B.1: interactive My Nova
 
-Stage 7A adds only the owner-scoped data/domain foundation for future explicit Nova
-memory. It is not user-visible yet: there is no Telegram menu, no automatic extraction
-from conversation history and no memory injection into AI prompts. A later UI must show
-an explicit preview and require confirmation before creating a memory item.
+Stage 7A introduced the owner-scoped durable memory domain. Stage 7B.1 adds its explicit
+Telegram CRUD UI: an access-aware `🧬 Моя Nova` menu, `/mynova` recovery, deterministic
+text/voice commands, preview-before-save, category and importance controls, paged lists,
+item editing, hard delete and revision-fenced delete-all. Ordinary conversation is never
+captured automatically, and memory is still not injected into AI prompts.
 
 The rollout gates are fail-closed and independent:
 
@@ -402,13 +403,18 @@ ENABLE_NOVA_MEMORY_APPLICATION=false
 NOVA_MEMORY_MAX_ITEMS=100
 ```
 
-`ENABLE_NOVA_MEMORY_APPLICATION` is a separate future kill switch for using confirmed
-items in prompts; enabling CRUD alone must not apply memory. The Telegram `admin` tier
+`ENABLE_NOVA_MEMORY` enables the CRUD surface. `NOVA_MEMORY_ADMIN_ONLY=true` keeps its
+menu and commands restricted to the admin pilot; setting it to false allows subscriber
+and admin tiers. `ENABLE_NOVA_MEMORY_APPLICATION` is a separate future kill switch for
+using confirmed items in prompts; enabling CRUD alone must not apply memory. The Telegram
+`admin` tier
 does not grant cross-user browsing or mutation: admins, like subscribers, can access
 only their own items. Deleting an item hard-deletes its content from the active database,
 while separately retained backups can still contain an older copy until their retention
-period expires. The bounded conversation-expiry purge exists only as a service contract
-in Stage 7A; no periodic runtime job is wired before Stage 7B.
+period expires. The bounded conversation-expiry purge exists only as a service contract;
+Stage 7B.1 still does not register a periodic purge job. The full
+UI, routing, fencing and privacy contract is documented in
+[docs/NOVA_MEMORY_GUIDE.md](docs/NOVA_MEMORY_GUIDE.md).
 
 `/collections` и `/spaces` не взаимозаменяемы. «Мои разделы» организуют только личные
 записи владельца, а workspace является отдельной границей доступа. Создатель получает

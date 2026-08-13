@@ -277,6 +277,7 @@ class ReminderHandlers:
             else:
                 result = fresh
 
+            await self.nova_memory_clear_current(update)
             if (
                 result.status is not ReminderIntentStatus.NOT_REMINDER
                 and _UNSUPPORTED_RECURRENCE.search(text)
@@ -314,6 +315,10 @@ class ReminderHandlers:
                 canonical_message_id=canonical_message_id,
                 profile_timezone=user.timezone,
             )
+            # Retire memory only while this exact reminder generation remains
+            # current. If a concurrent memory launch already retired it, its
+            # reciprocal cleanup must not remove the newer memory session.
+            await self._nova_memory_clear_if_reminder_current(session)
             delivery_binding = await self._reminder_access(update)
             if (
                 delivery_binding is None
@@ -845,6 +850,7 @@ class ReminderHandlers:
         relative_day_offset: int | None,
         calendar_anchor_utc: datetime | None,
     ) -> tuple[ReminderFlowSession, Any | None] | None:
+        await self.nova_memory_clear_current(update)
         await self.nova_clear_bound(user.id, update.effective_chat.id)
         canonical_message_id = current.canonical_message_id if current is not None else None
         if candidate_message is not None:
@@ -889,6 +895,7 @@ class ReminderHandlers:
             )
         if session is None:
             return None
+        await self._nova_memory_clear_if_reminder_current(session)
         delivery_user = await self._reminder_access(update)
         if (
             delivery_user is None

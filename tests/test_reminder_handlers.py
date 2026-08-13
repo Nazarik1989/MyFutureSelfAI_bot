@@ -19,6 +19,7 @@ from future_self.models import (
     TaskReminder,
     User,
 )
+from future_self.nova_memory_flow import NovaMemoryFlowPhase
 from future_self.reminder_flow import ReminderFlowPhase, ReminderFlowStore
 from future_self.reminder_handlers import REMINDER_STALE_TEXT
 from future_self.reminder_intent import (
@@ -138,6 +139,24 @@ async def current_session(bot: FutureSelfBot, user: User, chat_id: int):
         owner_id=user.id,
         telegram_user_id=user.telegram_id,
         chat_id=chat_id,
+    )
+
+
+async def seed_memory_root(
+    bot: FutureSelfBot,
+    user: User,
+    *,
+    chat_id: int,
+    canonical_message_id: int,
+):
+    return await bot.nova_memory_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=chat_id,
+        tier=user.access_tier,
+        access_version=user.access_version,
+        canonical_message_id=canonical_message_id,
+        phase=NovaMemoryFlowPhase.ROOT,
     )
 
 
@@ -445,6 +464,78 @@ async def test_ordinary_text_is_not_intercepted(db, fake_ai):
 
     assert await bot.reminder_text_gate(update, reminder_context()) is False
     assert incoming.replies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_accepted_reminder_clears_only_exact_memory_flow(db, fake_ai, source):
+    user = await subscriber(db, 6196 if source == "text" else 6195)
+    bot = deterministic_bot(db, fake_ai)
+    chat_id = 9196 if source == "text" else 9195
+    exact = await seed_memory_root(
+        bot,
+        user,
+        chat_id=chat_id,
+        canonical_message_id=91_960,
+    )
+    other = await seed_memory_root(
+        bot,
+        user,
+        chat_id=chat_id + 100,
+        canonical_message_id=91_961,
+    )
+    context = reminder_context()
+    command = "Каждый день напоминай в 20:30 заполнить дневник"
+    if source == "text":
+        incoming = ReminderMessage(command)
+        handled = await bot.reminder_text_gate(
+            reminder_update(
+                incoming,
+                telegram_user_id=user.telegram_id,
+                chat_id=chat_id,
+            ),
+            context,
+        )
+    else:
+        progress = ReminderMessage("Расшифровываю…")
+        handled = await bot.reminder_voice_gate(
+            reminder_update(
+                progress,
+                telegram_user_id=user.telegram_id,
+                chat_id=chat_id,
+            ),
+            context,
+            command,
+            progress,
+            expected_access_version=user.access_version,
+            expected_session=None,
+        )
+
+    assert handled is True
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=chat_id + 100,
+        )
+        == other
+    )
+    reminder = await current_session(bot, user, chat_id)
+    assert reminder is not None
+    assert reminder.title == "заполнить дневник"
+    assert exact.id != other.id
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
 
 
 @pytest.mark.asyncio

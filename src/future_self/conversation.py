@@ -5,6 +5,7 @@ from sqlalchemy import delete, select, update
 
 from .db import Database
 from .models import ConversationMessage, ConversationSession, DraftInboxItem, InboxItem, User
+from .nova_memory import NovaMemoryValidationError, normalize_nova_memory_content
 
 
 @dataclass(slots=True)
@@ -697,6 +698,61 @@ class ConversationContextService:
             )
         ]
         return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def latest_nova_memory_candidate(snapshot: ConversationSnapshot) -> str | None:
+        """Return only the latest bounded user reply when it is safe to preview.
+
+        The helper deliberately does not skip an unsuitable latest user message in
+        search of older content.  That keeps the meaning of ``remember this``
+        bounded without claiming Telegram-level adjacency.
+        """
+
+        latest_user = next(
+            (message for message in reversed(snapshot.messages) if message.get("role") == "user"),
+            None,
+        )
+        if latest_user is None:
+            return None
+        source = latest_user.get("source")
+        intent = latest_user.get("intent")
+        blocked_intents = {
+            "command",
+            "control",
+            "error",
+            "navigation",
+            "system",
+            "system_action",
+            "relative_reminder",
+            "date_conflict",
+            "confirm_date",
+            "explicit_capture",
+        }
+        intent_key = intent.casefold() if isinstance(intent, str) else ""
+        if (
+            source not in {"text", "voice"}
+            or intent_key in blocked_intents
+            or any(
+                intent_key.startswith(f"{prefix}:")
+                for prefix in ("command", "control", "error", "navigation", "system")
+            )
+        ):
+            return None
+        content = latest_user.get("content")
+        if not isinstance(content, str):
+            return None
+        try:
+            normalized = normalize_nova_memory_content(content)
+        except NovaMemoryValidationError:
+            return None
+
+        # Keep the dependency local so the durable conversation service remains
+        # independent from the process-local memory flow lifecycle.
+        from .nova_memory_flow import NovaMemoryIntentKind, classify_nova_memory_intent
+
+        if classify_nova_memory_intent(normalized).kind is not NovaMemoryIntentKind.NONE:
+            return None
+        return normalized
 
     @staticmethod
     def _is_expired(value: datetime, now: datetime) -> bool:

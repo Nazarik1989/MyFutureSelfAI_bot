@@ -97,6 +97,13 @@ from .navigation import NavigationFlowStore
 from .navigation_handlers import NavigationHandlers
 from .nova import NovaSessionStore, is_explicit_nova_invocation
 from .nova_handlers import NovaHandlers
+from .nova_memory import NovaMemoryService, NovaMemoryValidationError
+from .nova_memory_flow import (
+    NovaMemoryFlowStore,
+    NovaMemoryIntentKind,
+    classify_nova_memory_intent,
+)
+from .nova_memory_handlers import NovaMemoryHandlers
 from .recurring_reminders import (
     RecurringReminderDelivery,
     RecurringTaskReminderEngine,
@@ -201,6 +208,7 @@ class FutureSelfBot(
     CollectionHandlers,
     WorkspaceHandlers,
     KnowledgeHandlers,
+    NovaMemoryHandlers,
     ReminderHandlers,
     NovaHandlers,
     NavigationHandlers,
@@ -240,6 +248,13 @@ class FutureSelfBot(
         self.nova_sessions = NovaSessionStore()
         self._nova_ui_lock = asyncio.Lock()
         self._nova_launch_lock = asyncio.Lock()
+        self.nova_memory_service = NovaMemoryService(
+            db,
+            max_items=settings.nova_memory_max_items,
+        )
+        self.nova_memory_sessions = NovaMemoryFlowStore()
+        self._nova_memory_ui_lock = asyncio.Lock()
+        self._nova_memory_launch_lock = asyncio.Lock()
         self.reminder_sessions = ReminderFlowStore()
         self._reminder_ui_lock = asyncio.Lock()
         self._reminder_launch_lock = asyncio.Lock()
@@ -378,6 +393,7 @@ class FutureSelfBot(
             "last_saved",
             "evening",
             "labs",
+            "mynova",
         ]
         if getattr(self.settings, "enable_workspace_access", False):
             gated_public_commands.extend(("spaces", "workspaces"))
@@ -602,6 +618,7 @@ class FutureSelfBot(
         app.add_handler(health_checkin)
         app.add_handler(doctor_prepare)
         app.add_handler(CommandHandler("menu", self.menu_command))
+        app.add_handler(CommandHandler("mynova", self.mynova_command))
         app.add_handler(CommandHandler("tasks", self.tasks_command))
         app.add_handler(CommandHandler("collections", self.collections_command))
         if getattr(self.settings, "enable_workspace_access", False):
@@ -632,6 +649,12 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("doctor_find", self.doctor_find))
         app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
+        app.add_handler(
+            CallbackQueryHandler(
+                self.nova_memory_callback,
+                pattern=r"^nmem:[A-Za-z0-9_-]+$",
+            )
+        )
         app.add_handler(
             CallbackQueryHandler(
                 self.reminder_callback,
@@ -1001,12 +1024,30 @@ class FutureSelfBot(
         detached = bool(context.user_data.get("onboarding_detached"))
         restored = await self._restore_onboarding_context(update, context)
         if restored is None:
+            flow = await self._active_navigation_flow(update, context)
+            if command == "/cancel":
+                if flow is not None:
+                    await self.nova_memory_clear_current(update)
+                elif await self.nova_memory_public_command_gate(update, context):
+                    raise ApplicationHandlerStop
+                return
+            if flow is not None:
+                await self.reminder_clear_current(update)
+                await self.nova_memory_clear_current(update)
+                await self._prompt_navigation_flow(update.effective_message, update, flow)
+                raise ApplicationHandlerStop
+            if await self.nova_memory_public_command_gate(update, context):
+                raise ApplicationHandlerStop
             return
         if command == "/help":
             await self.help_command(update, context)
             raise ApplicationHandlerStop
         if command == "/menu":
-            await self._send_navigation_root(update.effective_message)
+            user = await self._user(update.effective_user.id)
+            await self._send_navigation_root(
+                update.effective_message,
+                tier=user.access_tier,
+            )
             raise ApplicationHandlerStop
         if attached and not detached and restored[1] >= len(ONBOARDING_QUESTIONS):
             context.user_data["onboarding_detached"] = True
@@ -1033,6 +1074,7 @@ class FutureSelfBot(
         raise ApplicationHandlerStop
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.nova_memory_clear_current(update)
         await self.reminder_clear_current(update)
         await self.nova_clear_current(update)
         user = await self._user(update.effective_user.id)
@@ -1533,7 +1575,7 @@ class FutureSelfBot(
         user = await self._user(update.effective_user.id)
         if user.onboarding_completed:
             await query.answer("Регистрация уже завершена", show_alert=True)
-            await self._send_navigation_root(query.message)
+            await self._send_navigation_root(query.message, tier=user.access_tier)
             return ConversationHandler.END
         async with self.db.sessions() as session:
             state = await OnboardingRepository(session).get(user.id)
@@ -1647,7 +1689,7 @@ class FutureSelfBot(
             "Кнопки регистрации убраны — дальше можно пользоваться обычным меню.",
             reply_markup=ReplyKeyboardRemove(),
         )
-        await self._send_navigation_root(query.message)
+        await self._send_navigation_root(query.message, tier=user.access_tier)
         await self._propose_goals(query, user.id, summary)
         return ConversationHandler.END
 
@@ -2144,6 +2186,19 @@ class FutureSelfBot(
                         "Аудио не отправлено на распознавание; используй preview или /cancel."
                     )
                     return
+        voice_user = None
+        voice_memory_fence = None
+        telegram_user = getattr(update, "effective_user", None)
+        effective_chat = getattr(update, "effective_chat", None)
+        if (
+            getattr(telegram_user, "id", None) is not None
+            and getattr(effective_chat, "id", None) is not None
+        ):
+            voice_user = await self._user(telegram_user.id)
+            voice_memory_fence = await self.nova_memory_voice_fence(
+                update,
+                user=voice_user,
+            )
         media = update.effective_message.voice or update.effective_message.audio
         if not self.voice_enabled:
             message = (
@@ -2151,24 +2206,62 @@ class FutureSelfBot(
                 if not self.settings.enable_voice
                 else "Распознавание голосовых временно не настроено. Пришли мысль текстом."
             )
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
             await update.effective_message.reply_text(message)
             return
         if media.duration and media.duration > self.settings.max_audio_seconds:
-            await update.effective_message.reply_text(
-                "Аудио слишком длинное. Пришли запись короче трёх минут."
-            )
+            message = "Аудио слишком длинное. Пришли запись короче трёх минут."
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
+            await update.effective_message.reply_text(message)
             return
         if media.file_size and media.file_size > self.settings.max_audio_bytes:
-            await update.effective_message.reply_text("Аудиофайл слишком большой.")
+            message = "Аудиофайл слишком большой."
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
+            await update.effective_message.reply_text(message)
             return
         mime = getattr(media, "mime_type", None)
         if mime and not (mime.startswith("audio/") or mime == "application/ogg"):
-            await update.effective_message.reply_text("Этот формат аудио не поддерживается.")
+            message = "Этот формат аудио не поддерживается."
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
+            await update.effective_message.reply_text(message)
             return
         # Freeze the access generation before STT. A downgrade or version bounce
         # while the transcript is being produced must not be hidden by a later
         # repository read.
-        voice_user = await self._user(update.effective_user.id)
+        if voice_user is None:
+            voice_user = await self._user(update.effective_user.id)
+            voice_memory_fence = await self.nova_memory_voice_fence(
+                update,
+                user=voice_user,
+            )
         voice_nova_session = await self.nova_sessions.current(
             owner_id=voice_user.id,
             telegram_user_id=update.effective_user.id,
@@ -2190,43 +2283,122 @@ class FutureSelfBot(
             text = await self.transcription.transcribe(audio, filename)
         except (TranscriptionError, TelegramError, ValueError) as exc:
             log_safe_failure("Voice processing failed", exc)
-            await progress.edit_text(
-                "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
-            )
+            message = "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=progress,
+                notice=message,
+            ):
+                return
+            await progress.edit_text(message)
             return
-        if await self._try_system_action(update, context, text):
-            await progress.edit_text(f"Я услышал: «{_truncate_utf16(text, 4_000)}»")
-            return
-        screen_update = self._edited_screen_update(update, progress)
-        onboarding_result = await self.onboarding_persistent_input(
+        if await self.nova_memory_voice_pre_route(
             update,
+            context,
+            progress,
+            fence=voice_memory_fence,
+        ):
+            raise ApplicationHandlerStop
+        screen_update = self._edited_screen_update(update, progress)
+        memory_voice_active = (
+            voice_memory_fence is not None and voice_memory_fence.session is not None
+        )
+        ownership_update = screen_update if memory_voice_active else update
+        if await self._try_system_action(
+            ownership_update,
+            context,
+            text,
+            clear_current_memory=False,
+        ):
+            await self._clear_frozen_voice_memory(voice_memory_fence)
+            if not memory_voice_active:
+                await progress.edit_text(f"Я услышал: «{_truncate_utf16(text, 4_000)}»")
+            return
+        voice_flow = await self._active_navigation_flow(update, context)
+        if await self.nova_memory_voice_pre_route(
+            update,
+            context,
+            progress,
+            fence=voice_memory_fence,
+        ):
+            raise ApplicationHandlerStop
+        try:
+            memory_intent = classify_nova_memory_intent(text).kind
+        except NovaMemoryValidationError:
+            memory_intent = NovaMemoryIntentKind.AWAIT_CONTENT
+        if voice_flow == "onboarding" and memory_intent is not NovaMemoryIntentKind.NONE:
+            await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self.reminder_clear_current(update)
+            await self.nova_clear_current(update)
+            await self._prompt_navigation_flow(
+                screen_update.effective_message,
+                update,
+                voice_flow,
+            )
+            raise ApplicationHandlerStop
+        onboarding_result = await self.onboarding_persistent_input(
+            ownership_update,
             context,
             text,
             force=True,
             navigation_update=screen_update,
         )
         if onboarding_result is not None:
+            await self._clear_frozen_voice_memory(voice_memory_fence)
             onboarding_state, navigation_action = onboarding_result
-            if navigation_action is None:
+            if not memory_voice_active and navigation_action is None:
                 await progress.edit_text("Голос распознан и обработан в регистрации.")
             return onboarding_state
-        voice_flow = await self._active_navigation_flow(update, context)
         reminder_voice_state = ReminderVoiceGateState(
             access_expected=is_full_access_tier(voice_user.access_tier)
         )
-        if voice_flow is None:
-            if await self.reminder_voice_gate(
-                update,
-                context,
-                text,
-                progress,
-                expected_access_version=voice_access_version,
-                expected_session=voice_reminder_session,
-                voice_state=reminder_voice_state,
-            ):
-                return
-        else:
+        if voice_flow is not None:
+            await self._clear_frozen_voice_memory(voice_memory_fence)
+            if memory_intent is not NovaMemoryIntentKind.NONE:
+                await self.reminder_clear_current(update)
+                await self.nova_clear_current(update)
+                await self._prompt_navigation_flow(
+                    screen_update.effective_message,
+                    update,
+                    voice_flow,
+                )
+                raise ApplicationHandlerStop
             await self.reminder_clear_current(update)
+            if memory_voice_active:
+                if await self._route_voice_durable_flow(
+                    ownership_update,
+                    context,
+                    voice_flow,
+                    text,
+                ):
+                    return
+                await self._prompt_navigation_flow(
+                    screen_update.effective_message,
+                    update,
+                    voice_flow,
+                )
+                raise ApplicationHandlerStop
+        if await self.nova_memory_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            user=voice_user,
+            fence=voice_memory_fence,
+        ):
+            raise ApplicationHandlerStop
+        if await self.reminder_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            expected_access_version=voice_access_version,
+            expected_session=voice_reminder_session,
+            voice_state=reminder_voice_state,
+        ):
+            return
         if not reminder_voice_state.access_failed:
             natural_command = self.natural_command_router.route(text)
             explicit_unknown = (
@@ -2250,19 +2422,24 @@ class FutureSelfBot(
                             flow,
                         )
                     else:
+                        await self.nova_memory_clear_current(update)
                         await self._handle_natural_command(screen_update, context, action)
                     return
-            if await self.workspace_pending_text(update, text, "voice"):
-                await progress.edit_text("Голос распознан и обработан в пространстве.")
+            if await self.workspace_pending_text(ownership_update, text, "voice"):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и обработан в пространстве.")
                 return
-            if await self.collection_pending_text(update, text, "voice"):
-                await progress.edit_text("Голос распознан и обработан в разделе.")
+            if await self.collection_pending_text(ownership_update, text, "voice"):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и обработан в разделе.")
                 return
-            if await self.task_pending_text(update, text):
-                await progress.edit_text("Голос распознан и применён к задаче.")
+            if await self.task_pending_text(ownership_update, text):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и применён к задаче.")
                 return
-            if await self._handle_vision_input(update, text):
-                await progress.edit_text("Голос распознан и добавлен в карточку.")
+            if await self._handle_vision_input(ownership_update, text):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и добавлен в карточку.")
                 return
         if await self.nova_voice_gate(
             update,
@@ -2280,11 +2457,65 @@ class FutureSelfBot(
         await progress.edit_text(f"Я услышал: «{heard_text}»")
         await self._route_message(update, context, text, "voice")
 
+    async def _route_voice_durable_flow(
+        self,
+        update: Any,
+        context: ContextTypes.DEFAULT_TYPE,
+        flow: str,
+        text: str,
+    ) -> bool:
+        """Give an already-persisted flow the STT result on the progress screen."""
+
+        if flow == "workspace":
+            return await self.workspace_pending_text(update, text, "voice")
+        if flow == "collection_input":
+            return await self.collection_pending_text(update, text, "voice")
+        if flow == "task_edit":
+            return await self.task_pending_text(update, text)
+        if flow == "vision":
+            return await self._handle_vision_input(update, text)
+        if flow == "date_choice":
+            user = await self._user(update.effective_user.id)
+            snapshot = await self.conversation.get(
+                update.effective_user.id,
+                update.effective_chat.id,
+            )
+            selected = self.date_resolver.choose_option(text, snapshot.pending_date_options)
+            if selected is None:
+                return False
+            await self._confirm_pending_date(
+                update,
+                context,
+                user,
+                snapshot,
+                selected.value,
+                "voice",
+                input_text=text,
+            )
+            return True
+        if flow in {"draft_action", "draft_edit"}:
+            await self._route_message(update, context, text, "voice")
+            return True
+        return False
+
+    async def _clear_frozen_voice_memory(self, fence: Any | None) -> bool:
+        session = getattr(fence, "session", None)
+        if session is None:
+            return False
+        return await self.nova_memory_clear_bound(
+            fence.owner_id,
+            fence.telegram_user_id,
+            fence.chat_id,
+            session_id=session.id,
+        )
+
     async def _try_system_action(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         text: str,
+        *,
+        clear_current_memory: bool = True,
     ) -> bool:
         """Consume destructive control language before any content flow or LLM."""
 
@@ -2294,6 +2525,8 @@ class FutureSelfBot(
             update.effective_chat.id,
         )
         if not snapshot.system_pending_action:
+            if await self.nova_memory_owns_text(update, text, user=user):
+                return False
             nova_session = await self.nova_sessions.current(
                 owner_id=user.id,
                 telegram_user_id=update.effective_user.id,
@@ -2335,6 +2568,8 @@ class FutureSelfBot(
             return False
         if route.kind == "none":
             return False
+        if clear_current_memory:
+            await self.nova_memory_clear_current(update)
         await self.reminder_clear_current(update)
         await self._handle_system_action_route(update, context, user, snapshot, route)
         return True
@@ -2344,11 +2579,13 @@ class FutureSelfBot(
     ) -> None:
         natural_command = self.natural_command_router.route(text)
         if natural_command is not None:
+            await self.nova_memory_clear_current(update)
             await self._handle_natural_command(update, context, natural_command.action)
             return
         if await self.handle_collection_natural(update, context, text, source):
             return
         if self.natural_command_router.is_explicit_navigation_request(text):
+            await self.nova_memory_clear_current(update)
             await self.help_command(update, context)
             return
         user = await self._user(update.effective_user.id)
@@ -2615,6 +2852,8 @@ class FutureSelfBot(
         snapshot: ConversationSnapshot,
         selected_date: date,
         source: str,
+        *,
+        input_text: str | None = None,
     ) -> None:
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
@@ -2626,11 +2865,12 @@ class FutureSelfBot(
             )
             return
         await self.conversation.set_resolved_date(telegram_user_id, chat_id, selected_date)
+        selected_expression = input_text or update.effective_message.text or "Выбрана дата"
         await self.conversation.append(
             telegram_user_id,
             chat_id,
             role="user",
-            content=update.effective_message.text or "Выбрана дата",
+            content=selected_expression,
             source=source,
             intent="confirm_date",
             topic=snapshot.current_topic,
@@ -2641,7 +2881,7 @@ class FutureSelfBot(
                 for message in reversed(snapshot.messages)
                 if message["role"] == "user" and message["intent"] == "date_conflict"
             ),
-            update.effective_message.text or "Выбрана дата",
+            selected_expression,
         )
         local_time = self.date_resolver.extract_local_time(original_expression)
         if local_time is None and candidates:

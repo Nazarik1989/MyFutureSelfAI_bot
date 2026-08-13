@@ -118,6 +118,8 @@ class NovaHandlers:
         await self._nova_open_message(update.effective_message, update, user)
 
     async def _nova_open_message(self, message: Any, update: Any, user: Any) -> bool:
+        await self.nova_memory_clear_current(update)
+        published = None
         async with self._nova_ui_lock:
             current = await self.nova_sessions.current(
                 owner_id=user.id,
@@ -136,7 +138,7 @@ class NovaHandlers:
                     "Nova canonical creation failed operation=reply error_type=MissingMessageId"
                 )
                 return False
-            await self.nova_sessions.create(
+            published = await self.nova_sessions.create(
                 owner_id=user.id,
                 telegram_user_id=update.effective_user.id,
                 chat_id=update.effective_chat.id,
@@ -144,7 +146,9 @@ class NovaHandlers:
                 canonical_message_id=message_id,
                 tier=require_access_tier(user.access_tier),
             )
-            return True
+        if published is not None:
+            await self._nova_memory_clear_if_guided_current(published)
+        return True
 
     async def nova_navigation_help_callback(
         self,
@@ -161,6 +165,7 @@ class NovaHandlers:
             await query.answer()
             await self._nova_flow_help(query.message, update, flow, query=query)
             return
+        await self.nova_memory_clear_current(update)
         if topic_key is None:
             text = NOVA_ROOT_TEXT
             markup = self._nova_root_keyboard(tier)
@@ -172,6 +177,7 @@ class NovaHandlers:
             text = f"{topic[0]}\n\n{topic[1]}"
             markup = self._nova_back_keyboard(tier)
         await query.answer()
+        published = None
         async with self._nova_ui_lock:
             current = await self.nova_sessions.current(
                 owner_id=user.id,
@@ -187,7 +193,7 @@ class NovaHandlers:
                 operation="help",
             )
             if message_id is not None:
-                await self.nova_sessions.create(
+                published = await self.nova_sessions.create(
                     owner_id=user.id,
                     telegram_user_id=update.effective_user.id,
                     chat_id=update.effective_chat.id,
@@ -195,17 +201,26 @@ class NovaHandlers:
                     canonical_message_id=message_id,
                     tier=tier,
                 )
+        if published is not None:
+            await self._nova_memory_clear_if_guided_current(published)
 
     async def nova_non_text_gate(self, update: Update, context: Any) -> None:
         """Leave Nova for photo/document; voice and audio may continue the session."""
 
-        del context
         message = update.effective_message
         if (
             getattr(message, "voice", None) is not None
             or getattr(message, "audio", None) is not None
         ):
             return
+        if await self._active_navigation_flow(update, context) is not None:
+            await self.nova_memory_clear_current(update)
+            return
+        if await self.nova_memory_media_gate(update, context):
+            from telegram.ext import ApplicationHandlerStop
+
+            raise ApplicationHandlerStop
+        await self.nova_memory_clear_current(update)
         await self.reminder_clear_current(update)
         await self.nova_clear_current(update)
 
@@ -309,6 +324,7 @@ class NovaHandlers:
                     )
                 return False
         question = explicit_question if explicit_question is not None else text.strip()
+        await self.nova_memory_clear_current(update)
         started: NovaSession | None = None
         async with self._nova_launch_lock:
             if tier != GUEST and await self._active_navigation_flow(update, context) is not None:
@@ -417,6 +433,7 @@ class NovaHandlers:
                     session_id=current.id,
                 )
         if started is not None:
+            await self._nova_memory_clear_if_guided_current(started)
             await self._nova_process_question(
                 update,
                 context,
@@ -703,6 +720,7 @@ class NovaHandlers:
             return
         if data == "nova:root":
             await query.answer()
+            published = None
             async with self._nova_ui_lock:
                 live = await self.nova_sessions.get(
                     owner_id=session.owner_id,
@@ -732,7 +750,7 @@ class NovaHandlers:
                     operation="root",
                 )
                 if message_id is not None:
-                    await self.nova_sessions.create(
+                    published = await self.nova_sessions.create(
                         owner_id=live.owner_id,
                         telegram_user_id=live.telegram_user_id,
                         chat_id=live.chat_id,
@@ -740,6 +758,8 @@ class NovaHandlers:
                         canonical_message_id=message_id,
                         tier=live.tier,
                     )
+            if published is not None:
+                await self._nova_memory_clear_if_guided_current(published)
             return
         if data.startswith("nova:topic:"):
             key = data.removeprefix("nova:topic:")
@@ -883,6 +903,10 @@ class NovaHandlers:
         capability = await self._nova_revalidate_action(update, context, user, action_id)
         if capability is None:
             return None
+        if await self.nova_memory_blocks_navigation(update):
+            await self.nova_memory_public_command_gate(update, context)
+            return None
+        await self.nova_memory_clear_current(update)
         screen = _NovaCallbackMessage(
             self,
             update.callback_query,
@@ -1003,11 +1027,12 @@ class NovaHandlers:
     ) -> None:
         target = capability.target
         query = update.callback_query
+        await self.nova_memory_clear_current(update)
         if target == "nav:root":
             await self._edit_or_send(
                 query,
                 "Главное меню\n\nЧто хочешь сделать?",
-                self._root_keyboard(),
+                self._root_keyboard(user.access_tier),
             )
             return
         if target.startswith("nav:section:"):
@@ -1153,6 +1178,10 @@ class NovaHandlers:
 
     async def nova_cancel_gate(self, update: Any, context: Any) -> None:
         flow = await self._active_navigation_flow(update, context)
+        if flow is None and await self.nova_memory_cancel_gate(update, context):
+            from telegram.ext import ApplicationHandlerStop
+
+            raise ApplicationHandlerStop
         if flow is None and await self.reminder_cancel_gate(update, context):
             from telegram.ext import ApplicationHandlerStop
 
@@ -1254,6 +1283,7 @@ class NovaHandlers:
         query: Any | None = None,
     ) -> None:
         user = await self._user(update.effective_user.id)
+        await self.nova_memory_clear_current(update)
         async with self._nova_ui_lock:
             current = await self.nova_sessions.current(
                 owner_id=user.id,

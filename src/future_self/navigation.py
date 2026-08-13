@@ -50,6 +50,7 @@ ADVANCED_COMMANDS = frozenset(
         "skip",
         "cancel",
         "profile",
+        "mynova",
         "timezone",
         "evening",
         "collections",

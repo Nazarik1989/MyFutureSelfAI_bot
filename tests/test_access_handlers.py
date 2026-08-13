@@ -264,6 +264,42 @@ async def test_admin_passes_gate_and_blocked_is_stopped(db, fake_ai):
     assert "guest:" not in repr(rendered["reply_markup"])
 
 
+async def test_full_access_gate_syncs_memory_before_other_ephemeral_flows(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot, _transcription = make_bot(db, fake_ai)
+    telegram_id = 7022
+    chat_id = 8022
+    await set_user_state(bot, telegram_id, tier=ADMIN)
+    calls: list[str] = []
+
+    async def memory_sync(*_args, **_kwargs):
+        calls.append("memory")
+
+    async def nova_sync(*_args, **_kwargs):
+        calls.append("nova")
+
+    async def reminder_sync(*_args, **_kwargs):
+        calls.append("reminder")
+
+    async def command_sync(*_args, **_kwargs):
+        calls.append("commands")
+
+    monkeypatch.setattr(bot, "nova_memory_sync_access", memory_sync)
+    monkeypatch.setattr(bot, "nova_sync_access", nova_sync)
+    monkeypatch.setattr(bot, "reminder_sync_access", reminder_sync)
+    monkeypatch.setattr(bot, "_sync_access_commands", command_sync)
+
+    await bot.access_gate(
+        update_for(GateMessage("/menu"), user_id=telegram_id, chat_id=chat_id),
+        context(),
+    )
+
+    assert calls == ["memory", "nova", "reminder", "commands"]
+
+
 @pytest.mark.parametrize("command", ["/today", "/vision", "/onboarding", "/capture"])
 async def test_guest_full_commands_are_consumed_without_ai(db, fake_ai, command):
     bot, _transcription = make_bot(db, fake_ai)

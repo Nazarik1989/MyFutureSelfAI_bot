@@ -40,15 +40,20 @@ from future_self.navigation import (
     public_commands,
     validate_catalog,
 )
+from future_self.nova_memory_flow import NovaMemoryFlowPhase
 from future_self.schemas import ParsedThought
 
 
-def settings() -> Settings:
+def settings(**overrides) -> Settings:
+    values = {
+        "_env_file": None,
+        "telegram_bot_token": "123456:test-token",
+        "ai_api_key": "test-key",
+        "database_url": "sqlite+aiosqlite:///:memory:",
+    }
+    values.update(overrides)
     return Settings(
-        _env_file=None,
-        telegram_bot_token="123456:test-token",
-        ai_api_key="test-key",
-        database_url="sqlite+aiosqlite:///:memory:",
+        **values,
     )
 
 
@@ -375,6 +380,8 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
     ]
     assert len(names) == len(set(names))
     assert len(ACTIONS) == len(set(ACTIONS))
+    assert "mynova" in ADVANCED_COMMANDS
+    assert "mynova" not in names
     used_actions = {action for section in SECTIONS.values() for action in section.actions}
     assert used_actions | LEGACY_ACTIONS == set(ACTIONS)
 
@@ -392,9 +399,227 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
         *(f"nav:help:{key}" for key in HELP_TOPICS),
         "nav:root",
         "nav:help",
+        "nav:nova-memory",
     ]
     assert all(len(value.encode()) <= 64 for value in callbacks)
     assert all(not any(char.isdigit() for char in value) for value in callbacks)
+
+
+async def test_nova_memory_root_entry_is_full_width_and_tier_feature_gated(db, fake_ai):
+    telegram_id = 410
+    chat_id = 510
+    bot = FutureSelfBot(
+        settings(enable_nova_memory=True, nova_memory_admin_only=True),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )
+    await bot._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+
+    subscriber_message = FakeMessage("/menu")
+    await bot.menu_command(
+        update_for(subscriber_message, user_id=telegram_id, chat_id=chat_id),
+        context(),
+    )
+    subscriber_rows = subscriber_message.replies[-1]["reply_markup"].inline_keyboard
+    assert all(
+        button.callback_data != "nav:nova-memory" for row in subscriber_rows for button in row
+    )
+
+    await AccessService(db).grant_admin(telegram_id, source="test")
+    admin_message = FakeMessage("/menu")
+    await bot.menu_command(
+        update_for(admin_message, user_id=telegram_id, chat_id=chat_id),
+        context(),
+    )
+    admin_rows = admin_message.replies[-1]["reply_markup"].inline_keyboard
+    assert [(button.text, button.callback_data) for button in admin_rows[3]] == [
+        ("🧬 Моя Nova", "nav:nova-memory")
+    ]
+    assert admin_rows[2][0].callback_data == "nav:section:vision"
+    assert {button.callback_data for button in admin_rows[4]} == {
+        "nav:section:sections",
+        "nav:section:settings",
+    }
+
+    subscriber_enabled = FutureSelfBot(
+        settings(enable_nova_memory=True, nova_memory_admin_only=False),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )._root_keyboard("subscriber")
+    assert [
+        button.callback_data
+        for row in subscriber_enabled.inline_keyboard
+        for button in row
+        if button.callback_data == "nav:nova-memory"
+    ] == ["nav:nova-memory"]
+
+
+async def test_nova_memory_navigation_callback_opens_bound_canonical_root(db, fake_ai):
+    telegram_id = 412
+    chat_id = 512
+    bot = FutureSelfBot(
+        settings(enable_nova_memory=True, nova_memory_admin_only=True),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )
+    user = await bot._user(telegram_id)
+    await AccessService(db).grant_admin(telegram_id, source="test")
+    message = FakeMessage()
+    query = FakeCallbackQuery("nav:nova-memory", message)
+
+    await bot.navigation_action(
+        update_for(message, user_id=telegram_id, chat_id=chat_id, query=query),
+        context(),
+    )
+
+    assert query.answers == [(None, False)]
+    assert query.edits[-1].startswith("🧬 Моя Nova")
+    current = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == message.message_id
+    assert current.phase.value == "root"
+
+
+async def test_nova_memory_text_routing_precedes_reminder_nova_and_natural(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    calls: list[str] = []
+
+    async def memory_gate(*_args, **_kwargs):
+        calls.append("memory")
+        return True
+
+    async def forbidden_gate(*_args, **_kwargs):
+        raise AssertionError("downstream router must not run")
+
+    monkeypatch.setattr(bot, "nova_memory_text_gate", memory_gate)
+    monkeypatch.setattr(bot, "reminder_text_gate", forbidden_gate)
+    monkeypatch.setattr(bot, "nova_text_gate", forbidden_gate)
+    message = FakeMessage("Nova, запомни: synthetic preference")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(update_for(message), context())
+
+    assert calls == ["memory"]
+    assert fake_ai.route_calls == []
+
+
+async def test_mynova_command_bypasses_memory_prompt_for_canonical_recovery(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+
+    async def forbidden_memory_prompt(*_args, **_kwargs):
+        raise AssertionError("/mynova must reach its recovery command handler")
+
+    monkeypatch.setattr(
+        bot,
+        "nova_memory_public_command_gate",
+        forbidden_memory_prompt,
+    )
+    message = FakeMessage("/mynova")
+
+    assert await bot.navigation_public_command_gate(update_for(message), context()) is None
+
+
+async def test_explicit_nova_memory_input_cannot_steal_active_durable_flow(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 411
+    chat_id = 511
+    await _seed_durable_navigation_flow(
+        bot,
+        "date_choice",
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    user = await bot._user(telegram_id)
+    await bot.nova_memory_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        tier=user.access_tier,
+        access_version=user.access_version,
+        canonical_message_id=612,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+    message = FakeMessage("Nova, запомни: synthetic preference")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(
+            update_for(message, user_id=telegram_id, chat_id=chat_id),
+            context(),
+        )
+
+    assert message.replies[-1]["text"].startswith("Сейчас не завершён сценарий")
+    assert callback_from(message, "nav:flow:continue:").startswith("nav:flow:continue:")
+    snapshot = await bot.conversation.get(telegram_id, chat_id)
+    assert snapshot.pending_date_options
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+    assert fake_ai.route_calls == []
+
+
+async def test_active_durable_flow_clears_memory_before_accepting_ordinary_input(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 413
+    chat_id = 513
+    await _seed_durable_navigation_flow(
+        bot,
+        "date_choice",
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    user = await bot._user(telegram_id)
+    await bot.nova_memory_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        tier=user.access_tier,
+        access_version=user.access_version,
+        canonical_message_id=613,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+
+    message = FakeMessage("завтра")
+    assert (
+        await bot.navigation_text_gate(
+            update_for(message, user_id=telegram_id, chat_id=chat_id),
+            context(),
+        )
+        is None
+    )
+
+    assert message.reply_text_calls == 0
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+    snapshot = await bot.conversation.get(telegram_id, chat_id)
+    assert snapshot.pending_date_options
+    assert fake_ai.route_calls == []
 
 
 def test_knowledge_catalog_is_flag_aware_and_capture_stays_advanced():

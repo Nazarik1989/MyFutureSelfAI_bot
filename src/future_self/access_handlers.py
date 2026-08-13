@@ -266,6 +266,12 @@ class AccessHandlers:
             await self._access_fail_closed(update)
             raise ApplicationHandlerStop from None
 
+        await self.nova_memory_sync_access(
+            user,
+            chat.id,
+            context=context,
+            source_message=update.effective_message,
+        )
         await self.nova_sync_access(
             user,
             chat.id,
