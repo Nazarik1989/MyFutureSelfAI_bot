@@ -64,6 +64,7 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.enable_nova_memory is False
     assert configured.nova_memory_admin_only is True
     assert configured.enable_nova_memory_application is False
+    assert configured.nova_memory_application_admin_only is True
     assert configured.nova_memory_max_items == 100
 
 
@@ -333,9 +334,33 @@ def test_container_and_build_context_are_hardened() -> None:
         "--env ENABLE_NOVA_MEMORY=false",
         "--env NOVA_MEMORY_ADMIN_ONLY=true",
         "--env ENABLE_NOVA_MEMORY_APPLICATION=false",
+        "--env NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true",
         "--env NOVA_MEMORY_MAX_ITEMS=100",
     ):
         assert nova_memory_control in runbook
+
+
+def test_stage_7c_memory_transparency_docs_are_explicit_and_retention_honest() -> None:
+    root = Path(__file__).resolve().parents[1]
+    guide = (root / "docs/NOVA_MEMORY_GUIDE.md").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    runbook = (root / "docs/operations/production-hardening.md").read_text(encoding="utf-8")
+    combined = "\n".join((guide, readme, runbook))
+    normalized = " ".join(combined.split())
+
+    for expected_text in (
+        "Персонализация AI-ответов: включена",
+        "NOVA_MEMORY_APPLICATION_ADMIN_ONLY",
+        "category",
+        "important",
+        "content",
+        "configured provider and account",
+    ):
+        assert expected_text in normalized
+    assert "Zero Data Retention" in normalized
+    assert "does not claim Zero Data Retention" in normalized
+    assert "Losing access preserves the records but stops their application" in normalized
+    assert "does not require the model to mention them" in normalized
 
 
 def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:

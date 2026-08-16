@@ -92,6 +92,122 @@ async def counts(db) -> tuple[int, int]:
     return int(drafts), int(inbox)
 
 
+def test_snapshot_for_prompt_excludes_memory_answers_without_mutating_local_history():
+    user_message = {
+        "role": "user",
+        "content": "What should I do next?",
+        "source": "text",
+        "intent": "question",
+    }
+    memory_answer = {
+        "role": "assistant",
+        "content": "MEMORY_DERIVED_ANSWER_SENTINEL",
+        "source": "text",
+        "intent": "memory_answer",
+    }
+    ordinary_answer = {
+        "role": "assistant",
+        "content": "An ordinary answer remains available.",
+        "source": "text",
+        "intent": "answer",
+    }
+    snapshot = ConversationSnapshot(
+        messages=[user_message, memory_answer, ordinary_answer],
+    )
+
+    prompt = snapshot.for_prompt()
+
+    assert prompt["recent_messages"] == [user_message, ordinary_answer]
+    assert snapshot.messages == [user_message, memory_answer, ordinary_answer]
+    assert snapshot.messages[1]["content"] == "MEMORY_DERIVED_ANSWER_SENTINEL"
+    assert "MEMORY_DERIVED_ANSWER_SENTINEL" not in repr(prompt)
+    assert "MEMORY_DERIVED_ANSWER_SENTINEL" not in repr(snapshot)
+    assert ConversationContextService.latest_nova_memory_candidate(snapshot) == (
+        "What should I do next?"
+    )
+
+
+def test_snapshot_for_prompt_returns_fresh_message_list_and_dicts_on_every_call():
+    original_message = {
+        "role": "assistant",
+        "content": "Keep this ordinary answer.",
+        "source": "text",
+        "intent": "answer",
+    }
+    snapshot = ConversationSnapshot(messages=[original_message])
+
+    first_messages = snapshot.for_prompt()["recent_messages"]
+    second_messages = snapshot.for_prompt()["recent_messages"]
+
+    assert isinstance(first_messages, list)
+    assert isinstance(second_messages, list)
+    assert first_messages is not snapshot.messages
+    assert second_messages is not first_messages
+    assert first_messages[0] is not original_message
+    assert second_messages[0] is not first_messages[0]
+
+    first_messages[0]["content"] = "mutated provider copy"
+    first_messages.append({"role": "assistant", "content": "provider-only"})
+
+    assert snapshot.messages == [original_message]
+    assert second_messages == [original_message]
+
+
+def test_snapshot_for_prompt_filter_is_independent_of_application_feature_state():
+    messages = [
+        {
+            "role": "user",
+            "content": "Current user request",
+            "source": "text",
+            "intent": "question",
+        },
+        {
+            "role": "assistant",
+            "content": "STALE_MEMORY_ANSWER_SENTINEL",
+            "source": "text",
+            "intent": "memory_answer",
+        },
+    ]
+
+    contexts_by_application_state = {
+        application_enabled: ConversationSnapshot(messages=messages).for_prompt()
+        for application_enabled in (False, True)
+    }
+
+    expected = [messages[0]]
+    assert contexts_by_application_state[False]["recent_messages"] == expected
+    assert contexts_by_application_state[True]["recent_messages"] == expected
+
+
+async def test_persisted_memory_answer_remains_local_but_is_excluded_from_prompt(db):
+    service = ConversationContextService(db, 12, 24)
+    await service.append(
+        901,
+        902,
+        role="user",
+        content="Current question",
+        source="text",
+        intent="question",
+    )
+    await service.append(
+        901,
+        902,
+        role="assistant",
+        content="PERSISTED_MEMORY_ANSWER_SENTINEL",
+        source="text",
+        intent="memory_answer",
+    )
+
+    snapshot = await service.get(901, 902)
+
+    assert [message["intent"] for message in snapshot.messages] == [
+        "question",
+        "memory_answer",
+    ]
+    assert snapshot.messages[-1]["content"] == "PERSISTED_MEMORY_ANSWER_SENTINEL"
+    assert snapshot.for_prompt()["recent_messages"] == [snapshot.messages[0]]
+
+
 async def test_context_is_persistent_bounded_and_available_after_recreation(db):
     first = ConversationContextService(db, 12, 24)
     for index in range(15):

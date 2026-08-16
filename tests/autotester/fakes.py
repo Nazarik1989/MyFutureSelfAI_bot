@@ -35,7 +35,10 @@ class StrictAI:
         text: str,
         temporal_context: dict[str, str],
         conversation_context: dict[str, object] | None = None,
+        *,
+        confirmed_memory: Any | None = None,
     ) -> AssistantAnswer:
+        del temporal_context, conversation_context, confirmed_memory
         raise UnexpectedLLMCall(f"Unexpected LLM answer for {text!r}")
 
 

@@ -18,6 +18,7 @@ from .models import (
     VisionItem,
     VisionProfile,
 )
+from .nova_memory_application import NovaMemoryProjection
 from .repositories import ProfileRepository
 from .schemas import AssistantAnswer, IntentResult, ParsedThought, TodayPlan
 
@@ -116,6 +117,8 @@ class PendingIntent:
     source: str
     result: IntentResult
     handled: bool = False
+    canonical_chat_id: int | None = None
+    canonical_message_id: int | None = None
 
 
 WEEKDAYS_RU = (
@@ -163,6 +166,7 @@ class IntentRouter:
         *,
         now: datetime | None = None,
         conversation_context: dict[str, object] | None = None,
+        defer_answer: bool = False,
     ) -> IntentResult:
         clean = text.strip()
         if not clean:
@@ -173,7 +177,7 @@ class IntentRouter:
             return result.model_copy(
                 update={"intent": "unknown", "inbox_kind": None, "answer": None}
             )
-        if result.intent in {"conversation", "question"} and not result.answer:
+        if result.intent in {"conversation", "question"} and not result.answer and not defer_answer:
             answer = await self.ai.answer_message(clean, context, conversation_context)
             return result.model_copy(update={"answer": answer.answer})
         kind = self.CAPTURE_INTENTS.get(result.intent)
@@ -190,7 +194,15 @@ class IntentRouter:
         *,
         now: datetime | None = None,
         conversation_context: dict[str, object] | None = None,
+        confirmed_memory: NovaMemoryProjection | None = None,
     ) -> AssistantAnswer:
+        if confirmed_memory is not None and confirmed_memory.records:
+            return await self.ai.answer_message(
+                text.strip(),
+                temporal_context(timezone_name, now=now),
+                conversation_context,
+                confirmed_memory=confirmed_memory,
+            )
         return await self.ai.answer_message(
             text.strip(), temporal_context(timezone_name, now=now), conversation_context
         )

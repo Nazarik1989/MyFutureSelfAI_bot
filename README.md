@@ -386,13 +386,14 @@ default `NOVA_AI_ADMIN_ONLY=true` он доступен только tier `admin
 не запускает destructive/admin actions и не предлагает ещё не реализованные функции.
 Подробный контракт: [docs/NOVA_HELP_GUIDE.md](docs/NOVA_HELP_GUIDE.md).
 
-### Stage 7B.1: interactive My Nova
+### Stage 7C: confirmed My Nova personalization
 
 Stage 7A introduced the owner-scoped durable memory domain. Stage 7B.1 adds its explicit
 Telegram CRUD UI: an access-aware `🧬 Моя Nova` menu, `/mynova` recovery, deterministic
 text/voice commands, preview-before-save, category and importance controls, paged lists,
-item editing, hard delete and revision-fenced delete-all. Ordinary conversation is never
-captured automatically, and memory is still not injected into AI prompts.
+item editing, hard delete and revision-fenced delete-all. Stage 7C can apply a bounded,
+revision-fenced projection of confirmed records only to final conversational/question AI
+answers. Ordinary conversation is never captured automatically.
 
 The rollout gates are fail-closed and independent:
 
@@ -400,20 +401,36 @@ The rollout gates are fail-closed and independent:
 ENABLE_NOVA_MEMORY=false
 NOVA_MEMORY_ADMIN_ONLY=true
 ENABLE_NOVA_MEMORY_APPLICATION=false
+NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true
 NOVA_MEMORY_MAX_ITEMS=100
 ```
 
 `ENABLE_NOVA_MEMORY` enables the CRUD surface. `NOVA_MEMORY_ADMIN_ONLY=true` keeps its
 menu and commands restricted to the admin pilot; setting it to false allows subscriber
-and admin tiers. `ENABLE_NOVA_MEMORY_APPLICATION` is a separate future kill switch for
-using confirmed items in prompts; enabling CRUD alone must not apply memory. The Telegram
-`admin` tier
+and admin tiers. `ENABLE_NOVA_MEMORY_APPLICATION` is the independent kill switch for
+using confirmed items in final answers, and `NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true`
+keeps that use in the admin pilot. Both CRUD and application gates and both applicable
+tier policies must allow the actor. Enabling either flag alone must not apply memory. The
+Telegram `admin` tier
 does not grant cross-user browsing or mutation: admins, like subscribers, can access
 only their own items. Deleting an item hard-deletes its content from the active database,
 while separately retained backups can still contain an older copy until their retention
 period expires. The bounded conversation-expiry purge exists only as a service contract;
-Stage 7B.1 still does not register a periodic purge job. The full
-UI, routing, fencing and privacy contract is documented in
+it is not registered as a periodic runtime job.
+
+Root and help display the effective personalization state. When enabled, a maximum of 12
+whole confirmed records and 8 KiB of compact JSON are selected, with important records
+receiving priority and category coverage preserved where possible. `Важное` affects only
+selection priority; it does not force the answer to mention a record. The configured text
+AI provider receives only `category`, `important`, and `content`. Memory never enters
+intent/action routing, reminders, timezone resolution, durable flows, Tasks, workspaces,
+collections, Knowledge, Vision, guest/image/health paths, or guided Nova help. Users can
+inspect, edit, and delete records in `🧬 Моя Nova`; losing access preserves those records
+but stops their application. Provider retention depends on the configured provider and
+account—no Zero Data Retention guarantee is implied by this feature.
+
+The full UI, routing, access/revision fencing, Telegram compensation and privacy contract
+is documented in
 [docs/NOVA_MEMORY_GUIDE.md](docs/NOVA_MEMORY_GUIDE.md).
 
 `/collections` и `/spaces` не взаимозаменяемы. «Мои разделы» организуют только личные

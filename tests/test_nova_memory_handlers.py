@@ -183,11 +183,21 @@ class BlockingMemoryBot(MemoryBot):
 
 
 class MemoryHarness(NovaMemoryHandlers):
-    def __init__(self, db, *, admin_only: bool = False) -> None:
+    def __init__(
+        self,
+        db,
+        *,
+        enabled: bool = True,
+        admin_only: bool = False,
+        application_enabled: bool = False,
+        application_admin_only: bool = True,
+    ) -> None:
         self.db = db
         self.settings = SimpleNamespace(
-            enable_nova_memory=True,
+            enable_nova_memory=enabled,
             nova_memory_admin_only=admin_only,
+            enable_nova_memory_application=application_enabled,
+            nova_memory_application_admin_only=application_admin_only,
         )
         self.access_service = AccessService(db)
         self.nova_memory_service = NovaMemoryService(db)
@@ -278,7 +288,11 @@ async def test_command_root_is_exact_access_aware_and_single_canonical(db):
     assert await bot.nova_memory_command(update, memory_context()) is True
     assert len(incoming.replies) == 1
     canonical = incoming.replies[0]["message"]
-    assert canonical.edits[-1]["text"] == NOVA_MEMORY_ROOT_TEXT.format(count=0, max_items=100)
+    assert canonical.edits[-1]["text"] == NOVA_MEMORY_ROOT_TEXT.format(
+        count=0,
+        max_items=100,
+        personalization_status="выключена",
+    )
     labels = [
         button.text for row in canonical.edits[-1]["reply_markup"].inline_keyboard for button in row
     ]
@@ -297,6 +311,109 @@ async def test_command_root_is_exact_access_aware_and_single_canonical(db):
         for button in row
     ]
     assert all(value.startswith("nmem:") and len(value.encode()) <= 64 for value in callbacks)
+
+
+@pytest.mark.parametrize(
+    (
+        "enabled",
+        "admin_only",
+        "application_enabled",
+        "application_admin_only",
+        "tier",
+        "expected",
+    ),
+    [
+        (False, False, True, False, ADMIN, False),
+        (True, False, False, False, ADMIN, False),
+        (True, True, True, False, SUBSCRIBER, False),
+        (True, False, True, True, SUBSCRIBER, False),
+        (True, True, True, True, ADMIN, True),
+        (True, False, True, False, SUBSCRIBER, True),
+        (True, False, True, False, GUEST, False),
+    ],
+)
+def test_application_effective_policy_requires_both_gates_and_tier_policies(
+    db,
+    enabled: bool,
+    admin_only: bool,
+    application_enabled: bool,
+    application_admin_only: bool,
+    tier: str,
+    expected: bool,
+):
+    bot = MemoryHarness(
+        db,
+        enabled=enabled,
+        admin_only=admin_only,
+        application_enabled=application_enabled,
+        application_admin_only=application_admin_only,
+    )
+
+    policy = bot.nova_memory_application_policy()
+
+    assert policy.memory_enabled is enabled
+    assert policy.memory_admin_only is admin_only
+    assert policy.application_enabled is application_enabled
+    assert policy.application_admin_only is application_admin_only
+    assert bot.nova_memory_application_available_for_tier(tier) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("application_admin_only", "tier", "expected_status"),
+    [
+        (True, SUBSCRIBER, "выключена"),
+        (True, ADMIN, "включена"),
+        (False, SUBSCRIBER, "включена"),
+    ],
+)
+async def test_root_and_help_show_effective_application_status_without_new_routes(
+    db,
+    application_admin_only: bool,
+    tier: str,
+    expected_status: str,
+):
+    user = await memory_user(db, next(MemoryMessage._ids), tier=tier)
+    bot = MemoryHarness(
+        db,
+        application_enabled=True,
+        application_admin_only=application_admin_only,
+    )
+    context = memory_context()
+    incoming = MemoryMessage("/mynova")
+    chat_id = next(MemoryMessage._ids)
+
+    assert await bot.nova_memory_command(
+        memory_update(incoming, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    canonical = incoming.replies[0]["message"]
+    root = canonical.edits[-1]
+    assert f"Персонализация AI-ответов: {expected_status}" in root["text"]
+    root_labels = [button.text for row in root["reply_markup"].inline_keyboard for button in row]
+
+    help_query = await click(
+        bot,
+        user,
+        chat_id,
+        canonical,
+        context,
+        root["reply_markup"],
+        "❓ Как это работает",
+    )
+
+    assert f"Персонализация AI-ответов: {expected_status}" in help_query.edits[-1]["text"]
+    assert "ограниченная выборка подтверждённых записей" in help_query.edits[-1]["text"]
+    assert "не означает\nобязательное упоминание" in help_query.edits[-1]["text"]
+    assert root_labels == [
+        "➕ Научить Nova",
+        "⭐ Важное",
+        "📖 Что Nova знает обо мне",
+        "⚙️ Как со мной работать",
+        "🧭 Мои ориентиры",
+        "❓ Как это работает",
+        "🏠 Главное меню",
+    ]
 
 
 @pytest.mark.asyncio

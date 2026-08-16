@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from .access import FULL_ACCESS_TIERS
+from .access import ACCESS_TIERS, FULL_ACCESS_TIERS
 from .db import Database
 from .models import NovaMemoryChange, NovaMemoryItem, User
 
@@ -32,6 +32,14 @@ type NovaMemoryMutationStatus = Literal[
     "stale_access",
     "limit_reached",
     "access_denied",
+]
+type NovaMemoryApplicationStatus = Literal[
+    "ready",
+    "empty",
+    "disabled",
+    "access_changed",
+    "memory_changed",
+    "unavailable",
 ]
 
 NOVA_MEMORY_CATEGORIES = frozenset({"about_me", "interaction", "orientation"})
@@ -94,6 +102,53 @@ class NovaMemoryStatus:
     remaining: int = 0
     access_version: int | None = None
     collection_revision: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NovaMemoryApplicationPolicy:
+    """Feature and tier policy required to apply user-managed memory."""
+
+    memory_enabled: bool
+    memory_admin_only: bool
+    application_enabled: bool
+    application_admin_only: bool
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, bool)
+            for value in (
+                self.memory_enabled,
+                self.memory_admin_only,
+                self.application_enabled,
+                self.application_admin_only,
+            )
+        ):
+            raise NovaMemoryValidationError("Memory application policy is invalid.")
+
+    def allows(self, tier: str) -> bool:
+        if not self.memory_enabled or not self.application_enabled:
+            return False
+        if tier not in FULL_ACCESS_TIERS:
+            return False
+        if self.memory_admin_only and tier != "admin":
+            return False
+        return not self.application_admin_only or tier == "admin"
+
+
+@dataclass(frozen=True, slots=True)
+class NovaMemoryApplicationSnapshot:
+    """Atomic owner snapshot; private records and revision stay out of repr."""
+
+    status: NovaMemoryApplicationStatus
+    items: tuple[NovaMemorySnapshot, ...] = field(default=(), repr=False)
+    collection_revision: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class NovaMemoryApplicationCurrent:
+    """Select-only result for a frozen application generation."""
+
+    status: NovaMemoryApplicationStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,6 +604,108 @@ class NovaMemoryService:
         except SQLAlchemyError:
             raise NovaMemoryStorageError("Memory status read failed.") from None
 
+    async def application_snapshot(
+        self,
+        *,
+        telegram_actor_id: int,
+        expected_tier: str,
+        expected_access_version: int,
+        policy: NovaMemoryApplicationPolicy,
+    ) -> NovaMemoryApplicationSnapshot:
+        """Materialize one atomic, owner-scoped collection for AI application."""
+        actor_id = self._telegram_actor_id(telegram_actor_id)
+        tier = self._application_tier(expected_tier)
+        access_version = self._positive_version(expected_access_version, "access")
+        application_policy = self._application_policy(policy)
+        if not application_policy.allows(tier):
+            return NovaMemoryApplicationSnapshot("disabled")
+
+        try:
+            async with self.db.sessions() as session:
+                rows = await self._application_rows(
+                    session,
+                    telegram_actor_id=actor_id,
+                    expected_tier=tier,
+                    expected_access_version=access_version,
+                )
+                if not rows:
+                    return NovaMemoryApplicationSnapshot("access_changed")
+                owner_id = rows[0][0]
+                items = tuple(
+                    NovaMemorySnapshot(
+                        public_id=row[1],
+                        category=cast(NovaMemoryCategory, row[2]),
+                        content=row[3],
+                        important=row[4],
+                        version=row[5],
+                        created_at=row[6],
+                        updated_at=row[7],
+                    )
+                    for row in rows
+                    if row[1] is not None
+                )
+                revision = self._collection_revision(
+                    tuple((row[8], row[1], row[5]) for row in rows if row[1] is not None)
+                )
+            await self._before_application_generation_check(
+                actor_id,
+                tier,
+                access_version,
+                revision,
+            )
+            if not await self._application_access_is_current(
+                telegram_actor_id=actor_id,
+                owner_id=owner_id,
+                expected_tier=tier,
+                expected_access_version=access_version,
+            ):
+                return NovaMemoryApplicationSnapshot("access_changed")
+            return NovaMemoryApplicationSnapshot(
+                "ready" if items else "empty",
+                items=items,
+                collection_revision=revision,
+            )
+        except SQLAlchemyError:
+            return NovaMemoryApplicationSnapshot("unavailable")
+
+    async def application_current_check(
+        self,
+        *,
+        telegram_actor_id: int,
+        expected_tier: str,
+        expected_access_version: int,
+        expected_collection_revision: str,
+        policy: NovaMemoryApplicationPolicy,
+    ) -> NovaMemoryApplicationCurrent:
+        """Check access and whole-collection revision in one select-only read."""
+        actor_id = self._telegram_actor_id(telegram_actor_id)
+        tier = self._application_tier(expected_tier)
+        access_version = self._positive_version(expected_access_version, "access")
+        revision = self._expected_collection_revision(expected_collection_revision)
+        application_policy = self._application_policy(policy)
+        if not application_policy.allows(tier):
+            return NovaMemoryApplicationCurrent("disabled")
+
+        try:
+            async with self.db.sessions() as session:
+                rows = await self._application_revision_rows(
+                    session,
+                    telegram_actor_id=actor_id,
+                    expected_tier=tier,
+                    expected_access_version=access_version,
+                )
+                if not rows:
+                    return NovaMemoryApplicationCurrent("access_changed")
+                current_revision = self._collection_revision(
+                    tuple((row[1], row[2], row[3]) for row in rows if row[2] is not None)
+                )
+                item_count = sum(row[2] is not None for row in rows)
+            if current_revision != revision:
+                return NovaMemoryApplicationCurrent("memory_changed")
+            return NovaMemoryApplicationCurrent("ready" if item_count else "empty")
+        except SQLAlchemyError:
+            return NovaMemoryApplicationCurrent("unavailable")
+
     async def _preflight_mutation(
         self, telegram_actor_id: int, expected_access_version: int
     ) -> Literal["access_denied", "stale_access"] | None:
@@ -599,6 +756,99 @@ class NovaMemoryService:
     ) -> None:
         """Test seam after payload materialization and before the final read fence."""
         del telegram_actor_id, actor
+
+    async def _before_application_generation_check(
+        self,
+        telegram_actor_id: int,
+        expected_tier: str,
+        expected_access_version: int,
+        collection_revision: str,
+    ) -> None:
+        """Test seam after application materialization and before its fresh fence."""
+        del telegram_actor_id, expected_tier, expected_access_version, collection_revision
+
+    async def _application_access_is_current(
+        self,
+        *,
+        telegram_actor_id: int,
+        owner_id: int,
+        expected_tier: str,
+        expected_access_version: int,
+    ) -> bool:
+        async with self.db.sessions() as session:
+            current = await session.scalar(
+                select(User.id).where(
+                    User.id == owner_id,
+                    User.telegram_id == telegram_actor_id,
+                    User.access_tier == expected_tier,
+                    User.access_tier.in_(FULL_ACCESS_TIERS),
+                    User.access_version == expected_access_version,
+                )
+            )
+        return current == owner_id
+
+    @staticmethod
+    async def _application_rows(
+        session: AsyncSession,
+        *,
+        telegram_actor_id: int,
+        expected_tier: str,
+        expected_access_version: int,
+    ) -> tuple[
+        tuple[int, str | None, str | None, str | None, bool, int, datetime, datetime, int], ...
+    ]:
+        rows = (
+            await session.execute(
+                select(
+                    User.id,
+                    NovaMemoryItem.public_id,
+                    NovaMemoryItem.category,
+                    NovaMemoryItem.content,
+                    NovaMemoryItem.important,
+                    NovaMemoryItem.version,
+                    NovaMemoryItem.created_at,
+                    NovaMemoryItem.updated_at,
+                    NovaMemoryItem.id,
+                )
+                .select_from(User)
+                .outerjoin(NovaMemoryItem, NovaMemoryItem.owner_id == User.id)
+                .where(
+                    User.telegram_id == telegram_actor_id,
+                    User.access_tier == expected_tier,
+                    User.access_tier.in_(FULL_ACCESS_TIERS),
+                    User.access_version == expected_access_version,
+                )
+            )
+        ).all()
+        return tuple(rows)
+
+    @staticmethod
+    async def _application_revision_rows(
+        session: AsyncSession,
+        *,
+        telegram_actor_id: int,
+        expected_tier: str,
+        expected_access_version: int,
+    ) -> tuple[tuple[int, int | None, str | None, int | None], ...]:
+        rows = (
+            await session.execute(
+                select(
+                    User.id,
+                    NovaMemoryItem.id,
+                    NovaMemoryItem.public_id,
+                    NovaMemoryItem.version,
+                )
+                .select_from(User)
+                .outerjoin(NovaMemoryItem, NovaMemoryItem.owner_id == User.id)
+                .where(
+                    User.telegram_id == telegram_actor_id,
+                    User.access_tier == expected_tier,
+                    User.access_tier.in_(FULL_ACCESS_TIERS),
+                    User.access_version == expected_access_version,
+                )
+            )
+        ).all()
+        return tuple(rows)
 
     @staticmethod
     def _access_generation_condition(
@@ -757,6 +1007,18 @@ class NovaMemoryService:
     def _expected_collection_revision(value: str) -> str:
         if not isinstance(value, str) or _COLLECTION_REVISION_PATTERN.fullmatch(value) is None:
             raise NovaMemoryValidationError("Expected collection revision is invalid.")
+        return value
+
+    @staticmethod
+    def _application_tier(value: str) -> str:
+        if not isinstance(value, str) or value not in ACCESS_TIERS:
+            raise NovaMemoryValidationError("Expected memory application tier is invalid.")
+        return value
+
+    @staticmethod
+    def _application_policy(value: object) -> NovaMemoryApplicationPolicy:
+        if not isinstance(value, NovaMemoryApplicationPolicy):
+            raise NovaMemoryValidationError("Memory application policy is invalid.")
         return value
 
     @staticmethod

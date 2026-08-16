@@ -103,6 +103,7 @@ docker run -d \
   --env ENABLE_NOVA_MEMORY=false \
   --env NOVA_MEMORY_ADMIN_ONLY=true \
   --env ENABLE_NOVA_MEMORY_APPLICATION=false \
+  --env NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true \
   --env NOVA_MEMORY_MAX_ITEMS=100 \
   --mount type=bind,src=/opt/myfutureselfai/data,dst=/data \
   --mount type=bind,src=/opt/myfutureselfai/data/backups,dst=/data/backups,readonly \
@@ -151,22 +152,50 @@ files stay root-owned `0700/0600`.
   rows explicitly before rollback; migration `20260725_0020` intentionally refuses to
   downgrade while recoverable trash exists.
 
-## Stage 7A/7B.1 Nova memory and conversation retention
+## Stage 7A–7C Nova memory and conversation retention
 
 Stage 7A is the data/domain foundation. Stage 7B.1 adds the separately reviewed Telegram
-CRUD flow. Keep `NOVA_MEMORY_ADMIN_ONLY=true` for an admin-only pilot when enabling
-`ENABLE_NOVA_MEMORY=true`. The application flag remains independent and must stay
-`ENABLE_NOVA_MEMORY_APPLICATION=false`: enabling CRUD must not inject confirmed items
-into AI prompts. `NOVA_MEMORY_MAX_ITEMS=100` is the hard configuration ceiling. The UI
-creates memory only after an explicit preview and confirmation; it must not import
-conversation history, onboarding answers or Vision data automatically.
+CRUD flow. Stage 7C adds separately gated application to final conversational/question AI
+answers. Keep both `NOVA_MEMORY_ADMIN_ONLY=true` and
+`NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true` for an admin-only pilot. Enable application only
+after `ENABLE_NOVA_MEMORY=true`; `ENABLE_NOVA_MEMORY_APPLICATION=true` alone is not an
+authorization path. Both flags and both applicable tier policies must pass for the current
+actor. `NOVA_MEMORY_MAX_ITEMS=100` is the hard storage ceiling. The UI creates memory only
+after an explicit preview and confirmation; it must not import conversation history,
+onboarding answers or Vision data automatically.
 
 The application kill switch is independent from CRUD so confirmed records can be
-managed without being injected into prompts. Telegram tier `admin` never authorizes
+managed without being injected into prompts. Root and help report the effective state as
+`Персонализация AI-ответов: включена` or `выключена`. Telegram tier `admin` never authorizes
 cross-user browsing or mutation. Item deletion removes content from the active database,
 but historical backups remain subject to the separate backup-retention policy and must
-not be described as immediately erased. The bounded expired-conversation purge remains
-unwired in Stage 7B.1; enabling memory CRUD does not register a periodic runtime job.
+not be described as immediately erased. Access loss preserves records while stopping
+application, and importance changes selection priority rather than retention. The bounded
+expired-conversation purge remains unwired; enabling memory CRUD/application does not
+register a periodic runtime job.
+
+Application is restricted to final `conversation`/`question` answers after the normal,
+memory-blind router. Never inject memory into classification, action selection, system or
+onboarding flows, reminders/timezone, Tasks, workspaces, collections, Knowledge, Vision,
+guest/image/health flows, or guided Nova help. The outbound projection is limited to 12
+whole records and 8 KiB of compact JSON. It contains only `category`, `important`, and
+`content`; no IDs, collection revision, fingerprint, timestamps, versions, or audit data
+may cross the provider boundary. Treat every content value as untrusted user data, never
+as system/developer/tool instructions.
+
+Snapshot, provider call, and Telegram delivery are fenced to the exact actor tier/access
+version and whole-collection revision. A lost fence discards the provider result without a
+retry. If Telegram already accepted it, delete that exact message or neutralize that same
+message if deletion fails. Do not retain DB transactions over provider or Telegram I/O,
+repeat provider calls, or log questions, answers, memory content, IDs, revisions, SQL,
+exception text, or provider bodies.
+
+The selected records are sent to the configured text AI provider. Provider retention and
+training behavior depend on the deployed provider, account, and contractual settings.
+Do not claim Zero Data Retention unless that exact provider/account configuration has been
+independently verified. Users must be directed to `🧬 Моя Nova` to inspect, edit, and
+delete active records; backup copies remain governed by the existing backup-retention
+policy.
 
 Migration downgrade from `20260811_0026` drops both `nova_memory_items` and
 `nova_memory_changes`, destroying Nova memory in the active database. An application or

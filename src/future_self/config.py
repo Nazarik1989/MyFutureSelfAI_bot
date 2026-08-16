@@ -50,11 +50,11 @@ class Settings(BaseSettings):
     enable_nova_ai: bool = False
     nova_ai_admin_only: bool = True
 
-    # Stage 7A is a data/domain foundation only. CRUD and future prompt
-    # application remain independently fail-closed until their UI rollout.
+    # Nova memory CRUD and answer application use independent fail-closed gates.
     enable_nova_memory: bool = False
     nova_memory_admin_only: bool = True
     enable_nova_memory_application: bool = False
+    nova_memory_application_admin_only: bool = True
     nova_memory_max_items: int = Field(default=100, ge=1, le=100)
 
     transcription_provider: Literal["openai", "local", "disabled"] = "disabled"

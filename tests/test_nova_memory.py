@@ -7,13 +7,28 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import event, func, select
+from sqlalchemy.exc import OperationalError
 
 from future_self.models import NovaMemoryChange, NovaMemoryItem, User
 from future_self.nova_memory import (
+    NovaMemoryApplicationPolicy,
     NovaMemoryService,
     NovaMemoryValidationError,
     normalize_nova_memory_content,
     nova_memory_fingerprint,
+)
+
+OPEN_APPLICATION_POLICY = NovaMemoryApplicationPolicy(
+    memory_enabled=True,
+    memory_admin_only=False,
+    application_enabled=True,
+    application_admin_only=False,
+)
+ADMIN_APPLICATION_POLICY = NovaMemoryApplicationPolicy(
+    memory_enabled=True,
+    memory_admin_only=True,
+    application_enabled=True,
+    application_admin_only=True,
 )
 
 
@@ -240,6 +255,24 @@ class _PausingReadFenceService(NovaMemoryService):
         await self.continue_to_final_fence.wait()
 
 
+class _PausingApplicationFenceService(NovaMemoryService):
+    def __init__(self, db):
+        super().__init__(db)
+        self.snapshot_materialized = asyncio.Event()
+        self.continue_to_final_fence = asyncio.Event()
+
+    async def _before_application_generation_check(
+        self,
+        telegram_actor_id,
+        expected_tier,
+        expected_access_version,
+        collection_revision,
+    ):
+        del telegram_actor_id, expected_tier, expected_access_version, collection_revision
+        self.snapshot_materialized.set()
+        await self.continue_to_final_fence.wait()
+
+
 class _PausingOwnerLockService(NovaMemoryService):
     def __init__(self, db):
         super().__init__(db)
@@ -416,6 +449,391 @@ async def test_get_list_and_status_read_fences_are_select_only(db):
 
     assert statements
     assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+
+
+async def test_application_snapshot_is_atomic_owner_scoped_and_repr_safe(db):
+    telegram_id = 71_026
+    other_id = 71_027
+    await _add_user(db, telegram_id)
+    await _add_user(db, other_id)
+    service = NovaMemoryService(db)
+    private = "PRIVATE_APPLICATION_MEMORY"
+    first = await _create(service, telegram_id, private, category="interaction", important=True)
+    await _create(service, telegram_id, "Lives in Saratov", category="about_me")
+    await _create(service, other_id, "OTHER_OWNER_PRIVATE_MEMORY")
+    assert first.item is not None
+
+    snapshot = await service.application_snapshot(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+
+    assert snapshot.status == "ready"
+    assert {item.content for item in snapshot.items} == {private, "Lives in Saratov"}
+    assert snapshot.collection_revision == await _collection_revision(service, telegram_id)
+    assert private not in repr(snapshot)
+    assert snapshot.collection_revision not in repr(snapshot)
+    empty_id = 71_028
+    await _add_user(db, empty_id, tier="admin", access_version=4)
+    empty = await service.application_snapshot(
+        telegram_actor_id=empty_id,
+        expected_tier="admin",
+        expected_access_version=4,
+        policy=ADMIN_APPLICATION_POLICY,
+    )
+    assert empty.status == "empty"
+    assert empty.items == ()
+    assert empty.collection_revision is not None
+
+
+async def test_application_snapshot_policy_and_exact_generation_fail_closed(db):
+    subscriber_id = 71_029
+    admin_id = 71_030
+    guest_id = 71_031
+    blocked_id = 71_032
+    await _add_user(db, subscriber_id)
+    await _add_user(db, admin_id, tier="admin")
+    await _add_user(db, guest_id, tier="guest")
+    await _add_user(db, blocked_id, tier="blocked")
+    service = NovaMemoryService(db)
+
+    assert (
+        await service.application_snapshot(
+            telegram_actor_id=subscriber_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            policy=ADMIN_APPLICATION_POLICY,
+        )
+    ).status == "disabled"
+    assert (
+        await service.application_snapshot(
+            telegram_actor_id=admin_id,
+            expected_tier="admin",
+            expected_access_version=1,
+            policy=ADMIN_APPLICATION_POLICY,
+        )
+    ).status == "empty"
+    for actor_id, tier in (
+        (subscriber_id, "admin"),
+        (admin_id, "subscriber"),
+        (subscriber_id, "subscriber"),
+    ):
+        result = await service.application_snapshot(
+            telegram_actor_id=actor_id,
+            expected_tier=tier,
+            expected_access_version=2 if actor_id == subscriber_id and tier == "subscriber" else 1,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+        assert result.status == "access_changed"
+        assert result.items == ()
+        assert result.collection_revision is None
+    for actor_id in (guest_id, blocked_id, 999_998):
+        denied = await service.application_snapshot(
+            telegram_actor_id=actor_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+        assert denied.status == "access_changed"
+        assert denied.items == ()
+
+
+@pytest.mark.parametrize("restricted_tier", ["guest", "blocked"])
+async def test_application_apis_return_typed_empty_results_for_restricted_expected_tiers(
+    db,
+    restricted_tier,
+):
+    telegram_id = 71_133 if restricted_tier == "guest" else 71_134
+    await _add_user(db, telegram_id, tier=restricted_tier)
+    service = NovaMemoryService(db)
+
+    disabled_snapshot = await service.application_snapshot(
+        telegram_actor_id=telegram_id,
+        expected_tier=restricted_tier,
+        expected_access_version=1,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+    disabled_current = await service.application_current_check(
+        telegram_actor_id=telegram_id,
+        expected_tier=restricted_tier,
+        expected_access_version=1,
+        expected_collection_revision="0" * 64,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+
+    assert disabled_snapshot.status == "disabled"
+    assert disabled_snapshot.items == ()
+    assert disabled_snapshot.collection_revision is None
+    assert disabled_current.status == "disabled"
+
+    changed_snapshot = await service.application_snapshot(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+    changed_current = await service.application_current_check(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        expected_collection_revision="0" * 64,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+
+    assert changed_snapshot.status == "access_changed"
+    assert changed_snapshot.items == ()
+    assert changed_snapshot.collection_revision is None
+    assert changed_current.status == "access_changed"
+
+
+async def test_application_snapshot_discards_materialized_data_after_access_bounce(db):
+    telegram_id = 71_033
+    await _add_user(db, telegram_id)
+    baseline = NovaMemoryService(db)
+    await _create(baseline, telegram_id, "PRIVATE_APPLICATION_RACE")
+    service = _PausingApplicationFenceService(db)
+
+    task = asyncio.create_task(
+        service.application_snapshot(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+    )
+    await service.snapshot_materialized.wait()
+    async with db.session() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        assert user is not None
+        user.access_version = 3
+    service.continue_to_final_fence.set()
+
+    result = await task
+    assert result.status == "access_changed"
+    assert result.items == ()
+    assert result.collection_revision is None
+
+
+async def test_application_current_check_detects_memory_and_access_changes(db):
+    telegram_id = 71_034
+    await _add_user(db, telegram_id)
+    service = NovaMemoryService(db)
+    initial = await service.application_snapshot(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+    assert initial.status == "empty" and initial.collection_revision is not None
+    assert (
+        await service.application_current_check(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            expected_collection_revision=initial.collection_revision,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+    ).status == "empty"
+    await _create(service, telegram_id, "New memory")
+    assert (
+        await service.application_current_check(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            expected_collection_revision=initial.collection_revision,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+    ).status == "memory_changed"
+    current = await service.application_snapshot(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+    assert current.status == "ready" and current.collection_revision is not None
+    async with db.session() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        assert user is not None
+        user.access_tier = "admin"
+        user.access_version = 2
+    assert (
+        await service.application_current_check(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            expected_collection_revision=current.collection_revision,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+    ).status == "access_changed"
+
+
+async def test_application_current_check_tracks_every_collection_mutation(db):
+    telegram_id = 71_037
+    await _add_user(db, telegram_id)
+    service = NovaMemoryService(db)
+
+    async def snapshot_revision() -> str:
+        snapshot = await service.application_snapshot(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+        assert snapshot.collection_revision is not None
+        return snapshot.collection_revision
+
+    async def assert_stale(revision: str) -> None:
+        checked = await service.application_current_check(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            expected_collection_revision=revision,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+        assert checked.status == "memory_changed"
+
+    empty_revision = await snapshot_revision()
+    created = await _create(service, telegram_id, "Application revision transitions")
+    assert created.item is not None
+    await assert_stale(empty_revision)
+    created_revision = await snapshot_revision()
+    updated = await service.update(
+        telegram_actor_id=telegram_id,
+        public_id=created.item.public_id,
+        expected_version=1,
+        expected_access_version=1,
+        content="Application revision updated",
+    )
+    assert updated.item is not None
+    await assert_stale(created_revision)
+    updated_revision = await snapshot_revision()
+    important = await service.set_important(
+        telegram_actor_id=telegram_id,
+        public_id=created.item.public_id,
+        expected_version=2,
+        expected_access_version=1,
+        important=True,
+    )
+    assert important.item is not None
+    await assert_stale(updated_revision)
+    important_revision = await snapshot_revision()
+    assert (
+        await service.delete(
+            telegram_actor_id=telegram_id,
+            public_id=created.item.public_id,
+            expected_version=3,
+            expected_access_version=1,
+        )
+    ).status == "deleted"
+    await assert_stale(important_revision)
+    await _create(service, telegram_id, "Delete all application memory")
+    delete_all_revision = await snapshot_revision()
+    assert (
+        await service.delete_all(
+            telegram_actor_id=telegram_id,
+            expected_access_version=1,
+            expected_collection_revision=delete_all_revision,
+        )
+    ).status == "deleted_all"
+    await assert_stale(delete_all_revision)
+
+
+async def test_application_disabled_has_zero_reads_and_enabled_reads_are_select_only(db):
+    telegram_id = 71_035
+    await _add_user(db, telegram_id)
+    service = NovaMemoryService(db)
+    baseline = await service.application_snapshot(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+    assert baseline.collection_revision is not None
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        statements.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", capture_statement)
+    try:
+        disabled = await service.application_snapshot(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            policy=ADMIN_APPLICATION_POLICY,
+        )
+        assert disabled.status == "disabled"
+        disabled_check = await service.application_current_check(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            expected_collection_revision=baseline.collection_revision,
+            policy=ADMIN_APPLICATION_POLICY,
+        )
+        assert disabled_check.status == "disabled"
+        assert statements == []
+        ready = await service.application_snapshot(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+        assert ready.status == "empty" and ready.collection_revision is not None
+        checked = await service.application_current_check(
+            telegram_actor_id=telegram_id,
+            expected_tier="subscriber",
+            expected_access_version=1,
+            expected_collection_revision=ready.collection_revision,
+            policy=OPEN_APPLICATION_POLICY,
+        )
+        assert checked.status == "empty"
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", capture_statement)
+
+    assert statements
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+
+
+async def test_application_storage_errors_are_typed_empty_and_private_data_safe(db, monkeypatch):
+    telegram_id = 71_036
+    await _add_user(db, telegram_id)
+    service = NovaMemoryService(db)
+    private = "PRIVATE_SQL_PARAMETER_SENTINEL"
+
+    async def fail_application_rows(*args, **kwargs):
+        del args, kwargs
+        raise OperationalError("SELECT private", {"content": private}, RuntimeError(private))
+
+    monkeypatch.setattr(service, "_application_rows", fail_application_rows)
+    snapshot = await service.application_snapshot(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+    monkeypatch.setattr(service, "_application_revision_rows", fail_application_rows)
+    current = await service.application_current_check(
+        telegram_actor_id=telegram_id,
+        expected_tier="subscriber",
+        expected_access_version=1,
+        expected_collection_revision="0" * 64,
+        policy=OPEN_APPLICATION_POLICY,
+    )
+
+    assert snapshot.status == current.status == "unavailable"
+    assert snapshot.items == ()
+    assert snapshot.collection_revision is None
+    assert private not in repr(snapshot)
+    assert private not in repr(current)
 
 
 async def test_version_fences_noops_and_real_transitions_write_exact_audit(db):

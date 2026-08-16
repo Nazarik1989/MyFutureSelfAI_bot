@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from . import prompts
 from .config import Settings
+from .nova_memory_application import NovaMemoryProjection
 from .schemas import (
     AssistantAnswer,
     GoalProposals,
@@ -33,6 +34,7 @@ NOVA_HELP_MAX_INPUT_CHARS = 600
 NOVA_HELP_TIMEOUT_SECONDS = 30.0
 REMINDER_TIMEZONE_MAX_INPUT_CHARS = 120
 REMINDER_TIMEZONE_TIMEOUT_SECONDS = 20.0
+NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS = 30.0
 
 
 def _guest_demo_input(text: str) -> str:
@@ -150,6 +152,8 @@ class AIService(Protocol):
         text: str,
         temporal_context: dict[str, str],
         conversation_context: dict[str, object] | None = None,
+        *,
+        confirmed_memory: NovaMemoryProjection | None = None,
     ) -> AssistantAnswer: ...
 
 
@@ -302,12 +306,41 @@ class OpenAICompatibleAIService:
         text: str,
         temporal_context: dict[str, str],
         conversation_context: dict[str, object] | None = None,
+        *,
+        confirmed_memory: NovaMemoryProjection | None = None,
     ) -> AssistantAnswer:
         payload = {
             "message": text,
             "temporal_context": temporal_context,
             "conversation_context": conversation_context or {},
         }
+        if confirmed_memory is not None and confirmed_memory.records:
+            payload["confirmed_memory"] = confirmed_memory.provider_payload()
+            client = self.client.with_options(max_retries=0)
+            async with asyncio.timeout(NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS):
+                response = await client.responses.parse(
+                    model=self.model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": f"{prompts.ANSWER_SYSTEM}\nСтиль ответа: {self.tone}.",
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    ],
+                    text_format=AssistantAnswer,
+                    timeout=NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS,
+                )
+            parsed = response.output_parsed
+            if parsed is None:
+                raise ValueError("The model returned no structured output")
+            return AssistantAnswer.model_validate(parsed)
         return await self._parse(
             AssistantAnswer,
             prompts.ANSWER_SYSTEM,

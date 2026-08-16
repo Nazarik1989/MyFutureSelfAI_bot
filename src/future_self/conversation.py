@@ -13,7 +13,7 @@ class ConversationSnapshot:
     session_id: int | None = None
     current_topic: str | None = None
     summary: str | None = None
-    messages: list[dict[str, str]] = field(default_factory=list)
+    messages: list[dict[str, str]] = field(default_factory=list, repr=False)
     active_draft: dict[str, object] | None = None
     pending_date_options: list[dict[str, str]] = field(default_factory=list)
     resolved_date: str | None = None
@@ -29,10 +29,13 @@ class ConversationSnapshot:
     last_saved_at: str | None = None
 
     def for_prompt(self) -> dict[str, object]:
+        provider_messages = [
+            dict(message) for message in self.messages if message.get("intent") != "memory_answer"
+        ]
         return {
             "current_topic": self.current_topic,
             "summary": self.summary,
-            "recent_messages": self.messages,
+            "recent_messages": provider_messages,
             "active_draft": self.active_draft,
             "pending_date_options": self.pending_date_options,
             "resolved_date": self.resolved_date,

@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 
 from future_self.db import Database
+from future_self.nova_memory_application import NovaMemoryProjection
 from future_self.schemas import (
     AssistantAnswer,
     GoalProposal,
@@ -27,6 +28,13 @@ class FakeAI:
         self.last_today_context: dict[str, object] | None = None
         self.route_calls: list[tuple[str, dict[str, str]]] = []
         self.conversation_contexts: list[dict[str, object]] = []
+        self.answer_calls: list[tuple[str, dict[str, str]]] = []
+        self.answer_conversation_contexts: list[dict[str, object]] = []
+        self.answer_confirmed_memory_calls: list[NovaMemoryProjection | None] = []
+        self.answer_error: BaseException | None = None
+        self.answer_started = asyncio.Event()
+        self.answer_release = asyncio.Event()
+        self.answer_release.set()
         self.timezone_calls: list[str] = []
         self.timezone_results: dict[str, TimezoneResolution] = {}
         self.reminder_timezone_calls: list[str] = []
@@ -220,7 +228,16 @@ class FakeAI:
         text: str,
         temporal_context: dict[str, str],
         conversation_context: dict[str, object] | None = None,
+        *,
+        confirmed_memory: NovaMemoryProjection | None = None,
     ) -> AssistantAnswer:
+        self.answer_calls.append((text, temporal_context))
+        self.answer_conversation_contexts.append(conversation_context or {})
+        self.answer_confirmed_memory_calls.append(confirmed_memory)
+        self.answer_started.set()
+        await self.answer_release.wait()
+        if self.answer_error is not None:
+            raise self.answer_error
         return AssistantAnswer(answer=f"Ответ на: {text}")
 
 

@@ -15,6 +15,7 @@ from telegram.ext import ContextTypes
 from .access import ADMIN, SUBSCRIBER, AccessTier, require_access_tier
 from .models import User
 from .nova_memory import (
+    NovaMemoryApplicationPolicy,
     NovaMemoryPage,
     NovaMemoryService,
     NovaMemorySnapshot,
@@ -38,6 +39,7 @@ NOVA_MEMORY_ROOT_TEXT = """🧬 Моя Nova
 Здесь хранится только то, что ты сам попросил Nova запомнить и подтвердил.
 
 Обычные сообщения сюда не попадают.
+Персонализация AI-ответов: {personalization_status}
 Сохранено: {count} из {max_items}."""
 
 NOVA_MEMORY_CREATE_TEXT = """➕ Научить Nova
@@ -55,7 +57,15 @@ NOVA_MEMORY_HELP_TEXT = """❓ Как работает «Моя Nova»
 • «Мои ориентиры» — ценности, приоритеты и направления.
 • ⭐ Важное — особенно значимые записи.
 
-Перед сохранением можно изменить текст, раздел и важность. Любую запись можно изменить или забыть."""
+Персонализация AI-ответов: {personalization_status}
+
+Когда персонализация включена, ограниченная выборка подтверждённых записей передаётся
+настроенному AI-провайдеру. «Важное» задаёт приоритет выбора, но не означает
+обязательное упоминание записи в ответе.
+
+Перед сохранением можно изменить текст, раздел и важность. Любую запись можно увидеть,
+изменить или удалить здесь. Потеря доступа сохраняет записи, но прекращает их применение.
+Срок хранения переданных данных зависит от политики настроенного AI-провайдера и аккаунта."""
 
 NOVA_MEMORY_ACCESS_CHANGED_TEXT = (
     "🧬 Моя Nova\n\nДоступ изменился. Содержимое памяти скрыто. Открой /mynova заново."
@@ -199,6 +209,28 @@ class NovaMemoryHandlers:
         if tier not in {SUBSCRIBER, ADMIN}:
             return False
         return not bool(getattr(self.settings, "nova_memory_admin_only", True)) or tier == ADMIN
+
+    def nova_memory_application_policy(self) -> NovaMemoryApplicationPolicy:
+        """Return the complete fail-closed CRUD + answer-application policy."""
+
+        return NovaMemoryApplicationPolicy(
+            memory_enabled=bool(getattr(self.settings, "enable_nova_memory", False)),
+            memory_admin_only=bool(getattr(self.settings, "nova_memory_admin_only", True)),
+            application_enabled=bool(
+                getattr(self.settings, "enable_nova_memory_application", False)
+            ),
+            application_admin_only=bool(
+                getattr(self.settings, "nova_memory_application_admin_only", True)
+            ),
+        )
+
+    def nova_memory_application_available_for_tier(self, tier: str) -> bool:
+        """Report the effective answer-personalization state for one access tier."""
+
+        return self.nova_memory_application_policy().allows(tier)
+
+    def _nova_memory_personalization_status(self, tier: str) -> str:
+        return "включена" if self.nova_memory_application_available_for_tier(tier) else "выключена"
 
     async def _nova_memory_identity(self, update: Any) -> User | None:
         telegram_user = getattr(update, "effective_user", None)
@@ -1406,7 +1438,11 @@ class NovaMemoryHandlers:
                 await self._nova_memory_deliver(
                     context,
                     updated,
-                    NOVA_MEMORY_HELP_TEXT,
+                    NOVA_MEMORY_HELP_TEXT.format(
+                        personalization_status=self._nova_memory_personalization_status(
+                            updated.tier
+                        )
+                    ),
                     InlineKeyboardMarkup(
                         [[InlineKeyboardButton("← К моей Nova", callback_data=tokens["root"])]]
                     ),
@@ -1623,7 +1659,11 @@ class NovaMemoryHandlers:
                 [InlineKeyboardButton("🗑 Забыть всё", callback_data=tokens["delete_all_preview"])]
             )
         rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data=tokens["exit_home"])])
-        text = NOVA_MEMORY_ROOT_TEXT.format(count=status.count, max_items=status.max_items)
+        text = NOVA_MEMORY_ROOT_TEXT.format(
+            count=status.count,
+            max_items=status.max_items,
+            personalization_status=self._nova_memory_personalization_status(updated.tier),
+        )
         if notice:
             text = f"{notice}\n\n{text}"
         await self._nova_memory_deliver(
