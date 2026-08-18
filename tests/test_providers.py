@@ -12,6 +12,7 @@ from future_self.ai import (
     NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS,
     REMINDER_TIMEZONE_MAX_INPUT_CHARS,
     REMINDER_TIMEZONE_TIMEOUT_SECONDS,
+    WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS,
     OpenAICompatibleAIService,
     ProviderHealthCheck,
     create_ai_service,
@@ -24,11 +25,15 @@ from future_self.schemas import (
     IntentResult,
     ReminderTimezoneResolution,
     TimezoneResolution,
+    TodayPlan,
+    WeeklyReviewExtraction,
+    WeeklyReviewReminderCandidate,
 )
 from future_self.transcription import (
     DisabledTranscriptionService,
     create_transcription_service,
 )
+from future_self.weekly_review_extraction import WEEKLY_REVIEW_MAX_INPUT_CHARS
 
 
 def settings(**overrides) -> Settings:
@@ -43,6 +48,48 @@ def settings(**overrides) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+async def test_today_plan_uses_one_scoped_provider_attempt_without_global_mutation():
+    class Responses:
+        def __init__(self):
+            self.calls = []
+
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                output_parsed=TodayPlan(
+                    vision_reminder="Беречь ресурс",
+                    main_focus="Сохранить спокойный темп",
+                    actions=["Закрыть одну важную задачу"],
+                    hard_day_minimum="Сделать один короткий шаг",
+                )
+            )
+
+    class ScopedClient:
+        def __init__(self):
+            self.responses = Responses()
+
+    class Client:
+        def __init__(self):
+            self.responses = Responses()
+            self.scoped = ScopedClient()
+            self.option_calls = []
+
+        def with_options(self, **kwargs):
+            self.option_calls.append(kwargs)
+            return self.scoped
+
+    client = Client()
+    service = OpenAICompatibleAIService(client, "test-model")
+
+    plan = await service.make_today_plan({"weekly_focus": "Беречь ресурс"})
+
+    assert plan.main_focus == "Сохранить спокойный темп"
+    assert client.option_calls == [{"max_retries": 0}]
+    assert client.responses.calls == []
+    assert len(client.scoped.responses.calls) == 1
+    assert client.scoped.responses.calls[0]["text_format"] is TodayPlan
 
 
 def test_openrouter_client_receives_base_url_and_optional_headers():
@@ -466,6 +513,168 @@ async def test_invalid_memory_answer_output_is_not_retried_or_fallen_back():
 
     assert client.option_calls == [{"max_retries": 0}]
     assert client.responses.calls == 1
+
+
+async def test_weekly_review_extraction_uses_one_scoped_structured_call():
+    text = "Буду двигаться постепенно.\nФокус: Подготовить запуск.\nВ 15:05 позвонить Назару"
+
+    class Responses:
+        def __init__(self):
+            self.calls = []
+
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                output_parsed=WeeklyReviewExtraction(
+                    focus="provider paraphrase",
+                    approach="Двигаться постепенно",
+                    small_steps=["Подготовить основу"],
+                    reminder_candidates=[
+                        WeeklyReviewReminderCandidate(
+                            title="Позвонить Назару",
+                            schedule_wording="В 15:05",
+                            evidence="В 15:05 позвонить Назару",
+                        )
+                    ],
+                )
+            )
+
+    class ScopedClient:
+        def __init__(self):
+            self.responses = Responses()
+
+    class Client:
+        def __init__(self):
+            self.responses = Responses()
+            self.scoped = ScopedClient()
+            self.option_calls = []
+
+        def with_options(self, **kwargs):
+            self.option_calls.append(kwargs)
+            return self.scoped
+
+    client = Client()
+    service = OpenAICompatibleAIService(client, "test-model", "must-not-enter-prompt")
+    context = {"timezone": "Europe/Moscow", "today_date": "2026-08-17"}
+
+    result = await service.extract_weekly_review(text, context)
+
+    assert result.focus == "Подготовить запуск."
+    assert client.option_calls == [{"max_retries": 0}]
+    assert client.responses.calls == []
+    assert len(client.scoped.responses.calls) == 1
+    call = client.scoped.responses.calls[0]
+    assert call["text_format"] is WeeklyReviewExtraction
+    assert call["timeout"] == WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS == 30.0
+    assert call["input"][0] == {
+        "role": "system",
+        "content": prompts.WEEKLY_REVIEW_EXTRACTION_SYSTEM,
+    }
+    assert "must-not-enter-prompt" not in repr(call["input"])
+    assert json.loads(call["input"][1]["content"]) == {
+        "text": text,
+        "temporal_context": context,
+    }
+    for forbidden in ("confirmed_memory", "conversation_context", "recent_messages"):
+        assert forbidden not in call["input"][1]["content"]
+
+
+async def test_weekly_review_invalid_evidence_is_not_retried_or_fallen_back():
+    class Responses:
+        def __init__(self):
+            self.calls = 0
+
+        async def parse(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return SimpleNamespace(
+                output_parsed=WeeklyReviewExtraction(
+                    focus="Подготовить запуск",
+                    reminder_candidates=[
+                        WeeklyReviewReminderCandidate(
+                            title="Позвонить Назару",
+                            schedule_wording="В 15:05",
+                            evidence="В 15:05 позвонить Назару",
+                        )
+                    ],
+                )
+            )
+
+    class Client:
+        def __init__(self):
+            self.responses = Responses()
+            self.option_calls = []
+
+        def with_options(self, **kwargs):
+            self.option_calls.append(kwargs)
+            return self
+
+    client = Client()
+    service = OpenAICompatibleAIService(client, "test-model")
+
+    with pytest.raises(ValueError, match="exact unique input span"):
+        await service.extract_weekly_review(
+            "Составной ответ. Здесь нет напоминания.",
+            {"timezone": "Europe/Moscow"},
+        )
+
+    assert client.option_calls == [{"max_retries": 0}]
+    assert client.responses.calls == 1
+
+
+async def test_weekly_review_extraction_has_fixed_timeout_without_retry(monkeypatch):
+    class Responses:
+        def __init__(self):
+            self.calls = 0
+
+        async def parse(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            await asyncio.sleep(1)
+
+    class Client:
+        def __init__(self):
+            self.responses = Responses()
+            self.option_calls = []
+
+        def with_options(self, **kwargs):
+            self.option_calls.append(kwargs)
+            return self
+
+    monkeypatch.setattr("future_self.ai.WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS", 0.001)
+    client = Client()
+    service = OpenAICompatibleAIService(client, "test-model")
+
+    with pytest.raises(TimeoutError):
+        await service.extract_weekly_review(
+            "Составной ответ. Затем ещё одно предложение.",
+            {"timezone": "Europe/Moscow"},
+        )
+
+    assert client.option_calls == [{"max_retries": 0}]
+    assert client.responses.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "context"),
+    [
+        ("", {"timezone": "Europe/Moscow"}),
+        ("x" * (WEEKLY_REVIEW_MAX_INPUT_CHARS + 1), {"timezone": "Europe/Moscow"}),
+        ("Составной ответ. Ещё один.", {"timezone": "x" * 129}),
+        ("Составной ответ. Ещё один.", {"timezone": 42}),
+        ("Составной ответ. Ещё один.", {"confirmed_memory": "private value"}),
+        ("Составной ответ. Ещё один.", {"conversation_context": "private value"}),
+    ],
+)
+async def test_weekly_review_extraction_rejects_unbounded_input_before_provider(text, context):
+    class Client:
+        def with_options(self, **kwargs):
+            raise AssertionError(f"provider must not be prepared: {kwargs}")
+
+    service = OpenAICompatibleAIService(Client(), "test-model")
+
+    with pytest.raises(ValueError, match="weekly review"):
+        await service.extract_weekly_review(text, context)
 
 
 async def test_memory_answer_has_fixed_timeout_without_retry(monkeypatch):

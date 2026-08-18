@@ -3,7 +3,7 @@ from typing import Any
 
 from telegram.error import BadRequest
 
-from future_self.schemas import AssistantAnswer, IntentResult
+from future_self.schemas import AssistantAnswer, IntentResult, WeeklyReviewExtraction
 
 
 class UnexpectedLLMCall(AssertionError):
@@ -40,6 +40,14 @@ class StrictAI:
     ) -> AssistantAnswer:
         del temporal_context, conversation_context, confirmed_memory
         raise UnexpectedLLMCall(f"Unexpected LLM answer for {text!r}")
+
+    async def extract_weekly_review(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+    ) -> WeeklyReviewExtraction:
+        del temporal_context
+        raise UnexpectedLLMCall(f"Unexpected weekly review extraction for {text!r}")
 
 
 class ScriptedTranscription:
@@ -119,6 +127,7 @@ class FakeMessage:
         self.reply_to_message = None
         self.replies: list[dict[str, Any]] = []
         self.edits: list[str] = []
+        self.edit_kwargs: list[dict[str, Any]] = []
         self.reply_text_calls = 0
         self.deleted = False
         self.message_id = next(self._ids)
@@ -161,8 +170,8 @@ class FakeMessage:
         return self
 
     async def edit_text(self, text: str, **kwargs: Any) -> None:
-        del kwargs
         self.edits.append(text)
+        self.edit_kwargs.append(kwargs)
 
     async def delete(self) -> None:
         self.deleted = True

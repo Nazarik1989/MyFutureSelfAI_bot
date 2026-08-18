@@ -23,7 +23,9 @@ from .schemas import (
     TimezoneResolution,
     TodayPlan,
     VisionSummary,
+    WeeklyReviewExtraction,
 )
+from .weekly_review_extraction import validate_weekly_review_extraction, weekly_review_input
 
 if TYPE_CHECKING:
     from .nova import NovaCatalog
@@ -35,6 +37,24 @@ NOVA_HELP_TIMEOUT_SECONDS = 30.0
 REMINDER_TIMEZONE_MAX_INPUT_CHARS = 120
 REMINDER_TIMEZONE_TIMEOUT_SECONDS = 20.0
 NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS = 30.0
+WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS = 30.0
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_ITEMS = 12
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_KEY_CHARS = 64
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_VALUE_CHARS = 128
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_FIELDS = frozenset(
+    {
+        "timezone",
+        "local_datetime",
+        "today_date",
+        "today_weekday",
+        "tomorrow_date",
+        "tomorrow_weekday",
+        "week_start",
+        "week_end",
+        "target_week_start",
+        "target_week_end",
+    }
+)
 
 
 def _guest_demo_input(text: str) -> str:
@@ -73,6 +93,30 @@ def _reminder_timezone_input(fragment: str) -> str:
             f"{REMINDER_TIMEZONE_MAX_INPUT_CHARS} characters"
         )
     return cleaned
+
+
+def _weekly_review_temporal_context(context: dict[str, str]) -> dict[str, str]:
+    if not isinstance(context, dict):
+        raise ValueError("weekly review temporal context must be a mapping")
+    if len(context) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_ITEMS:
+        raise ValueError("weekly review temporal context has too many fields")
+    bounded: dict[str, str] = {}
+    for key, value in context.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("weekly review temporal context must contain strings")
+        clean_key = key.strip()
+        clean_value = value.strip()
+        if (
+            not clean_key
+            or not clean_value
+            or len(clean_key) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_KEY_CHARS
+            or len(clean_value) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_VALUE_CHARS
+            or clean_key not in WEEKLY_REVIEW_TEMPORAL_CONTEXT_FIELDS
+            or clean_key in bounded
+        ):
+            raise ValueError("weekly review temporal context contains an invalid field")
+        bounded[clean_key] = clean_value
+    return bounded
 
 
 def _nova_catalog_payload(capability_catalog: NovaCatalog) -> dict[str, object]:
@@ -125,6 +169,12 @@ class AIService(Protocol):
         self,
         timezone_fragment: str,
     ) -> ReminderTimezoneResolution: ...
+
+    async def extract_weekly_review(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+    ) -> WeeklyReviewExtraction: ...
 
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals: ...
 
@@ -226,6 +276,42 @@ class OpenAICompatibleAIService:
             raise ValueError("The model returned no structured output")
         return ReminderTimezoneResolution.model_validate(parsed)
 
+    async def extract_weekly_review(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+    ) -> WeeklyReviewExtraction:
+        clean = weekly_review_input(text)
+        payload = {
+            "text": clean,
+            "temporal_context": _weekly_review_temporal_context(temporal_context),
+        }
+        client = self.client.with_options(max_retries=0)
+        async with asyncio.timeout(WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS):
+            response = await client.responses.parse(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": prompts.WEEKLY_REVIEW_EXTRACTION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                text_format=WeeklyReviewExtraction,
+                timeout=WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS,
+            )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("The model returned no structured output")
+        return validate_weekly_review_extraction(
+            clean,
+            WeeklyReviewExtraction.model_validate(parsed),
+        )
+
     async def health_check(self) -> ProviderHealthCheck:
         return await self._parse(
             ProviderHealthCheck,
@@ -284,7 +370,12 @@ class OpenAICompatibleAIService:
         return NovaHelpPlan.model_validate(parsed)
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan:
-        return await self._parse(TodayPlan, prompts.TODAY_SYSTEM, repr(context))
+        return await self._parse(
+            TodayPlan,
+            prompts.TODAY_SYSTEM,
+            repr(context),
+            max_retries=0,
+        )
 
     async def route_message(
         self,

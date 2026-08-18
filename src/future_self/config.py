@@ -176,7 +176,10 @@ class Settings(BaseSettings):
 
     enable_task_reminders: bool = True
     enable_voice: bool = True
+    # Weekly review is an additive pilot. The feature switch controls every
+    # surface and the tier switch defaults to administrators only.
     enable_weekly_review: bool = True
+    weekly_review_admin_only: bool = True
     log_level: str = "INFO"
 
     model_config = SettingsConfigDict(

@@ -567,6 +567,20 @@ IMAGE_GENERATION_TIMEOUT_SECONDS=150
 
 Помимо провайдеров можно настроить строку БД, часовой пояс, имя и тон ассистента, расписание, ограничения аудио и feature flags.
 
+«Недельный обзор» управляется двумя независимыми rollout-настройками:
+
+```dotenv
+ENABLE_WEEKLY_REVIEW=true
+WEEKLY_REVIEW_ADMIN_ONLY=true
+```
+
+`ENABLE_WEEKLY_REVIEW=false` — полный kill switch: скрывает weekly UI и отключает
+команды, STT/text routing, callbacks, recovery, maintenance, proactive delivery и
+применение фокуса недели в `/today`. Пилот по умолчанию ограничен администраторами;
+`WEEKLY_REVIEW_ADMIN_ONLY=false` открывает функцию подписчикам. Ручной `/week` всегда
+относится к текущему локальному циклу понедельник–воскресенье, а scheduled review — к
+следующему циклу; `WEEKLY_REVIEW_WEEKDAY` задаёт только момент scheduled-запуска.
+
 PR #23 добавляет только Access/Workspace foundation. Его UI включается независимо через
 `ENABLE_WORKSPACE_ACCESS`; по умолчанию флаг выключен и команда/кнопки отсутствуют.
 Capture, ingestion runner, retrieval, embeddings, OCR, Knowledge media, Council,

@@ -1,3 +1,4 @@
+import unicodedata
 from datetime import date, datetime, time
 from typing import Annotated, Literal, Self
 
@@ -10,6 +11,10 @@ GuestAction = Annotated[
 
 NOVA_HELP_MAX_PAYLOAD_BYTES = 4 * 1024
 NovaHelpStep = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+]
+WeeklyReviewSmallStep = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
 ]
@@ -49,6 +54,52 @@ class ReminderTimezoneResolution(BaseModel):
                 raise ValueError("ambiguous reminder timezone requires matched_text only")
         elif self.timezone is not None or self.matched_text is not None:
             raise ValueError("unresolved reminder timezone must not include resolution fields")
+        return self
+
+
+class WeeklyReviewReminderCandidate(BaseModel):
+    """Untrusted provider output retained only until evidence verification."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    title: str = Field(min_length=1, max_length=200)
+    schedule_wording: str = Field(min_length=1, max_length=200)
+    evidence: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def fields_are_grounded_in_evidence(self) -> Self:
+        if self.schedule_wording not in self.evidence:
+            raise ValueError("weekly reminder schedule must be copied from its evidence")
+        title = unicodedata.normalize("NFKC", self.title).casefold()
+        evidence = unicodedata.normalize("NFKC", self.evidence).casefold()
+        if title not in evidence:
+            raise ValueError("weekly reminder title must be copied from its evidence")
+        return self
+
+
+class WeeklyReviewExtraction(BaseModel):
+    """Strict, transient result of weekly-review input extraction."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    focus: str = Field(min_length=1, max_length=300)
+    approach: str | None = Field(default=None, min_length=1, max_length=500)
+    small_steps: list[WeeklyReviewSmallStep] = Field(
+        default_factory=list,
+        min_length=0,
+        max_length=3,
+    )
+    reminder_candidates: list[WeeklyReviewReminderCandidate] = Field(
+        default_factory=list,
+        min_length=0,
+        max_length=5,
+    )
+
+    @model_validator(mode="after")
+    def candidate_evidence_is_not_reused(self) -> Self:
+        evidence = [candidate.evidence for candidate in self.reminder_candidates]
+        if len(evidence) != len(set(evidence)):
+            raise ValueError("weekly reminder evidence must not be reused")
         return self
 
 

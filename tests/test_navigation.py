@@ -10,7 +10,7 @@ from autotester.fakes import (
     FakeVoice,
     ScriptedTranscription,
 )
-from telegram import BotCommandScopeAllPrivateChats
+from telegram import BotCommandScopeAllPrivateChats, ReplyKeyboardRemove
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     ApplicationHandlerStop,
@@ -19,7 +19,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-from future_self.access import AccessService
+from future_self.access import ADMIN, AccessService
 from future_self.bot import EVENING_WORKED, FutureSelfBot
 from future_self.callback_ui import edit_callback_screen
 from future_self.config import Settings
@@ -41,6 +41,8 @@ from future_self.navigation import (
     validate_catalog,
 )
 from future_self.nova_memory_flow import NovaMemoryFlowPhase
+from future_self.reminder_flow import ReminderFlowPhase
+from future_self.reminder_intent import ReminderScheduleKind, ReminderTimezoneSource
 from future_self.schemas import ParsedThought
 
 
@@ -88,7 +90,9 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
     message = FakeMessage("/menu")
     await bot.menu_command(update_for(message), context())
     assert message.replies[-1]["text"] == "Главное меню\n\nЧто хочешь сделать?"
-    markup = message.replies[-1]["reply_markup"]
+    assert isinstance(message.replies[-1]["reply_markup"], ReplyKeyboardRemove)
+    assert message.edits[-1] == "Главное меню\n\nЧто хочешь сделать?"
+    markup = message.edit_kwargs[-1]["reply_markup"]
     assert [
         [(button.text, button.callback_data) for button in row] for row in markup.inline_keyboard
     ] == [
@@ -103,7 +107,12 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
     ]
 
     expected_section_labels = {
-        "today": ["Фокус на сегодня", "Задачи на сегодня", "Вечерний итог"],
+        "today": [
+            "Фокус на сегодня",
+            "🧭 Обзор недели",
+            "Задачи на сегодня",
+            "Вечерний итог",
+        ],
         "tasks": [
             "Создать задачу",
             "Сегодня",
@@ -132,7 +141,7 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
 
     for section_key, section in SECTIONS.items():
         section_message = FakeMessage()
-        await bot._send_navigation_section(section_message, section_key)
+        await bot._send_navigation_section(section_message, section_key, tier=ADMIN)
         section_markup = section_message.replies[-1]["reply_markup"]
         section_callbacks = [
             button.callback_data for row in section_markup.inline_keyboard for button in row
@@ -382,6 +391,7 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
     assert len(ACTIONS) == len(set(ACTIONS))
     assert "mynova" in ADVANCED_COMMANDS
     assert "mynova" not in names
+    assert "week" in ADVANCED_COMMANDS
     used_actions = {action for section in SECTIONS.values() for action in section.actions}
     assert used_actions | LEGACY_ACTIONS == set(ACTIONS)
 
@@ -422,7 +432,7 @@ async def test_nova_memory_root_entry_is_full_width_and_tier_feature_gated(db, f
         update_for(subscriber_message, user_id=telegram_id, chat_id=chat_id),
         context(),
     )
-    subscriber_rows = subscriber_message.replies[-1]["reply_markup"].inline_keyboard
+    subscriber_rows = subscriber_message.edit_kwargs[-1]["reply_markup"].inline_keyboard
     assert all(
         button.callback_data != "nav:nova-memory" for row in subscriber_rows for button in row
     )
@@ -433,7 +443,7 @@ async def test_nova_memory_root_entry_is_full_width_and_tier_feature_gated(db, f
         update_for(admin_message, user_id=telegram_id, chat_id=chat_id),
         context(),
     )
-    admin_rows = admin_message.replies[-1]["reply_markup"].inline_keyboard
+    admin_rows = admin_message.edit_kwargs[-1]["reply_markup"].inline_keyboard
     assert [(button.text, button.callback_data) for button in admin_rows[3]] == [
         ("🧬 Моя Nova", "nav:nova-memory")
     ]
@@ -1170,7 +1180,9 @@ async def test_start_after_onboarding_offers_main_menu_without_llm(db, fake_ai):
     message = FakeMessage("/start")
     result = await bot.start(update_for(message, user_id=777), context())
     assert result == ConversationHandler.END
-    assert callback_from(message, "nav:root") == "nav:root"
+    assert isinstance(message.replies[-1]["reply_markup"], ReplyKeyboardRemove)
+    markup = message.edit_kwargs[-1]["reply_markup"]
+    assert markup.inline_keyboard[0][0].callback_data == "nav:root"
     assert fake_ai.route_calls == []
 
 
@@ -1200,3 +1212,70 @@ async def test_evening_reflection_starts_from_main_menu_button(db, fake_ai):
     assert blocked_context.user_data["health_checkin"] == {"energy": 4}
     assert "evening" not in blocked_context.user_data
     assert callback_from(blocked_message, "nav:flow:continue:").startswith("nav:flow:continue:")
+
+
+async def test_direct_weekly_navigation_preserves_active_reminder_canonical_and_answers_once(
+    db,
+    fake_ai,
+):
+    telegram_id = 718_001
+    chat_id = 718_101
+    bot = FutureSelfBot(
+        settings(
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )
+    await bot._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    user = await bot._user(telegram_id)
+    canonical = FakeMessage()
+    reminder = await bot.reminder_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        access_version=user.access_version,
+        title="Позвонить врачу",
+        schedule_kind=ReminderScheduleKind.ONCE,
+        local_date=None,
+        local_time=None,
+        timezone=user.timezone,
+        timezone_source=ReminderTimezoneSource.PROFILE,
+        phase=ReminderFlowPhase.WHEN,
+        canonical_message_id=canonical.message_id,
+    )
+    query = FakeCallbackQuery("nav:action:weekly_review", canonical)
+
+    await bot.navigation_action(
+        update_for(
+            canonical,
+            user_id=telegram_id,
+            chat_id=chat_id,
+            query=query,
+        ),
+        context(),
+    )
+
+    assert query.answers == [(None, False)]
+    assert query.edits == []
+    assert canonical.reply_text_calls == 0
+    assert canonical.edits == ["🔔 Когда напомнить?"]
+    assert (
+        await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        == reminder
+    )
+    assert (
+        await bot.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=chat_id,
+            expected_access_version=user.access_version,
+        )
+    ).session is None
+    assert fake_ai.weekly_review_calls == []

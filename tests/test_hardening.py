@@ -66,6 +66,8 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.enable_nova_memory_application is False
     assert configured.nova_memory_application_admin_only is True
     assert configured.nova_memory_max_items == 100
+    assert configured.enable_weekly_review is True
+    assert configured.weekly_review_admin_only is True
 
 
 def test_nova_memory_gates_are_independent_and_item_limit_is_bounded() -> None:
@@ -366,7 +368,7 @@ def test_stage_7c_memory_transparency_docs_are_explicit_and_retention_honest() -
 def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260811_0026"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260817_0027"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
     for access_model in (
         "Workspace",

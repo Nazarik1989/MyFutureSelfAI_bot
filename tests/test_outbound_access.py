@@ -2,6 +2,7 @@ import logging
 from datetime import time
 from types import SimpleNamespace
 
+import pytest
 from telegram.error import TelegramError
 
 from future_self.access import ADMIN, BLOCKED, GUEST, SUBSCRIBER, is_full_access_tier
@@ -116,6 +117,44 @@ async def test_scheduler_allows_full_tiers_and_preserves_default_allow_behavior(
     assert sent[-1] == 205
 
 
+async def test_scheduler_weekly_review_callback_reschedules_in_finally_after_failure():
+    scheduled: list[dict[str, object]] = []
+    legacy_sends: list[tuple[int, str]] = []
+    weekly_calls: list[tuple[int, str]] = []
+
+    class Queue:
+        def run_once(self, callback, **kwargs):
+            scheduled.append({"callback": callback, **kwargs})
+
+    async def send(chat_id: int, text: str) -> int:
+        legacy_sends.append((chat_id, text))
+        return 1
+
+    async def weekly_review_send(telegram_id: int, timezone: str) -> None:
+        weekly_calls.append((telegram_id, timezone))
+        raise RuntimeError("synthetic weekly delivery failure")
+
+    scheduler = JobQueueScheduler(
+        Queue(),
+        send,
+        8,
+        21,
+        6,
+        weekly_review_send=weekly_review_send,
+    )
+    context = SimpleNamespace(
+        job=SimpleNamespace(data={"telegram_id": 206, "timezone": "Europe/Moscow"})
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic weekly delivery failure"):
+        await scheduler._weekly(context)
+
+    assert weekly_calls == [(206, "Europe/Moscow")]
+    assert legacy_sends == []
+    assert len(scheduled) == 1
+    assert scheduled[0]["name"] == "user:206:weekly"
+
+
 async def test_post_init_isolates_global_telegram_errors_and_initializes_scheduler(
     db, fake_ai, monkeypatch, caplog
 ):
@@ -179,7 +218,9 @@ async def test_post_init_isolates_global_telegram_errors_and_initializes_schedul
         )
     assert sends == []
     assert one_off == ["user:999:morning"]
-    assert "error_type=RuntimeError user_id=999" in caplog.text
+    assert "Background access check failed error_type=RuntimeError" in caplog.text
+    assert "user_id=" not in caplog.text
+    assert "999" not in caplog.text
     assert "database provider detail" not in caplog.text
 
 

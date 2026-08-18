@@ -1,9 +1,12 @@
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
+from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, select, update
 
 from .ai import AIService
 from .db import Database
@@ -12,11 +15,15 @@ from .models import (
     DailyCheckIn,
     Goal,
     InboxItem,
+    RecurringTaskReminderSchedule,
     Routine,
+    TaskReminder,
+    TaskState,
     User,
     VisionCompanionPreference,
     VisionItem,
     VisionProfile,
+    WeeklyFocus,
 )
 from .nova_memory_application import NovaMemoryProjection
 from .repositories import ProfileRepository
@@ -47,6 +54,96 @@ ONBOARDING_QUESTIONS: tuple[tuple[str, str, bool], ...] = (
 DISPLAY_NAME_MAX_CHARS = 120
 ONBOARDING_ANSWER_MAX_CHARS = 8_000
 ONBOARDING_TOTAL_MAX_CHARS = 30_000
+TODAY_URGENT_TASK_LIMIT = 3
+TODAY_REMINDER_LIMIT = 5
+
+
+class TodayApplicationStatus(StrEnum):
+    CURRENT = "current"
+    ACTOR_CHANGED = "actor_changed"
+    ACCESS_CHANGED = "access_changed"
+    TIMEZONE_CHANGED = "timezone_changed"
+    WEEK_CHANGED = "week_changed"
+    FOCUS_CHANGED = "focus_changed"
+
+
+@dataclass(frozen=True, slots=True)
+class TodayApplicationCheck:
+    status: TodayApplicationStatus
+
+    @property
+    def is_current(self) -> bool:
+        return self.status is TodayApplicationStatus.CURRENT
+
+
+@dataclass(frozen=True, slots=True)
+class TodayApplicationSnapshot:
+    actor_id: int
+    telegram_id: int
+    access_tier: str
+    access_version: int
+    timezone: str
+    local_week_start: date
+    includes_weekly_focus: bool
+    weekly_focus_public_id: str | None
+    weekly_focus_version: int | None
+    weekly_focus: str | None = field(repr=False)
+    _provider_context: Mapping[str, object] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.includes_weekly_focus:
+            has_identity = (
+                self.weekly_focus_public_id is not None
+                and self.weekly_focus_version is not None
+                and self.weekly_focus is not None
+            )
+            is_confirmed_absence = (
+                self.weekly_focus_public_id is None
+                and self.weekly_focus_version is None
+                and self.weekly_focus is None
+            )
+            if not (has_identity or is_confirmed_absence):
+                raise ValueError(
+                    "weekly focus snapshot must contain an exact generation or absence"
+                )
+        elif any(
+            value is not None
+            for value in (
+                self.weekly_focus_public_id,
+                self.weekly_focus_version,
+                self.weekly_focus,
+            )
+        ):
+            raise ValueError("excluded weekly focus snapshot cannot contain weekly data")
+        object.__setattr__(
+            self,
+            "_provider_context",
+            _freeze_today_context(self._provider_context),
+        )
+
+    def provider_context(self) -> dict[str, object]:
+        context = _thaw_today_context(self._provider_context)
+        if not isinstance(context, dict):  # pragma: no cover - constructor invariant
+            raise RuntimeError("today provider context is not a mapping")
+        return context
+
+
+def _freeze_today_context(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_today_context(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_today_context(item) for item in value)
+    return value
+
+
+def _thaw_today_context(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_today_context(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_today_context(item) for item in value]
+    return value
 
 
 def normalize_display_name(value: str, *, clip_legacy: bool = False) -> str:
@@ -261,8 +358,64 @@ class FocusService:
     def __init__(self, db: Database, ai: AIService):
         self.db, self.ai = db, ai
 
-    async def generate(self, user_id: int) -> TodayPlan:
+    async def generate(self, user_id: int, *, now: datetime | None = None) -> TodayPlan:
+        plan, _weekly_focus = await self.generate_with_weekly_focus(user_id, now=now)
+        return plan
+
+    async def generate_with_weekly_focus(
+        self,
+        user_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[TodayPlan, str | None]:
+        snapshot = await self.materialize_today_application(
+            user_id,
+            include_weekly_focus=True,
+            now=now,
+        )
+        plan = await self.generate_today_plan(snapshot)
+        return plan, snapshot.weekly_focus
+
+    async def materialize_today_application(
+        self,
+        user_id: int,
+        *,
+        include_weekly_focus: bool,
+        now: datetime | None = None,
+    ) -> TodayApplicationSnapshot:
+        current = self._utc_now(now)
         async with self.db.sessions() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                raise ValueError("User not found")
+            zone = ZoneInfo(user.timezone)
+            local_today = current.astimezone(zone).date()
+            local_week_start = local_today - timedelta(days=local_today.weekday())
+            local_tomorrow = datetime.combine(
+                local_today + timedelta(days=1),
+                time.min,
+                tzinfo=zone,
+            ).astimezone(UTC)
+            weekly_focus_public_id: str | None = None
+            weekly_focus_version: int | None = None
+            weekly_focus: str | None = None
+            if include_weekly_focus:
+                weekly_focus_row = (
+                    await session.execute(
+                        select(
+                            WeeklyFocus.public_id,
+                            WeeklyFocus.version,
+                            WeeklyFocus.focus,
+                        ).where(
+                            WeeklyFocus.owner_id == user_id,
+                            WeeklyFocus.week_start == local_week_start,
+                        )
+                    )
+                ).one_or_none()
+                if weekly_focus_row is not None:
+                    weekly_focus_public_id = weekly_focus_row.public_id
+                    weekly_focus_version = weekly_focus_row.version
+                    weekly_focus = weekly_focus_row.focus
             profile = await session.scalar(
                 select(VisionProfile).where(VisionProfile.user_id == user_id)
             )
@@ -291,6 +444,89 @@ class FocusService:
                     )
                     .order_by(InboxItem.id.desc())
                     .limit(3)
+                )
+            ).all()
+            urgent_task_rows = (
+                await session.execute(
+                    select(InboxItem.title, TaskState.event_at)
+                    .join(
+                        TaskState,
+                        and_(
+                            TaskState.inbox_item_id == InboxItem.id,
+                            TaskState.owner_id == InboxItem.user_id,
+                        ),
+                    )
+                    .where(
+                        InboxItem.user_id == user_id,
+                        InboxItem.status == "confirmed",
+                        InboxItem.kind == "task",
+                        TaskState.status == "active",
+                        TaskState.event_at.is_not(None),
+                        TaskState.event_at < local_tomorrow,
+                    )
+                    .order_by(TaskState.event_at, InboxItem.id)
+                    .limit(TODAY_URGENT_TASK_LIMIT)
+                )
+            ).all()
+            one_shot_rows = (
+                await session.execute(
+                    select(InboxItem.title, TaskReminder.remind_at)
+                    .join(
+                        TaskState,
+                        and_(
+                            TaskState.inbox_item_id == InboxItem.id,
+                            TaskState.owner_id == InboxItem.user_id,
+                        ),
+                    )
+                    .join(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                    .where(
+                        InboxItem.user_id == user_id,
+                        InboxItem.status == "confirmed",
+                        InboxItem.kind == "task",
+                        TaskState.status == "active",
+                        TaskReminder.status.in_({"pending", "processing"}),
+                        TaskReminder.remind_at >= current,
+                    )
+                    .order_by(TaskReminder.remind_at, TaskReminder.id)
+                    .limit(TODAY_REMINDER_LIMIT)
+                )
+            ).all()
+            daily_rows = (
+                await session.execute(
+                    select(
+                        InboxItem.title,
+                        RecurringTaskReminderSchedule.next_occurrence_at,
+                        RecurringTaskReminderSchedule.local_time,
+                        RecurringTaskReminderSchedule.timezone,
+                    )
+                    .join(
+                        TaskState,
+                        and_(
+                            TaskState.inbox_item_id == InboxItem.id,
+                            TaskState.owner_id == InboxItem.user_id,
+                        ),
+                    )
+                    .join(
+                        RecurringTaskReminderSchedule,
+                        and_(
+                            RecurringTaskReminderSchedule.inbox_item_id == InboxItem.id,
+                            RecurringTaskReminderSchedule.owner_id == InboxItem.user_id,
+                        ),
+                    )
+                    .where(
+                        InboxItem.user_id == user_id,
+                        InboxItem.status == "confirmed",
+                        InboxItem.kind == "task",
+                        TaskState.status == "active",
+                        RecurringTaskReminderSchedule.status == "active",
+                        RecurringTaskReminderSchedule.recurrence_kind == "daily",
+                        RecurringTaskReminderSchedule.next_occurrence_at >= current,
+                    )
+                    .order_by(
+                        RecurringTaskReminderSchedule.next_occurrence_at,
+                        RecurringTaskReminderSchedule.id,
+                    )
+                    .limit(TODAY_REMINDER_LIMIT)
                 )
             ).all()
             history = (
@@ -322,16 +558,131 @@ class FocusService:
                         "why": item.why_text,
                         "first_step": item.first_step,
                     }
+            reminders = [
+                {
+                    "kind": "one_shot",
+                    "title": row.title,
+                    "next_at": self._utc_isoformat(row.remind_at),
+                }
+                for row in one_shot_rows
+            ]
+            reminders.extend(
+                {
+                    "kind": "daily",
+                    "title": row.title,
+                    "next_at": self._utc_isoformat(row.next_occurrence_at),
+                    "local_time": row.local_time.isoformat(timespec="minutes"),
+                    "timezone": row.timezone,
+                }
+                for row in daily_rows
+            )
+            reminders.sort(key=lambda reminder: str(reminder["next_at"]))
             context = {
                 "profile": profile.summary if profile else None,
                 "goals": [goal.title for goal in goals],
                 "routines": [routine.normal_version for routine in routines],
                 "confirmed_tasks": [task.title for task in tasks],
+                "urgent_confirmed_tasks": [
+                    {
+                        "title": row.title,
+                        "event_at": self._utc_isoformat(row.event_at),
+                    }
+                    for row in urgent_task_rows
+                ],
+                "upcoming_reminders": reminders[:TODAY_REMINDER_LIMIT],
                 "recent_completed": [x for row in history for x in row.completed_actions],
                 "recent_skipped": [x for row in history for x in row.skipped_actions],
                 "vision_focus": vision_focus,
             }
-        return await self.ai.make_today_plan(context)
+            if include_weekly_focus:
+                context["weekly_focus"] = weekly_focus
+            return TodayApplicationSnapshot(
+                actor_id=user.id,
+                telegram_id=user.telegram_id,
+                access_tier=user.access_tier,
+                access_version=user.access_version,
+                timezone=user.timezone,
+                local_week_start=local_week_start,
+                includes_weekly_focus=include_weekly_focus,
+                weekly_focus_public_id=weekly_focus_public_id,
+                weekly_focus_version=weekly_focus_version,
+                weekly_focus=weekly_focus,
+                _provider_context=context,
+            )
+
+    async def check_today_application(
+        self,
+        snapshot: TodayApplicationSnapshot,
+        *,
+        now: datetime | None = None,
+    ) -> TodayApplicationCheck:
+        current = self._utc_now(now)
+        async with self.db.sessions() as session:
+            actor = (
+                await session.execute(
+                    select(
+                        User.id,
+                        User.access_tier,
+                        User.access_version,
+                        User.timezone,
+                    ).where(User.telegram_id == snapshot.telegram_id)
+                )
+            ).one_or_none()
+            if actor is None or actor.id != snapshot.actor_id:
+                return TodayApplicationCheck(TodayApplicationStatus.ACTOR_CHANGED)
+            if (
+                actor.access_tier != snapshot.access_tier
+                or actor.access_version != snapshot.access_version
+            ):
+                return TodayApplicationCheck(TodayApplicationStatus.ACCESS_CHANGED)
+            if actor.timezone != snapshot.timezone:
+                return TodayApplicationCheck(TodayApplicationStatus.TIMEZONE_CHANGED)
+            try:
+                zone = ZoneInfo(actor.timezone)
+            except ZoneInfoNotFoundError:
+                return TodayApplicationCheck(TodayApplicationStatus.TIMEZONE_CHANGED)
+            local_today = current.astimezone(zone).date()
+            local_week_start = local_today - timedelta(days=local_today.weekday())
+            if local_week_start != snapshot.local_week_start:
+                return TodayApplicationCheck(TodayApplicationStatus.WEEK_CHANGED)
+            if not snapshot.includes_weekly_focus:
+                return TodayApplicationCheck(TodayApplicationStatus.CURRENT)
+            weekly_focus_row = (
+                await session.execute(
+                    select(WeeklyFocus.public_id, WeeklyFocus.version).where(
+                        WeeklyFocus.owner_id == actor.id,
+                        WeeklyFocus.week_start == local_week_start,
+                    )
+                )
+            ).one_or_none()
+            if weekly_focus_row is None:
+                focus_matches = (
+                    snapshot.weekly_focus_public_id is None
+                    and snapshot.weekly_focus_version is None
+                )
+            else:
+                focus_matches = (
+                    weekly_focus_row.public_id == snapshot.weekly_focus_public_id
+                    and weekly_focus_row.version == snapshot.weekly_focus_version
+                )
+            return TodayApplicationCheck(
+                TodayApplicationStatus.CURRENT
+                if focus_matches
+                else TodayApplicationStatus.FOCUS_CHANGED
+            )
+
+    async def generate_today_plan(self, snapshot: TodayApplicationSnapshot) -> TodayPlan:
+        return await self.ai.make_today_plan(snapshot.provider_context())
+
+    @staticmethod
+    def _utc_isoformat(value: datetime) -> str:
+        aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return aware.isoformat(timespec="seconds")
+
+    @staticmethod
+    def _utc_now(value: datetime | None) -> datetime:
+        current = value or datetime.now(UTC)
+        return current.replace(tzinfo=UTC) if current.tzinfo is None else current.astimezone(UTC)
 
 
 _TIMEZONE_ALIASES = {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -15,7 +16,13 @@ from telegram.ext import ContextTypes
 
 from .access import FULL_ACCESS_TIERS, is_full_access_tier
 from .drafts import DraftInboxService, DraftResult, log_transition
-from .models import User
+from .models import (
+    InboxItem,
+    RecurringTaskReminderSchedule,
+    TaskReminder,
+    TaskState,
+    User,
+)
 from .recurring_reminders import RecurringScheduleMutation
 from .reminder_flow import (
     ReminderFlowAction,
@@ -93,6 +100,79 @@ class ReminderHandlers:
     recurring_reminder_service: Any
     draft_service: DraftInboxService
 
+    async def reminder_from_weekly_candidate(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        title: str,
+        schedule_wording: str,
+        canonical_message: Any,
+        expected_access_version: int,
+    ) -> bool:
+        """Hand one verified weekly candidate to the existing reminder flow.
+
+        This adapter intentionally owns no parser, persistence or scheduler.  It
+        accepts one normalized candidate, binds the existing flow to the weekly
+        canonical message and leaves creation behind the regular reminder
+        confirmation.
+        """
+
+        clean_title = " ".join(str(title).split()).strip()
+        clean_schedule = " ".join(str(schedule_wording).split()).strip()
+        if not clean_title or len(clean_title) > 200 or not clean_schedule:
+            return False
+        binding = await self._reminder_access(update)
+        if (
+            binding is None
+            or binding.access_version != expected_access_version
+            or update.effective_user is None
+            or update.effective_chat is None
+        ):
+            return False
+        current = await self.reminder_sessions.current(
+            owner_id=binding.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+        )
+        if current is not None:
+            return False
+        return await self._reminder_question_gate(
+            update,
+            context,
+            f"Напомни {clean_schedule} {clean_title}",
+            candidate_message=canonical_message,
+            expected_access_version=expected_access_version,
+            expected_session=None,
+            voice_fenced=False,
+            voice_state=None,
+            weekly_candidate_handoff=True,
+        )
+
+    async def _reminder_weekly_return_markup(
+        self,
+        session: ReminderFlowSession,
+    ) -> InlineKeyboardMarkup | None:
+        hook = getattr(self, "weekly_review_reminder_return_markup", None)
+        if not callable(hook):
+            return None
+        try:
+            return await hook(
+                owner_id=session.owner_id,
+                telegram_user_id=session.telegram_user_id,
+                chat_id=session.chat_id,
+                canonical_message_id=session.canonical_message_id,
+                access_version=session.access_version,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Reminder weekly return lookup failed error_type=%s",
+                type(exc).__name__,
+            )
+            return None
+
     async def reminder_text_gate(
         self,
         update: Update,
@@ -110,6 +190,7 @@ class ReminderHandlers:
             expected_session=None,
             voice_fenced=False,
             voice_state=None,
+            weekly_candidate_handoff=False,
         )
 
     async def reminder_voice_gate(
@@ -132,6 +213,7 @@ class ReminderHandlers:
             expected_session=expected_session,
             voice_fenced=True,
             voice_state=voice_state,
+            weekly_candidate_handoff=False,
         )
 
     async def _reminder_question_gate(
@@ -145,6 +227,7 @@ class ReminderHandlers:
         expected_session: ReminderFlowSession | None,
         voice_fenced: bool,
         voice_state: ReminderVoiceGateState | None,
+        weekly_candidate_handoff: bool,
     ) -> bool:
         binding = await self._reminder_access(update)
         if binding is None:
@@ -187,6 +270,7 @@ class ReminderHandlers:
             expected_access_version=expected_access_version,
             expected_session=expected_session,
             voice_fenced=voice_fenced,
+            weekly_candidate_handoff=weekly_candidate_handoff,
         ):
             return True
 
@@ -314,6 +398,12 @@ class ReminderHandlers:
                 phase=phase,
                 canonical_message_id=canonical_message_id,
                 profile_timezone=user.timezone,
+                weekly_candidate_handoff=(
+                    weekly_candidate_handoff
+                    or bool(
+                        current is not None and not replacement and current.weekly_candidate_handoff
+                    )
+                ),
             )
             # Retire memory only while this exact reminder generation remains
             # current. If a concurrent memory launch already retired it, its
@@ -402,6 +492,7 @@ class ReminderHandlers:
         expected_access_version: int | None,
         expected_session: ReminderFlowSession | None,
         voice_fenced: bool,
+        weekly_candidate_handoff: bool,
     ) -> bool:
         pending: _PendingReminderTimezone | None = None
         async with self._reminder_launch_lock:
@@ -579,6 +670,14 @@ class ReminderHandlers:
                         if current is not None and not replace_invalid
                         else self._reminder_now()
                     ),
+                    weekly_candidate_handoff=(
+                        weekly_candidate_handoff
+                        or bool(
+                            current is not None
+                            and not replace_invalid
+                            and current.weekly_candidate_handoff
+                        )
+                    ),
                 )
                 return True
 
@@ -653,6 +752,14 @@ class ReminderHandlers:
                         if clarification and current is not None
                         else self._reminder_now()
                     ),
+                    weekly_candidate_handoff=(
+                        weekly_candidate_handoff
+                        or bool(
+                            current is not None
+                            and not replacement
+                            and current.weekly_candidate_handoff
+                        )
+                    ),
                 )
                 return True
 
@@ -678,6 +785,12 @@ class ReminderHandlers:
                 timezone_fragment_fingerprint=fingerprint,
                 relative_day_offset=relative_offset,
                 calendar_anchor_utc=anchor,
+                weekly_candidate_handoff=(
+                    weekly_candidate_handoff
+                    or bool(
+                        current is not None and not replacement and current.weekly_candidate_handoff
+                    )
+                ),
             )
             if stored is None:
                 return True
@@ -849,6 +962,7 @@ class ReminderHandlers:
         timezone_fragment_fingerprint: str | None,
         relative_day_offset: int | None,
         calendar_anchor_utc: datetime | None,
+        weekly_candidate_handoff: bool,
     ) -> tuple[ReminderFlowSession, Any | None] | None:
         await self.nova_memory_clear_current(update)
         await self.nova_clear_bound(user.id, update.effective_chat.id)
@@ -892,6 +1006,7 @@ class ReminderHandlers:
                 timezone_fragment_fingerprint=timezone_fragment_fingerprint,
                 relative_day_offset=relative_day_offset,
                 calendar_anchor_utc=calendar_anchor_utc,
+                weekly_candidate_handoff=weekly_candidate_handoff,
             )
         if session is None:
             return None
@@ -1269,7 +1384,7 @@ class ReminderHandlers:
                     context,
                     session,
                     "🔔 Напоминание отменено. Ничего не сохранено.",
-                    None,
+                    await self._reminder_weekly_return_markup(session),
                     query=query,
                 )
                 return
@@ -1464,7 +1579,9 @@ class ReminderHandlers:
             chat_id=session.chat_id,
             session_id=session.id,
         )
-        if recurring is not None and recurring.schedule is not None:
+        if result.duplicate:
+            success = f"✓ Уже настроено\n\n{result.inbox_item.title}"
+        elif recurring is not None and recurring.schedule is not None:
             success = (
                 "✅ Ежедневное напоминание включено\n\n"
                 f"Что: {result.inbox_item.title}\n"
@@ -1481,7 +1598,7 @@ class ReminderHandlers:
                 context,
                 session,
                 success,
-                None,
+                await self._reminder_weekly_return_markup(session),
                 query=query,
             )
 
@@ -1554,6 +1671,23 @@ class ReminderHandlers:
                 and scheduled_for <= self._reminder_now()
             ):
                 raise _ReminderPastAtSave
+            if session.weekly_candidate_handoff:
+                duplicate = await self._weekly_reminder_duplicate_in_session(
+                    db_session,
+                    session,
+                    scheduled_for,
+                )
+                if duplicate is not None:
+                    inbox_item, reminder = duplicate
+                    return (
+                        DraftResult(
+                            True,
+                            inbox_item=inbox_item,
+                            reminder=reminder,
+                            duplicate=True,
+                        ),
+                        None,
+                    )
             draft = await self.draft_service.create_in_session(
                 db_session,
                 user_id=session.owner_id,
@@ -1570,7 +1704,10 @@ class ReminderHandlers:
                 session.telegram_user_id,
                 session.chat_id,
                 owner_locked=True,
-                allow_saved_dedup=session.schedule_kind is ReminderScheduleKind.ONCE,
+                allow_saved_dedup=(
+                    session.schedule_kind is ReminderScheduleKind.ONCE
+                    and not session.weekly_candidate_handoff
+                ),
                 return_existing=True,
                 expected_access_version=session.access_version,
             )
@@ -1595,6 +1732,142 @@ class ReminderHandlers:
             inbox_created=not result.duplicate,
         )
         return result, recurring
+
+    async def _weekly_reminder_duplicate_in_session(
+        self,
+        db_session: Any,
+        reminder: ReminderFlowSession,
+        scheduled_for: datetime,
+    ) -> tuple[InboxItem, TaskReminder | None] | None:
+        """Find an exact/near owner reminder at the same schedule.
+
+        This is deliberately part of the existing confirmation transaction:
+        the weekly adapter still creates no separate reminder domain path, and
+        a duplicate never creates a second Inbox/reminder row.
+        """
+
+        if (
+            not reminder.weekly_candidate_handoff
+            or reminder.title is None
+            or reminder.schedule_kind is None
+        ):
+            return None
+        if reminder.schedule_kind is ReminderScheduleKind.ONCE:
+            rows = (
+                await db_session.execute(
+                    select(InboxItem, TaskReminder)
+                    .join(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                    .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
+                    .where(
+                        InboxItem.user_id == reminder.owner_id,
+                        InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
+                        TaskState.owner_id == reminder.owner_id,
+                        TaskState.status == "active",
+                        TaskReminder.status.in_(("pending", "processing")),
+                        TaskReminder.event_at == scheduled_for,
+                        TaskReminder.timezone == reminder.timezone,
+                    )
+                    .order_by(InboxItem.id.desc())
+                )
+            ).all()
+            for item, existing in rows:
+                if self._weekly_reminder_titles_near(item.title, reminder.title):
+                    return item, existing
+            return None
+        if reminder.schedule_kind is not ReminderScheduleKind.DAILY:
+            return None
+        rows = (
+            await db_session.execute(
+                select(InboxItem, RecurringTaskReminderSchedule)
+                .join(
+                    RecurringTaskReminderSchedule,
+                    RecurringTaskReminderSchedule.inbox_item_id == InboxItem.id,
+                )
+                .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
+                .where(
+                    InboxItem.user_id == reminder.owner_id,
+                    InboxItem.kind == "task",
+                    InboxItem.status == "confirmed",
+                    TaskState.owner_id == reminder.owner_id,
+                    TaskState.status == "active",
+                    RecurringTaskReminderSchedule.owner_id == reminder.owner_id,
+                    RecurringTaskReminderSchedule.status == "active",
+                    RecurringTaskReminderSchedule.recurrence_kind == "daily",
+                    RecurringTaskReminderSchedule.local_time == reminder.local_time,
+                    RecurringTaskReminderSchedule.timezone == reminder.timezone,
+                )
+                .order_by(InboxItem.id.desc())
+            )
+        ).all()
+        for item, _schedule in rows:
+            if self._weekly_reminder_titles_near(item.title, reminder.title):
+                return item, None
+        return None
+
+    @staticmethod
+    def _weekly_reminder_titles_near(left: str, right: str) -> bool:
+        def tokens(value: str) -> tuple[tuple[str, bool], ...]:
+            normalized = unicodedata.normalize("NFKC", value)
+            words = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+            return tuple(
+                (word.casefold(), index > 0 and word.istitle()) for index, word in enumerate(words)
+            )
+
+        left_tokens = tokens(left)
+        right_tokens = tokens(right)
+        if not left_tokens or len(left_tokens) != len(right_tokens):
+            return False
+        left_words = tuple(word for word, _proper in left_tokens)
+        right_words = tuple(word for word, _proper in right_tokens)
+        if left_words == right_words:
+            return True
+
+        differences = [
+            (left_word, right_word, left_proper or right_proper)
+            for (left_word, left_proper), (right_word, right_proper) in zip(
+                left_tokens, right_tokens, strict=True
+            )
+            if left_word != right_word
+        ]
+        if len(differences) != 1:
+            return False
+        left_word, right_word, proper_name = differences[0]
+        negations = {"без", "не", "нет", "ни", "no", "not", "never", "without"}
+        if (
+            proper_name
+            or any(character.isdigit() for character in left_word + right_word)
+            or left_word in negations
+            or right_word in negations
+            or min(len(left_word), len(right_word)) < 5
+            or left_word[0] != right_word[0]
+        ):
+            return False
+        return ReminderHandlers._weekly_reminder_single_edit(left_word, right_word)
+
+    @staticmethod
+    def _weekly_reminder_single_edit(left: str, right: str) -> bool:
+        if left == right or abs(len(left) - len(right)) > 1:
+            return False
+        if len(left) == len(right):
+            mismatches = [
+                index
+                for index, pair in enumerate(zip(left, right, strict=True))
+                if pair[0] != pair[1]
+            ]
+            if len(mismatches) == 1:
+                return True
+            return bool(
+                len(mismatches) == 2
+                and mismatches[1] == mismatches[0] + 1
+                and left[mismatches[0]] == right[mismatches[1]]
+                and left[mismatches[1]] == right[mismatches[0]]
+            )
+        shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+        index = 0
+        while index < len(shorter) and shorter[index] == longer[index]:
+            index += 1
+        return shorter[index:] == longer[index + 1 :]
 
     async def reminder_cancel_gate(
         self,
@@ -1678,6 +1951,58 @@ class ReminderHandlers:
                     telegram_user_id=update.effective_user.id,
                     chat_id=update.effective_chat.id,
                 )
+
+    async def reminder_blocks_navigation(self, update: Update) -> bool:
+        """Return whether an exact active reminder flow owns this chat update."""
+
+        user = await self._reminder_access(update)
+        if user is None or update.effective_user is None or update.effective_chat is None:
+            return False
+        current = await self.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+        )
+        return current is not None
+
+    async def reminder_public_command_gate(self, update: Update, context: Any) -> bool:
+        """Keep an active reminder flow ahead of a competing public command."""
+
+        user = await self._reminder_access(update)
+        if user is None or update.effective_user is None or update.effective_chat is None:
+            return False
+        async with self._reminder_launch_lock:
+            current = await self.reminder_sessions.current(
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+            )
+            if current is None:
+                return False
+            fresh = await self._reminder_access(update)
+            live = await self.reminder_sessions.get_exact(current)
+            if (
+                fresh is None
+                or fresh.id != user.id
+                or fresh.access_version != user.access_version
+                or live is None
+            ):
+                if fresh is None or fresh.access_version != current.access_version:
+                    await self._reminder_access_changed(
+                        context,
+                        current,
+                        source_message=update.effective_message,
+                    )
+                return True
+            async with self._reminder_ui_lock:
+                live = await self.reminder_sessions.get_exact(current)
+                if live is not None:
+                    await self._reminder_edit_canonical(
+                        context,
+                        live,
+                        source_message=update.effective_message,
+                    )
+            return True
 
     async def _reminder_access(self, update: Update) -> User | None:
         telegram_user = update.effective_user

@@ -2,13 +2,13 @@ import asyncio
 import gc
 import logging
 import warnings
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select, text
-from telegram import CallbackQuery, Chat, Message, Update
+from sqlalchemy import event, func, select, text
+from telegram import CallbackQuery, Chat, Message, MessageEntity, ReplyKeyboardRemove, Update
 from telegram import User as TelegramUser
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -22,7 +22,7 @@ from telegram.ext import (
 
 import future_self.bot as bot_module
 import future_self.main as main_module
-from future_self.access import AccessService
+from future_self.access import FULL_ACCESS_TIERS, AccessService
 from future_self.bot import (
     NOVA_MEMORY_APPLICATION_CHANGED_TEXT,
     NOVA_MEMORY_APPLICATION_UNAVAILABLE_TEXT,
@@ -39,15 +39,32 @@ from future_self.models import (
     NovaMemoryChange,
     NovaMemoryItem,
     OnboardingState,
+    RecurringTaskReminderSchedule,
+    TaskReminder,
     User,
+    WeeklyFocus,
+    WeeklyFocusChange,
+    WeeklyReviewSession,
 )
 from future_self.nova_handlers import NOVA_ROOT_TEXT
 from future_self.nova_memory import NovaMemoryApplicationCurrent
 from future_self.nova_memory_flow import NovaMemoryFlowPhase
+from future_self.reminder_flow import ReminderFlowPhase
+from future_self.reminder_intent import ReminderScheduleKind, ReminderTimezoneSource
 from future_self.repositories import OnboardingRepository, UserRepository
-from future_self.schemas import IntentResult, ParsedThought, ReminderTimezoneResolution
+from future_self.schemas import (
+    IntentResult,
+    ParsedThought,
+    ReminderTimezoneResolution,
+    WeeklyReviewExtraction,
+)
 from future_self.tasks import add_task_state
 from future_self.timezones import extract_reminder_timezone_fragment
+from future_self.weekly_review import WeeklyReviewPhase
+from future_self.weekly_review_handlers import (
+    WEEKLY_REVIEW_ACCESS_CHANGED_TEXT,
+    WEEKLY_REVIEW_QUESTION,
+)
 
 
 class FakeTranscription:
@@ -108,6 +125,34 @@ async def _runtime_subscriber(
     return await core._user(telegram_id)
 
 
+async def _runtime_weekly_focus(
+    core: FutureSelfBot,
+    db,
+    owner: User,
+    focus: str,
+) -> WeeklyFocus:
+    baseline = await core.focus_service.materialize_today_application(
+        owner.id,
+        include_weekly_focus=False,
+    )
+    async with db.session() as session:
+        weekly_focus = WeeklyFocus(
+            owner_id=owner.id,
+            week_start=baseline.local_week_start,
+            focus=focus,
+            approach=None,
+            small_steps=[],
+            source="text",
+        )
+        session.add(weekly_focus)
+        await session.flush()
+        public_id = weekly_focus.public_id
+    async with db.sessions() as session:
+        stored = await session.scalar(select(WeeklyFocus).where(WeeklyFocus.public_id == public_id))
+        assert stored is not None
+        return stored
+
+
 async def _runtime_active_memory(core: FutureSelfBot, owner, telegram_id: int, chat_id: int):
     return await core.nova_memory_sessions.create(
         owner_id=owner.id,
@@ -128,8 +173,8 @@ def _runtime_voice_update(
     source_message_id: int,
     progress_message_id: int,
 ):
-    telegram_user = TelegramUser(telegram_id, False, "Тест")
-    bot_user = TelegramUser(123456, True, "Future Self")
+    telegram_user = TelegramUser(telegram_id, "Тест", False)
+    bot_user = TelegramUser(123456, "Future Self", True)
     chat = Chat(telegram_id, "private")
     source_message = Message(
         source_message_id,
@@ -458,7 +503,7 @@ async def test_doctor_default_makes_no_network_calls(db, monkeypatch):
     async with db.session() as session:
         await session.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
         await session.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES ('20260811_0026')")
+            text("INSERT INTO alembic_version (version_num) VALUES ('20260817_0027')")
         )
 
     async def forbidden_network(*args, **kwargs):
@@ -810,6 +855,7 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "last_saved",
         "cleanup_drafts",
         "today",
+        "week",
         "cancel",
         "health",
         "health_delete",
@@ -822,7 +868,13 @@ def test_key_telegram_handlers_are_registered(fake_ai):
         "doctor_find",
         "doctor_find_task",
     } <= commands
-    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 19
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 20
+    assert any(
+        isinstance(handler, CallbackQueryHandler)
+        and handler.callback.__name__ == "weekly_review_callback"
+        and getattr(handler.pattern, "pattern", None) == r"^wrev:[A-Za-z0-9_-]+$"
+        for handler in handlers
+    )
     assert any(
         isinstance(handler, CallbackQueryHandler)
         and handler.callback.__name__ == "nova_memory_callback"
@@ -5563,6 +5615,2908 @@ async def test_stage7c_shutdown_drain_waits_only_tracked_tasks_and_is_idempotent
     assert [warning for warning in caught_warnings if warning.category is RuntimeWarning] == []
 
 
+def _patch_runtime_weekly_transport(monkeypatch, application):
+    sent: list[dict[str, object]] = []
+    sent_messages: list[Message] = []
+    edits: list[dict[str, object]] = []
+    deletes: list[dict[str, object]] = []
+    answers: list[dict[str, object]] = []
+    messages: dict[tuple[int, int], Message] = {}
+    next_message_id = 81_000
+    bot_user = TelegramUser(123456, True, "Future Self")
+
+    def make_message(chat_id: int, message_id: int, text_value: str = "pending") -> Message:
+        message = Message(
+            message_id,
+            datetime.now(UTC),
+            Chat(chat_id, "private"),
+            from_user=bot_user,
+            text=text_value,
+        )
+        message.set_bot(application.bot)
+        messages[(chat_id, message_id)] = message
+        return message
+
+    async def fake_send_message(self, *args, **kwargs):
+        nonlocal next_message_id
+        del self, args
+        record = dict(kwargs)
+        sent.append(record)
+        chat_id = int(record["chat_id"])
+        message = make_message(chat_id, next_message_id, str(record.get("text", "")))
+        next_message_id += 1
+        sent_messages.append(message)
+        return message
+
+    async def fake_edit_message_text(self, *args, **kwargs):
+        del self, args
+        record = dict(kwargs)
+        edits.append(record)
+        chat_id = int(record["chat_id"])
+        message_id = int(record["message_id"])
+        return messages.get((chat_id, message_id)) or make_message(
+            chat_id,
+            message_id,
+            str(record.get("text", "")),
+        )
+
+    async def fake_delete_message(self, *args, **kwargs):
+        del self, args
+        deletes.append(dict(kwargs))
+        return True
+
+    async def fake_answer_callback_query(self, callback_query_id, *args, **kwargs):
+        del self, args
+        answers.append({"callback_query_id": callback_query_id, **kwargs})
+        return True
+
+    async def fake_set_my_commands(self, commands, **kwargs):
+        del self, commands, kwargs
+        return True
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", fake_edit_message_text)
+    monkeypatch.setattr(ExtBot, "delete_message", fake_delete_message)
+    monkeypatch.setattr(ExtBot, "answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr(ExtBot, "set_my_commands", fake_set_my_commands)
+    return SimpleNamespace(
+        sent=sent,
+        sent_messages=sent_messages,
+        edits=edits,
+        deletes=deletes,
+        answers=answers,
+        make_message=make_message,
+    )
+
+
+def _runtime_weekly_callback_update(
+    application,
+    telegram_user: TelegramUser,
+    message: Message,
+    data: str,
+    *,
+    update_id: int,
+) -> tuple[Update, CallbackQuery]:
+    query = CallbackQuery(
+        f"runtime-weekly-{update_id}",
+        telegram_user,
+        "runtime-weekly-chat",
+        message=message,
+        data=data,
+    )
+    update = Update(update_id, callback_query=query)
+    update.set_bot(application.bot)
+    query.set_bot(application.bot)
+    return update, query
+
+
+def _runtime_weekly_text_update(
+    application,
+    telegram_id: int,
+    text_value: str,
+    *,
+    update_id: int,
+    source_message_id: int,
+) -> Update:
+    telegram_user = TelegramUser(telegram_id, "Варвара", False)
+    source_message = Message(
+        source_message_id,
+        datetime.now(UTC),
+        Chat(telegram_id, "private"),
+        from_user=telegram_user,
+        text=text_value,
+    )
+    update = Update(update_id, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    return update
+
+
+def _runtime_weekly_command_update(
+    application,
+    telegram_id: int,
+    command: str,
+    *,
+    update_id: int,
+    source_message_id: int,
+) -> Update:
+    application.bot._bot_user = TelegramUser(
+        123456,
+        "Future Self",
+        True,
+        username="future_self_bot",
+    )
+    telegram_user = TelegramUser(telegram_id, "Варвара", False)
+    source_message = Message(
+        source_message_id,
+        datetime.now(UTC),
+        Chat(telegram_id, "private"),
+        from_user=telegram_user,
+        text=command,
+        entities=[MessageEntity(MessageEntity.BOT_COMMAND, 0, len(command))],
+    )
+    update = Update(update_id, message=source_message)
+    update.set_bot(application.bot)
+    source_message.set_bot(application.bot)
+    return update
+
+
+async def _runtime_weekly_today_callback_update(
+    core: FutureSelfBot,
+    application,
+    transport,
+    owner: User,
+    *,
+    canonical_message_id: int,
+    update_id: int,
+) -> tuple[Update, CallbackQuery]:
+    created = await core.weekly_review_service.create_session(
+        telegram_actor_id=owner.telegram_id,
+        chat_id=owner.telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=canonical_message_id,
+        phase=WeeklyReviewPhase.SAVED,
+    )
+    assert created.status == "created"
+    assert created.session is not None
+    canonical = transport.make_message(
+        owner.telegram_id,
+        canonical_message_id,
+        "PRIVATE_FROZEN_WEEKLY_SCREEN",
+    )
+    tokens = await core.weekly_review_capabilities.issue(
+        actions=("today",),
+        owner_id=owner.id,
+        telegram_user_id=owner.telegram_id,
+        chat_id=owner.telegram_id,
+        canonical_message_id=canonical_message_id,
+        access_version=owner.access_version,
+        week_start=created.session.week_start,
+        session_public_id=created.session.public_id,
+        session_version=created.session.version,
+    )
+    telegram_user = TelegramUser(owner.telegram_id, "Варвара", False)
+    return _runtime_weekly_callback_update(
+        application,
+        telegram_user,
+        canonical,
+        f"wrev:{tokens['today']}",
+        update_id=update_id,
+    )
+
+
+async def _runtime_apply_today_race(
+    db,
+    owner: User,
+    race: str,
+    *,
+    week_start: date,
+    advance_clock,
+) -> None:
+    if race == "downgrade":
+        await AccessService(db).set_guest(owner.telegram_id, source="today-fence-test")
+        return
+    if race == "bounce":
+        access = AccessService(db)
+        await access.set_guest(owner.telegram_id, source="today-fence-test")
+        await access.grant_subscriber(owner.telegram_id, source="today-fence-test")
+        return
+    if race == "timezone":
+        async with db.session() as session:
+            stored = await session.get(User, owner.id)
+            assert stored is not None
+            stored.timezone = "UTC" if stored.timezone != "UTC" else "Europe/Moscow"
+        return
+    if race == "week":
+        advance_clock()
+        return
+    async with db.session() as session:
+        focus = await session.scalar(
+            select(WeeklyFocus).where(
+                WeeklyFocus.owner_id == owner.id,
+                WeeklyFocus.week_start == week_start,
+            )
+        )
+        if race == "focus_edit":
+            assert focus is not None
+            focus.focus = "PRIVATE_CHANGED_WEEKLY_FOCUS"
+            focus.version += 1
+        elif race == "focus_delete":
+            assert focus is not None
+            await session.delete(focus)
+        elif race == "focus_create":
+            assert focus is None
+            session.add(
+                WeeklyFocus(
+                    owner_id=owner.id,
+                    week_start=week_start,
+                    focus="PRIVATE_CREATED_WEEKLY_FOCUS",
+                    approach=None,
+                    small_steps=[],
+                    source="text",
+                )
+            )
+        else:
+            raise AssertionError(f"unknown today race: {race}")
+
+
+async def _runtime_prepare_today_case(
+    db,
+    fake_ai,
+    monkeypatch,
+    *,
+    surface: str,
+    with_focus: bool,
+    telegram_id: int,
+):
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    if with_focus:
+        await _runtime_weekly_focus(
+            core,
+            db,
+            owner,
+            "PRIVATE_FROZEN_WEEKLY_FOCUS",
+        )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    query = None
+    if surface == "command":
+        update = _runtime_weekly_command_update(
+            application,
+            telegram_id,
+            "/today",
+            update_id=32_100,
+            source_message_id=97_100,
+        )
+    else:
+        assert surface == "callback"
+        update, query = await _runtime_weekly_today_callback_update(
+            core,
+            application,
+            transport,
+            owner,
+            canonical_message_id=97_101,
+            update_id=32_101,
+        )
+    return SimpleNamespace(
+        core=core,
+        application=application,
+        owner=owner,
+        transport=transport,
+        update=update,
+        query=query,
+    )
+
+
+async def _assert_runtime_today_callback_terminal(
+    env,
+    *,
+    edit_count: int,
+    access_changed: bool,
+) -> None:
+    assert env.query is not None
+    assert len(env.transport.edits) == edit_count
+    canonical_message_id = env.query.message.message_id
+    assert {entry["message_id"] for entry in env.transport.edits} == {canonical_message_id}
+    final = env.transport.edits[-1]
+    if access_changed:
+        assert final["text"] == WEEKLY_REVIEW_ACCESS_CHANGED_TEXT
+        assert final["reply_markup"] is None
+        return
+    markup = final["reply_markup"]
+    assert markup is not None
+    callbacks = [
+        str(button.callback_data)
+        for row in markup.inline_keyboard
+        for button in row
+        if str(button.callback_data).startswith("wrev:")
+    ]
+    assert callbacks
+    for callback in callbacks:
+        claim = await env.core.weekly_review_capabilities.peek(
+            callback.removeprefix("wrev:"),
+            telegram_user_id=env.owner.telegram_id,
+            chat_id=env.owner.telegram_id,
+            canonical_message_id=canonical_message_id,
+        )
+        assert claim is not None
+
+
+def _runtime_callback_for_fragment(markup, fragment: str, *, prefix: str) -> str:
+    matches = [
+        str(button.callback_data)
+        for row in markup.inline_keyboard
+        for button in row
+        if fragment in button.text and str(button.callback_data).startswith(prefix)
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+async def test_real_application_scheduled_weekly_capability_keeps_next_week_binding(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_001
+    frozen_sunday = datetime(2026, 8, 16, 15, 0, tzinfo=UTC)
+    next_monday = date(2026, 8, 17)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    assert (
+        core.weekly_review_service.target_week_start(
+            owner.timezone,
+            now=frozen_sunday,
+            scheduled=True,
+            review_weekday=6,
+        )
+        == next_monday
+    )
+    live_scheduled_week = core.weekly_review_service.target_week_start(
+        owner.timezone,
+        scheduled=True,
+        review_weekday=6,
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    canonical = transport.make_message(telegram_id, 91_001, "weekly scheduled nudge")
+    original_create_session = core.weekly_review_service.create_session
+    scheduled_values: list[bool] = []
+
+    async def record_scheduled_create(**kwargs):
+        scheduled_values.append(bool(kwargs.get("scheduled")))
+        return await original_create_session(**kwargs)
+
+    monkeypatch.setattr(core.weekly_review_service, "create_session", record_scheduled_create)
+    tokens = await core.weekly_review_capabilities.issue(
+        actions=("start", "focus", "reminders", "cancel"),
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+        canonical_message_id=canonical.message_id,
+        access_version=owner.access_version,
+        week_start=live_scheduled_week,
+        scheduled=True,
+    )
+    assert all(token.isascii() and len(token) <= 40 for token in tokens.values())
+    assert all("715001" not in token and "2026" not in token for token in tokens.values())
+    telegram_user = TelegramUser(telegram_id, "Варвара", False)
+    callback_update, query = _runtime_weekly_callback_update(
+        application,
+        telegram_user,
+        canonical,
+        f"wrev:{tokens['start']}",
+        update_id=31_001,
+    )
+
+    await application.process_update(callback_update)
+
+    current = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.status == "found", (
+        scheduled_values,
+        transport.answers,
+        transport.edits,
+    )
+    assert current.session is not None
+    assert current.session.week_start == live_scheduled_week
+    assert current.session.phase is WeeklyReviewPhase.AWAITING_INPUT
+    assert current.session.canonical_message_id == canonical.message_id
+    assert transport.sent == []
+    assert str(transport.edits[-1]["text"]).endswith(WEEKLY_REVIEW_QUESTION)
+    assert transport.edits[-1]["message_id"] == canonical.message_id
+    assert [entry["callback_query_id"] for entry in transport.answers] == [query.id]
+    assert scheduled_values == [True]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+async def test_real_application_varvara_weekly_review_requires_two_independent_confirms(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_002
+    launch = "Давай скорректируем систему"
+    focus_launch = "Фокус на неделю"
+    exact_focus = "спокойно закрывать подтверждённые напоминания дня."
+    reminder_evidence = "В 15:05 сказать Назару, что я люблю его…"
+    long_answer = (
+        "Хочу скорректировать.\n"
+        "Можно держать в уме образ будущего и двигаться к нему\n"
+        "через один небольшой шаг.\n"
+        f"Фокус: {exact_focus}\n"
+        f"{reminder_evidence}"
+    )
+    fake_ai.weekly_review_result = WeeklyReviewExtraction(
+        focus="provider must not replace the explicit focus",
+        approach="Держать в уме образ будущего",
+        small_steps=["Сделать один небольшой шаг"],
+        reminder_candidates=[
+            {
+                "title": "сказать Назару, что я люблю его",
+                "schedule_wording": "В 15:05",
+                "evidence": reminder_evidence,
+            }
+        ],
+    )
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    downstream: list[int] = []
+
+    async def forbidden_generic(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("weekly routing must not enter generic AI")
+
+    async def downstream_probe(update, context):
+        del context
+        downstream.append(update.update_id)
+
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_generic)
+    probe = TypeHandler(Update, downstream_probe)
+    application.add_handler(probe, group=100)
+
+    await application.process_update(
+        _runtime_weekly_text_update(
+            application,
+            telegram_id,
+            launch,
+            update_id=31_010,
+            source_message_id=92_010,
+        )
+    )
+    assert len(transport.sent) == 1
+    canonical = transport.sent_messages[0]
+    assert transport.edits[-1]["message_id"] == canonical.message_id
+    assert all(
+        str(button.callback_data).startswith("wrev:")
+        for row in transport.edits[-1]["reply_markup"].inline_keyboard
+        for button in row
+    )
+    assert fake_ai.weekly_review_calls == []
+    assert downstream == []
+
+    await application.process_update(
+        _runtime_weekly_text_update(
+            application,
+            telegram_id,
+            focus_launch,
+            update_id=31_011,
+            source_message_id=92_011,
+        )
+    )
+    assert str(transport.edits[-1]["text"]).endswith(WEEKLY_REVIEW_QUESTION)
+    assert transport.edits[-1]["message_id"] == canonical.message_id
+    assert len(transport.sent) == 1
+
+    await application.process_update(
+        _runtime_weekly_text_update(
+            application,
+            telegram_id,
+            long_answer,
+            update_id=31_012,
+            source_message_id=92_012,
+        )
+    )
+    application.remove_handler(probe, group=100)
+
+    assert downstream == []
+    assert [call[0] for call in fake_ai.weekly_review_calls] == [long_answer]
+    preview = str(transport.edits[-1]["text"])
+    assert exact_focus in preview
+    assert "Держать в уме образ будущего" in preview
+    assert "Сделать один небольшой шаг" in preview
+    assert "сказать Назару, что я люблю его" in preview
+    assert "В 15:05" in preview
+    assert "Ещё не создано" in preview
+    assert transport.edits[-1]["message_id"] == canonical.message_id
+    preview_markup = transport.edits[-1]["reply_markup"]
+    save_data = _runtime_callback_for_fragment(
+        preview_markup,
+        "Сохранить на неделю",
+        prefix="wrev:",
+    )
+    current = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.status == "found"
+    assert current.session is not None
+    assert current.session.phase is WeeklyReviewPhase.PREVIEW
+    assert current.session.focus == exact_focus
+    assert current.session.source == "text"
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+    telegram_user = TelegramUser(telegram_id, "Варвара", False)
+    callback_queries: list[CallbackQuery] = []
+
+    async def click(data: str, update_id: int) -> None:
+        callback_update, query = _runtime_weekly_callback_update(
+            application,
+            telegram_user,
+            canonical,
+            data,
+            update_id=update_id,
+        )
+        callback_queries.append(query)
+        before = len(transport.answers)
+        await application.process_update(callback_update)
+        assert len(transport.answers) == before + 1
+        assert transport.answers[-1]["callback_query_id"] == query.id
+
+    await click(save_data, 31_013)
+
+    assert str(transport.edits[-1]["text"]).endswith("✅ Фокус недели сохранён")
+    async with db.sessions() as session:
+        focus_rows = list((await session.scalars(select(WeeklyFocus))).all())
+        audit_rows = list((await session.scalars(select(WeeklyFocusChange))).all())
+        assert len(focus_rows) == 1
+        assert focus_rows[0].focus == exact_focus
+        assert focus_rows[0].source == "text"
+        assert len(audit_rows) == 1
+        assert audit_rows[0].operation == "created"
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+    configure_data = _runtime_callback_for_fragment(
+        transport.edits[-1]["reply_markup"],
+        "Настроить найденные (1)",
+        prefix="wrev:",
+    )
+    await click(configure_data, 31_014)
+    candidate_data = _runtime_callback_for_fragment(
+        transport.edits[-1]["reply_markup"],
+        "Назару",
+        prefix="wrev:",
+    )
+    assert exact_focus not in candidate_data
+    assert "Назару" not in candidate_data
+    await click(candidate_data, 31_015)
+
+    reminder_session = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert reminder_session is not None
+    assert reminder_session.canonical_message_id == canonical.message_id
+    assert str(transport.edits[-1]["text"]) == "🔔 Когда напомнить?"
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 1
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 1
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+    tomorrow_data = _runtime_callback_for_fragment(
+        transport.edits[-1]["reply_markup"],
+        "Завтра",
+        prefix="rmd:",
+    )
+    await click(tomorrow_data, 31_016)
+    assert "Проверь напоминание" in str(transport.edits[-1]["text"])
+    confirm_data = _runtime_callback_for_fragment(
+        transport.edits[-1]["reply_markup"],
+        "Создать",
+        prefix="rmd:",
+    )
+    await click(confirm_data, 31_017)
+
+    assert "Напоминание создано" in str(transport.edits[-1]["text"])
+    assert len(transport.sent) == 1
+    assert all(entry["message_id"] == canonical.message_id for entry in transport.edits)
+    assert len(transport.answers) == len(callback_queries)
+    assert fake_ai.route_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 1
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 1
+        assert await session.scalar(select(func.count(InboxItem.id))) == 1
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 1
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+async def test_real_application_active_weekly_voice_owns_reminder_like_transcript(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_003
+    transcript = (
+        "На этой неделе спокойно закрывать дела. Завтра в 15:05 сказать Назару, что я люблю его."
+    )
+    reminder_evidence = "Завтра в 15:05 сказать Назару, что я люблю его."
+    transcription = RuntimeTranscription(transcript)
+    fake_ai.weekly_review_result = WeeklyReviewExtraction(
+        focus="Спокойно закрывать дела",
+        small_steps=["Закрыть одно подтверждённое дело"],
+        reminder_candidates=[
+            {
+                "title": "сказать Назару, что я люблю его",
+                "schedule_wording": "Завтра в 15:05",
+                "evidence": reminder_evidence,
+            }
+        ],
+    )
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    created = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=91_003,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert created.session is not None
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_020,
+        source_message_id=92_020,
+        progress_message_id=93_020,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    deletes: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_delete_message(self, *args, **kwargs):
+        del self, args
+        deletes.append(dict(kwargs))
+        return True
+
+    async def forbidden_generic(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("active weekly voice must stop generic/reminder routing")
+
+    async def downstream_probe(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "delete_message", fake_delete_message)
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_generic)
+    application.add_handler(TypeHandler(Update, downstream_probe), group=100)
+
+    await application.process_update(update)
+
+    current = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.status == "found"
+    assert current.session is not None
+    assert current.session.phase is WeeklyReviewPhase.PREVIEW
+    assert current.session.source == "voice"
+    assert [call[0] for call in fake_ai.weekly_review_calls] == [transcript]
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert downstream == []
+    assert [entry["text"] for entry in sent] == ["Расшифровываю голосовую мысль…"]
+    assert edits[-1]["message_id"] == created.session.canonical_message_id
+    assert "Спокойно закрывать дела" in str(edits[-1]["text"])
+    assert [(entry["chat_id"], entry["message_id"]) for entry in deletes] == [
+        (telegram_id, progress.message_id)
+    ]
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+async def test_real_application_natural_weekly_voice_retires_progress_and_reuses_cleanup_send(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_004
+    transcript = "Давай скорректируем систему"
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    update, _unused_progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_021,
+        source_message_id=92_021,
+        progress_message_id=93_021,
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+
+    await application.process_update(update)
+    await asyncio.sleep(0)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert [entry["text"] for entry in transport.sent] == [
+        "Расшифровываю голосовую мысль…",
+        transport.edits[0]["text"],
+    ]
+    assert isinstance(transport.sent[1]["reply_markup"], ReplyKeyboardRemove)
+    progress, canonical = transport.sent_messages
+    assert [(entry["chat_id"], entry["message_id"]) for entry in transport.deletes] == [
+        (telegram_id, progress.message_id)
+    ]
+    assert len(transport.edits) == 1
+    assert transport.edits[0]["message_id"] == canonical.message_id
+    assert transport.edits[0]["reply_markup"] is not None
+    current = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.status == "found"
+    assert current.session is not None
+    assert current.session.phase is WeeklyReviewPhase.AWAITING_INPUT
+    assert current.session.canonical_message_id == canonical.message_id
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    assert core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("durable_owner", ["onboarding", "workspace"])
+async def test_real_application_durable_owner_wins_natural_weekly_voice(
+    db,
+    fake_ai,
+    monkeypatch,
+    durable_owner,
+):
+    telegram_id = 715_005 if durable_owner == "onboarding" else 715_006
+    transcript = "Давай скорректируем систему"
+    transcription = RuntimeTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+            enable_workspace_access=True,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=durable_owner != "onboarding",
+    )
+    if durable_owner == "onboarding":
+        async with db.session() as session:
+            session.add(
+                OnboardingState(
+                    user_id=owner.id,
+                    current_step=2,
+                    answers={"display_name": "Варвара"},
+                    status="in_progress",
+                )
+            )
+    else:
+        await core.workspace_service.begin_input(
+            owner.id,
+            telegram_id,
+            "invite_recipient",
+            payload={"request_id": 47},
+        )
+    update, _unused_progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_022 if durable_owner == "onboarding" else 31_023,
+        source_message_id=92_022,
+        progress_message_id=93_022,
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+
+    await application.process_update(update)
+    await asyncio.sleep(0)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert all("Обзор недели" not in str(entry.get("text", "")) for entry in transport.sent)
+    assert all("Обзор недели" not in str(entry.get("text", "")) for entry in transport.edits)
+    assert all(
+        not isinstance(entry.get("reply_markup"), ReplyKeyboardRemove) for entry in transport.sent
+    )
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    assert (
+        await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+    ).session is None
+    if durable_owner == "onboarding":
+        async with db.sessions() as session:
+            state = await session.scalar(
+                select(OnboardingState).where(OnboardingState.user_id == owner.id)
+            )
+        assert state is not None
+        assert state.status == "in_progress"
+        assert state.current_step == 3
+        assert state.answers["future_life"] == transcript
+    else:
+        pending = await core.workspace_service.pending_input(owner.id, telegram_id)
+        assert pending is not None
+        assert pending.action == "input:invite_recipient"
+        assert pending.payload == {"request_id": 47}
+    assert core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("durable_owner", ["onboarding", "workspace"])
+async def test_real_application_durable_owner_wins_explicit_weekly_text(
+    db,
+    fake_ai,
+    monkeypatch,
+    durable_owner,
+):
+    telegram_id = 715_010 if durable_owner == "onboarding" else 715_011
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+            enable_workspace_access=True,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=durable_owner != "onboarding",
+    )
+    if durable_owner == "onboarding":
+        async with db.session() as session:
+            session.add(
+                OnboardingState(
+                    user_id=owner.id,
+                    current_step=2,
+                    answers={"display_name": "Варвара"},
+                    status="in_progress",
+                )
+            )
+    else:
+        await core.workspace_service.begin_input(
+            owner.id,
+            telegram_id,
+            "create_name",
+            payload={"character": "family"},
+        )
+    created = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=91_010 + telegram_id,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert created.session is not None
+    _patch_runtime_weekly_transport(monkeypatch, application)
+
+    async def forbidden_generic(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("durable owner must stop weekly, reminder and generic routing")
+
+    monkeypatch.setattr(fake_ai, "route_message", forbidden_generic)
+    await application.process_update(
+        _runtime_weekly_text_update(
+            application,
+            telegram_id,
+            "Фокус на неделю",
+            update_id=31_030 + telegram_id,
+            source_message_id=92_030,
+        )
+    )
+
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    assert (
+        await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+    ).session is None
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    if durable_owner == "onboarding":
+        async with db.sessions() as session:
+            state = await session.scalar(
+                select(OnboardingState).where(OnboardingState.user_id == owner.id)
+            )
+        assert state is not None
+        assert state.current_step == 3
+        assert state.answers["future_life"] == "Фокус на неделю"
+    else:
+        pending = await core.workspace_service.pending_input(owner.id, telegram_id)
+        assert pending is not None
+        assert pending.action == "input:create_name"
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+@pytest.mark.parametrize("owner_kind", ["onboarding", "workspace"])
+async def test_scheduled_weekly_waits_for_real_reply_keyboard_owner_acquisition(
+    db,
+    fake_ai,
+    monkeypatch,
+    owner_kind,
+):
+    telegram_id = 715_110 if owner_kind == "onboarding" else 715_111
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+            enable_workspace_access=True,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=owner_kind != "onboarding",
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    owner_locked = asyncio.Event()
+    owner_release = asyncio.Event()
+
+    if owner_kind == "onboarding":
+        original_ask = core._ask_question
+
+        async def blocked_ask(update, step):
+            owner_locked.set()
+            await owner_release.wait()
+            await original_ask(update, step)
+
+        monkeypatch.setattr(core, "_ask_question", blocked_ask)
+        owner_task = asyncio.create_task(
+            application.process_update(
+                _runtime_weekly_command_update(
+                    application,
+                    telegram_id,
+                    "/start",
+                    update_id=31_110,
+                    source_message_id=92_110,
+                )
+            )
+        )
+    else:
+        original_begin = core.workspace_service.begin_input
+
+        async def blocked_begin(*args, **kwargs):
+            owner_locked.set()
+            await owner_release.wait()
+            return await original_begin(*args, **kwargs)
+
+        monkeypatch.setattr(core.workspace_service, "begin_input", blocked_begin)
+        owner_task = asyncio.create_task(
+            core._begin_workspace_input(
+                owner.id,
+                telegram_id,
+                "input_invite_recipient",
+                payload={"request_id": 51},
+            )
+        )
+
+    delivery = None
+    try:
+        await asyncio.wait_for(owner_locked.wait(), timeout=10)
+        delivery = asyncio.create_task(
+            core.weekly_review_scheduled_notification(
+                application.bot,
+                telegram_id,
+                owner.timezone,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not delivery.done()
+        assert all("Обзор недели" not in str(entry.get("text", "")) for entry in transport.sent)
+        owner_release.set()
+        await asyncio.wait_for(asyncio.gather(owner_task, delivery), timeout=10)
+    finally:
+        owner_release.set()
+        pending = [task for task in (owner_task, delivery) if task is not None and not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert all("Обзор недели" not in str(entry.get("text", "")) for entry in transport.sent)
+    assert all("Обзор недели" not in str(entry.get("text", "")) for entry in transport.edits)
+    assert transport.deletes == []
+    if owner_kind == "onboarding":
+        async with db.sessions() as session:
+            state = await session.scalar(
+                select(OnboardingState).where(OnboardingState.user_id == owner.id)
+            )
+        assert state is not None
+        assert state.status == "in_progress"
+    else:
+        pending_owner = await core.workspace_service.pending_input(owner.id, telegram_id)
+        assert pending_owner is not None
+        assert pending_owner.action == "input:invite_recipient"
+    assert (
+        await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+    ).session is None
+    assert core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("owner_kind", ["onboarding", "workspace"])
+async def test_scheduled_weekly_post_send_owner_mismatch_neutralizes_exact_message(
+    db,
+    fake_ai,
+    monkeypatch,
+    owner_kind,
+):
+    telegram_id = 715_112 if owner_kind == "onboarding" else 715_113
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+            enable_workspace_access=True,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=owner_kind != "onboarding",
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    plain_send = ExtBot.send_message
+    owner_published = asyncio.Event()
+
+    async def send_then_publish_owner(self, *args, **kwargs):
+        sent = await plain_send(self, *args, **kwargs)
+        if owner_kind == "onboarding":
+            async with db.session() as session:
+                session.add(
+                    OnboardingState(
+                        user_id=owner.id,
+                        current_step=0,
+                        answers={},
+                        status="in_progress",
+                    )
+                )
+        else:
+            # This direct durable write models another process, outside the
+            # process-local reply-keyboard lock, winning after Telegram accepts.
+            await core.workspace_service.begin_input(
+                owner.id,
+                telegram_id,
+                "invite_recipient",
+                payload={"request_id": 52},
+            )
+        owner_published.set()
+        return sent
+
+    monkeypatch.setattr(ExtBot, "send_message", send_then_publish_owner)
+
+    await core.weekly_review_scheduled_notification(
+        application.bot,
+        telegram_id,
+        owner.timezone,
+    )
+    await asyncio.sleep(0)
+
+    assert owner_published.is_set()
+    assert len(transport.sent) == 1
+    assert isinstance(transport.sent[0]["reply_markup"], ReplyKeyboardRemove)
+    sent = transport.sent_messages[0]
+    assert [(entry["chat_id"], entry["message_id"]) for entry in transport.deletes] == [
+        (telegram_id, sent.message_id)
+    ]
+    assert transport.edits == []
+    if owner_kind == "onboarding":
+        async with db.sessions() as session:
+            state = await session.scalar(
+                select(OnboardingState).where(OnboardingState.user_id == owner.id)
+            )
+        assert state is not None
+        assert state.status == "in_progress"
+    else:
+        pending_owner = await core.workspace_service.pending_input(owner.id, telegram_id)
+        assert pending_owner is not None
+        assert pending_owner.action == "input:invite_recipient"
+    assert (
+        await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+    ).session is None
+    assert core.weekly_review_capabilities._capabilities == {}
+    assert core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("blocking_owner", ["onboarding", "workspace", "memory", "reminder"])
+async def test_real_application_sessionless_weekly_callback_defers_without_spending_token(
+    db,
+    fake_ai,
+    monkeypatch,
+    blocking_owner,
+):
+    telegram_id = {
+        "onboarding": 715_012,
+        "workspace": 715_013,
+        "memory": 715_014,
+        "reminder": 715_015,
+    }[blocking_owner]
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+            enable_workspace_access=True,
+            enable_nova_memory=True,
+            nova_memory_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=blocking_owner != "onboarding",
+    )
+    memory_session = None
+    reminder_session = None
+    if blocking_owner == "onboarding":
+        async with db.session() as session:
+            session.add(
+                OnboardingState(
+                    user_id=owner.id,
+                    current_step=2,
+                    answers={"display_name": "Варвара"},
+                    status="in_progress",
+                )
+            )
+    elif blocking_owner == "workspace":
+        await core.workspace_service.begin_input(
+            owner.id,
+            telegram_id,
+            "create_name",
+            payload={"character": "family"},
+        )
+    elif blocking_owner == "memory":
+        memory_session = await _runtime_active_memory(core, owner, telegram_id, telegram_id)
+    else:
+        reminder_session = await core.reminder_sessions.create(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+            access_version=owner.access_version,
+            title="Позвонить врачу",
+            schedule_kind=ReminderScheduleKind.ONCE,
+            local_date=None,
+            local_time=None,
+            timezone=owner.timezone,
+            timezone_source=ReminderTimezoneSource.PROFILE,
+            phase=ReminderFlowPhase.WHEN,
+            canonical_message_id=91_015,
+        )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    canonical = transport.make_message(telegram_id, 91_012, "weekly scheduled nudge")
+    scheduled_week = core.weekly_review_service.target_week_start(
+        owner.timezone,
+        scheduled=True,
+        review_weekday=6,
+    )
+    tokens = await core.weekly_review_capabilities.issue(
+        actions=("start",),
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+        canonical_message_id=canonical.message_id,
+        access_version=owner.access_version,
+        week_start=scheduled_week,
+        scheduled=True,
+    )
+    callback_data = f"wrev:{tokens['start']}"
+    telegram_user = TelegramUser(telegram_id, "Варвара", False)
+    blocked_update, blocked_query = _runtime_weekly_callback_update(
+        application,
+        telegram_user,
+        canonical,
+        callback_data,
+        update_id=31_035,
+    )
+
+    await application.process_update(blocked_update)
+
+    blocked = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert blocked.session is None
+    assert [entry["callback_query_id"] for entry in transport.answers] == [blocked_query.id]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+
+    if blocking_owner == "onboarding":
+        async with db.session() as session:
+            stored = await session.get(User, owner.id)
+            state = await session.scalar(
+                select(OnboardingState).where(OnboardingState.user_id == owner.id)
+            )
+            assert stored is not None and state is not None
+            stored.onboarding_completed = True
+            state.status = "completed"
+    elif blocking_owner == "workspace":
+        assert await core.workspace_service.cancel_input(owner.id, telegram_id)
+    elif blocking_owner == "memory":
+        assert memory_session is not None
+        assert await core.nova_memory_clear_bound(
+            owner.id,
+            telegram_id,
+            telegram_id,
+            session_id=memory_session.id,
+        )
+    else:
+        assert reminder_session is not None
+        assert await core.reminder_sessions.clear(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+            session_id=reminder_session.id,
+        )
+
+    retry_update, retry_query = _runtime_weekly_callback_update(
+        application,
+        telegram_user,
+        canonical,
+        callback_data,
+        update_id=31_036,
+    )
+    await application.process_update(retry_update)
+
+    current = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.status == "found"
+    assert current.session is not None
+    assert current.session.week_start == scheduled_week
+    assert current.session.phase is WeeklyReviewPhase.AWAITING_INPUT
+    assert current.session.canonical_message_id == canonical.message_id
+    assert str(transport.edits[-1]["text"]).endswith(WEEKLY_REVIEW_QUESTION)
+    assert [entry["callback_query_id"] for entry in transport.answers] == [
+        blocked_query.id,
+        retry_query.id,
+    ]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+
+
+@pytest.mark.parametrize("race", ["replacement", "access_bounce"])
+async def test_real_application_weekly_voice_post_stt_race_is_fail_closed(
+    db,
+    fake_ai,
+    monkeypatch,
+    race,
+):
+    telegram_id = 715_020 if race == "replacement" else 715_021
+    transcript = "Завтра в 15:05 сказать Назару, что я люблю его"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingTranscription(RuntimeTranscription):
+        async def transcribe(self, audio: bytes, filename: str) -> str:
+            self.calls.append((audio, filename))
+            started.set()
+            await release.wait()
+            return self.transcript
+
+    transcription = BlockingTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    frozen = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=91_020,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert frozen.session is not None
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_040 + telegram_id,
+        source_message_id=92_040,
+        progress_message_id=93_040,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    deletes: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def fake_delete_message(self, *args, **kwargs):
+        del self, args
+        deletes.append(dict(kwargs))
+        return True
+
+    async def downstream_probe(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "delete_message", fake_delete_message)
+    application.add_handler(TypeHandler(Update, downstream_probe), group=100)
+    processing = asyncio.create_task(application.process_update(update))
+    replacement = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        if race == "replacement":
+            replacement_result = await core.weekly_review_service.create_session(
+                telegram_actor_id=telegram_id,
+                chat_id=telegram_id,
+                expected_access_version=owner.access_version,
+                canonical_message_id=91_021,
+                phase=WeeklyReviewPhase.ROOT,
+            )
+            replacement = replacement_result.session
+            assert replacement is not None
+        else:
+            access = AccessService(db)
+            await access.set_guest(telegram_id, source="weekly-runtime-race")
+            await access.grant_subscriber(telegram_id, source="weekly-runtime-race")
+        release.set()
+        await asyncio.wait_for(processing, timeout=10)
+    finally:
+        release.set()
+        if not processing.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(processing), timeout=10)
+            except TimeoutError:
+                processing.cancel()
+        await asyncio.gather(processing, return_exceptions=True)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    assert downstream == []
+    assert [entry["text"] for entry in sent] == ["Расшифровываю голосовую мысль…"]
+    assert [(entry["chat_id"], entry["message_id"]) for entry in deletes] == [
+        (telegram_id, progress.message_id)
+    ]
+    if race == "replacement":
+        current = await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+        assert current.status == "found"
+        assert current.session == replacement
+        assert current.session is not None
+        assert current.session.phase is WeeklyReviewPhase.ROOT
+        assert current.session.canonical_message_id == 91_021
+        assert edits == []
+    else:
+        refreshed = await core._user(telegram_id)
+        current = await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=refreshed.access_version,
+        )
+        assert current.session is None
+        assert edits
+        assert all(entry["message_id"] == frozen.session.canonical_message_id for entry in edits)
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+async def test_real_application_weekly_voice_initial_session_lookup_error_is_fail_closed(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_022
+    transcription = RuntimeTranscription("Завтра в 15:05 сказать Назару, что я люблю его")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    frozen = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=91_022,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert frozen.session is not None
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_062,
+        source_message_id=92_062,
+        progress_message_id=93_062,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    downstream: list[int] = []
+    original_current = core.weekly_review_service.current_session
+
+    async def failed_current(**kwargs):
+        del kwargs
+        raise RuntimeError("private-weekly-lookup")
+
+    async def downstream_probe(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(core.weekly_review_service, "current_session", failed_current)
+    application.add_handler(TypeHandler(Update, downstream_probe), group=100)
+    await application.process_update(update)
+
+    assert transcription.calls == []
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    assert downstream == []
+    assert sent == []
+    assert edits == []
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    current = await original_current(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.session == frozen.session
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+async def test_weekly_maintenance_consecutive_batches_drain_more_than_limit(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    expired_remaining = 237
+    processing_remaining = 205
+    expired_batches: list[int] = []
+    processing_batches: list[int] = []
+    rendered: list[int] = []
+
+    async def cleanup_expired(**kwargs):
+        assert kwargs == {"allowed_tiers": FULL_ACCESS_TIERS}
+        nonlocal expired_remaining
+        batch = min(100, expired_remaining)
+        expired_remaining -= batch
+        expired_batches.append(batch)
+        return batch
+
+    async def recover_processing(**kwargs):
+        assert kwargs == {"allowed_tiers": FULL_ACCESS_TIERS}
+        nonlocal processing_remaining
+        batch = min(100, processing_remaining)
+        processing_remaining -= batch
+        processing_batches.append(batch)
+        return tuple(
+            SimpleNamespace(canonical_message_id=95_000 + len(rendered) + index)
+            for index in range(batch)
+        )
+
+    async def no_markup(session):
+        del session
+        return None
+
+    async def record_render(context, session, text_value, markup):
+        del context, text_value, markup
+        rendered.append(session.canonical_message_id)
+        return True
+
+    monkeypatch.setattr(core.weekly_review_service, "cleanup_expired", cleanup_expired)
+    monkeypatch.setattr(
+        core.weekly_review_service,
+        "recover_processing_session_snapshots",
+        recover_processing,
+    )
+    monkeypatch.setattr(core, "_weekly_review_cancel_markup", no_markup)
+    monkeypatch.setattr(core, "_weekly_review_render", record_render)
+    monkeypatch.setattr(core, "_weekly_review_week_heading", lambda session: "🧭 Неделя")
+
+    for _ in range(4):
+        await core._maintain_weekly_review_state(
+            SimpleNamespace(),
+            startup_recovery=True,
+        )
+
+    assert expired_batches == [100, 100, 37, 0]
+    assert processing_batches == [100, 100, 5, 0]
+    assert expired_remaining == processing_remaining == 0
+    assert len(rendered) == 205
+    assert len(set(rendered)) == 205
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+
+
+async def test_weekly_maintenance_recovers_processing_to_retry_without_provider(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_030
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    created = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=95_030,
+        phase=WeeklyReviewPhase.PROCESSING,
+    )
+    assert created.session is not None
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    transport.make_message(telegram_id, created.session.canonical_message_id, "processing")
+
+    await core._maintain_weekly_review_state(
+        application.bot,
+        startup_recovery=True,
+    )
+
+    recovered = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert recovered.status == "found"
+    assert recovered.session is not None
+    assert recovered.session.phase is WeeklyReviewPhase.AWAITING_INPUT
+    assert recovered.session.version == created.session.version + 1
+    assert transport.edits[-1]["message_id"] == created.session.canonical_message_id
+    assert "Ничего не сохранено — отправь его ещё раз" in str(transport.edits[-1]["text"])
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    edit_count = len(transport.edits)
+
+    await core._maintain_weekly_review_state(
+        application.bot,
+        startup_recovery=True,
+    )
+
+    assert len(transport.edits) == edit_count
+    assert fake_ai.weekly_review_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+
+
+async def test_periodic_weekly_maintenance_does_not_reset_live_provider_generation(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_031
+    private_input = "PRIVATE_WEEKLY_LIVE_PROVIDER_" + ("x" * 180)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    created = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=95_031,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert created.session is not None
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    transport.make_message(telegram_id, created.session.canonical_message_id, "awaiting")
+    original_recovery = core.weekly_review_service.recover_processing_session_snapshots
+    recovery_calls: list[dict[str, object]] = []
+
+    async def record_recovery(**kwargs):
+        recovery_calls.append(dict(kwargs))
+        return await original_recovery(**kwargs)
+
+    monkeypatch.setattr(
+        core.weekly_review_service,
+        "recover_processing_session_snapshots",
+        record_recovery,
+    )
+    fake_ai.weekly_review_release.clear()
+    processing = asyncio.create_task(
+        application.process_update(
+            _runtime_weekly_text_update(
+                application,
+                telegram_id,
+                private_input,
+                update_id=31_053,
+                source_message_id=96_031,
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(fake_ai.weekly_review_started.wait(), timeout=2)
+        frozen = await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+        assert frozen.status == "found"
+        assert frozen.session is not None
+        assert frozen.session.phase is WeeklyReviewPhase.PROCESSING
+        assert frozen.session.version == created.session.version + 1
+        edit_count = len(transport.edits)
+
+        maintenance_started = datetime.now(UTC)
+        await core._maintain_weekly_review_state(
+            application.bot,
+            startup_recovery=False,
+        )
+        maintenance_finished = datetime.now(UTC)
+
+        still_processing = await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+        assert still_processing.session == frozen.session
+        assert not processing.done()
+        assert len(transport.edits) == edit_count
+        assert len(recovery_calls) == 1
+        assert "now" not in recovery_calls[0]
+        recovery_cutoff = recovery_calls[0]["updated_before"]
+        assert isinstance(recovery_cutoff, datetime)
+        assert maintenance_started.timestamp() - 36 <= recovery_cutoff.timestamp()
+        assert recovery_cutoff.timestamp() <= maintenance_finished.timestamp() - 34
+        assert recovery_calls[0]["allowed_tiers"] == FULL_ACCESS_TIERS
+
+        fake_ai.weekly_review_release.set()
+        await asyncio.wait_for(processing, timeout=2)
+    finally:
+        fake_ai.weekly_review_release.set()
+        if not processing.done():
+            await asyncio.gather(processing, return_exceptions=True)
+        await asyncio.gather(*tuple(core._weekly_review_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+
+    preview = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert preview.status == "found"
+    assert preview.session is not None
+    assert preview.session.phase is WeeklyReviewPhase.PREVIEW
+    assert preview.session.version == frozen.session.version + 1
+    assert [call[0] for call in fake_ai.weekly_review_calls] == [private_input]
+    assert core._weekly_review_tasks == set()
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+
+
+@pytest.mark.parametrize("checkpoint", ["provider", "post_send"])
+async def test_real_application_today_access_bounce_is_fail_closed(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+    checkpoint,
+):
+    telegram_id = 715_040 if checkpoint == "provider" else 715_041
+    private_focus = f"PRIVATE_TODAY_{checkpoint.upper()}_FOCUS"
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    await _runtime_weekly_focus(core, db, owner, private_focus)
+    plan = await fake_ai.make_today_plan({})
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    checkpoint_started = asyncio.Event()
+    checkpoint_release = asyncio.Event()
+    provider_calls = 0
+
+    async def blocked_generate(snapshot):
+        nonlocal provider_calls
+        assert snapshot.actor_id == owner.id
+        assert snapshot.weekly_focus == private_focus
+        provider_calls += 1
+        if checkpoint == "provider":
+            checkpoint_started.set()
+            await checkpoint_release.wait()
+        return plan
+
+    monkeypatch.setattr(core.focus_service, "generate_today_plan", blocked_generate)
+    if checkpoint == "post_send":
+
+        async def blocked_send(self, *args, **kwargs):
+            del self, args
+            record = dict(kwargs)
+            transport.sent.append(record)
+            message = transport.make_message(
+                int(record["chat_id"]),
+                96_041,
+                str(record.get("text", "")),
+            )
+            transport.sent_messages.append(message)
+            checkpoint_started.set()
+            await checkpoint_release.wait()
+            return message
+
+        monkeypatch.setattr(ExtBot, "send_message", blocked_send)
+    update = _runtime_weekly_command_update(
+        application,
+        telegram_id,
+        "/today",
+        update_id=31_050,
+        source_message_id=96_040,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        processing = asyncio.create_task(application.process_update(update))
+        await asyncio.wait_for(checkpoint_started.wait(), timeout=2)
+        access = AccessService(db)
+        await access.set_guest(telegram_id, source="today-runtime-race")
+        await access.grant_subscriber(telegram_id, source="today-runtime-race")
+        checkpoint_release.set()
+        await asyncio.wait_for(processing, timeout=2)
+
+    refreshed = await core._user(telegram_id)
+    assert refreshed.access_tier == "subscriber"
+    assert refreshed.access_version == owner.access_version + 2
+    assert provider_calls == 1
+    if checkpoint == "provider":
+        assert transport.sent == []
+        assert transport.deletes == []
+        assert transport.edits == []
+    else:
+        assert len(transport.sent) == 1
+        assert private_focus in str(transport.sent[0]["text"])
+        assert [(entry["chat_id"], entry["message_id"]) for entry in transport.deletes] == [
+            (telegram_id, 96_041)
+        ]
+        assert transport.edits == []
+    assert private_focus not in caplog.text
+    assert str(telegram_id) not in caplog.text
+
+
+async def test_real_application_today_pre_provider_fence_error_sends_nothing(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+):
+    telegram_id = 715_044
+    private_error = "PRIVATE_TODAY_PRE_PROVIDER_FENCE_ERROR"
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    provider_calls = 0
+
+    async def failed_check(snapshot):
+        del snapshot
+        raise RuntimeError(private_error)
+
+    async def forbidden_provider(snapshot):
+        nonlocal provider_calls
+        del snapshot
+        provider_calls += 1
+        raise AssertionError("provider must not run after a failed pre-provider fence")
+
+    monkeypatch.setattr(core.focus_service, "check_today_application", failed_check)
+    monkeypatch.setattr(core.focus_service, "generate_today_plan", forbidden_provider)
+    update = _runtime_weekly_command_update(
+        application,
+        telegram_id,
+        "/today",
+        update_id=31_054,
+        source_message_id=96_044,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await application.process_update(update)
+
+    assert provider_calls == 0
+    assert transport.sent == []
+    assert transport.edits == []
+    assert transport.deletes == []
+    assert private_error not in caplog.text
+    assert str(telegram_id) not in caplog.text
+
+
+async def test_real_application_today_outer_cancel_keeps_shielded_lifecycle_running(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_042
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    await _runtime_weekly_focus(core, db, owner, "Сохраняемый фокус недели")
+    plan = await fake_ai.make_today_plan({})
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    provider_started = asyncio.Event()
+    provider_release = asyncio.Event()
+
+    async def blocked_generate(snapshot):
+        assert snapshot.actor_id == owner.id
+        provider_started.set()
+        await provider_release.wait()
+        return plan
+
+    monkeypatch.setattr(core.focus_service, "generate_today_plan", blocked_generate)
+    update = _runtime_weekly_command_update(
+        application,
+        telegram_id,
+        "/today",
+        update_id=31_051,
+        source_message_id=96_042,
+    )
+    outer = asyncio.create_task(application.process_update(update))
+    await asyncio.wait_for(provider_started.wait(), timeout=2)
+    inner = next(
+        task
+        for task in core._weekly_review_tasks
+        if task.get_name() == "weekly-review-today-lifecycle"
+    )
+
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    assert not inner.done()
+    assert transport.sent == []
+    provider_release.set()
+    await asyncio.wait_for(inner, timeout=2)
+    await asyncio.sleep(0)
+
+    assert len(transport.sent) == 1
+    assert "Сохраняемый фокус недели" in str(transport.sent[0]["text"])
+    assert transport.sent_messages[0].message_id > 0
+    assert transport.deletes == []
+    assert core._weekly_review_tasks == set()
+
+
+async def test_real_application_today_direct_telegram_cancel_is_not_delivery(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_043
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    await _runtime_weekly_focus(core, db, owner, "Недоставленный фокус недели")
+    plan = await fake_ai.make_today_plan({})
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    send_attempts = 0
+
+    async def generate(snapshot):
+        assert snapshot.actor_id == owner.id
+        return plan
+
+    async def cancelled_send(self, *args, **kwargs):
+        nonlocal send_attempts
+        del self, args, kwargs
+        send_attempts += 1
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(core.focus_service, "generate_today_plan", generate)
+    monkeypatch.setattr(ExtBot, "send_message", cancelled_send)
+    update = _runtime_weekly_command_update(
+        application,
+        telegram_id,
+        "/today",
+        update_id=31_052,
+        source_message_id=96_043,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await application.process_update(update)
+    await asyncio.sleep(0)
+
+    assert send_attempts == 1
+    assert transport.sent == []
+    assert transport.sent_messages == []
+    assert transport.deletes == []
+    assert transport.edits == []
+    assert core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("surface", ["command", "callback"])
+@pytest.mark.parametrize(
+    "race",
+    [
+        "downgrade",
+        "bounce",
+        "status_error",
+        "timezone",
+        "week",
+        "focus_edit",
+        "focus_delete",
+        "focus_create",
+    ],
+)
+async def test_real_application_today_surfaces_fail_closed_before_provider(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+    surface,
+    race,
+):
+    private_error = "PRIVATE_TODAY_PRE_PROVIDER_STATUS_ERROR"
+    env = await _runtime_prepare_today_case(
+        db,
+        fake_ai,
+        monkeypatch,
+        surface=surface,
+        with_focus=race != "focus_create",
+        telegram_id=716_100,
+    )
+    clock = {"advanced": False}
+    base_now = datetime.now(UTC)
+
+    def frozen_clock(value):
+        del value
+        return base_now + (timedelta(days=8) if clock["advanced"] else timedelta())
+
+    monkeypatch.setattr(env.core.focus_service, "_utc_now", frozen_clock)
+    original_materialize = env.core.focus_service.materialize_today_application
+
+    async def raced_materialize(user_id, *, include_weekly_focus, now=None):
+        snapshot = await original_materialize(
+            user_id,
+            include_weekly_focus=include_weekly_focus,
+            now=now,
+        )
+        await _runtime_apply_today_race(
+            db,
+            env.owner,
+            race,
+            week_start=snapshot.local_week_start,
+            advance_clock=lambda: clock.__setitem__("advanced", True),
+        )
+        return snapshot
+
+    if race == "status_error":
+
+        async def failed_check(snapshot):
+            del snapshot
+            raise RuntimeError(private_error)
+
+        monkeypatch.setattr(env.core.focus_service, "check_today_application", failed_check)
+    else:
+        monkeypatch.setattr(
+            env.core.focus_service,
+            "materialize_today_application",
+            raced_materialize,
+        )
+    provider_calls = 0
+    original_generate = env.core.focus_service.generate_today_plan
+
+    async def forbidden_generate(snapshot):
+        nonlocal provider_calls
+        provider_calls += 1
+        return await original_generate(snapshot)
+
+    monkeypatch.setattr(env.core.focus_service, "generate_today_plan", forbidden_generate)
+
+    with caplog.at_level(logging.WARNING):
+        await env.application.process_update(env.update)
+    await asyncio.sleep(0)
+
+    assert provider_calls == 0
+    assert env.transport.sent == []
+    assert env.transport.deletes == []
+    if env.query is None:
+        assert env.transport.edits == []
+    else:
+        assert [entry["callback_query_id"] for entry in env.transport.answers] == [env.query.id]
+        await _assert_runtime_today_callback_terminal(
+            env,
+            edit_count=1,
+            access_changed=race in {"downgrade", "bounce"},
+        )
+    assert private_error not in caplog.text
+    assert "PRIVATE_FROZEN_WEEKLY_FOCUS" not in caplog.text
+    assert str(env.owner.telegram_id) not in caplog.text
+    assert env.core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("surface", ["command", "callback"])
+@pytest.mark.parametrize(
+    "race",
+    [
+        "downgrade",
+        "bounce",
+        "timezone",
+        "week",
+        "focus_edit",
+        "focus_delete",
+        "focus_create",
+    ],
+)
+async def test_real_application_today_surfaces_discard_provider_result_after_race(
+    db,
+    fake_ai,
+    monkeypatch,
+    surface,
+    race,
+):
+    env = await _runtime_prepare_today_case(
+        db,
+        fake_ai,
+        monkeypatch,
+        surface=surface,
+        with_focus=race != "focus_create",
+        telegram_id=716_110,
+    )
+    clock = {"advanced": False}
+    base_now = datetime.now(UTC)
+
+    def frozen_clock(value):
+        del value
+        return base_now + (timedelta(days=8) if clock["advanced"] else timedelta())
+
+    monkeypatch.setattr(env.core.focus_service, "_utc_now", frozen_clock)
+    provider_started = asyncio.Event()
+    provider_release = asyncio.Event()
+    provider_snapshots = []
+    original_generate = env.core.focus_service.generate_today_plan
+
+    async def blocked_generate(snapshot):
+        provider_snapshots.append(snapshot)
+        provider_started.set()
+        await provider_release.wait()
+        return await original_generate(snapshot)
+
+    monkeypatch.setattr(env.core.focus_service, "generate_today_plan", blocked_generate)
+    processing = asyncio.create_task(env.application.process_update(env.update))
+    try:
+        await asyncio.wait_for(provider_started.wait(), timeout=10)
+        assert len(provider_snapshots) == 1
+        snapshot = provider_snapshots[0]
+        await _runtime_apply_today_race(
+            db,
+            env.owner,
+            race,
+            week_start=snapshot.local_week_start,
+            advance_clock=lambda: clock.__setitem__("advanced", True),
+        )
+        provider_release.set()
+        await asyncio.wait_for(processing, timeout=10)
+    finally:
+        provider_release.set()
+        if not processing.done():
+            await asyncio.gather(processing, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert len(provider_snapshots) == 1
+    assert provider_snapshots[0].includes_weekly_focus is True
+    assert fake_ai.last_today_context is not None
+    assert "weekly_focus" in fake_ai.last_today_context
+    if race != "focus_create":
+        assert fake_ai.last_today_context["weekly_focus"] == "PRIVATE_FROZEN_WEEKLY_FOCUS"
+    else:
+        assert fake_ai.last_today_context["weekly_focus"] is None
+    assert env.transport.sent == []
+    assert env.transport.deletes == []
+    if env.query is None:
+        assert env.transport.edits == []
+    else:
+        assert [entry["callback_query_id"] for entry in env.transport.answers] == [env.query.id]
+        await _assert_runtime_today_callback_terminal(
+            env,
+            edit_count=1,
+            access_changed=race in {"downgrade", "bounce"},
+        )
+    assert env.core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("surface", ["command", "callback"])
+@pytest.mark.parametrize("race", ["bounce", "timezone", "week", "focus_delete"])
+async def test_real_application_today_surfaces_compensate_exact_accepted_telegram_output(
+    db,
+    fake_ai,
+    monkeypatch,
+    surface,
+    race,
+):
+    env = await _runtime_prepare_today_case(
+        db,
+        fake_ai,
+        monkeypatch,
+        surface=surface,
+        with_focus=True,
+        telegram_id=716_120,
+    )
+    clock = {"advanced": False}
+    base_now = datetime.now(UTC)
+
+    def frozen_clock(value):
+        del value
+        return base_now + (timedelta(days=8) if clock["advanced"] else timedelta())
+
+    monkeypatch.setattr(env.core.focus_service, "_utc_now", frozen_clock)
+    provider_snapshots = []
+    original_generate = env.core.focus_service.generate_today_plan
+
+    async def record_generate(snapshot):
+        provider_snapshots.append(snapshot)
+        return await original_generate(snapshot)
+
+    monkeypatch.setattr(env.core.focus_service, "generate_today_plan", record_generate)
+    telegram_accepted = asyncio.Event()
+    telegram_release = asyncio.Event()
+    accepted_message_id = 97_120
+    if surface == "command":
+
+        async def blocked_send(self, *args, **kwargs):
+            del self, args
+            record = dict(kwargs)
+            env.transport.sent.append(record)
+            message = env.transport.make_message(
+                int(record["chat_id"]),
+                accepted_message_id,
+                str(record.get("text", "")),
+            )
+            env.transport.sent_messages.append(message)
+            telegram_accepted.set()
+            await telegram_release.wait()
+            return message
+
+        monkeypatch.setattr(ExtBot, "send_message", blocked_send)
+    else:
+        first_edit = True
+
+        async def blocked_edit(self, *args, **kwargs):
+            nonlocal first_edit
+            del self, args
+            record = dict(kwargs)
+            env.transport.edits.append(record)
+            message = env.transport.make_message(
+                int(record["chat_id"]),
+                int(record["message_id"]),
+                str(record.get("text", "")),
+            )
+            if first_edit:
+                first_edit = False
+                telegram_accepted.set()
+                await telegram_release.wait()
+            return message
+
+        monkeypatch.setattr(ExtBot, "edit_message_text", blocked_edit)
+    processing = asyncio.create_task(env.application.process_update(env.update))
+    try:
+        await asyncio.wait_for(telegram_accepted.wait(), timeout=10)
+        assert len(provider_snapshots) == 1
+        await _runtime_apply_today_race(
+            db,
+            env.owner,
+            race,
+            week_start=provider_snapshots[0].local_week_start,
+            advance_clock=lambda: clock.__setitem__("advanced", True),
+        )
+        telegram_release.set()
+        await asyncio.wait_for(processing, timeout=10)
+    finally:
+        telegram_release.set()
+        if not processing.done():
+            await asyncio.gather(processing, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert len(provider_snapshots) == 1
+    if surface == "command":
+        assert len(env.transport.sent) == 1
+        assert "PRIVATE_FROZEN_WEEKLY_FOCUS" in str(env.transport.sent[0]["text"])
+        assert [(entry["chat_id"], entry["message_id"]) for entry in env.transport.deletes] == [
+            (env.owner.telegram_id, accepted_message_id)
+        ]
+        assert env.transport.edits == []
+    else:
+        assert env.query is not None
+        assert [entry["callback_query_id"] for entry in env.transport.answers] == [env.query.id]
+        assert len(env.transport.edits) == 3
+        assert "PRIVATE_FROZEN_WEEKLY_FOCUS" in str(env.transport.edits[0]["text"])
+        assert env.transport.edits[1]["text"] == WEEKLY_REVIEW_ACCESS_CHANGED_TEXT
+        assert {entry["message_id"] for entry in env.transport.edits} == {97_101}
+        await _assert_runtime_today_callback_terminal(
+            env,
+            edit_count=3,
+            access_changed=race == "bounce",
+        )
+        assert env.transport.sent == []
+        assert env.transport.deletes == []
+    assert env.core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize("surface", ["command", "callback"])
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_real_application_today_final_fence_failure_compensates_exact_output(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+    surface,
+    failure,
+):
+    private_error = "PRIVATE_TODAY_FINAL_FENCE_FAILURE"
+    env = await _runtime_prepare_today_case(
+        db,
+        fake_ai,
+        monkeypatch,
+        surface=surface,
+        with_focus=True,
+        telegram_id=716_130,
+    )
+    provider_calls = 0
+    original_generate = env.core.focus_service.generate_today_plan
+
+    async def record_generate(snapshot):
+        nonlocal provider_calls
+        provider_calls += 1
+        return await original_generate(snapshot)
+
+    monkeypatch.setattr(env.core.focus_service, "generate_today_plan", record_generate)
+    check_calls = 0
+    final_call = 3 if surface == "command" else 4
+    original_check = env.core.focus_service.check_today_application
+
+    async def fail_final_check(snapshot):
+        nonlocal check_calls
+        check_calls += 1
+        if check_calls == final_call:
+            if failure == "cancel":
+                raise asyncio.CancelledError(private_error)
+            raise RuntimeError(private_error)
+        return await original_check(snapshot)
+
+    monkeypatch.setattr(env.core.focus_service, "check_today_application", fail_final_check)
+    with caplog.at_level(logging.WARNING):
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await env.application.process_update(env.update)
+        else:
+            await env.application.process_update(env.update)
+    await asyncio.sleep(0)
+
+    assert provider_calls == 1
+    assert check_calls == final_call
+    if surface == "command":
+        assert len(env.transport.sent) == 1
+        sent_message = env.transport.sent_messages[0]
+        assert [(entry["chat_id"], entry["message_id"]) for entry in env.transport.deletes] == [
+            (env.owner.telegram_id, sent_message.message_id)
+        ]
+        assert env.transport.edits == []
+    else:
+        assert env.query is not None
+        assert [entry["callback_query_id"] for entry in env.transport.answers] == [env.query.id]
+        assert len(env.transport.edits) == 3
+        assert env.transport.edits[1]["text"] == WEEKLY_REVIEW_ACCESS_CHANGED_TEXT
+        assert {entry["message_id"] for entry in env.transport.edits} == {97_101}
+        await _assert_runtime_today_callback_terminal(
+            env,
+            edit_count=3,
+            access_changed=False,
+        )
+        assert env.transport.sent == []
+        assert env.transport.deletes == []
+    assert private_error not in caplog.text
+    assert "PRIVATE_FROZEN_WEEKLY_FOCUS" not in caplog.text
+    assert str(env.owner.telegram_id) not in caplog.text
+    assert env.core._weekly_review_tasks == set()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "admin_only"),
+    [(False, False), (True, True)],
+    ids=["disabled", "admin-only-subscriber"],
+)
+async def test_real_application_today_policy_denial_uses_legacy_context_without_weekly_sql(
+    db,
+    fake_ai,
+    monkeypatch,
+    enabled,
+    admin_only,
+):
+    telegram_id = 716_140
+    private_focus = "PRIVATE_LEGACY_WEEKLY_FOCUS"
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=enabled,
+            weekly_review_admin_only=admin_only,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    await _runtime_weekly_focus(core, db, owner, private_focus)
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    provider_calls = 0
+    provider_snapshots = []
+    original_generate = core.focus_service.generate_today_plan
+
+    async def record_generate(snapshot):
+        nonlocal provider_calls
+        provider_calls += 1
+        provider_snapshots.append(snapshot)
+        return await original_generate(snapshot)
+
+    monkeypatch.setattr(core.focus_service, "generate_today_plan", record_generate)
+    statements: list[str] = []
+
+    def record_sql(conn, cursor, statement, parameters, context, executemany):
+        del conn, cursor, parameters, context, executemany
+        statements.append(str(statement).casefold())
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_sql)
+    try:
+        await application.process_update(
+            _runtime_weekly_command_update(
+                application,
+                telegram_id,
+                "/today",
+                update_id=32_140,
+                source_message_id=97_140,
+            )
+        )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_sql)
+    await asyncio.sleep(0)
+
+    assert provider_calls == 1
+    assert len(provider_snapshots) == 1
+    assert provider_snapshots[0].includes_weekly_focus is False
+    assert provider_snapshots[0].weekly_focus is None
+    assert fake_ai.last_today_context is not None
+    assert "weekly_focus" not in fake_ai.last_today_context
+    assert len(transport.sent) == 1
+    assert private_focus not in str(transport.sent[0]["text"])
+    assert transport.edits == []
+    assert transport.deletes == []
+    assert not any(
+        table in statement
+        for statement in statements
+        for table in (
+            "weekly_focuses",
+            "weekly_focus_changes",
+            "weekly_review_sessions",
+        )
+    )
+    assert core._weekly_review_tasks == set()
+
+
+async def test_weekly_shutdown_repeats_cancel_and_leaves_unrelated_task_running(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(runtime_settings(database_url=db.url), db, fake_ai, FakeTranscription())
+    started = asyncio.Event()
+    first_cancel = asyncio.Event()
+    second_cancel = asyncio.Event()
+    blocker = asyncio.Event()
+    unrelated_release = asyncio.Event()
+
+    async def cancellation_suppressor() -> None:
+        started.set()
+        try:
+            await blocker.wait()
+        except asyncio.CancelledError:
+            first_cancel.set()
+            try:
+                await blocker.wait()
+            except asyncio.CancelledError:
+                second_cancel.set()
+                raise
+
+    tracked = asyncio.create_task(
+        cancellation_suppressor(),
+        name="weekly-review-delivery-lifecycle",
+    )
+    core._weekly_review_tasks.add(tracked)
+    unrelated = asyncio.create_task(unrelated_release.wait(), name="unrelated-runtime-task")
+    monkeypatch.setattr(bot_module, "_WEEKLY_REVIEW_DRAIN_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(bot_module, "_WEEKLY_REVIEW_CANCEL_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(bot_module, "_WEEKLY_REVIEW_CANCEL_RETRY_SECONDS", 0.01)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(core._drain_weekly_review_tasks(), timeout=2)
+        assert first_cancel.is_set()
+        assert second_cancel.is_set()
+        assert tracked.cancelled()
+        assert core._weekly_review_tasks == set()
+        assert not unrelated.done()
+    finally:
+        blocker.set()
+        unrelated_release.set()
+        await asyncio.gather(tracked, unrelated, return_exceptions=True)
+
+
+async def test_post_stop_redrains_weekly_delivery_spawned_during_maintenance_stop(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(runtime_settings(database_url=db.url), db, fake_ai, FakeTranscription())
+    first_empty_snapshot = asyncio.Event()
+    delivery_started = asyncio.Event()
+    delivery_release = asyncio.Event()
+    maintenance_started = asyncio.Event()
+    maintenance_cancelled = asyncio.Event()
+    second_drain_started = asyncio.Event()
+    unrelated_release = asyncio.Event()
+    inner_tasks: list[asyncio.Task[bool]] = []
+    drain_calls = 0
+
+    async def blocked_delivery() -> bool:
+        delivery_started.set()
+        await delivery_release.wait()
+        return True
+
+    async def maintenance_producer() -> None:
+        maintenance_started.set()
+        await first_empty_snapshot.wait()
+        inner = asyncio.create_task(
+            blocked_delivery(),
+            name="weekly-review-delivery-lifecycle",
+        )
+        inner_tasks.append(inner)
+        core._weekly_review_track_task(inner)
+        try:
+            await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            maintenance_cancelled.set()
+            raise
+
+    original_drain = core._drain_private_delivery_tasks
+
+    async def coordinated_drain() -> None:
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls == 2:
+            second_drain_started.set()
+        await original_drain()
+        if drain_calls == 1:
+            first_empty_snapshot.set()
+            await delivery_started.wait()
+
+    monkeypatch.setattr(core, "_drain_private_delivery_tasks", coordinated_drain)
+    maintenance = asyncio.create_task(
+        maintenance_producer(),
+        name="guest-result-maintenance",
+    )
+    core._guest_maintenance_task = maintenance
+    unrelated = asyncio.create_task(
+        unrelated_release.wait(),
+        name="unrelated-runtime-task",
+    )
+    stopping: asyncio.Task[None] | None = None
+    loop = asyncio.get_running_loop()
+    prior_debug = loop.get_debug()
+    prior_exception_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always", RuntimeWarning)
+        loop.set_debug(True)
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            await asyncio.wait_for(maintenance_started.wait(), timeout=1)
+            stopping = asyncio.create_task(core._post_stop(SimpleNamespace()))
+            await asyncio.wait_for(maintenance_cancelled.wait(), timeout=1)
+            await asyncio.wait_for(second_drain_started.wait(), timeout=1)
+
+            assert drain_calls == 2
+            assert len(inner_tasks) == 1
+            assert inner_tasks[0] in core._weekly_review_tasks
+            assert not inner_tasks[0].done()
+            assert not stopping.done()
+            assert not unrelated.done()
+
+            delivery_release.set()
+            await asyncio.wait_for(stopping, timeout=1)
+
+            assert maintenance.cancelled()
+            assert core._guest_maintenance_task is None
+            assert inner_tasks[0].result() is True
+            assert core._weekly_review_tasks == set()
+            assert drain_calls == 2
+            assert not unrelated.done()
+
+            await core._post_shutdown(SimpleNamespace())
+            await core._post_shutdown(SimpleNamespace())
+            assert core._guest_maintenance_task is None
+            assert core._weekly_review_tasks == set()
+            assert drain_calls == 6
+            assert not unrelated.done()
+        finally:
+            delivery_release.set()
+            unrelated_release.set()
+            if stopping is not None and not stopping.done():
+                stopping.cancel()
+            if not maintenance.done():
+                maintenance.cancel()
+            await asyncio.gather(
+                *(inner_tasks + [maintenance, unrelated]),
+                *(() if stopping is None else (stopping,)),
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+            gc.collect()
+            loop.set_exception_handler(prior_exception_handler)
+            loop.set_debug(prior_debug)
+    assert loop_errors == []
+    assert [warning for warning in caught_warnings if warning.category is RuntimeWarning] == []
+
+
+async def test_post_stop_stops_maintenance_and_redrains_when_initial_drain_fails(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    core = FutureSelfBot(runtime_settings(database_url=db.url), db, fake_ai, FakeTranscription())
+    maintenance_started = asyncio.Event()
+    maintenance_observed = asyncio.Event()
+    drain_calls = 0
+
+    class InitialDrainFailure(RuntimeError):
+        pass
+
+    failure = InitialDrainFailure("initial private delivery drain failed")
+    original_drain = core._drain_private_delivery_tasks
+
+    async def fail_once_then_drain() -> None:
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls == 1:
+            raise failure
+        await original_drain()
+
+    async def maintenance_producer() -> None:
+        maintenance_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            maintenance_observed.set()
+
+    monkeypatch.setattr(core, "_drain_private_delivery_tasks", fail_once_then_drain)
+    maintenance = asyncio.create_task(
+        maintenance_producer(),
+        name="guest-result-maintenance",
+    )
+    core._guest_maintenance_task = maintenance
+    await asyncio.wait_for(maintenance_started.wait(), timeout=1)
+
+    with pytest.raises(InitialDrainFailure) as exc_info:
+        await core._post_stop(SimpleNamespace())
+
+    assert exc_info.value is failure
+    assert maintenance_observed.is_set()
+    assert maintenance.cancelled()
+    assert core._guest_maintenance_task is None
+    assert core._weekly_review_tasks == set()
+    assert drain_calls == 2
+
+
 @pytest.mark.parametrize(
     "terminal_outcome",
     ["cancelled", "failure"],
@@ -5892,3 +8846,355 @@ async def test_stage7c_terminal_drain_hard_deadline_raises_and_retains_live_task
             loop.set_debug(prior_debug)
     assert loop_errors == []
     assert [warning for warning in caught_warnings if warning.category is RuntimeWarning] == []
+
+
+async def test_real_application_weekly_voice_pre_route_outer_cancel_keeps_cleanup_alive(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_044
+    stt_started = asyncio.Event()
+    stt_release = asyncio.Event()
+
+    class BlockingPreRouteTranscription(RuntimeTranscription):
+        async def transcribe(self, audio: bytes, filename: str) -> str:
+            self.calls.append((audio, filename))
+            stt_started.set()
+            await stt_release.wait()
+            return self.transcript
+
+    transcript = "Р—Р°РІС‚СЂР° РІ 15:05 СЃРґРµР»Р°С‚СЊ РЅРµР±РѕР»СЊС€РѕР№ С€Р°Рі"
+    transcription = BlockingPreRouteTranscription(transcript)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    frozen = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=97_044,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert frozen.session is not None
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_054,
+        source_message_id=96_044,
+        progress_message_id=98_044,
+    )
+    sent: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+    deletes: list[dict[str, object]] = []
+    edit_started = asyncio.Event()
+    edit_release = asyncio.Event()
+    access = AccessService(db)
+
+    async def fake_send_message(self, *args, **kwargs):
+        del self, args
+        sent.append(dict(kwargs))
+        return progress
+
+    async def blocked_edit_message_text(self, *args, **kwargs):
+        del self, args
+        edits.append(dict(kwargs))
+        edit_started.set()
+        await edit_release.wait()
+        return progress
+
+    async def fake_delete_message(self, *args, **kwargs):
+        del self, args
+        deletes.append(dict(kwargs))
+        return True
+
+    monkeypatch.setattr(ExtBot, "send_message", fake_send_message)
+    monkeypatch.setattr(ExtBot, "edit_message_text", blocked_edit_message_text)
+    monkeypatch.setattr(ExtBot, "delete_message", fake_delete_message)
+
+    outer = asyncio.create_task(application.process_update(update))
+    try:
+        await asyncio.wait_for(stt_started.wait(), timeout=10)
+        await access.set_guest(telegram_id, source="weekly-runtime-cancel")
+        await access.grant_subscriber(telegram_id, source="weekly-runtime-cancel")
+        stt_release.set()
+        await asyncio.wait_for(edit_started.wait(), timeout=10)
+        inner = next(
+            task
+            for task in core._weekly_review_tasks
+            if task.get_name() == "weekly-review-voice-pre-route-lifecycle"
+        )
+        async with db.sessions() as session:
+            assert await session.scalar(select(func.count(WeeklyReviewSession.id))) == 0
+
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+        assert not inner.done()
+        assert inner in core._weekly_review_tasks
+
+        edit_release.set()
+        assert await asyncio.wait_for(inner, timeout=10) is True
+        await asyncio.sleep(0)
+    finally:
+        stt_release.set()
+        edit_release.set()
+        if not outer.done():
+            outer.cancel()
+        await asyncio.gather(outer, *tuple(core._weekly_review_tasks), return_exceptions=True)
+
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert len(sent) == 1
+    assert sent[0]["chat_id"] == telegram_id
+    assert [(entry["chat_id"], entry["message_id"]) for entry in deletes] == [
+        (telegram_id, progress.message_id)
+    ]
+    assert len(edits) == 1
+    assert edits[0]["message_id"] == frozen.session.canonical_message_id
+    assert edits[0]["reply_markup"] is None
+    assert edits[0]["parse_mode"] is None
+    assert core._weekly_review_tasks == set()
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyReviewSession.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+async def test_real_application_weekly_voice_direct_stt_cancel_is_not_delivery(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_045
+
+    class CancellingTranscription(RuntimeTranscription):
+        async def transcribe(self, audio: bytes, filename: str) -> str:
+            self.calls.append((audio, filename))
+            raise asyncio.CancelledError
+
+    transcription = CancellingTranscription("private transcript must not exist")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    frozen = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=97_045,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert frozen.session is not None
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_055,
+        source_message_id=96_045,
+        progress_message_id=98_045,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    deletes: list[dict[str, object]] = []
+    cleanup_started = asyncio.Event()
+    downstream: list[int] = []
+
+    async def cleanup_delete(self, *args, **kwargs):
+        del self, args
+        deletes.append(dict(kwargs))
+        cleanup_started.set()
+        return True
+
+    async def downstream_probe(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "delete_message", cleanup_delete)
+    application.add_handler(TypeHandler(Update, downstream_probe), group=100)
+
+    with pytest.raises(asyncio.CancelledError):
+        await application.process_update(update)
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+    await asyncio.gather(*tuple(core._weekly_review_tasks))
+    await asyncio.sleep(0)
+
+    current = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.status == "found"
+    assert current.session == frozen.session
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert len(sent) == 1
+    assert sent[0]["chat_id"] == telegram_id
+    assert edits == []
+    assert [(entry["chat_id"], entry["message_id"]) for entry in deletes] == [
+        (telegram_id, progress.message_id)
+    ]
+    assert downstream == []
+    assert core._weekly_review_tasks == set()
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+async def test_real_application_weekly_voice_outer_stt_cancel_tracks_progress_cleanup(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 715_046
+    stt_started = asyncio.Event()
+    stt_blocker = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    class BlockingCancelledTranscription(RuntimeTranscription):
+        async def transcribe(self, audio: bytes, filename: str) -> str:
+            self.calls.append((audio, filename))
+            stt_started.set()
+            await stt_blocker.wait()
+            return self.transcript
+
+    transcription = BlockingCancelledTranscription("private cancelled transcript")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_subscriber(
+        core,
+        db,
+        telegram_id,
+        onboarding_completed=True,
+    )
+    frozen = await core.weekly_review_service.create_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+        canonical_message_id=97_046,
+        phase=WeeklyReviewPhase.AWAITING_INPUT,
+    )
+    assert frozen.session is not None
+    update, progress = _runtime_voice_update(
+        application,
+        telegram_id,
+        update_id=31_056,
+        source_message_id=96_046,
+        progress_message_id=98_046,
+    )
+    sent, edits = _patch_runtime_voice_transport(monkeypatch, progress)
+    deletes: list[dict[str, object]] = []
+    downstream: list[int] = []
+
+    async def blocked_cleanup_delete(self, *args, **kwargs):
+        del self, args
+        deletes.append(dict(kwargs))
+        cleanup_started.set()
+        await cleanup_release.wait()
+        return True
+
+    async def downstream_probe(late_update, context):
+        del context
+        downstream.append(late_update.update_id)
+
+    monkeypatch.setattr(ExtBot, "delete_message", blocked_cleanup_delete)
+    application.add_handler(TypeHandler(Update, downstream_probe), group=100)
+    outer = asyncio.create_task(application.process_update(update))
+    try:
+        await asyncio.wait_for(stt_started.wait(), timeout=10)
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(outer, timeout=1)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=10)
+        inner = next(
+            task
+            for task in core._weekly_review_tasks
+            if task.get_name() == "weekly-review-voice-cancel-cleanup-lifecycle"
+        )
+        assert not inner.done()
+        assert inner in core._weekly_review_tasks
+
+        current_before_release = await core.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=telegram_id,
+            expected_access_version=owner.access_version,
+        )
+        assert current_before_release.session == frozen.session
+
+        cleanup_release.set()
+        assert await asyncio.wait_for(inner, timeout=10) is None
+        await asyncio.sleep(0)
+    finally:
+        stt_blocker.set()
+        cleanup_release.set()
+        if not outer.done():
+            outer.cancel()
+        await asyncio.gather(outer, *tuple(core._weekly_review_tasks), return_exceptions=True)
+
+    current = await core.weekly_review_service.current_session(
+        telegram_actor_id=telegram_id,
+        chat_id=telegram_id,
+        expected_access_version=owner.access_version,
+    )
+    assert current.status == "found"
+    assert current.session == frozen.session
+    assert transcription.calls == [(b"runtime-voice", "voice.ogg")]
+    assert len(sent) == 1
+    assert sent[0]["chat_id"] == telegram_id
+    assert edits == []
+    assert [(entry["chat_id"], entry["message_id"]) for entry in deletes] == [
+        (telegram_id, progress.message_id)
+    ]
+    assert downstream == []
+    assert core._weekly_review_tasks == set()
+    assert fake_ai.weekly_review_calls == []
+    assert fake_ai.route_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(WeeklyFocus.id))) == 0
+        assert await session.scalar(select(func.count(WeeklyFocusChange.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0

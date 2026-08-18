@@ -2723,6 +2723,171 @@ async def test_action_token_rejects_forged_id_then_allows_once_and_rejects_repla
 
 
 @pytest.mark.asyncio
+async def test_weekly_nova_action_preserves_active_reminder_owner(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_weekly_review=True,
+        weekly_review_admin_only=False,
+    )
+    user_id = 61_120
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    reminder_message = NovaMessage("Каждый день напоминай в 20:30 заполнить дневник")
+    assert await bot.reminder_text_gate(
+        update_for(reminder_message, user_id=user_id),
+        context,
+    )
+    reminder = await bot.reminder_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert reminder is not None
+
+    canonical = NovaMessage(message_id=88_120)
+    guided = await bot.nova_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+        access_version=user.access_version,
+        canonical_message_id=canonical.message_id,
+        tier=SUBSCRIBER,
+    )
+    token = await bot.nova_sessions.issue_action(
+        action_id="weekly_review",
+        owner_id=guided.owner_id,
+        telegram_user_id=guided.telegram_user_id,
+        chat_id=guided.chat_id,
+        access_version=guided.access_version,
+        canonical_message_id=guided.canonical_message_id,
+        tier=guided.tier,
+        session_id=guided.id,
+    )
+    assert token is not None
+    query = NovaQuery(f"nova:action:weekly_review:{token}", canonical)
+
+    await bot.nova_callback(
+        update_for(canonical, user_id=user_id, query=query),
+        context,
+    )
+
+    assert query.answers == [(None, False)]
+    assert (
+        await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        == reminder
+    )
+    assert (
+        await bot.weekly_review_service.current_session(
+            telegram_actor_id=user_id,
+            chat_id=user_id,
+            expected_access_version=user.access_version,
+        )
+    ).session is None
+    assert ai.calls == []
+
+
+@pytest.mark.asyncio
+async def test_weekly_nova_action_rechecks_false_snapshot_after_late_reminder_acquisition(
+    db,
+    monkeypatch,
+):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_weekly_review=True,
+        weekly_review_admin_only=False,
+    )
+    user_id = 61_121
+    user = await user_with_tier(bot, user_id, SUBSCRIBER)
+    context = nova_context()
+    canonical = NovaMessage(message_id=88_121)
+    guided = await bot.nova_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+        access_version=user.access_version,
+        canonical_message_id=canonical.message_id,
+        tier=SUBSCRIBER,
+    )
+    token = await bot.nova_sessions.issue_action(
+        action_id="weekly_review",
+        owner_id=guided.owner_id,
+        telegram_user_id=guided.telegram_user_id,
+        chat_id=guided.chat_id,
+        access_version=guided.access_version,
+        canonical_message_id=guided.canonical_message_id,
+        tier=guided.tier,
+        session_id=guided.id,
+    )
+    assert token is not None
+    query = NovaQuery(f"nova:action:weekly_review:{token}", canonical)
+    callback_update = update_for(canonical, user_id=user_id, query=query)
+    first_snapshot_read = asyncio.Event()
+    first_snapshot_release = asyncio.Event()
+    original_blocks = bot.reminder_blocks_navigation
+    checks = 0
+
+    async def false_then_live(update: Any) -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            assert await original_blocks(update) is False
+            first_snapshot_read.set()
+            await first_snapshot_release.wait()
+            return False
+        return await original_blocks(update)
+
+    monkeypatch.setattr(bot, "reminder_blocks_navigation", false_then_live)
+    processing = asyncio.create_task(bot.nova_callback(callback_update, context))
+    try:
+        await asyncio.wait_for(first_snapshot_read.wait(), timeout=10)
+        reminder_message = NovaMessage("Каждый день напоминай в 20:30 заполнить дневник")
+        assert await bot.reminder_text_gate(
+            update_for(reminder_message, user_id=user_id),
+            context,
+        )
+        late_reminder = await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        assert late_reminder is not None
+        first_snapshot_release.set()
+        await asyncio.wait_for(processing, timeout=10)
+    finally:
+        first_snapshot_release.set()
+        if not processing.done():
+            await asyncio.gather(processing, return_exceptions=True)
+
+    assert checks == 2
+    assert query.answers == [(None, False)]
+    assert (
+        await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        == late_reminder
+    )
+    assert late_reminder.canonical_message_id == reminder_message.replies[0]["message"].message_id
+    assert (
+        await bot.weekly_review_service.current_session(
+            telegram_actor_id=user_id,
+            chat_id=user_id,
+            expected_access_version=user.access_version,
+        )
+    ).session is None
+    assert ai.calls == []
+
+
+@pytest.mark.asyncio
 async def test_voice_visualization_cta_dispatches_real_menu_once_and_rejects_replay(db):
     ai = NovaAIStub()
     transcription = NovaTranscription("Привет, где у тебя находится визуализация?")

@@ -26,6 +26,59 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
+def _json_string_items_check(column: str, *, maximum_items: int) -> str:
+    return " AND ".join(
+        f"(json_array_length({column}) < {index + 1} OR "
+        f"(coalesce(substr(CAST({column} -> {index} AS TEXT), 1, 1) = '\"', false) "
+        f"AND coalesce(length({column} ->> {index}), 0) BETWEEN 1 AND 200))"
+        for index in range(maximum_items)
+    )
+
+
+def _weekly_reminder_candidate_fields_check(column: str) -> str:
+    """SQLite exact-shape check; PostgreSQL gets its own conditional CHECK."""
+
+    checks: list[str] = []
+    for index in range(5):
+        candidate_path = f"'$[{index}]'"
+        title_path = f"'$[{index}].title'"
+        schedule_path = f"'$[{index}].schedule_wording'"
+        checks.append(
+            f"(json_array_length({column}) < {index + 1} OR ("
+            f"coalesce(json_type({column}, {candidate_path}) = 'object', false) "
+            f"AND coalesce(json_type({column}, {title_path}) = 'text', false) "
+            f"AND coalesce(length(json_extract({column}, {title_path})), 0) "
+            f"BETWEEN 1 AND 200 "
+            f"AND coalesce(json_type({column}, {schedule_path}) = 'text', false) "
+            f"AND coalesce(length(json_extract({column}, {schedule_path})), 0) "
+            f"BETWEEN 1 AND 200 "
+            f"AND json_remove(json_extract({column}, {candidate_path}), "
+            f"'$.title', '$.schedule_wording') = '{{}}'))"
+        )
+    return " AND ".join(checks)
+
+
+def _weekly_reminder_candidate_fields_check_postgresql(column: str) -> str:
+    """PostgreSQL exact-shape check using JSONB key subtraction."""
+
+    checks: list[str] = []
+    for index in range(5):
+        candidate = f"({column} -> {index})"
+        candidate_jsonb = f"({candidate})::jsonb"
+        checks.append(
+            f"(json_array_length({column}) < {index + 1} OR ("
+            f"coalesce(jsonb_typeof({candidate_jsonb}) = 'object', false) "
+            f"AND coalesce(jsonb_typeof({candidate_jsonb} -> 'title') = 'string', false) "
+            f"AND coalesce(length({candidate_jsonb} ->> 'title'), 0) BETWEEN 1 AND 200 "
+            f"AND coalesce(jsonb_typeof({candidate_jsonb} -> 'schedule_wording') = "
+            f"'string', false) "
+            f"AND coalesce(length({candidate_jsonb} ->> 'schedule_wording'), 0) "
+            f"BETWEEN 1 AND 200 "
+            f"AND ({candidate_jsonb} - 'title' - 'schedule_wording') = '{{}}'::jsonb))"
+        )
+    return " AND ".join(checks)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -89,6 +142,21 @@ class User(TimestampMixin, Base):
         passive_deletes=True,
     )
     nova_memory_changes: Mapped[list[NovaMemoryChange]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    weekly_focuses: Mapped[list[WeeklyFocus]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    weekly_focus_changes: Mapped[list[WeeklyFocusChange]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    weekly_review_sessions: Mapped[list[WeeklyReviewSession]] = relationship(
         back_populates="owner",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -204,6 +272,218 @@ class NovaMemoryChange(Base):
     affected_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     owner: Mapped[User] = relationship(back_populates="nova_memory_changes")
+
+
+class WeeklyFocus(TimestampMixin, Base):
+    __tablename__ = "weekly_focuses"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_weekly_focuses_public_id"),
+        UniqueConstraint("owner_id", "week_start", name="uq_weekly_focuses_owner_week"),
+        CheckConstraint(
+            "length(public_id) = 36",
+            name="ck_weekly_focuses_public_id_length",
+        ),
+        CheckConstraint(
+            "length(focus) BETWEEN 1 AND 300",
+            name="ck_weekly_focuses_focus_length",
+        ),
+        CheckConstraint(
+            "approach IS NULL OR length(approach) BETWEEN 1 AND 500",
+            name="ck_weekly_focuses_approach_length",
+        ),
+        CheckConstraint(
+            "json_array_length(small_steps) BETWEEN 0 AND 3",
+            name="ck_weekly_focuses_small_steps_count",
+        ),
+        CheckConstraint(
+            "substr(CAST(small_steps AS TEXT), 1, 1) = '[' "
+            "AND length(CAST(small_steps AS TEXT)) BETWEEN 2 AND 4096",
+            name="ck_weekly_focuses_small_steps_json_shape",
+        ),
+        CheckConstraint(
+            _json_string_items_check("small_steps", maximum_items=3),
+            name="ck_weekly_focuses_small_steps_lengths",
+        ),
+        CheckConstraint(
+            "source IN ('text', 'voice')",
+            name="ck_weekly_focuses_source",
+        ),
+        CheckConstraint("version > 0", name="ck_weekly_focuses_version"),
+        Index("ix_weekly_focuses_owner_history", "owner_id", "week_start", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    week_start: Mapped[date] = mapped_column(Date)
+    focus: Mapped[str] = mapped_column(Text)
+    approach: Mapped[str | None] = mapped_column(Text)
+    small_steps: Mapped[list[str]] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    source: Mapped[str] = mapped_column(String(8))
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    owner: Mapped[User] = relationship(back_populates="weekly_focuses")
+
+
+class WeeklyFocusChange(Base):
+    __tablename__ = "weekly_focus_changes"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('created', 'updated', 'deleted')",
+            name="ck_weekly_focus_changes_operation",
+        ),
+        CheckConstraint(
+            "length(focus_public_id) = 36",
+            name="ck_weekly_focus_changes_public_id_length",
+        ),
+        CheckConstraint(
+            "resulting_version > 0",
+            name="ck_weekly_focus_changes_resulting_version",
+        ),
+        Index(
+            "ix_weekly_focus_changes_owner_created",
+            "owner_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_weekly_focus_changes_focus_history",
+            "owner_id",
+            "focus_public_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    focus_public_id: Mapped[str] = mapped_column(String(36))
+    operation: Mapped[str] = mapped_column(String(12))
+    resulting_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    owner: Mapped[User] = relationship(back_populates="weekly_focus_changes")
+
+
+class WeeklyReviewSession(TimestampMixin, Base):
+    __tablename__ = "weekly_review_sessions"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_weekly_review_sessions_public_id"),
+        UniqueConstraint(
+            "owner_id",
+            "chat_id",
+            name="uq_weekly_review_sessions_owner_chat",
+        ),
+        CheckConstraint(
+            "length(public_id) = 36",
+            name="ck_weekly_review_sessions_public_id_length",
+        ),
+        CheckConstraint(
+            "phase IN ('root', 'awaiting_input', 'processing', 'preview', 'saved', "
+            "'candidates', 'reminder_handoff', 'delete_preview', 'completed')",
+            name="ck_weekly_review_sessions_phase",
+        ),
+        CheckConstraint(
+            "access_version > 0",
+            name="ck_weekly_review_sessions_access_version",
+        ),
+        CheckConstraint(
+            "version > 0",
+            name="ck_weekly_review_sessions_version",
+        ),
+        CheckConstraint(
+            "extracted_focus IS NULL OR length(extracted_focus) BETWEEN 1 AND 300",
+            name="ck_weekly_review_sessions_focus_length",
+        ),
+        CheckConstraint(
+            "extracted_approach IS NULL OR length(extracted_approach) BETWEEN 1 AND 500",
+            name="ck_weekly_review_sessions_approach_length",
+        ),
+        CheckConstraint(
+            "json_array_length(small_steps) BETWEEN 0 AND 3",
+            name="ck_weekly_review_sessions_small_steps_count",
+        ),
+        CheckConstraint(
+            "substr(CAST(small_steps AS TEXT), 1, 1) = '[' "
+            "AND length(CAST(small_steps AS TEXT)) BETWEEN 2 AND 4096",
+            name="ck_weekly_review_sessions_small_steps_json_shape",
+        ),
+        CheckConstraint(
+            _json_string_items_check("small_steps", maximum_items=3),
+            name="ck_weekly_review_sessions_small_steps_lengths",
+        ),
+        CheckConstraint(
+            "json_array_length(reminder_candidates) BETWEEN 0 AND 5",
+            name="ck_weekly_review_sessions_candidates_count",
+        ),
+        CheckConstraint(
+            "substr(CAST(reminder_candidates AS TEXT), 1, 1) = '[' "
+            "AND length(CAST(reminder_candidates AS TEXT)) BETWEEN 2 AND 20000",
+            name="ck_weekly_review_sessions_candidates_json_shape",
+        ),
+        CheckConstraint(
+            _weekly_reminder_candidate_fields_check("reminder_candidates"),
+            name="ck_weekly_review_sessions_candidates_fields",
+        ).ddl_if(dialect="sqlite"),
+        CheckConstraint(
+            _weekly_reminder_candidate_fields_check_postgresql("reminder_candidates"),
+            name="ck_weekly_review_sessions_candidates_fields",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "extracted_source IS NULL OR extracted_source IN ('text', 'voice')",
+            name="ck_weekly_review_sessions_source",
+        ),
+        CheckConstraint(
+            "(canonical_chat_id IS NULL AND canonical_message_id IS NULL) OR "
+            "(canonical_chat_id IS NOT NULL AND canonical_message_id IS NOT NULL "
+            "AND canonical_chat_id = chat_id AND canonical_message_id > 0)",
+            name="ck_weekly_review_sessions_canonical_binding",
+        ),
+        CheckConstraint(
+            "(base_focus_public_id IS NULL AND base_focus_version IS NULL) OR "
+            "(base_focus_public_id IS NOT NULL AND base_focus_version IS NOT NULL "
+            "AND length(base_focus_public_id) = 36 AND base_focus_version > 0)",
+            name="ck_weekly_review_sessions_base_focus_generation",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_weekly_review_sessions_expiry_order",
+        ),
+        Index(
+            "ix_weekly_review_sessions_expiry",
+            "expires_at",
+            "id",
+        ),
+        Index(
+            "ix_weekly_review_sessions_owner_week",
+            "owner_id",
+            "week_start",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    access_version: Mapped[int] = mapped_column(Integer)
+    week_start: Mapped[date] = mapped_column(Date)
+    phase: Mapped[str] = mapped_column(String(24))
+    canonical_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    canonical_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    base_focus_public_id: Mapped[str | None] = mapped_column(String(36))
+    base_focus_version: Mapped[int | None] = mapped_column(Integer)
+    extracted_focus: Mapped[str | None] = mapped_column(Text)
+    extracted_approach: Mapped[str | None] = mapped_column(Text)
+    small_steps: Mapped[list[str]] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    reminder_candidates: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'"),
+    )
+    extracted_source: Mapped[str | None] = mapped_column(String(8))
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    owner: Mapped[User] = relationship(back_populates="weekly_review_sessions")
 
 
 class AccessTierChange(Base):

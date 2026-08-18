@@ -20,6 +20,7 @@ from future_self.schemas import (
     TimezoneResolution,
     TodayPlan,
     VisionSummary,
+    WeeklyReviewExtraction,
 )
 
 
@@ -43,6 +44,12 @@ class FakeAI:
         self.reminder_timezone_started = asyncio.Event()
         self.reminder_timezone_release = asyncio.Event()
         self.reminder_timezone_release.set()
+        self.weekly_review_calls: list[tuple[str, dict[str, str]]] = []
+        self.weekly_review_result = WeeklyReviewExtraction(focus="Спокойный фокус недели")
+        self.weekly_review_error: BaseException | None = None
+        self.weekly_review_started = asyncio.Event()
+        self.weekly_review_release = asyncio.Event()
+        self.weekly_review_release.set()
         self.guest_thought_calls = 0
         self.guest_first_step_calls = 0
         self.guest_thought_result = GuestThoughtBreakdown(
@@ -94,6 +101,18 @@ class FakeAI:
             timezone_fragment,
             ReminderTimezoneResolution(status="insufficient"),
         )
+
+    async def extract_weekly_review(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+    ) -> WeeklyReviewExtraction:
+        self.weekly_review_calls.append((text, temporal_context))
+        self.weekly_review_started.set()
+        await self.weekly_review_release.wait()
+        if self.weekly_review_error is not None:
+            raise self.weekly_review_error
+        return self.weekly_review_result.model_copy(deep=True)
 
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals:
         return GoalProposals(

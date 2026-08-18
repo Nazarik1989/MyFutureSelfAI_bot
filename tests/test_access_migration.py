@@ -56,7 +56,7 @@ def test_access_migration_backfills_constraints_and_preserves_domain_data(tmp_pa
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260811_0026"
+        "20260817_0027"
     )
     users = connection.execute(
         "SELECT telegram_id, access_tier, access_version FROM users ORDER BY telegram_id"
@@ -118,7 +118,7 @@ def test_access_migration_upgrades_clean_sqlite_with_foreign_keys(tmp_path):
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA foreign_keys=ON")
     assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-        "20260811_0026"
+        "20260817_0027"
     )
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

@@ -343,7 +343,7 @@ class KnowledgeHandlers:
         query = update.callback_query
         if query is None:
             return
-        if (query.data or "").startswith(("nav:", "nova:", "rmd:", "nmem:")):
+        if (query.data or "").startswith(("nav:", "nova:", "rmd:", "nmem:", "wrev:")):
             return
         await self.reminder_clear_current(update)
         await self.nova_clear_current(update)

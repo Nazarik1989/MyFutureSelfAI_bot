@@ -358,7 +358,7 @@ class WorkspaceHandlers:
         if not self._workspace_enabled() or update.callback_query is None:
             return
         if (update.callback_query.data or "").startswith(
-            ("space:", "spacei:", "nav:", "nova:", "nmem:")
+            ("space:", "spacei:", "nav:", "nova:", "nmem:", "wrev:")
         ):
             return
         user = await self._user(update.effective_user.id)
@@ -2421,16 +2421,17 @@ class WorkspaceHandlers:
         await self.vision_image_sessions.cancel_active(actor_id, chat_id)
         await self.vision_reference_sessions.cancel_active(actor_id, chat_id)
         await self.vision_service.cancel(actor_id, chat_id)
-        await self.workspace_service.begin_input(
-            actor_id,
-            chat_id,
-            action.removeprefix("input_"),
-            payload=payload,
-            context=access,
-            workspace_version=workspace_version,
-            workspace_project_id=workspace_project_id,
-            workspace_project_version=workspace_project_version,
-        )
+        async with self._reply_keyboard_owner_lock:
+            await self.workspace_service.begin_input(
+                actor_id,
+                chat_id,
+                action.removeprefix("input_"),
+                payload=payload,
+                context=access,
+                workspace_version=workspace_version,
+                workspace_project_id=workspace_project_id,
+                workspace_project_version=workspace_project_version,
+            )
 
     async def _rearm_workspace_input(self, actor_id: int, chat_id: int, claim: Any) -> None:
         action = claim.action.removeprefix("input:")

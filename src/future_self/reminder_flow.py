@@ -66,6 +66,7 @@ class ReminderFlowSession:
     timezone_fragment_fingerprint: str | None = None
     relative_day_offset: int | None = None
     calendar_anchor_utc: datetime | None = None
+    weekly_candidate_handoff: bool = False
 
     def parser_state(self) -> ReminderIntentResult:
         if self.phase is ReminderFlowPhase.WHEN:
@@ -141,6 +142,7 @@ class ReminderFlowStore:
         timezone_fragment_fingerprint: str | None = None,
         relative_day_offset: int | None = None,
         calendar_anchor_utc: datetime | None = None,
+        weekly_candidate_handoff: bool = False,
         now: datetime | None = None,
     ) -> ReminderFlowSession:
         current = self._utc(now)
@@ -176,6 +178,7 @@ class ReminderFlowStore:
                 calendar_anchor_utc=self._utc(calendar_anchor_utc)
                 if calendar_anchor_utc is not None
                 else None,
+                weekly_candidate_handoff=bool(weekly_candidate_handoff),
             )
             self._sessions[key] = session
             return session

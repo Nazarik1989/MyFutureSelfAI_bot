@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -18,6 +19,7 @@ from .navigation import (
 )
 from .nova_memory import NovaMemoryValidationError
 from .nova_memory_flow import NovaMemoryIntentKind, classify_nova_memory_intent
+from .weekly_review_handlers import classify_weekly_review_intent
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +130,13 @@ class NavigationHandlers:
         if flow is None:
             if command != "/mynova" and await self.nova_memory_public_command_gate(update, context):
                 raise ApplicationHandlerStop
+            if command == "/week" and await self.reminder_public_command_gate(update, context):
+                raise ApplicationHandlerStop
+            if command != "/week":
+                await self.weekly_review_clear_current(update)
             await self.reminder_clear_current(update)
+            if command == "/week":
+                await self.nova_memory_clear_current(update)
             if command != "/help":
                 await self.nova_clear_current(update)
             if hasattr(self, "collection_service"):
@@ -153,15 +161,23 @@ class NavigationHandlers:
             update, context, update.effective_message.text or ""
         )
         if onboarding_result is not None:
+            await self.weekly_review_clear_current(update)
             raise ApplicationHandlerStop
         text = update.effective_message.text or ""
         flow = await self._active_navigation_flow(update, context)
         if flow is None:
+            if await self.weekly_review_active_text_gate(update, context):
+                raise ApplicationHandlerStop
             if await self.nova_memory_text_gate(update, context):
                 raise ApplicationHandlerStop
             if await self.reminder_text_gate(update, context):
                 raise ApplicationHandlerStop
+            if await self.weekly_review_launch_text_gate(update, context):
+                raise ApplicationHandlerStop
+            if await self.weekly_review_stale_control_gate(update, context):
+                raise ApplicationHandlerStop
         else:
+            await self.weekly_review_clear_current(update)
             await self.reminder_clear_current(update)
             await self.nova_memory_clear_current(update)
             try:
@@ -170,7 +186,8 @@ class NavigationHandlers:
                 )
             except NovaMemoryValidationError:
                 memory_owned = True
-            if memory_owned:
+            weekly_owned = classify_weekly_review_intent(text) != "none"
+            if memory_owned or weekly_owned:
                 await self._prompt_navigation_flow(update.effective_message, update, flow)
                 raise ApplicationHandlerStop
         command = self.natural_command_router.route(text)
@@ -201,14 +218,16 @@ class NavigationHandlers:
             return
         if await self.nova_memory_public_command_gate(update, context):
             return
+        await self.weekly_review_clear_current(update)
         await self.nova_clear_current(update)
         user = await self._user(update.effective_user.id)
         if hasattr(self, "collection_service"):
             await self.collection_service.clear_context(user.id, update.effective_chat.id)
             await self.collection_service.cancel_input(user.id, update.effective_chat.id)
-        await self._send_navigation_root(
+        await self._send_after_reply_keyboard_cleanup(
             update.effective_message,
-            tier=user.access_tier,
+            "Главное меню\n\nЧто хочешь сделать?",
+            self._root_keyboard(user.access_tier),
         )
 
     async def doctor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -216,7 +235,12 @@ class NavigationHandlers:
         if flow is not None:
             await self._prompt_navigation_flow(update.effective_message, update, flow)
             return
-        await self._send_navigation_section(update.effective_message, "health")
+        user = await self._user(update.effective_user.id)
+        await self._send_navigation_section(
+            update.effective_message,
+            "health",
+            tier=user.access_tier,
+        )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -230,7 +254,13 @@ class NavigationHandlers:
     ) -> int | None:
         query = update.callback_query
         data = query.data or ""
-        await self.reminder_clear_current(update)
+        if data == "nav:action:weekly_review":
+            if await self.reminder_blocks_navigation(update):
+                await query.answer()
+                await self.reminder_public_command_gate(update, context)
+                return None
+        else:
+            await self.reminder_clear_current(update)
         if data.startswith("nav:flow:"):
             return await self._navigation_flow_action(update, context)
 
@@ -245,6 +275,9 @@ class NavigationHandlers:
             await self.nova_memory_clear_current(update)
             await self.nova_navigation_help_callback(update, context)
             return None
+
+        if data != "nav:action:weekly_review":
+            await self.weekly_review_clear_current(update)
 
         if data != "nav:nova-memory" and await self.nova_memory_blocks_navigation(update):
             await query.answer()
@@ -278,11 +311,13 @@ class NavigationHandlers:
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            self.weekly_review_available_for_tier(user.access_tier),
         )
         actions = navigation_actions(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            self.weekly_review_available_for_tier(user.access_tier),
         )
         topics = help_topics(
             self._workspace_enabled(),
@@ -307,7 +342,7 @@ class NavigationHandlers:
             await self._edit_or_send(
                 query,
                 f"{section.emoji} {section.label}\n\n{section.description}",
-                self._section_keyboard(section_key),
+                self._section_keyboard(section_key, user.access_tier),
             )
             return None
         if data.startswith("nav:help:"):
@@ -352,6 +387,28 @@ class NavigationHandlers:
                     f"{topic[0]}\n\n{topic[1]}",
                     self._back_keyboard("nav:section:health"),
                 )
+                return None
+            if action_key == "weekly_review":
+                async with self._reminder_launch_lock:
+                    if await self.reminder_blocks_navigation(update):
+                        reminder_owns = True
+                    else:
+                        reminder_owns = False
+                        await query.answer()
+                        screen = _CallbackScreenMessage(
+                            self,
+                            query,
+                            self._back_keyboard(self._section_for_action(action_key)),
+                        )
+                        original_args = getattr(context, "args", None)
+                        context.args = []
+                        try:
+                            await self.week_command(_ScreenUpdate(update, screen), context)
+                        finally:
+                            context.args = original_args or []
+                if reminder_owns:
+                    await query.answer()
+                    await self.reminder_public_command_gate(update, context)
                 return None
             await query.answer()
             screen = _CallbackScreenMessage(
@@ -821,15 +878,52 @@ class NavigationHandlers:
             reply_markup=self._root_keyboard(tier),
         )
 
-    async def _send_navigation_section(self, message: Any, section_key: str) -> None:
+    async def _send_after_reply_keyboard_cleanup(
+        self,
+        message: Any,
+        text: str,
+        markup: InlineKeyboardMarkup,
+    ) -> None:
+        sent = await self._weekly_review_send_keyboard_cleanup(message, text, None)
+        if sent is None:
+            return
+        try:
+            await sent.edit_text(text, reply_markup=markup)
+        except asyncio.CancelledError:
+            raise
+        except TelegramError as exc:
+            if not self._message_not_modified(exc):
+                logger.warning(
+                    "Navigation keyboard cleanup failed operation=edit error_type=%s",
+                    type(exc).__name__,
+                )
+        except (TypeError, AttributeError) as exc:
+            logger.warning(
+                "Navigation keyboard cleanup failed operation=edit error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _send_navigation_section(
+        self,
+        message: Any,
+        section_key: str,
+        *,
+        tier: str | None = None,
+    ) -> None:
+        sender = getattr(message, "from_user", None)
+        telegram_id = getattr(sender, "id", None)
+        if tier is None and isinstance(telegram_id, int) and telegram_id > 0:
+            tier = (await self._user(telegram_id)).access_tier
+        weekly_available = self.weekly_review_available_for_tier(tier)
         section = navigation_sections(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            weekly_available,
         )[section_key]
         await message.reply_text(
             f"{section.emoji} {section.label}\n\n{section.description}",
-            reply_markup=self._section_keyboard(section_key),
+            reply_markup=self._section_keyboard(section_key, tier),
         )
 
     def _root_keyboard(self, tier: str | None = None) -> InlineKeyboardMarkup:
@@ -869,16 +963,23 @@ class NavigationHandlers:
         )
         return InlineKeyboardMarkup(rows)
 
-    def _section_keyboard(self, section_key: str) -> InlineKeyboardMarkup:
+    def _section_keyboard(
+        self,
+        section_key: str,
+        tier: str | None = None,
+    ) -> InlineKeyboardMarkup:
+        weekly_available = self.weekly_review_available_for_tier(tier)
         sections = navigation_sections(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            weekly_available,
         )
         actions = navigation_actions(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            weekly_available,
         )
         section = sections[section_key]
         label_overrides = {
@@ -943,6 +1044,7 @@ class NavigationHandlers:
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            True,
         ).values():
             if action_key in section.actions:
                 return f"nav:section:{section.key}"

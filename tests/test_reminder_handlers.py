@@ -17,6 +17,7 @@ from future_self.models import (
     InboxItem,
     RecurringTaskReminderSchedule,
     TaskReminder,
+    TaskState,
     User,
 )
 from future_self.nova_memory_flow import NovaMemoryFlowPhase
@@ -142,6 +143,37 @@ async def current_session(bot: FutureSelfBot, user: User, chat_id: int):
     )
 
 
+async def save_direct_reminder(
+    bot: FutureSelfBot,
+    user: User,
+    *,
+    title: str,
+    weekly_candidate_handoff: bool,
+    chat_id: int,
+    schedule_kind: ReminderScheduleKind = ReminderScheduleKind.ONCE,
+    local_time: time = time(19, 30),
+    timezone: str = "Europe/Moscow",
+):
+    flow_session = await bot.reminder_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=chat_id,
+        access_version=user.access_version,
+        title=title,
+        schedule_kind=schedule_kind,
+        local_date=date(2026, 8, 11) if schedule_kind is ReminderScheduleKind.ONCE else None,
+        local_time=local_time,
+        timezone=timezone,
+        timezone_source=ReminderTimezoneSource.PROFILE,
+        phase=ReminderFlowPhase.PREVIEW,
+        weekly_candidate_handoff=weekly_candidate_handoff,
+    )
+    result, recurring = await bot._reminder_save_atomic(flow_session)
+    assert result.ok is True
+    assert result.inbox_item is not None
+    return flow_session, result, recurring
+
+
 async def seed_memory_root(
     bot: FutureSelfBot,
     user: User,
@@ -218,6 +250,316 @@ async def test_complete_once_uses_one_canonical_and_existing_task_reminder_path(
         assert await session.scalar(select(func.count(InboxItem.id))) == 1
         assert await session.scalar(select(func.count(TaskReminder.id))) == 1
         assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_weekly_candidate_adapter_reuses_one_canonical_and_existing_confirm_path(
+    db,
+    fake_ai,
+):
+    user = await subscriber(db, 6199)
+    bot = deterministic_bot(db, fake_ai)
+    canonical = ReminderMessage(message_id=89_999)
+    update = reminder_update(
+        canonical,
+        telegram_user_id=user.telegram_id,
+        chat_id=9199,
+    )
+    context = reminder_context()
+
+    handled = await bot.reminder_from_weekly_candidate(
+        update,
+        context,
+        title="Позвонить врачу",
+        schedule_wording="завтра в 19:30",
+        canonical_message=canonical,
+        expected_access_version=user.access_version,
+    )
+
+    assert handled is True
+    assert canonical.replies == []
+    assert len(canonical.edits) == 1
+    reminder_session = await current_session(bot, user, 9199)
+    assert reminder_session is not None
+    assert reminder_session.canonical_message_id == canonical.message_id
+    assert reminder_session.weekly_candidate_handoff is True
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+    callback_data = callback_for(latest_markup(canonical), "✅ Создать")
+    query = ReminderQuery(callback_data, canonical)
+    callback_update = reminder_update(
+        canonical,
+        telegram_user_id=user.telegram_id,
+        chat_id=9199,
+        query=query,
+    )
+    await bot.reminder_callback(callback_update, context)
+
+    assert query.answers == [{"args": ()}]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(InboxItem.id))) == 1
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 1
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+@pytest.mark.parametrize("near_title", ["  ПОЗВОНИТЬ,   ВРАЧУ!!! ", "Позвонить врачю"])
+@pytest.mark.asyncio
+async def test_weekly_candidate_near_duplicate_reuses_existing_owner_reminder(
+    db,
+    fake_ai,
+    near_title,
+):
+    user = await subscriber(db, 6200)
+    bot = deterministic_bot(db, fake_ai)
+    context = reminder_context()
+
+    first_canonical = ReminderMessage(message_id=90_001)
+    first_update = reminder_update(
+        first_canonical,
+        telegram_user_id=user.telegram_id,
+        chat_id=9200,
+    )
+    assert await bot.reminder_from_weekly_candidate(
+        first_update,
+        context,
+        title="Позвонить врачу",
+        schedule_wording="завтра в 19:30",
+        canonical_message=first_canonical,
+        expected_access_version=user.access_version,
+    )
+    first_query = ReminderQuery(
+        callback_for(latest_markup(first_canonical), "✅ Создать"),
+        first_canonical,
+    )
+    await bot.reminder_callback(
+        reminder_update(
+            first_canonical,
+            telegram_user_id=user.telegram_id,
+            chat_id=9200,
+            query=first_query,
+        ),
+        context,
+    )
+
+    near_canonical = ReminderMessage(message_id=90_002)
+    near_update = reminder_update(
+        near_canonical,
+        telegram_user_id=user.telegram_id,
+        chat_id=9200,
+    )
+    assert await bot.reminder_from_weekly_candidate(
+        near_update,
+        context,
+        title=near_title,
+        schedule_wording="завтра в 19:30",
+        canonical_message=near_canonical,
+        expected_access_version=user.access_version,
+    )
+    near_query = ReminderQuery(
+        callback_for(latest_markup(near_canonical), "✅ Создать"),
+        near_canonical,
+    )
+    await bot.reminder_callback(
+        reminder_update(
+            near_canonical,
+            telegram_user_id=user.telegram_id,
+            chat_id=9200,
+            query=near_query,
+        ),
+        context,
+    )
+
+    assert near_query.answers == [{"args": ()}]
+    assert "✓ Уже настроено" in near_query.edits[-1]["text"]
+    async with db.sessions() as db_session:
+        assert await db_session.scalar(select(func.count(InboxItem.id))) == 1
+        assert await db_session.scalar(select(func.count(TaskReminder.id))) == 1
+        assert await db_session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("Не звонить врачу", "Звонить врачу"),
+        ("Купить 2 билета", "Купить 3 билета"),
+        ("Позвонить Анне", "Позвонить Алле"),
+        ("Отправить письмо Анне", "Отправить письмо Алине"),
+        ("Проверить важную почту", "Проверить личную почту"),
+    ],
+)
+def test_weekly_near_duplicate_matcher_preserves_semantic_distinctions(left, right):
+    assert FutureSelfBot._weekly_reminder_titles_near(left, right) is False
+
+
+@pytest.mark.asyncio
+async def test_weekly_duplicate_short_circuit_has_only_owner_lock_dml_and_no_audit(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    user = await subscriber(db, 6230)
+    bot = deterministic_bot(db, fake_ai)
+    await save_direct_reminder(
+        bot,
+        user,
+        title="Позвонить врачу",
+        weekly_candidate_handoff=False,
+        chat_id=9230,
+    )
+    audit_calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        "future_self.reminder_handlers.log_transition",
+        lambda *args, **kwargs: audit_calls.append((*args, kwargs)),
+    )
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        verb = statement.lstrip().split(maxsplit=1)[0].upper()
+        if verb in {"INSERT", "UPDATE", "DELETE"}:
+            statements.append(" ".join(statement.split()).lower())
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        _flow, result, recurring = await save_direct_reminder(
+            bot,
+            user,
+            title="Позвонить врачю",
+            weekly_candidate_handoff=True,
+            chat_id=9230,
+        )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert result.duplicate is True
+    assert recurring is None
+    assert audit_calls == []
+    assert len(statements) == 1
+    assert statements[0].startswith("update users set updated_at=users.updated_at")
+    async with db.sessions() as db_session:
+        assert await db_session.scalar(select(func.count(DraftInboxItem.id))) == 1
+        assert await db_session.scalar(select(func.count(InboxItem.id))) == 1
+        assert await db_session.scalar(select(func.count(TaskState.id))) == 1
+        assert await db_session.scalar(select(func.count(TaskReminder.id))) == 1
+        assert await db_session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_ordinary_reminder_flow_does_not_gain_weekly_typo_dedup(db, fake_ai):
+    user = await subscriber(db, 6231)
+    bot = deterministic_bot(db, fake_ai)
+    first, first_result, _recurring = await save_direct_reminder(
+        bot,
+        user,
+        title="Позвонить врачу",
+        weekly_candidate_handoff=False,
+        chat_id=9231,
+    )
+    second, second_result, _recurring = await save_direct_reminder(
+        bot,
+        user,
+        title="Позвонить врачю",
+        weekly_candidate_handoff=False,
+        chat_id=9231,
+    )
+
+    assert first.weekly_candidate_handoff is False
+    assert second.weekly_candidate_handoff is False
+    assert first_result.duplicate is False
+    assert second_result.duplicate is False
+    async with db.sessions() as db_session:
+        assert await db_session.scalar(select(func.count(DraftInboxItem.id))) == 2
+        assert await db_session.scalar(select(func.count(InboxItem.id))) == 2
+        assert await db_session.scalar(select(func.count(TaskState.id))) == 2
+        assert await db_session.scalar(select(func.count(TaskReminder.id))) == 2
+        assert await db_session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+@pytest.mark.parametrize(
+    "excluded_scope",
+    [
+        "other_owner",
+        "other_schedule",
+        "other_timezone",
+        "other_kind",
+        "unconfirmed_item",
+        "inactive_task",
+        "inactive_reminder",
+        "daily_schedule",
+    ],
+)
+@pytest.mark.asyncio
+async def test_weekly_duplicate_query_requires_exact_active_task_scope(
+    db,
+    fake_ai,
+    excluded_scope,
+):
+    candidate_user = await subscriber(db, 6240)
+    seed_user = await subscriber(db, 6241) if excluded_scope == "other_owner" else candidate_user
+    bot = deterministic_bot(db, fake_ai)
+    seed_kind = (
+        ReminderScheduleKind.DAILY
+        if excluded_scope == "daily_schedule"
+        else ReminderScheduleKind.ONCE
+    )
+    seed_time = time(18, 30) if excluded_scope == "other_schedule" else time(19, 30)
+    await save_direct_reminder(
+        bot,
+        seed_user,
+        title="Позвонить врачу",
+        weekly_candidate_handoff=False,
+        chat_id=9240,
+        schedule_kind=seed_kind,
+        local_time=seed_time,
+    )
+
+    if excluded_scope not in {"other_owner", "other_schedule", "daily_schedule"}:
+        async with db.session() as db_session:
+            item = await db_session.scalar(select(InboxItem))
+            assert item is not None
+            reminder = await db_session.scalar(
+                select(TaskReminder).where(TaskReminder.inbox_item_id == item.id)
+            )
+            state = await db_session.scalar(
+                select(TaskState).where(TaskState.inbox_item_id == item.id)
+            )
+            assert reminder is not None and state is not None
+            if excluded_scope == "other_timezone":
+                reminder.timezone = "Europe/London"
+            elif excluded_scope == "other_kind":
+                item.kind = "note"
+            elif excluded_scope == "unconfirmed_item":
+                item.status = "archived"
+            elif excluded_scope == "inactive_task":
+                state.status = "completed"
+                state.completed_at = NOW
+            elif excluded_scope == "inactive_reminder":
+                reminder.status = "sent"
+                reminder.sent_at = NOW
+
+    _flow, result, recurring = await save_direct_reminder(
+        bot,
+        candidate_user,
+        title="Позвонить врачу!",
+        weekly_candidate_handoff=True,
+        chat_id=9242,
+    )
+
+    assert result.duplicate is False
+    assert recurring is None
+    async with db.sessions() as db_session:
+        assert await db_session.scalar(select(func.count(DraftInboxItem.id))) == 2
+        assert await db_session.scalar(select(func.count(InboxItem.id))) == 2
+        assert await db_session.scalar(select(func.count(TaskState.id))) == 2
+        expected_once = 1 if excluded_scope == "daily_schedule" else 2
+        expected_daily = 1 if excluded_scope == "daily_schedule" else 0
+        assert await db_session.scalar(select(func.count(TaskReminder.id))) == expected_once
+        assert (
+            await db_session.scalar(select(func.count(RecurringTaskReminderSchedule.id)))
+            == expected_daily
+        )
 
 
 @pytest.mark.asyncio

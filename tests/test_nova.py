@@ -108,6 +108,39 @@ def test_catalog_respects_tier_and_runtime_flags():
 
 
 @pytest.mark.parametrize(
+    ("tier", "enabled", "admin_only", "expected"),
+    [
+        (ADMIN, True, True, True),
+        (SUBSCRIBER, True, True, False),
+        (SUBSCRIBER, True, False, True),
+        (ADMIN, False, False, False),
+        (SUBSCRIBER, False, False, False),
+    ],
+)
+def test_weekly_review_catalog_uses_the_centralized_policy(
+    tier,
+    enabled,
+    admin_only,
+    expected,
+):
+    catalog = build_nova_catalog(
+        tier,
+        NovaRuntimeFlags(
+            enable_weekly_review=enabled,
+            weekly_review_admin_only=admin_only,
+        ),
+    )
+
+    assert (catalog.capability("weekly_review") is not None) is expected
+    assert ("weekly_review" in catalog.enabled_features) is expected
+
+    today = navigation_sections(
+        enable_weekly_review=expected,
+    )["today"]
+    assert ("weekly_review" in today.actions) is expected
+
+
+@pytest.mark.parametrize(
     ("question", "expected_action"),
     [
         ("Как открыть главное меню?", "menu"),

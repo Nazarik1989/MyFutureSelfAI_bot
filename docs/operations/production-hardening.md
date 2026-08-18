@@ -57,7 +57,7 @@ offsite retention and secret rotation remain host-operator responsibilities.
    override it with a local process/SQLite check compatible with the retained revision:
 
    ```bash
-   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\",\"20260805_0023\",\"20260806_0024\",\"20260810_0025\",\"20260811_0026\"} else 1)'" \
+   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\",\"20260805_0023\",\"20260806_0024\",\"20260810_0025\",\"20260811_0026\",\"20260817_0027\"} else 1)'" \
    --health-interval=60s --health-timeout=20s --health-start-period=30s \
    --health-retries=3
    ```
@@ -318,6 +318,22 @@ continue while any unexpired processing lease exists, clears `maintenance_paused
 only then removes the exact marker inode. On an error it retains the marker, so retry the
 same command after the reported lease/state problem is resolved. Never remove the
 storage root or SQLite database.
+
+### Weekly review pilot and rollback (revision 0027)
+
+- Keep `ENABLE_WEEKLY_REVIEW=true` together with `WEEKLY_REVIEW_ADMIN_ONLY=true` for
+  the administrator-only pilot. `ENABLE_WEEKLY_REVIEW=false` is the full application
+  kill switch: no weekly UI, provider work, weekly-table reads/DML, recovery,
+  maintenance, proactive send, or weekly-focus application in `/today` is performed.
+- A manual review always targets the actor's current local Monday–Sunday cycle. A
+  scheduled review targets the next cycle; `WEEKLY_REVIEW_WEEKDAY` changes scheduling
+  time only and never moves a manual review to the next week.
+- Prefer a safe image/application rollback while preserving the additive schema at
+  Alembic revision `20260817_0027`. This keeps weekly focus, audit, and session data for
+  a later corrected rollout.
+- `alembic downgrade 20260811_0026` is destructive for Stage 8A: it drops the weekly
+  focus, audit, and durable session tables. Use it only on an isolated/restorable copy
+  after an explicit data-loss decision; never stamp the production database backward.
 
 ### Additive rollback after PR #24
 

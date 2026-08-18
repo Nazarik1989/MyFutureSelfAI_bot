@@ -1159,11 +1159,13 @@ class BotAutotester:
             "quick": frozenset({"nav:help:quick", "nova:topic:quick"}),
         }.get(action, frozenset())
         for message in reversed(self.messages):
-            for reply in reversed(message.replies):
-                markup = reply.get("reply_markup")
-                if markup is None:
+            render_kwargs = (*reversed(message.edit_kwargs), *reversed(message.replies))
+            for kwargs in render_kwargs:
+                markup = kwargs.get("reply_markup")
+                inline_keyboard = getattr(markup, "inline_keyboard", None)
+                if inline_keyboard is None:
                     continue
-                for row in markup.inline_keyboard:
+                for row in inline_keyboard:
                     for button in row:
                         data = button.callback_data
                         if data is None:

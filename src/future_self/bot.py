@@ -49,7 +49,7 @@ from .actions import (
     DraftAction,
     DraftActionService,
 )
-from .ai import AIService
+from .ai import WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS, AIService
 from .callback_ui import edit_callback_screen
 from .collection_commands import CollectionCommandRouter
 from .collection_handlers import CollectionHandlers
@@ -66,6 +66,7 @@ from .domain import (
     IntentRouter,
     OnboardingFlow,
     PendingIntent,
+    TodayApplicationSnapshot,
     normalize_display_name,
 )
 from .drafts import DraftInboxService
@@ -148,6 +149,9 @@ from .vision_renderer import (
     VisionRenderLimiter,
     VisionRenderSessionStore,
 )
+from .weekly_review import WeeklyReviewService
+from .weekly_review_flow import WeeklyReviewCapabilityStore, WeeklyReviewPolicy
+from .weekly_review_handlers import WEEKLY_REVIEW_RETRY_TEXT, WeeklyReviewHandlers
 from .workspace_access import WorkspaceAccessService
 from .workspace_handlers import WorkspaceHandlers
 
@@ -162,6 +166,10 @@ _NOVA_MEMORY_APPLICATION_ACCESS_ATTR = "_nova_memory_application_access_generati
 _NOVA_MEMORY_APPLICATION_DRAIN_TIMEOUT_SECONDS = 30.0
 _NOVA_MEMORY_APPLICATION_CANCEL_TIMEOUT_SECONDS = 5.0
 _NOVA_MEMORY_APPLICATION_CANCEL_RETRY_SECONDS = 0.1
+_WEEKLY_REVIEW_DRAIN_TIMEOUT_SECONDS = 31.0
+_WEEKLY_REVIEW_CANCEL_TIMEOUT_SECONDS = 5.0
+_WEEKLY_REVIEW_CANCEL_RETRY_SECONDS = 0.1
+_WEEKLY_REVIEW_PROCESSING_RECOVERY_MARGIN_SECONDS = 5.0
 EVENING_WORKED, EVENING_FAILED, EVENING_ENERGY, EVENING_OBSTACLE, EVENING_TOMORROW = range(10, 15)
 (
     HEALTH_ENERGY,
@@ -197,6 +205,10 @@ NOVA_MEMORY_APPLICATION_UNAVAILABLE_TEXT = (
 
 class _NovaMemoryApplicationDrainError(RuntimeError):
     """Raised when tracked delivery tasks ignore the bounded shutdown cancellation."""
+
+
+class _WeeklyReviewDrainError(RuntimeError):
+    """Raised when a tracked weekly lifecycle ignores bounded shutdown cancellation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +285,7 @@ class FutureSelfBot(
     CollectionHandlers,
     WorkspaceHandlers,
     KnowledgeHandlers,
+    WeeklyReviewHandlers,
     NovaMemoryHandlers,
     ReminderHandlers,
     NovaHandlers,
@@ -324,6 +337,21 @@ class FutureSelfBot(
         self._nova_memory_application_ui_locks: weakref.WeakValueDictionary[
             tuple[int, int], asyncio.Lock
         ] = weakref.WeakValueDictionary()
+        self.weekly_review_service = WeeklyReviewService(
+            db,
+            review_weekday=settings.weekly_review_weekday,
+        )
+        self.weekly_review_policy = WeeklyReviewPolicy(
+            enabled=bool(getattr(settings, "enable_weekly_review", False)),
+            admin_only=bool(getattr(settings, "weekly_review_admin_only", True)),
+        )
+        self.weekly_review_capabilities = WeeklyReviewCapabilityStore()
+        self._weekly_review_launch_lock = asyncio.Lock()
+        self._reply_keyboard_owner_lock = asyncio.Lock()
+        self._weekly_review_tasks: set[asyncio.Task[Any]] = set()
+        self._weekly_review_ui_locks: weakref.WeakValueDictionary[tuple[int, int], asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self.reminder_sessions = ReminderFlowStore()
         self._reminder_ui_lock = asyncio.Lock()
         self._reminder_launch_lock = asyncio.Lock()
@@ -442,6 +470,7 @@ class FutureSelfBot(
         gated_public_commands = [
             "menu",
             "today",
+            "week",
             "inbox",
             "tasks",
             "collections",
@@ -707,6 +736,7 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("last_saved", self.last_saved_command))
         app.add_handler(CommandHandler("cleanup_drafts", self.cleanup_drafts_command))
         app.add_handler(CommandHandler("today", self.today))
+        app.add_handler(CommandHandler("week", self.week_command))
         app.add_handler(CommandHandler("health", self.health_command))
         app.add_handler(CommandHandler("health_delete", self.health_delete_command))
         app.add_handler(CommandHandler("health_reminder_on", self.health_reminder_on))
@@ -718,6 +748,12 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("doctor_find", self.doctor_find))
         app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
+        app.add_handler(
+            CallbackQueryHandler(
+                self.weekly_review_callback,
+                pattern=r"^wrev:[A-Za-z0-9_-]+$",
+            )
+        )
         app.add_handler(
             CallbackQueryHandler(
                 self.nova_memory_callback,
@@ -836,6 +872,8 @@ class FutureSelfBot(
             self.knowledge_storage.cleanup_staging(
                 older_than_seconds=self.settings.knowledge_staging_ttl_minutes * 60
             )
+        if self.weekly_review_policy.enabled:
+            await self._maintain_weekly_review_state(app.bot, startup_recovery=True)
         try:
             await app.bot.set_my_commands(
                 [BotCommand(item.command, item.description) for item in GUEST_COMMANDS],
@@ -865,12 +903,31 @@ class FutureSelfBot(
         async def send_vision_companion(preference_id: int, moment: str) -> None:
             await self._vision_companion_notification(app.bot, preference_id, moment)
 
+        async def send_weekly_review(telegram_id: int, timezone: str) -> None:
+            await self.weekly_review_scheduled_notification(
+                app.bot,
+                telegram_id,
+                timezone,
+            )
+
         async def can_send(telegram_id: int) -> bool:
             try:
                 return await self.access_service.has_full_access_by_telegram_id(telegram_id)
             except Exception as exc:
-                log_safe_failure("Background access check failed", exc, user_id=telegram_id)
+                log_safe_failure("Background access check failed", exc)
                 return False
+
+        async def can_send_weekly(telegram_id: int) -> bool:
+            if not self.weekly_review_policy.enabled:
+                return False
+            try:
+                status = await self.access_service.status(telegram_id)
+            except Exception as exc:
+                log_safe_failure("Weekly background access check failed", exc)
+                return False
+            return bool(
+                status is not None and self.weekly_review_policy.allows_tier(status.access_tier)
+            )
 
         if isinstance(app, Application) or getattr(app, "post_stop", None) is not None:
             self._start_guest_maintenance(app.bot)
@@ -893,6 +950,8 @@ class FutureSelfBot(
             self.settings.enable_weekly_review,
             send_vision_companion,
             can_send=can_send,
+            weekly_review_send=send_weekly_review,
+            weekly_can_send=can_send_weekly,
         )
         if self.settings.enable_task_reminders:
             self.reminder_engine = TaskReminderEngine(
@@ -957,10 +1016,12 @@ class FutureSelfBot(
 
     async def _guest_maintenance_loop(self, telegram_bot: object) -> None:
         await self._cleanup_guest_results_safely()
+        await self._maintain_weekly_review_state(telegram_bot, startup_recovery=False)
         await self._recover_guest_demo_results(telegram_bot)
         while True:
             await self._guest_maintenance_wait()
             await self._cleanup_guest_results_safely()
+            await self._maintain_weekly_review_state(telegram_bot, startup_recovery=False)
 
     async def _guest_maintenance_wait(self) -> None:
         await asyncio.sleep(60)
@@ -972,6 +1033,57 @@ class FutureSelfBot(
             raise
         except Exception as exc:
             log_safe_failure("Guest result cleanup failed", exc)
+
+    async def _maintain_weekly_review_state(
+        self,
+        telegram_bot: object,
+        *,
+        startup_recovery: bool,
+    ) -> None:
+        """Run one bounded retention/recovery batch without provider work."""
+
+        if not self.weekly_review_policy.enabled:
+            return
+        allowed_tiers = (
+            frozenset({"admin"}) if self.weekly_review_policy.admin_only else FULL_ACCESS_TIERS
+        )
+        try:
+            await self.weekly_review_service.cleanup_expired(allowed_tiers=allowed_tiers)
+            if startup_recovery:
+                recovered = await self.weekly_review_service.recover_processing_session_snapshots(
+                    allowed_tiers=allowed_tiers,
+                )
+            else:
+                current = datetime.now(UTC)
+                processing_cutoff = current - timedelta(
+                    seconds=(
+                        WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS
+                        + _WEEKLY_REVIEW_PROCESSING_RECOVERY_MARGIN_SECONDS
+                    )
+                )
+                recovered = await self.weekly_review_service.recover_processing_session_snapshots(
+                    updated_before=processing_cutoff,
+                    allowed_tiers=allowed_tiers,
+                )
+            await self.weekly_review_capabilities.cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Weekly review maintenance failed operation=maintenance error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        context = type("WeeklyRecoveryContext", (), {"bot": telegram_bot})()
+        for session in recovered:
+            if session.canonical_message_id is None:
+                continue
+            await self._weekly_review_render(
+                context,
+                session,
+                f"{self._weekly_review_week_heading(session)}\n\n{WEEKLY_REVIEW_RETRY_TEXT}",
+                await self._weekly_review_cancel_markup(session),
+            )
 
     async def _stop_guest_maintenance(self) -> None:
         task = self._guest_maintenance_task
@@ -989,20 +1101,112 @@ class FutureSelfBot(
 
     async def _post_stop(self, app: Application) -> None:
         del app
-        await self._drain_nova_memory_application_tasks()
-        await self._stop_guest_maintenance()
+        await self._quiesce_private_delivery_tasks()
 
     async def _post_shutdown(self, app: Application) -> None:
         del app
-        await self._drain_nova_memory_application_tasks()
-        await self._stop_guest_maintenance()
-        await self.image_generation.close()
+        try:
+            await self._quiesce_private_delivery_tasks()
+        finally:
+            await self.image_generation.close()
+
+    async def _quiesce_private_delivery_tasks(self) -> None:
+        try:
+            await self._drain_private_delivery_tasks()
+        finally:
+            try:
+                await self._stop_guest_maintenance()
+            finally:
+                await self._drain_private_delivery_tasks()
+
+    async def _drain_private_delivery_tasks(self) -> None:
+        results = await asyncio.gather(
+            self._drain_weekly_review_tasks(),
+            self._drain_nova_memory_application_tasks(),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _drain_weekly_review_tasks(self) -> None:
+        current = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _WEEKLY_REVIEW_DRAIN_TIMEOUT_SECONDS
+        while True:
+            pending = self._pending_weekly_review_tasks(current)
+            if not pending:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            _done, still_pending = await asyncio.wait(pending, timeout=remaining)
+            if still_pending:
+                break
+
+        pending = self._pending_weekly_review_tasks(current)
+        if not pending:
+            return
+        logger.warning(
+            "Weekly review shutdown operation=drain error_type=TimeoutError pending_count=%s",
+            len(pending),
+        )
+        cancel_deadline = loop.time() + _WEEKLY_REVIEW_CANCEL_TIMEOUT_SECONDS
+        while True:
+            pending = self._pending_weekly_review_tasks(current)
+            if not pending:
+                return
+            for task in pending:
+                task.cancel()
+            remaining = cancel_deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.wait(
+                pending,
+                timeout=min(_WEEKLY_REVIEW_CANCEL_RETRY_SECONDS, remaining),
+            )
+
+        pending = self._pending_weekly_review_tasks(current)
+        if pending:
+            logger.error(
+                "Weekly review shutdown operation=terminal_drain error_type=TimeoutError "
+                "pending_count=%s",
+                len(pending),
+            )
+            raise _WeeklyReviewDrainError("Weekly review terminal drain timed out")
+
+    def _pending_weekly_review_tasks(
+        self,
+        current: asyncio.Task[object] | None,
+    ) -> set[asyncio.Task[Any]]:
+        tasks = self._weekly_review_tasks
+        for task in tuple(tasks):
+            if task is current or not task.done():
+                continue
+            try:
+                task.result()
+            except BaseException:
+                pass
+            tasks.discard(task)
+        return {task for task in tuple(tasks) if task is not current and not task.done()}
 
     async def _user(self, telegram_id: int) -> User:
         async with self.db.session() as session:
             return await UserRepository(session).get_or_create(
                 telegram_id, self.settings.default_timezone
             )
+
+    async def _weekly_review_has_reply_keyboard_owner(self, user: User) -> bool:
+        if not user.onboarding_completed:
+            async with self.db.sessions() as session:
+                onboarding = await OnboardingRepository(session).get(user.id)
+            if onboarding is not None and onboarding.status in _ACTIVE_ONBOARDING_STATUSES:
+                return True
+        if getattr(self.settings, "enable_workspace_access", False):
+            pending = await self.workspace_service.pending_input(user.id, user.telegram_id)
+            if pending is not None:
+                return True
+        return False
 
     @staticmethod
     def _onboarding_public_answers(answers: dict[str, object]) -> dict[str, str]:
@@ -1143,9 +1347,10 @@ class FutureSelfBot(
             raise ApplicationHandlerStop
         if command == "/menu":
             user = await self._user(update.effective_user.id)
-            await self._send_navigation_root(
+            await self._send_after_reply_keyboard_cleanup(
                 update.effective_message,
-                tier=user.access_tier,
+                "Главное меню\n\nЧто хочешь сделать?",
+                self._root_keyboard(user.access_tier),
             )
             raise ApplicationHandlerStop
         if attached and not detached and restored[1] >= len(ONBOARDING_QUESTIONS):
@@ -1173,6 +1378,7 @@ class FutureSelfBot(
         raise ApplicationHandlerStop
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.weekly_review_clear_current(update)
         await self.nova_memory_clear_current(update)
         await self.reminder_clear_current(update)
         await self.nova_clear_current(update)
@@ -1194,34 +1400,39 @@ class FutureSelfBot(
                 if user.display_name
                 else "друг"
             )
-            await update.effective_message.reply_text(
+            await self._send_after_reply_keyboard_cleanup(
+                update.effective_message,
                 f"С возвращением, {display_name}!",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [[InlineKeyboardButton("Открыть главное меню", callback_data="nav:root")]]
                 ),
             )
             return ConversationHandler.END
-        async with self.db.session() as session:
-            state = await OnboardingRepository(session).get_or_create(user.id)
-            if state.status == "cancelled":
-                state.status = "in_progress"
-            step = max(0, min(state.current_step, len(ONBOARDING_QUESTIONS)))
-            state.current_step = step
-        context.user_data["onboarding_user_id"] = user.id
-        context.user_data.pop("onboarding_detached", None)
-        intro = (
-            "Все ответы сохранены. Восстанавливаю итоговый профиль."
-            if step >= len(ONBOARDING_QUESTIONS)
-            else (
-                f"Я — «{self.settings.bot_persona_name}». Продолжим с шага {step + 1} из "
-                f"{len(ONBOARDING_QUESTIONS)}. Можно вернуться, пропустить необязательное или отменить."
+        async with self._reply_keyboard_owner_lock:
+            # This lock is shared with weekly proactive delivery. The durable
+            # owner is published before the reply keyboard and neither can be
+            # interleaved with a weekly ReplyKeyboardRemove.
+            async with self.db.session() as session:
+                state = await OnboardingRepository(session).get_or_create(user.id)
+                if state.status == "cancelled":
+                    state.status = "in_progress"
+                step = max(0, min(state.current_step, len(ONBOARDING_QUESTIONS)))
+                state.current_step = step
+            context.user_data["onboarding_user_id"] = user.id
+            context.user_data.pop("onboarding_detached", None)
+            intro = (
+                "Все ответы сохранены. Восстанавливаю итоговый профиль."
+                if step >= len(ONBOARDING_QUESTIONS)
+                else (
+                    f"Я — «{self.settings.bot_persona_name}». Продолжим с шага {step + 1} из "
+                    f"{len(ONBOARDING_QUESTIONS)}. Можно вернуться, пропустить необязательное или отменить."
+                )
             )
-        )
-        await update.effective_message.reply_text(intro)
-        if step >= len(ONBOARDING_QUESTIONS):
-            return await self._present_onboarding_summary(update, context)
-        await self._ask_question(update, step)
-        return ONBOARDING_INPUT
+            await update.effective_message.reply_text(intro)
+            if step >= len(ONBOARDING_QUESTIONS):
+                return await self._present_onboarding_summary(update, context)
+            await self._ask_question(update, step)
+            return ONBOARDING_INPUT
 
     async def _ask_question(self, update: Update, step: int) -> None:
         _, question, required = ONBOARDING_QUESTIONS[step]
@@ -2287,6 +2498,7 @@ class FutureSelfBot(
                     return
         voice_user = None
         voice_memory_fence = None
+        voice_weekly_session = None
         telegram_user = getattr(update, "effective_user", None)
         effective_chat = getattr(update, "effective_chat", None)
         if (
@@ -2298,6 +2510,12 @@ class FutureSelfBot(
                 update,
                 user=voice_user,
             )
+            voice_weekly_session = await self.weekly_review_voice_fence(
+                update,
+                user=voice_user,
+            )
+            if self.weekly_review_voice_lookup_failed(voice_weekly_session):
+                raise ApplicationHandlerStop
         media = update.effective_message.voice or update.effective_message.audio
         if not self.voice_enabled:
             message = (
@@ -2305,6 +2523,15 @@ class FutureSelfBot(
                 if not self.settings.enable_voice
                 else "Распознавание голосовых временно не настроено. Пришли мысль текстом."
             )
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
             if await self.nova_memory_voice_failure(
                 update,
                 context,
@@ -2317,6 +2544,15 @@ class FutureSelfBot(
             return
         if media.duration and media.duration > self.settings.max_audio_seconds:
             message = "Аудио слишком длинное. Пришли запись короче трёх минут."
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
             if await self.nova_memory_voice_failure(
                 update,
                 context,
@@ -2329,6 +2565,15 @@ class FutureSelfBot(
             return
         if media.file_size and media.file_size > self.settings.max_audio_bytes:
             message = "Аудиофайл слишком большой."
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
             if await self.nova_memory_voice_failure(
                 update,
                 context,
@@ -2342,6 +2587,15 @@ class FutureSelfBot(
         mime = getattr(media, "mime_type", None)
         if mime and not (mime.startswith("audio/") or mime == "application/ogg"):
             message = "Этот формат аудио не поддерживается."
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
             if await self.nova_memory_voice_failure(
                 update,
                 context,
@@ -2361,6 +2615,12 @@ class FutureSelfBot(
                 update,
                 user=voice_user,
             )
+            voice_weekly_session = await self.weekly_review_voice_fence(
+                update,
+                user=voice_user,
+            )
+            if self.weekly_review_voice_lookup_failed(voice_weekly_session):
+                raise ApplicationHandlerStop
         voice_nova_session = await self.nova_sessions.current(
             owner_id=voice_user.id,
             telegram_user_id=update.effective_user.id,
@@ -2380,9 +2640,27 @@ class FutureSelfBot(
                 raise ValueError("Audio exceeds limit")
             filename = getattr(media, "file_name", None) or "voice.ogg"
             text = await self.transcription.transcribe(audio, filename)
+        except asyncio.CancelledError:
+            self.weekly_review_schedule_voice_cancel_cleanup(
+                update,
+                context,
+                progress,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+            )
+            raise
         except (TranscriptionError, TelegramError, ValueError) as exc:
             log_safe_failure("Voice processing failed", exc)
             message = "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
+            if await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=progress,
+                notice=message,
+            ):
+                return
             if await self.nova_memory_voice_failure(
                 update,
                 context,
@@ -2400,19 +2678,31 @@ class FutureSelfBot(
             fence=voice_memory_fence,
         ):
             raise ApplicationHandlerStop
+        if await self.weekly_review_voice_pre_route(
+            update,
+            context,
+            progress,
+            expected_user=voice_user,
+            expected_session=voice_weekly_session,
+        ):
+            raise ApplicationHandlerStop
         screen_update = self._edited_screen_update(update, progress)
         memory_voice_active = (
             voice_memory_fence is not None and voice_memory_fence.session is not None
         )
-        ownership_update = screen_update if memory_voice_active else update
+        weekly_voice_active = voice_weekly_session is not None
+        stateful_voice_active = memory_voice_active or weekly_voice_active
+        ownership_update = screen_update if stateful_voice_active else update
         if await self._try_system_action(
             ownership_update,
             context,
             text,
             clear_current_memory=False,
+            clear_current_weekly=False,
         ):
             await self._clear_frozen_voice_memory(voice_memory_fence)
-            if not memory_voice_active:
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
+            if not stateful_voice_active:
                 await progress.edit_text(f"Я услышал: «{_truncate_utf16(text, 4_000)}»")
             return
         voice_flow = await self._active_navigation_flow(update, context)
@@ -2423,12 +2713,21 @@ class FutureSelfBot(
             fence=voice_memory_fence,
         ):
             raise ApplicationHandlerStop
+        if await self.weekly_review_voice_pre_route(
+            update,
+            context,
+            progress,
+            expected_user=voice_user,
+            expected_session=voice_weekly_session,
+        ):
+            raise ApplicationHandlerStop
         try:
             memory_intent = classify_nova_memory_intent(text).kind
         except NovaMemoryValidationError:
             memory_intent = NovaMemoryIntentKind.AWAIT_CONTENT
         if voice_flow == "onboarding" and memory_intent is not NovaMemoryIntentKind.NONE:
             await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
             await self.reminder_clear_current(update)
             await self.nova_clear_current(update)
             await self._prompt_navigation_flow(
@@ -2446,8 +2745,9 @@ class FutureSelfBot(
         )
         if onboarding_result is not None:
             await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
             onboarding_state, navigation_action = onboarding_result
-            if not memory_voice_active and navigation_action is None:
+            if not stateful_voice_active and navigation_action is None:
                 await progress.edit_text("Голос распознан и обработан в регистрации.")
             return onboarding_state
         reminder_voice_state = ReminderVoiceGateState(
@@ -2455,6 +2755,7 @@ class FutureSelfBot(
         )
         if voice_flow is not None:
             await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
             if memory_intent is not NovaMemoryIntentKind.NONE:
                 await self.reminder_clear_current(update)
                 await self.nova_clear_current(update)
@@ -2465,20 +2766,28 @@ class FutureSelfBot(
                 )
                 raise ApplicationHandlerStop
             await self.reminder_clear_current(update)
-            if memory_voice_active:
-                if await self._route_voice_durable_flow(
-                    ownership_update,
-                    context,
-                    voice_flow,
-                    text,
-                ):
-                    return
-                await self._prompt_navigation_flow(
-                    screen_update.effective_message,
-                    update,
-                    voice_flow,
-                )
-                raise ApplicationHandlerStop
+            if await self._route_voice_durable_flow(
+                ownership_update,
+                context,
+                voice_flow,
+                text,
+            ):
+                return
+            await self._prompt_navigation_flow(
+                screen_update.effective_message,
+                update,
+                voice_flow,
+            )
+            raise ApplicationHandlerStop
+        if await self.weekly_review_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            expected_user=voice_user,
+            expected_session=voice_weekly_session,
+        ):
+            raise ApplicationHandlerStop
         if await self.nova_memory_voice_gate(
             update,
             context,
@@ -2496,6 +2805,14 @@ class FutureSelfBot(
             expected_access_version=voice_access_version,
             expected_session=voice_reminder_session,
             voice_state=reminder_voice_state,
+        ):
+            return
+        if await self.weekly_review_launch_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            expected_user=voice_user,
         ):
             return
         if not reminder_voice_state.access_failed:
@@ -2608,6 +2925,11 @@ class FutureSelfBot(
             session_id=session.id,
         )
 
+    async def _clear_frozen_voice_weekly(self, session: Any | None) -> bool:
+        if session is None or self.weekly_review_voice_lookup_failed(session):
+            return False
+        return await self._weekly_review_clear_exact(session)
+
     async def _try_system_action(
         self,
         update: Update,
@@ -2615,6 +2937,7 @@ class FutureSelfBot(
         text: str,
         *,
         clear_current_memory: bool = True,
+        clear_current_weekly: bool = True,
     ) -> bool:
         """Consume destructive control language before any content flow or LLM."""
 
@@ -2669,6 +2992,8 @@ class FutureSelfBot(
             return False
         if clear_current_memory:
             await self.nova_memory_clear_current(update)
+        if clear_current_weekly:
+            await self.weekly_review_clear_current(update)
         await self.reminder_clear_current(update)
         await self._handle_system_action_route(update, context, user, snapshot, route)
         return True
@@ -5894,24 +6219,167 @@ class FutureSelfBot(
         )
 
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        task = asyncio.create_task(
+            self._today_lifecycle(update, context),
+            name="weekly-review-today-lifecycle",
+        )
+        self._weekly_review_track_task(task)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today delivery failed operation=weekly_today error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _today_lifecycle(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
         user = await self._user(update.effective_user.id)
         if not user.onboarding_completed:
             await update.effective_message.reply_text(
                 "Сначала заверши Vision Profile через /start."
             )
             return
+        include_weekly_focus = self.weekly_review_policy.allows_actor(user)
         try:
-            plan = await self.focus_service.generate(user.id)
+            snapshot = await self.focus_service.materialize_today_application(
+                user.id,
+                include_weekly_focus=include_weekly_focus,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            log_safe_failure("Today plan failed", exc, user_id=user.id)
+            logger.warning(
+                "Today plan failed operation=materialize error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        try:
+            provider_allowed = await self._today_application_is_current(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today plan failed operation=pre_provider_fence error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        if not provider_allowed:
+            return
+        try:
+            plan = await self.focus_service.generate_today_plan(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today plan failed operation=provider error_type=%s",
+                type(exc).__name__,
+            )
+            try:
+                fallback_allowed = await self._today_application_is_current(snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception as fence_exc:
+                logger.warning(
+                    "Today plan failed operation=provider_failure_fence error_type=%s",
+                    type(fence_exc).__name__,
+                )
+                return
+            if not fallback_allowed:
+                return
             await update.effective_message.reply_text(
                 "Не удалось собрать фокус дня. Попробуй немного позже."
             )
             return
+        try:
+            delivery_allowed = await self._today_application_is_current(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today plan failed operation=pre_send_fence error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        if not delivery_allowed:
+            return
         actions = "\n".join(f"{i}. {action}" for i, action in enumerate(plan.actions, 1))
-        await update.effective_message.reply_text(
-            f"{plan.vision_reminder}\n\nФокус: {plan.main_focus}\n{actions}\n\n"
+        weekly_line = (
+            f"🎯 Фокус недели: {snapshot.weekly_focus}\n\n"
+            if snapshot.includes_weekly_focus and snapshot.weekly_focus
+            else ""
+        )
+        sent = await update.effective_message.reply_text(
+            f"{weekly_line}{plan.vision_reminder}\n\nФокус: {plan.main_focus}\n{actions}\n\n"
             f"На сложный день: {plan.hard_day_minimum}"
+        )
+        try:
+            delivered_current = await self._today_application_is_current(snapshot)
+        except asyncio.CancelledError:
+            await self._today_neutralize_delivery(
+                context,
+                update,
+                sent,
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today delivery failed operation=post_send_fence error_type=%s",
+                type(exc).__name__,
+            )
+            delivered_current = False
+        if delivered_current:
+            return
+        await self._today_neutralize_delivery(context, update, sent)
+
+    async def _today_neutralize_delivery(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        update: Update,
+        sent: Any,
+    ) -> None:
+        message_id = getattr(sent, "message_id", None)
+        if isinstance(message_id, int) and message_id > 0:
+            await self._weekly_review_neutralize_sent(
+                context.bot,
+                update.effective_chat.id,
+                message_id,
+            )
+            return
+        delete = getattr(sent, "delete", None)
+        if not callable(delete):
+            logger.error(
+                "Today delivery cleanup failed operation=missing_message_id "
+                "error_type=MissingMessageId"
+            )
+            return
+        try:
+            await delete()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today delivery cleanup failed operation=delete error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _today_application_is_current(
+        self,
+        snapshot: TodayApplicationSnapshot,
+    ) -> bool:
+        check = await self.focus_service.check_today_application(snapshot)
+        if not check.is_current:
+            return False
+        if not snapshot.includes_weekly_focus:
+            return True
+        return self.weekly_review_policy.allows_actor(
+            snapshot,
+            expected_access_version=snapshot.access_version,
         )
 
     async def evening_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

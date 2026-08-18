@@ -10,6 +10,7 @@ from time import monotonic
 
 from .access import ACCESS_TIERS, ADMIN, BLOCKED, GUEST, AccessTier
 from .navigation import help_topics, navigation_actions, navigation_sections, public_commands
+from .weekly_review_flow import WeeklyReviewPolicy
 
 NOVA_SESSION_TTL_SECONDS = 15 * 60
 NOVA_MAX_SESSIONS = 128
@@ -47,6 +48,8 @@ class NovaRuntimeFlags:
     vision_image_admin_only: bool = True
     enable_nova_ai: bool = False
     nova_ai_admin_only: bool = True
+    enable_weekly_review: bool = True
+    weekly_review_admin_only: bool = True
 
     @classmethod
     def from_settings(cls, settings: object) -> NovaRuntimeFlags:
@@ -70,7 +73,15 @@ class NovaRuntimeFlags:
             vision_image_admin_only=bool(getattr(settings, "vision_image_admin_only", True)),
             enable_nova_ai=bool(getattr(settings, "enable_nova_ai", False)),
             nova_ai_admin_only=bool(getattr(settings, "nova_ai_admin_only", True)),
+            enable_weekly_review=bool(getattr(settings, "enable_weekly_review", True)),
+            weekly_review_admin_only=bool(getattr(settings, "weekly_review_admin_only", True)),
         )
+
+    def weekly_review_available_for_tier(self, tier: AccessTier) -> bool:
+        return WeeklyReviewPolicy(
+            enabled=self.enable_weekly_review,
+            admin_only=self.weekly_review_admin_only,
+        ).allows_tier(tier)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +147,7 @@ _SAFE_NAVIGATION_ACTION_IDS = frozenset(
         "spaces",
         "knowledge",
         "capture",
+        "weekly_review",
     }
 )
 
@@ -203,15 +215,18 @@ def build_nova_catalog(
             enabled_features=features,
         )
 
+    weekly_review_available = runtime.weekly_review_available_for_tier(tier)
     actions = navigation_actions(
         runtime.enable_workspace_access,
         runtime.enable_knowledge_hub,
         runtime.enable_knowledge_capture,
+        weekly_review_available,
     )
     sections = navigation_sections(
         runtime.enable_workspace_access,
         runtime.enable_knowledge_hub,
         runtime.enable_knowledge_capture,
+        weekly_review_available,
     )
     topics = help_topics(
         runtime.enable_workspace_access,
@@ -296,6 +311,8 @@ def _enabled_features(tier: AccessTier, flags: NovaRuntimeFlags) -> tuple[str, .
     if flags.enable_nova_ai and tier not in (GUEST, BLOCKED):
         if not flags.nova_ai_admin_only or tier == ADMIN:
             enabled.append("nova_ai")
+    if flags.weekly_review_available_for_tier(tier):
+        enabled.append("weekly_review")
     return tuple(enabled)
 
 

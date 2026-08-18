@@ -1028,6 +1028,9 @@ class NovaHandlers:
         target = capability.target
         query = update.callback_query
         await self.nova_memory_clear_current(update)
+        weekly_review_available = self._nova_flags().weekly_review_available_for_tier(
+            require_access_tier(user.access_tier)
+        )
         if target == "nav:root":
             await self._edit_or_send(
                 query,
@@ -1044,13 +1047,14 @@ class NovaHandlers:
                 self._workspace_enabled(),
                 self._knowledge_hub_enabled(),
                 self._knowledge_capture_enabled(),
+                weekly_review_available,
             ).get(section_key)
             if section is None:
                 return
             await self._edit_or_send(
                 query,
                 f"{section.emoji} {section.label}\n\n{section.description}",
-                self._section_keyboard(section_key),
+                self._section_keyboard(section_key, user.access_tier),
             )
             return
         if target.startswith("nav:help:"):
@@ -1070,8 +1074,32 @@ class NovaHandlers:
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            weekly_review_available,
         ).get(action_id)
         if action is None or action.handler is None:
+            return
+        if action_id == "weekly_review":
+            if await self.reminder_blocks_navigation(update):
+                await self.reminder_public_command_gate(update, context)
+                return
+            async with self._reminder_launch_lock:
+                reminder_owns = await self.reminder_blocks_navigation(update)
+                if not reminder_owns:
+                    screen = _NovaCallbackMessage(
+                        self,
+                        query,
+                        self._back_keyboard(self._section_for_action(action_id)),
+                    )
+                    original_args = getattr(context, "args", None)
+                    context.args = []
+                    try:
+                        await getattr(self, action.handler)(
+                            _NovaScreenUpdate(update, screen), context
+                        )
+                    finally:
+                        context.args = original_args or []
+            if reminder_owns:
+                await self.reminder_public_command_gate(update, context)
             return
         if action_id == "vision":
             await self._vision_menu(query.message, user=user, query=query)
@@ -1168,6 +1196,7 @@ class NovaHandlers:
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            self._nova_flags().weekly_review_available_for_tier(catalog.tier),
         ).get(capability.id)
         if action is None or action.handler is None:
             return None
@@ -1178,6 +1207,10 @@ class NovaHandlers:
 
     async def nova_cancel_gate(self, update: Any, context: Any) -> None:
         flow = await self._active_navigation_flow(update, context)
+        if flow is None and await self.weekly_review_cancel_gate(update, context):
+            from telegram.ext import ApplicationHandlerStop
+
+            raise ApplicationHandlerStop
         if flow is None and await self.nova_memory_cancel_gate(update, context):
             from telegram.ext import ApplicationHandlerStop
 
