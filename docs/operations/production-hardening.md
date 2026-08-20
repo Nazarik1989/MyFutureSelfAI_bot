@@ -100,6 +100,8 @@ docker run -d \
   --env ENABLE_COUNCIL=false \
   --env ENABLE_SCHEDULED_COUNCIL=false \
   --env ENABLE_KNOWLEDGE_EXPORT=false \
+  --env ENABLE_NOVA_COMPANION=false \
+  --env NOVA_COMPANION_ADMIN_ONLY=true \
   --env ENABLE_NOVA_MEMORY=false \
   --env NOVA_MEMORY_ADMIN_ONLY=true \
   --env ENABLE_NOVA_MEMORY_APPLICATION=false \
@@ -151,6 +153,22 @@ files stay root-owned `0700/0600`.
   the `trashed` lifecycle. If it is non-empty, keep the lifecycle-aware image or restore the
   rows explicitly before rollback; migration `20260725_0020` intentionally refuses to
   downgrade while recoverable trash exists.
+
+## Stage 8B.1 Nova Companion pilot
+
+Keep `ENABLE_NOVA_COMPANION=false` and `NOVA_COMPANION_ADMIN_ONLY=true` in the
+baseline deployment. The first flag is the independent kill switch; when it is enabled,
+the second limits conversation-first routing to the `admin` tier. Disabled or ineligible
+actors remain on the existing routing path.
+
+Companion answers may use a bounded owner-scoped projection of confirmed profile, Vision,
+goals, current weekly focus, confirmed Nova Memory and recent conversation data. Treat all
+projected values as untrusted user data. Never include Telegram/database identifiers,
+access metadata, drafts, callback tokens or unrelated Knowledge/health/lab content. The
+provider may return at most one grounded capture suggestion and must never mutate data.
+Only an explicit suggestion callback may create the existing draft preview; the existing
+separate save confirmation remains the sole final-write path. Do not log user content or
+callback payloads. Provider retention depends on the selected provider and account.
 
 ## Stage 7A–7C Nova memory and conversation retention
 

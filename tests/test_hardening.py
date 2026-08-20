@@ -66,6 +66,8 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.enable_nova_memory_application is False
     assert configured.nova_memory_application_admin_only is True
     assert configured.nova_memory_max_items == 100
+    assert configured.enable_nova_companion is False
+    assert configured.nova_companion_admin_only is True
     assert configured.enable_weekly_review is True
     assert configured.weekly_review_admin_only is True
 
@@ -340,6 +342,11 @@ def test_container_and_build_context_are_hardened() -> None:
         "--env NOVA_MEMORY_MAX_ITEMS=100",
     ):
         assert nova_memory_control in runbook
+    for nova_companion_control in (
+        "--env ENABLE_NOVA_COMPANION=false",
+        "--env NOVA_COMPANION_ADMIN_ONLY=true",
+    ):
+        assert nova_companion_control in runbook
 
 
 def test_stage_7c_memory_transparency_docs_are_explicit_and_retention_honest() -> None:

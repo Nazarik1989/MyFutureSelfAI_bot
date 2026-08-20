@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 
 from future_self.db import Database
+from future_self.nova_companion import NovaCompanionContextProjection
 from future_self.nova_memory_application import NovaMemoryProjection
 from future_self.schemas import (
     AssistantAnswer,
@@ -13,6 +14,7 @@ from future_self.schemas import (
     GuestFirstStep,
     GuestThoughtBreakdown,
     IntentResult,
+    NovaCompanionResponse,
     ParsedThought,
     ReminderTimezoneResolution,
     RoutineProposal,
@@ -36,6 +38,14 @@ class FakeAI:
         self.answer_started = asyncio.Event()
         self.answer_release = asyncio.Event()
         self.answer_release.set()
+        self.companion_calls: list[tuple[str, dict[str, str], NovaCompanionContextProjection]] = []
+        self.companion_result = NovaCompanionResponse(
+            answer="Я рядом. Расскажи, что сейчас для тебя важно."
+        )
+        self.companion_error: BaseException | None = None
+        self.companion_started = asyncio.Event()
+        self.companion_release = asyncio.Event()
+        self.companion_release.set()
         self.timezone_calls: list[str] = []
         self.timezone_results: dict[str, TimezoneResolution] = {}
         self.reminder_timezone_calls: list[str] = []
@@ -258,6 +268,19 @@ class FakeAI:
         if self.answer_error is not None:
             raise self.answer_error
         return AssistantAnswer(answer=f"Ответ на: {text}")
+
+    async def companion_message(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+        companion_context: NovaCompanionContextProjection,
+    ) -> NovaCompanionResponse:
+        self.companion_calls.append((text, dict(temporal_context), companion_context))
+        self.companion_started.set()
+        await self.companion_release.wait()
+        if self.companion_error is not None:
+            raise self.companion_error
+        return self.companion_result.model_copy(deep=True)
 
 
 @pytest.fixture

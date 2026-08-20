@@ -176,7 +176,8 @@ class DateResolver:
     def resolve(
         self, text: str, timezone_name: str, *, now: datetime | None = None
     ) -> DateResolution:
-        local_now = (now or datetime.now(UTC)).astimezone(ZoneInfo(timezone_name))
+        current = now if now is not None else self._now_provider()
+        local_now = current.astimezone(ZoneInfo(timezone_name))
         today = local_now.date()
         lowered = text.lower().replace("ё", "е")
         relative = self._relative(lowered, today)

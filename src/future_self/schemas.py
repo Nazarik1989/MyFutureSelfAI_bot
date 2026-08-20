@@ -209,6 +209,40 @@ class AssistantAnswer(BaseModel):
     answer: str = Field(min_length=1, max_length=2000)
 
 
+class NovaCompanionCapture(BaseModel):
+    """Grounded suggestion exposed to UI code after evidence has been discarded."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    kind: Literal["idea", "task", "desire", "note"]
+    title: str = Field(min_length=1, max_length=200, repr=False)
+    next_step: str | None = Field(default=None, min_length=1, max_length=300, repr=False)
+
+
+class NovaCompanionProviderCapture(NovaCompanionCapture):
+    """Untrusted provider suggestion with validation-only current-message evidence."""
+
+    evidence: str = Field(min_length=1, max_length=500, repr=False, exclude=True)
+
+
+class NovaCompanionProviderResponse(BaseModel):
+    """Private structured-output shape used only at the provider boundary."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    answer: str = Field(min_length=1, max_length=2000, repr=False)
+    capture: NovaCompanionProviderCapture | None = Field(default=None, repr=False)
+
+
+class NovaCompanionResponse(BaseModel):
+    """One conversation-first answer with at most one non-mutating capture offer."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    answer: str = Field(min_length=1, max_length=2000, repr=False)
+    capture: NovaCompanionCapture | None = Field(default=None, repr=False)
+
+
 class TodayPlan(BaseModel):
     vision_reminder: str
     main_focus: str

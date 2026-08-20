@@ -386,6 +386,24 @@ default `NOVA_AI_ADMIN_ONLY=true` он доступен только tier `admin
 не запускает destructive/admin actions и не предлагает ещё не реализованные функции.
 Подробный контракт: [docs/NOVA_HELP_GUIDE.md](docs/NOVA_HELP_GUIDE.md).
 
+### Nova Companion
+
+Stage 8B.1 adds a separately gated conversation-first route. It is disabled by default:
+
+```dotenv
+ENABLE_NOVA_COMPANION=false
+NOVA_COMPANION_ADMIN_ONLY=true
+```
+
+When enabled for an eligible actor, ordinary statements receive a human conversational
+answer instead of being converted immediately into an inbox preview. Explicit capture and
+reminder commands keep their existing preview-and-confirm flows. Nova can offer at most one
+grounded `idea`, `task`, `desire` or `note` suggestion; rejecting it writes nothing, and
+accepting it opens the existing draft preview rather than saving immediately. Confirmed,
+owner-scoped profile, Vision, goals, current weekly focus, Nova Memory and recent
+conversation may be projected within strict bounds. They are treated as data, never as
+instructions, and no automatic long-term memory is created from the conversation.
+
 ### Stage 7C: confirmed My Nova personalization
 
 Stage 7A introduced the owner-scoped durable memory domain. Stage 7B.1 adds its explicit

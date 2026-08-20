@@ -3,6 +3,7 @@ import logging
 import re
 import warnings
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from hashlib import blake2s
@@ -99,6 +100,7 @@ from .natural_commands import NaturalAction, NaturalCommandRouter
 from .navigation import NavigationFlowStore
 from .navigation_handlers import NavigationHandlers
 from .nova import NovaSessionStore, is_explicit_nova_invocation
+from .nova_companion_handlers import NovaCompanionHandlers
 from .nova_handlers import NovaHandlers
 from .nova_memory import (
     NovaMemoryApplicationSnapshot,
@@ -286,6 +288,7 @@ class FutureSelfBot(
     WorkspaceHandlers,
     KnowledgeHandlers,
     WeeklyReviewHandlers,
+    NovaCompanionHandlers,
     NovaMemoryHandlers,
     ReminderHandlers,
     NovaHandlers,
@@ -363,6 +366,7 @@ class FutureSelfBot(
             settings.draft_focus_ttl_minutes,
             settings.system_action_ttl_minutes,
         )
+        self._init_nova_companion()
         self.date_resolver = DateResolver()
         self.reminder_intent_parser = ReminderIntentParser()
         self.recurring_reminder_service = RecurringTaskReminderService(
@@ -756,6 +760,12 @@ class FutureSelfBot(
         )
         app.add_handler(
             CallbackQueryHandler(
+                self.nova_companion_callback,
+                pattern=r"^ncap:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
                 self.nova_memory_callback,
                 pattern=r"^nmem:[A-Za-z0-9_-]+$",
             )
@@ -1016,11 +1026,13 @@ class FutureSelfBot(
 
     async def _guest_maintenance_loop(self, telegram_bot: object) -> None:
         await self._cleanup_guest_results_safely()
+        await self._cleanup_nova_companion_capabilities_safely()
         await self._maintain_weekly_review_state(telegram_bot, startup_recovery=False)
         await self._recover_guest_demo_results(telegram_bot)
         while True:
             await self._guest_maintenance_wait()
             await self._cleanup_guest_results_safely()
+            await self._cleanup_nova_companion_capabilities_safely()
             await self._maintain_weekly_review_state(telegram_bot, startup_recovery=False)
 
     async def _guest_maintenance_wait(self) -> None:
@@ -1033,6 +1045,17 @@ class FutureSelfBot(
             raise
         except Exception as exc:
             log_safe_failure("Guest result cleanup failed", exc)
+
+    async def _cleanup_nova_companion_capabilities_safely(self) -> None:
+        try:
+            await self.nova_companion_captures.cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=capability_cleanup error_type=%s",
+                type(exc).__name__,
+            )
 
     async def _maintain_weekly_review_state(
         self,
@@ -1123,6 +1146,7 @@ class FutureSelfBot(
         results = await asyncio.gather(
             self._drain_weekly_review_tasks(),
             self._drain_nova_memory_application_tasks(),
+            self._drain_nova_companion_tasks(),
             return_exceptions=True,
         )
         for result in results:
@@ -2869,6 +2893,22 @@ class FutureSelfBot(
         if reminder_voice_state.access_failed:
             await self._reminder_edit_access_candidate(progress)
             return
+        if self.nova_companion_available_for_actor(voice_user):
+            snapshot = await self.conversation.get(
+                update.effective_user.id,
+                update.effective_chat.id,
+            )
+            handled = await self.nova_companion_route(
+                update,
+                context,
+                text,
+                "voice",
+                user=voice_user,
+                conversation_snapshot=snapshot,
+                delivery_message=progress,
+            )
+            if handled:
+                return
         heard_text = _truncate_utf16(text, 4_000)
         await progress.edit_text(f"Я услышал: «{heard_text}»")
         await self._route_message(update, context, text, "voice", frozen_user=voice_user)
@@ -3006,6 +3046,7 @@ class FutureSelfBot(
         source: str,
         *,
         frozen_user: User | None = None,
+        companion_delivery_message: object | None = None,
     ) -> None:
         natural_command = self.natural_command_router.route(text)
         if natural_command is not None:
@@ -3054,6 +3095,17 @@ class FutureSelfBot(
         )
         if action_route.kind != "none":
             await self._handle_action_route(update, context, user, snapshot, action_route, source)
+            return
+        editing = await self.draft_service.editing(update.effective_user.id, chat_id)
+        if editing is None and await self.nova_companion_route(
+            update,
+            context,
+            text,
+            source,
+            user=user,
+            conversation_snapshot=snapshot,
+            delivery_message=companion_delivery_message,
+        ):
             return
         relative_reminder = self.date_resolver.resolve_relative_reminder(text, user.timezone)
         if relative_reminder is not None:
@@ -3109,7 +3161,6 @@ class FutureSelfBot(
             )
             await update.effective_message.reply_text(response)
             return
-        editing = await self.draft_service.editing(update.effective_user.id, chat_id)
         prompt_context = snapshot.for_prompt()
         prompt_context["date_resolution"] = date_resolution.model_dump(mode="json")
         temporal_resolution = (
@@ -5118,7 +5169,9 @@ class FutureSelfBot(
         draft: DraftInboxItem,
         *,
         include_original: bool = True,
-    ) -> None:
+        on_sent: Callable[[object], None] | None = None,
+        bind_preview: bool = True,
+    ) -> object:
         step = f"\nСледующий шаг: {escape(draft.next_step)}" if draft.next_step else ""
         description = f"\nОписание: {escape(draft.description)}" if draft.description else ""
         if draft.temporal_resolution:
@@ -5158,8 +5211,11 @@ class FutureSelfBot(
             parse_mode="HTML",
             reply_markup=keyboard,
         )
-        if message_id := getattr(preview_message, "message_id", None):
+        if on_sent is not None:
+            on_sent(preview_message)
+        if bind_preview and (message_id := getattr(preview_message, "message_id", None)):
             await self.draft_service.set_preview_message(draft.id, message_id)
+        return preview_message
 
     async def _show_unknown(
         self,

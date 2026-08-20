@@ -23,6 +23,7 @@ from .nova import (
     is_nova_help_intent,
     resolve_nova_question,
 )
+from .nova_companion_flow import NovaAddressClassifier, NovaAddressKind, NovaCompanionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,91 @@ class NovaHandlers:
 
     def _nova_catalog(self, tier: AccessTier) -> NovaCatalog:
         return build_nova_catalog(tier, self._nova_flags())
+
+    def _nova_companion_policy_allows(self, user: Any) -> bool:
+        return NovaCompanionPolicy(
+            enabled=bool(getattr(self.settings, "enable_nova_companion", False)),
+            admin_only=bool(getattr(self.settings, "nova_companion_admin_only", True)),
+        ).allows_actor(user)
+
+    def _nova_companion_should_defer_nova_help(
+        self,
+        text: str,
+        *,
+        user: Any,
+        catalog: NovaCatalog,
+        active_session: NovaSession | None,
+    ) -> bool:
+        """Leave companion-addressed conversation to the ordinary message route.
+
+        The pilot is deliberately fail-closed.  Existing Nova Help keeps ownership
+        while a guided session is active, and an addressed request for an actual
+        bot capability still resolves through the existing help catalog.
+        """
+
+        if active_session is not None or not self._nova_companion_policy_allows(user):
+            return False
+        address = NovaAddressClassifier.classify(text)
+        if address.kind is NovaAddressKind.NONE:
+            return False
+        if address.is_local_response:
+            return True
+        if address.kind is not NovaAddressKind.VOCATIVE or address.content is None:
+            return False
+        return not self._nova_addressed_capability_help(address.content, catalog)
+
+    def _nova_companion_addressed_help_question(
+        self,
+        text: str,
+        *,
+        user: Any,
+        catalog: NovaCatalog,
+    ) -> str | None:
+        """Expose a pilot-gated Russian or Latin vocative capability question."""
+
+        if not self._nova_companion_policy_allows(user):
+            return None
+        address = NovaAddressClassifier.classify(text)
+        if (
+            address.kind is NovaAddressKind.VOCATIVE
+            and address.content is not None
+            and self._nova_addressed_capability_help(address.content, catalog)
+        ):
+            return address.content
+        return None
+
+    @staticmethod
+    def _nova_addressed_capability_help(content: str, catalog: NovaCatalog) -> bool:
+        """Recognize addressed interface help without treating all questions as help."""
+
+        if is_nova_help_intent(content, catalog):
+            return True
+        normalized = " ".join(content.casefold().replace("ё", "е").split())
+        capability_leads = (
+            "как добавить ",
+            "как создать ",
+            "как сохранить ",
+            "как открыть ",
+            "как изменить ",
+            "как удалить ",
+            "как настроить ",
+            "как отключить ",
+            "как загрузить ",
+            "как перейти ",
+            "где мои ",
+            "где мой ",
+            "где моя ",
+            "куда нажать",
+            "открой ",
+            "покажи ",
+            "подскажи где ",
+            "что ты умеешь",
+            "какие команды",
+        )
+        if not normalized.startswith(capability_leads):
+            return False
+        resolution = resolve_nova_question(content, catalog)
+        return resolution is not None and resolution.kind is not NovaResolutionKind.CLARIFY
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await self._user(update.effective_user.id)
@@ -298,7 +384,16 @@ class NovaHandlers:
             return False
         catalog = self._nova_catalog(tier)
         explicit_question = extract_explicit_nova_question(text)
-        standalone_intent = is_nova_help_intent(text, catalog)
+        addressed_help_question = self._nova_companion_addressed_help_question(
+            text,
+            user=user,
+            catalog=catalog,
+        )
+        if explicit_question is None:
+            explicit_question = addressed_help_question
+        standalone_intent = addressed_help_question is not None or is_nova_help_intent(
+            text, catalog
+        )
         voice_generation_changed = voice_session_fenced and not self._nova_voice_session_matches(
             current,
             expected_voice_session,
@@ -306,7 +401,14 @@ class NovaHandlers:
         intent_session = (
             (expected_voice_session or current) if voice_generation_changed else current
         )
-        if not is_nova_help_intent(
+        if self._nova_companion_should_defer_nova_help(
+            text,
+            user=user,
+            catalog=catalog,
+            active_session=intent_session,
+        ):
+            return False
+        if addressed_help_question is None and not is_nova_help_intent(
             text,
             catalog,
             active_session=intent_session is not None,

@@ -9,12 +9,20 @@ from pydantic import ValidationError
 import future_self.ai as ai_module
 from future_self import prompts
 from future_self.ai import (
+    NOVA_COMPANION_MAX_INPUT_CHARS,
+    NOVA_COMPANION_TIMEOUT_SECONDS,
     NOVA_HELP_MAX_INPUT_CHARS,
     NOVA_HELP_TIMEOUT_SECONDS,
     OpenAICompatibleAIService,
 )
 from future_self.config import Settings
-from future_self.schemas import NOVA_HELP_MAX_PAYLOAD_BYTES, NovaHelpPlan
+from future_self.nova_companion import build_nova_companion_context_projection
+from future_self.schemas import (
+    NOVA_HELP_MAX_PAYLOAD_BYTES,
+    NovaCompanionProviderCapture,
+    NovaCompanionProviderResponse,
+    NovaHelpPlan,
+)
 
 
 def help_plan(**overrides: object) -> NovaHelpPlan:
@@ -354,3 +362,265 @@ async def test_nova_help_does_not_log_raw_input_output_or_provider_error(caplog)
     assert len(responses.parse_calls) == 1
     assert question not in caplog.text
     assert output.response not in caplog.text
+
+
+def companion_projection():
+    return build_nova_companion_context_projection(
+        profile=SimpleNamespace(
+            summary="PRIVATE_PROFILE_CONTEXT",
+            values=["PRIVATE_PROFILE_VALUE"],
+            desired_identity=[],
+            constraints=[],
+            motivation_style=None,
+        ),
+        conversation_context={
+            "current_topic": "PRIVATE_TOPIC",
+            "recent_messages": [{"role": "user", "content": "PRIVATE_RECENT_MESSAGE", "id": 999}],
+            "active_draft": {"id": "PRIVATE_DRAFT"},
+        },
+    )
+
+
+def companion_response(**overrides: object) -> NovaCompanionProviderResponse:
+    payload: dict[str, object] = {
+        "answer": "Это звучит как конкретная идея, которую можно спокойно обдумать.",
+        "capture": NovaCompanionProviderCapture(
+            kind="idea",
+            title="клуб чтения",
+            next_step="собрать клуб чтения",
+            evidence="Хочу собрать клуб чтения",
+        ),
+    }
+    payload.update(overrides)
+    return NovaCompanionProviderResponse(**payload)
+
+
+async def test_nova_companion_uses_one_no_retry_call_and_minimal_bounded_payload():
+    output = companion_response()
+    service, client, responses = service_with_fake(output_parsed=output)
+
+    result = await service.companion_message(
+        "  Хочу собрать клуб чтения  ",
+        {
+            "timezone": "Europe/Moscow",
+            "local_datetime": "2026-08-18T15:00:00+03:00",
+            "today_date": "2026-08-18",
+        },
+        companion_projection(),
+    )
+
+    assert result.answer == output.answer
+    assert result.capture is not None
+    assert result.capture.kind == "idea"
+    assert result.capture.title == "клуб чтения"
+    assert result.capture.next_step == "собрать клуб чтения"
+    assert not hasattr(result.capture, "evidence")
+    assert client.with_options_calls == [{"max_retries": 0}]
+    assert client.responses.parse_calls == []
+    assert len(responses.parse_calls) == 1
+    call = responses.parse_calls[0]
+    assert call["model"] == "nova-test-model"
+    assert call["text_format"] is NovaCompanionProviderResponse
+    assert call["timeout"] == NOVA_COMPANION_TIMEOUT_SECONDS == 30.0
+    assert call["input"][0] == {
+        "role": "system",
+        "content": f"{prompts.NOVA_COMPANION_SYSTEM}\nСтиль ответа: спокойный и конкретный.",
+    }
+    provider_payload = json.loads(call["input"][1]["content"])
+    assert provider_payload["message"] == "Хочу собрать клуб чтения"
+    assert provider_payload["temporal_context"] == {
+        "timezone": "Europe/Moscow",
+        "local_datetime": "2026-08-18T15:00:00+03:00",
+        "today_date": "2026-08-18",
+    }
+    assert provider_payload["companion_context"] == {
+        "profile": {
+            "summary": "PRIVATE_PROFILE_CONTEXT",
+            "values": ["PRIVATE_PROFILE_VALUE"],
+        },
+        "recent_conversation": {
+            "current_topic": "PRIVATE_TOPIC",
+            "recent_messages": [{"role": "user", "content": "PRIVATE_RECENT_MESSAGE"}],
+        },
+    }
+    assert "PRIVATE_DRAFT" not in call["input"][1]["content"]
+    assert "999" not in call["input"][1]["content"]
+    assert "PRIVATE_PROFILE_CONTEXT" not in call["input"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Я постоянно забываю о главном, из-за каждодневной суеты",
+        "Это стоит сохранить?",
+        "Да не, я хотел просто пообщаться",
+        "Не сохраняй это",
+        "Не надо ничего записывать",
+        "Сегодня идёт дождь",
+        "Я обычно пью чай утром",
+        "Просто думаю о новом проекте",
+    ],
+)
+async def test_nova_companion_fail_closed_suppresses_capture_for_non_capture_text(text):
+    output = NovaCompanionProviderResponse(
+        answer="Я рядом и готова поговорить.",
+        capture=NovaCompanionProviderCapture(
+            kind="note",
+            title=text[: min(20, len(text))],
+            evidence=text,
+        ),
+    )
+    service, client, responses = service_with_fake(output_parsed=output)
+
+    result = await service.companion_message(
+        text,
+        {"timezone": "Europe/Moscow"},
+        companion_projection(),
+    )
+
+    assert result.answer == output.answer
+    assert result.capture is None
+    assert client.with_options_calls == [{"max_retries": 0}]
+    assert len(responses.parse_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [
+        NovaCompanionProviderCapture(
+            kind="idea",
+            title="чужой заголовок",
+            evidence="Хочу собрать клуб чтения",
+        ),
+        NovaCompanionProviderCapture(
+            kind="idea",
+            title="клуб чтения",
+            evidence="Текст отсутствует в сообщении",
+        ),
+        NovaCompanionProviderCapture(
+            kind="idea",
+            title="клуб чтения",
+            next_step="придуманный следующий шаг",
+            evidence="Хочу собрать клуб чтения",
+        ),
+    ],
+)
+async def test_nova_companion_drops_ungrounded_capture_but_keeps_human_answer(capture):
+    output = companion_response(capture=capture)
+    service, client, responses = service_with_fake(output_parsed=output)
+
+    result = await service.companion_message(
+        "Хочу собрать клуб чтения",
+        {"timezone": "Europe/Moscow"},
+        companion_projection(),
+    )
+
+    assert result.answer == output.answer
+    assert result.capture is None
+    assert client.with_options_calls == [{"max_retries": 0}]
+    assert len(responses.parse_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "temporal_context"),
+    [
+        (None, {"timezone": "Europe/Moscow"}),
+        ("", {"timezone": "Europe/Moscow"}),
+        ("x" * (NOVA_COMPANION_MAX_INPUT_CHARS + 1), {"timezone": "Europe/Moscow"}),
+        ("Привет", {"telegram_id": "123"}),
+        ("Привет", {"timezone": ""}),
+        ("Привет", {"timezone": 123}),
+    ],
+)
+async def test_nova_companion_rejects_invalid_input_before_sdk(text, temporal_context):
+    service, client, responses = service_with_fake(output_parsed=companion_response(capture=None))
+
+    with pytest.raises(ValueError):
+        await service.companion_message(text, temporal_context, companion_projection())
+
+    assert client.with_options_calls == []
+    assert responses.parse_calls == []
+
+
+async def test_nova_companion_missing_output_and_provider_error_do_not_retry():
+    missing_service, missing_client, missing_responses = service_with_fake(
+        output_parsed=SimpleNamespace()
+    )
+    missing_responses.output_parsed = None
+    with pytest.raises(ValueError, match="no structured output"):
+        await missing_service.companion_message(
+            "Поговорим",
+            {"timezone": "Europe/Moscow"},
+            companion_projection(),
+        )
+    assert missing_client.with_options_calls == [{"max_retries": 0}]
+    assert len(missing_responses.parse_calls) == 1
+
+    provider_error = RuntimeError("PRIVATE_PROVIDER_ERROR")
+    error_service, error_client, error_responses = service_with_fake(error=provider_error)
+    with pytest.raises(RuntimeError) as caught:
+        await error_service.companion_message(
+            "Поговорим",
+            {"timezone": "Europe/Moscow"},
+            companion_projection(),
+        )
+    assert caught.value is provider_error
+    assert error_client.with_options_calls == [{"max_retries": 0}]
+    assert len(error_responses.parse_calls) == 1
+
+
+async def test_nova_companion_propagates_cancellation_and_enforces_timeout(monkeypatch):
+    cancelled = asyncio.CancelledError()
+    cancel_service, cancel_client, cancel_responses = service_with_fake(error=cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await cancel_service.companion_message(
+            "Поговорим",
+            {"timezone": "Europe/Moscow"},
+            companion_projection(),
+        )
+    assert cancel_client.with_options_calls == [{"max_retries": 0}]
+    assert len(cancel_responses.parse_calls) == 1
+
+    timeout_service, timeout_client, timeout_responses = service_with_fake(wait_forever=True)
+    monkeypatch.setattr(ai_module, "NOVA_COMPANION_TIMEOUT_SECONDS", 0.01)
+    with pytest.raises(TimeoutError):
+        await timeout_service.companion_message(
+            "Поговорим",
+            {"timezone": "Europe/Moscow"},
+            companion_projection(),
+        )
+    assert timeout_client.with_options_calls == [{"max_retries": 0}]
+    assert len(timeout_responses.parse_calls) == 1
+    assert timeout_responses.parse_calls[0]["timeout"] == 0.01
+
+
+async def test_nova_companion_does_not_route_through_mutating_or_legacy_ai_methods():
+    service, _client, responses = service_with_fake(output_parsed=companion_response(capture=None))
+    for method_name in (
+        "parse_thought",
+        "route_message",
+        "answer_message",
+        "extract_weekly_review",
+        "propose_goals",
+        "propose_routines",
+        "make_today_plan",
+    ):
+        setattr(service, method_name, AsyncMock(side_effect=AssertionError(method_name)))
+
+    await service.companion_message(
+        "Мне хочется поговорить",
+        {"timezone": "Europe/Moscow"},
+        companion_projection(),
+    )
+
+    for method_name in (
+        "parse_thought",
+        "route_message",
+        "answer_message",
+        "extract_weekly_review",
+        "propose_goals",
+        "propose_routines",
+        "make_today_plan",
+    ):
+        getattr(service, method_name).assert_not_awaited()
+    assert len(responses.parse_calls) == 1

@@ -1333,6 +1333,172 @@ async def test_non_help_content_is_not_captured_by_nova_text_gate(db, content):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Nova",
+        "Нова",
+        "Nova, ты здесь?",
+        "Нова ты тут?",
+        "Ты Nova?",
+        "Ты Нова?",
+        "Nova, мне сегодня тревожно и хочется просто поговорить",
+        "Нова, я постоянно забываю о главном из-за каждодневной суеты",
+    ],
+)
+async def test_companion_pilot_defers_local_address_and_substantive_vocative(db, content):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_companion=True,
+        nova_companion_admin_only=True,
+    )
+    user_id = 61_162
+    user = await user_with_tier(bot, user_id, ADMIN)
+    context = nova_context()
+    message = NovaMessage(content)
+
+    assert not await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert message.replies == []
+    assert context.bot.edits == []
+    assert context.bot.sent == []
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user_id,
+            chat_id=user_id,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Nova, как добавить задачу с напоминанием?",
+        "Нова, как открыть мои задачи?",
+        "Nova, где мои задачи?",
+        "Нова, что ты умеешь?",
+    ],
+)
+async def test_companion_pilot_keeps_addressed_capability_questions_in_nova_help(
+    db,
+    question,
+):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_companion=True,
+        nova_companion_admin_only=True,
+    )
+    user_id = 61_163
+    user = await user_with_tier(bot, user_id, ADMIN)
+    context = nova_context()
+    message = NovaMessage(question)
+
+    assert await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert ai.calls == []
+    assert ai.other_calls == []
+    assert len(message.replies) == 1
+    assert len(context.bot.edits) == 1
+    assert context.bot.sent == []
+    current = await bot.nova_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+    )
+    assert current is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "admin_only", "tier", "deferred"),
+    [
+        (False, True, ADMIN, False),
+        (True, True, SUBSCRIBER, False),
+        (True, False, SUBSCRIBER, True),
+        (True, True, ADMIN, True),
+    ],
+)
+async def test_companion_vocative_defer_is_feature_and_tier_gated(
+    db,
+    enabled,
+    admin_only,
+    tier,
+    deferred,
+):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_companion=enabled,
+        nova_companion_admin_only=admin_only,
+    )
+    user_id = 61_164
+    user = await user_with_tier(bot, user_id, tier)
+    context = nova_context()
+    message = NovaMessage("Nova, мне хочется спокойно обдумать эту неделю")
+
+    handled = await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert handled is not deferred
+    assert ai.calls == []
+    assert ai.other_calls == []
+    if deferred:
+        assert message.replies == []
+        assert context.bot.edits == []
+    else:
+        assert len(message.replies) == 1
+        assert len(context.bot.edits) == 1
+
+
+@pytest.mark.asyncio
+async def test_active_nova_help_session_keeps_ordinary_vocative_ownership(db):
+    ai = NovaAIStub()
+    bot = make_bot(
+        db,
+        ai,
+        enable_nova_companion=True,
+        nova_companion_admin_only=True,
+    )
+    user_id = 61_165
+    user = await user_with_tier(bot, user_id, ADMIN)
+    _command, canonical, context = await open_nova(bot, user_id=user_id)
+    message = NovaMessage("Нова, мне хочется спокойно всё обдумать")
+
+    assert await bot.nova_text_gate(
+        update_for(message, user_id=user_id),
+        context,
+        user=user,
+    )
+
+    assert message.replies == []
+    assert len(context.bot.edits) == 1
+    assert context.bot.edits[0]["message_id"] == canonical.message_id
+    assert ai.calls == []
+    assert ai.other_calls == []
+
+
+@pytest.mark.asyncio
 async def test_oversized_natural_known_help_is_consumed_as_local_clarify(db):
     question = "Не могу найти визуализацию в меню этого бота. " + "пожалуйста " * 60
     assert len(question) > 600

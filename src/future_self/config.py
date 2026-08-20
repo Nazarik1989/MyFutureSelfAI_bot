@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     enable_nova_ai: bool = False
     nova_ai_admin_only: bool = True
 
+    # Nova Companion is an independent, fail-closed conversation pilot.
+    enable_nova_companion: bool = False
+    nova_companion_admin_only: bool = True
+
     # Nova memory CRUD and answer application use independent fail-closed gates.
     enable_nova_memory: bool = False
     nova_memory_admin_only: bool = True

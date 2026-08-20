@@ -3,6 +3,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from typing import Literal
 from uuid import uuid4
 
 from sqlalchemy import and_, or_, select, update
@@ -31,6 +32,23 @@ class DraftResult:
 class DraftCreation:
     draft: DraftInboxItem
     created: bool
+
+
+type FencedDraftCreationStatus = Literal["created", "reused", "access_changed"]
+
+
+@dataclass(frozen=True, slots=True)
+class FencedDraftCreation:
+    status: FencedDraftCreationStatus
+    draft: DraftInboxItem | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {"created", "reused"} and self.draft is not None
+
+    @property
+    def created(self) -> bool:
+        return self.status == "created"
 
 
 @dataclass(slots=True)
@@ -198,6 +216,96 @@ class DraftInboxService:
             created=True,
         )
 
+    async def create_or_get_for_suggestion(
+        self,
+        *,
+        user_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        expected_access_version: int,
+        source: str,
+        raw_text: str,
+        parsed: ParsedThought,
+    ) -> FencedDraftCreation:
+        """Create/reuse a suggestion draft for one exact full-access generation.
+
+        The owner write lock serializes access changes and concurrent suggestion
+        callbacks before any draft read or write.  A mismatched owner or access
+        generation therefore fails without creating or reusing domain state.
+        """
+
+        identifiers = (user_id, telegram_user_id, chat_id, expected_access_version)
+        if any(type(value) is not int or value <= 0 for value in identifiers):
+            return FencedDraftCreation("access_changed")
+
+        current = datetime.now(UTC)
+        transition: tuple[str, str, str] | None = None
+        async with self.db.session() as session:
+            locked_owner = await session.execute(
+                update(User)
+                .where(
+                    User.id == user_id,
+                    User.telegram_id == telegram_user_id,
+                    User.access_tier.in_(FULL_ACCESS_TIERS),
+                    User.access_version == expected_access_version,
+                )
+                .values(updated_at=User.updated_at)
+                .returning(User.id)
+                .execution_options(synchronize_session=False)
+            )
+            if locked_owner.scalar_one_or_none() is None:
+                return FencedDraftCreation("access_changed")
+
+            active = tuple(
+                (
+                    await session.scalars(
+                        select(DraftInboxItem)
+                        .where(
+                            DraftInboxItem.user_id == user_id,
+                            DraftInboxItem.telegram_user_id == telegram_user_id,
+                            DraftInboxItem.chat_id == chat_id,
+                            DraftInboxItem.status == "preview",
+                            DraftInboxItem.expires_at > current,
+                        )
+                        .order_by(DraftInboxItem.created_at.desc(), DraftInboxItem.id.desc())
+                    )
+                ).all()
+            )
+            draft = next(
+                (
+                    candidate
+                    for candidate in active
+                    if self._matches_suggestion_creation(
+                        candidate,
+                        source=source,
+                        raw_text=raw_text,
+                        parsed=parsed,
+                    )
+                ),
+                None,
+            )
+            if draft is not None:
+                transition = (draft.id, "preview", "reuse_duplicate")
+                result = FencedDraftCreation("reused", draft)
+            else:
+                draft = await self.create_in_session(
+                    session,
+                    user_id=user_id,
+                    telegram_user_id=telegram_user_id,
+                    chat_id=chat_id,
+                    source=source,
+                    raw_text=raw_text,
+                    parsed=parsed,
+                    now=current,
+                )
+                transition = (draft.id, "none", "create_suggestion")
+                result = FencedDraftCreation("created", draft)
+
+        if transition is not None:
+            draft_id, old_status, action = transition
+            log_transition(draft_id, telegram_user_id, old_status, "preview", action)
+        return result
+
     async def set_preview_message(self, draft_id: str, message_id: int) -> None:
         async with self.db.session() as session:
             await session.execute(
@@ -205,6 +313,105 @@ class DraftInboxService:
                 .where(DraftInboxItem.id == draft_id, DraftInboxItem.status == "preview")
                 .values(preview_message_id=message_id)
             )
+
+    async def restore_preview_message_if_current(
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_message_id: int | None,
+        restored_message_id: int | None,
+    ) -> bool:
+        """CAS one preview pointer without overwriting a newer canonical message."""
+
+        if (
+            not isinstance(draft_id, str)
+            or not draft_id
+            or type(version) is not int
+            or version <= 0
+            or type(telegram_user_id) is not int
+            or type(chat_id) is not int
+            or (
+                expected_message_id is not None
+                and (type(expected_message_id) is not int or expected_message_id <= 0)
+            )
+            or (
+                restored_message_id is not None
+                and (type(restored_message_id) is not int or restored_message_id <= 0)
+            )
+        ):
+            return False
+        expected_pointer = (
+            DraftInboxItem.preview_message_id.is_(None)
+            if expected_message_id is None
+            else DraftInboxItem.preview_message_id == expected_message_id
+        )
+        async with self.db.session() as session:
+            changed = await session.execute(
+                update(DraftInboxItem)
+                .where(
+                    DraftInboxItem.id == draft_id,
+                    DraftInboxItem.version == version,
+                    DraftInboxItem.telegram_user_id == telegram_user_id,
+                    DraftInboxItem.chat_id == chat_id,
+                    DraftInboxItem.status == "preview",
+                    expected_pointer,
+                )
+                .values(preview_message_id=restored_message_id)
+                .returning(DraftInboxItem.id)
+            )
+            return changed.scalar_one_or_none() is not None
+
+    async def drop_if_preview_message_current(
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_message_id: int | None,
+    ) -> DraftResult:
+        """Discard only the exact preview canonical owned by a failed delivery."""
+
+        if (
+            not isinstance(draft_id, str)
+            or not draft_id
+            or type(version) is not int
+            or version <= 0
+            or type(telegram_user_id) is not int
+            or type(chat_id) is not int
+            or (
+                expected_message_id is not None
+                and (type(expected_message_id) is not int or expected_message_id <= 0)
+            )
+        ):
+            return DraftResult(False)
+        expected_pointer = (
+            DraftInboxItem.preview_message_id.is_(None)
+            if expected_message_id is None
+            else DraftInboxItem.preview_message_id == expected_message_id
+        )
+        async with self.db.session() as session:
+            changed = await session.execute(
+                update(DraftInboxItem)
+                .where(
+                    DraftInboxItem.id == draft_id,
+                    DraftInboxItem.version == version,
+                    DraftInboxItem.telegram_user_id == telegram_user_id,
+                    DraftInboxItem.chat_id == chat_id,
+                    DraftInboxItem.status == "preview",
+                    expected_pointer,
+                )
+                .values(status="discarded")
+                .returning(DraftInboxItem.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                return DraftResult(False)
+        draft = await self.get(draft_id)
+        log_transition(draft_id, telegram_user_id, "preview", "discarded", "drop")
+        return DraftResult(True, draft=draft)
 
     async def _mark_expired(self, draft: DraftInboxItem, now: datetime) -> bool:
         expires_at = draft.expires_at
@@ -831,6 +1038,31 @@ class DraftInboxService:
     @staticmethod
     def _normalize(value: str) -> str:
         return re.sub(r"[^a-zа-я0-9]+", " ", value.lower().replace("ё", "е")).strip()
+
+    @classmethod
+    def _matches_suggestion_creation(
+        cls,
+        draft: DraftInboxItem,
+        *,
+        source: str,
+        raw_text: str,
+        parsed: ParsedThought,
+    ) -> bool:
+        temporal_resolution = (
+            parsed.temporal_resolution.model_dump(mode="json")
+            if parsed.temporal_resolution
+            else None
+        )
+        return bool(
+            draft.source == source
+            and draft.kind == parsed.kind
+            and cls._normalize(draft.raw_text) == cls._normalize(raw_text)
+            and cls._normalize(draft.title) == cls._normalize(parsed.title)
+            and cls._normalize(draft.description or "") == cls._normalize(parsed.description or "")
+            and cls._normalize(draft.next_step or "") == cls._normalize(parsed.next_step or "")
+            and draft.resolved_date == parsed.resolved_date
+            and (draft.temporal_resolution or None) == temporal_resolution
+        )
 
     @classmethod
     def semantic_key(cls, draft: DraftInboxItem | InboxItem) -> tuple[str, ...]:
