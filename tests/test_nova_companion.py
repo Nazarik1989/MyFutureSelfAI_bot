@@ -1124,4 +1124,83 @@ async def test_context_service_allows_missing_optional_sources(db):
 
     assert result.status == "ready"
     assert result.projection is not None
-    assert result.projection.provider_payload() == {}
+    assert result.projection.provider_payload() == {
+        "confirmed_identity": {"timezone": "Europe/Moscow"}
+    }
+
+
+async def test_confirmed_identity_is_owner_scoped_bounded_and_generation_fenced(db):
+    async with db.session() as session:
+        session.add_all(
+            [
+                User(
+                    telegram_id=4_041,
+                    display_name="Назар",
+                    location_city="Москва",
+                    location_fallback_city="PRIVATE_FALLBACK_CITY",
+                    timezone="Europe/Moscow",
+                    access_tier="subscriber",
+                    access_version=7,
+                    onboarding_completed=True,
+                ),
+                User(
+                    telegram_id=4_042,
+                    display_name="OTHER_PRIVATE_NAME",
+                    location_city="OTHER_PRIVATE_CITY",
+                    timezone="Europe/Moscow",
+                    access_tier="subscriber",
+                    access_version=7,
+                    onboarding_completed=True,
+                ),
+            ]
+        )
+
+    service = NovaCompanionContextService(db, conversation_message_limit=20)
+    snapshot = await service.snapshot(
+        telegram_actor_id=4_041,
+        expected_tier="subscriber",
+        expected_access_version=7,
+        conversation_context=None,
+        now=NOW,
+    )
+    assert snapshot.status == "ready"
+    assert snapshot.projection is not None and snapshot.fence is not None
+    payload = snapshot.projection.provider_payload()
+    assert payload["confirmed_identity"] == {
+        "display_name": "Назар",
+        "location_city": "Москва",
+        "timezone": "Europe/Moscow",
+    }
+    serialized = snapshot.projection.provider_json()
+    assert "PRIVATE_FALLBACK_CITY" not in serialized
+    assert "OTHER_PRIVATE_NAME" not in serialized
+    assert "OTHER_PRIVATE_CITY" not in serialized
+    assert "telegram" not in serialized.casefold()
+    assert "access_version" not in serialized
+    assert repr(snapshot.fence) == "NovaCompanionContextFence()"
+
+    async with db.session() as session:
+        await session.execute(
+            update(User).where(User.telegram_id == 4_041).values(display_name="Назар новый")
+        )
+    assert await service.current_check(snapshot.fence, now=NOW) is False
+
+
+def test_recent_projection_keeps_twenty_whole_safe_records_within_existing_budget():
+    messages = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"turn-{index}"}
+        for index in range(20)
+    ]
+    projection = build_nova_companion_context_projection(
+        profile=None,
+        conversation_context={"recent_messages": messages},
+        display_name="Назар",
+        location_city="Москва",
+        timezone_name="Europe/Moscow",
+    )
+    payload = projection.provider_payload()
+    recent = payload["recent_conversation"]
+    assert isinstance(recent, dict)
+    assert recent["recent_messages"] == messages
+    assert projection.recent_message_count == 20
+    assert projection.payload_bytes <= NOVA_COMPANION_CONTEXT_MAX_PAYLOAD_BYTES

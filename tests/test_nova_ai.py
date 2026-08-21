@@ -10,6 +10,7 @@ import future_self.ai as ai_module
 from future_self import prompts
 from future_self.ai import (
     NOVA_COMPANION_MAX_INPUT_CHARS,
+    NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT,
     NOVA_COMPANION_TIMEOUT_SECONDS,
     NOVA_HELP_MAX_INPUT_CHARS,
     NOVA_HELP_TIMEOUT_SECONDS,
@@ -20,6 +21,7 @@ from future_self.nova_companion import build_nova_companion_context_projection
 from future_self.schemas import (
     NOVA_HELP_MAX_PAYLOAD_BYTES,
     NovaCompanionProviderCapture,
+    NovaCompanionProviderReminderOffer,
     NovaCompanionProviderResponse,
     NovaHelpPlan,
 )
@@ -446,6 +448,133 @@ async def test_nova_companion_uses_one_no_retry_call_and_minimal_bounded_payload
     assert "PRIVATE_DRAFT" not in call["input"][1]["content"]
     assert "999" not in call["input"][1]["content"]
     assert "PRIVATE_PROFILE_CONTEXT" not in call["input"][0]["content"]
+
+
+async def test_nova_companion_accepts_exact_prior_user_reminder_evidence_only():
+    evidence = "Да))) не забыть бы мне завтра на стрижку)"
+    projection = build_nova_companion_context_projection(
+        profile=None,
+        conversation_context={
+            "recent_messages": [
+                {"role": "user", "content": evidence},
+                {"role": "assistant", "content": "Я поставила напоминание про врача"},
+            ]
+        },
+    )
+    output = NovaCompanionProviderResponse(
+        answer="Тогда лучше действительно поставить напоминание. Могу помочь 🙂",
+        reminder_offer=NovaCompanionProviderReminderOffer(
+            title="стрижку",
+            schedule_wording="завтра",
+            evidence=evidence,
+        ),
+    )
+    service, client, responses = service_with_fake(output_parsed=output)
+
+    result = await service.companion_message(
+        "А вдруг забуду?",
+        {"timezone": "Europe/Moscow"},
+        projection,
+    )
+
+    assert result.reminder_offer is not None
+    assert result.reminder_offer.title == "стрижку"
+    assert result.reminder_offer.schedule_wording == "завтра"
+    assert result.capture is None
+    assert client.with_options_calls == [{"max_retries": 0}]
+    assert len(responses.parse_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "Я поставила напоминание про врача",
+        "FORGED_EVENT_NOT_IN_USER_CONTEXT",
+    ],
+)
+async def test_nova_companion_rejects_assistant_only_or_forged_reminder_evidence(evidence):
+    projection = build_nova_companion_context_projection(
+        profile=None,
+        conversation_context={
+            "recent_messages": [
+                {"role": "user", "content": "А вдруг забуду?"},
+                {"role": "assistant", "content": "Я поставила напоминание про врача"},
+            ]
+        },
+    )
+    raw_answer = "Могу помочь — нажми кнопку ниже. PRIVATE_OFFER_ANSWER"
+    output = NovaCompanionProviderResponse(
+        answer=raw_answer,
+        reminder_offer=NovaCompanionProviderReminderOffer(
+            title="врача" if "врача" in evidence else "EVENT",
+            evidence=evidence,
+        ),
+    )
+    service, _client, _responses = service_with_fake(output_parsed=output)
+
+    result = await service.companion_message(
+        "А вдруг забуду?",
+        {"timezone": "Europe/Moscow"},
+        projection,
+    )
+
+    assert result.reminder_offer is None
+    assert result.answer == NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
+    assert raw_answer not in result.answer
+    assert evidence not in result.answer
+
+
+async def test_nova_companion_ambiguous_prior_events_return_one_local_clarification():
+    haircut = "Стрижка завтра в 19:00"
+    doctor = "Позвонить врачу послезавтра в 10:00"
+    projection = build_nova_companion_context_projection(
+        profile=None,
+        conversation_context={
+            "recent_messages": [
+                {"role": "user", "content": haircut},
+                {"role": "assistant", "content": "Что ещё важно?"},
+                {"role": "user", "content": doctor},
+            ]
+        },
+    )
+    raw_answer = "Выбери кнопку — я поставлю оба напоминания. PRIVATE_MULTI_EVENT"
+    output = NovaCompanionProviderResponse(
+        answer=raw_answer,
+        reminder_offer=NovaCompanionProviderReminderOffer(
+            title="стрижка",
+            schedule_wording="завтра в 19:00",
+            evidence=haircut,
+        ),
+    )
+    service, _client, _responses = service_with_fake(output_parsed=output)
+
+    result = await service.companion_message(
+        "Что мне не забыть?",
+        {"timezone": "Europe/Moscow"},
+        projection,
+    )
+
+    assert result.reminder_offer is None
+    assert result.answer == NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
+    assert raw_answer not in result.answer
+    assert haircut not in result.answer
+    assert doctor not in result.answer
+
+
+def test_nova_companion_schema_rejects_capture_and_reminder_offer_together():
+    with pytest.raises(ValidationError):
+        NovaCompanionProviderResponse(
+            answer="Ответ",
+            capture=NovaCompanionProviderCapture(
+                kind="note",
+                title="заметка",
+                evidence="заметка",
+            ),
+            reminder_offer=NovaCompanionProviderReminderOffer(
+                title="стрижку",
+                evidence="завтра на стрижку",
+            ),
+        )
 
 
 @pytest.mark.parametrize(

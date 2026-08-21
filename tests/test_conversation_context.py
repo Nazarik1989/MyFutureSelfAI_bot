@@ -292,8 +292,9 @@ def test_snapshot_for_companion_prompt_is_bounded_content_only_and_fail_closed()
 
     assert set(prompt) == {"recent_messages"}
     messages = prompt["recent_messages"]
-    assert len(messages) == COMPANION_PROMPT_MAX_MESSAGES
-    assert messages[0]["content"].startswith("ordinary-4 ")
+    assert len(messages) == min(len(safe_messages), COMPANION_PROMPT_MAX_MESSAGES)
+    first_safe_index = max(0, len(safe_messages) - COMPANION_PROMPT_MAX_MESSAGES)
+    assert messages[0]["content"].startswith(f"ordinary-{first_safe_index} ")
     assert messages[-1]["content"].startswith("ordinary-11 ")
     assert all(set(message) == {"role", "content"} for message in messages)
     assert all(

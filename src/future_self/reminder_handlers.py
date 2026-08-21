@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -23,6 +23,7 @@ from .models import (
     TaskState,
     User,
 )
+from .nova_companion_flow import NovaCompanionReminderCandidate
 from .recurring_reminders import RecurringScheduleMutation
 from .reminder_flow import (
     ReminderFlowAction,
@@ -59,11 +60,16 @@ REMINDER_TIMEZONE_RETRY_TEXT = (
     "Не удалось надёжно определить часовой пояс. Ничего не сохранено. "
     "Уточни город или попробуй ещё раз."
 )
+_COMPANION_REMINDER_SESSION_ATTR = "nova_companion_reminder_session"
 
 _TIME_ONLY = re.compile(
     r"^\s*(?:в\s+)?(?:[01]?\d|2[0-3])(?:\s*[:.]\s*[0-5]\d|\s+час(?:а|ов)?(?:\s+[0-5]?\d\s+минут(?:у|ы)?)?)"
     r"(?:\s*(?:по\s+)?(?:мск|по\s+москве|московское\s+время|[A-Za-z][A-Za-z0-9._+-]*/[A-Za-z0-9._+/-]+))?\s*$",
     re.IGNORECASE,
+)
+_BARE_CLOCK_FRAGMENT = re.compile(
+    r"(?<![\w:.])(?P<hour>[01]?\d|2[0-3])\s*[:.]\s*(?P<minute>[0-5]\d)"
+    r"(?!\d|\s*[.:]\s*\d)"
 )
 _UNSUPPORTED_RECURRENCE = re.compile(
     r"\b(?:кажд(?:ую|ой)\s+недел(?:ю|и|е|ей)?|по\s+будням|по\s+выходным|"
@@ -148,6 +154,109 @@ class ReminderHandlers:
             voice_state=None,
             weekly_candidate_handoff=True,
         )
+
+    async def reminder_from_companion_candidate(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        candidate: NovaCompanionReminderCandidate,
+        canonical_message_id: int,
+        expected_access_version: int,
+    ) -> bool:
+        """Hand one grounded offer to the existing reminder state machine."""
+
+        if (
+            not isinstance(candidate, NovaCompanionReminderCandidate)
+            or type(canonical_message_id) is not int
+            or canonical_message_id <= 0
+            or update.effective_user is None
+            or update.effective_chat is None
+        ):
+            return False
+        binding = await self._reminder_access(update)
+        if (
+            binding is None
+            or binding.access_version != expected_access_version
+            or binding.timezone != candidate.timezone
+        ):
+            return False
+        temporal = candidate.temporal
+        schedule_kind = ReminderScheduleKind.ONCE if temporal is not None else None
+        local_date = temporal.resolution.target_date if temporal is not None else None
+        local_time = temporal.local_time if temporal is not None else None
+        phase = self._reminder_fields_phase(
+            title=candidate.title,
+            schedule_kind=schedule_kind,
+            local_date=local_date,
+            local_time=local_time,
+            timezone=candidate.timezone,
+        )
+        session: ReminderFlowSession | None = None
+        try:
+            async with self._reminder_launch_lock:
+                fresh = await self._reminder_access(update)
+                if (
+                    fresh is None
+                    or fresh.id != binding.id
+                    or fresh.access_version != expected_access_version
+                    or fresh.timezone != candidate.timezone
+                ):
+                    return False
+                await self.nova_memory_clear_current(update)
+                await self.nova_clear_bound(fresh.id, update.effective_chat.id)
+                session = await self.reminder_sessions.create(
+                    owner_id=fresh.id,
+                    telegram_user_id=update.effective_user.id,
+                    chat_id=update.effective_chat.id,
+                    access_version=fresh.access_version,
+                    title=candidate.title,
+                    schedule_kind=schedule_kind,
+                    local_date=local_date,
+                    local_time=local_time,
+                    timezone=candidate.timezone,
+                    timezone_source=ReminderTimezoneSource.PROFILE,
+                    phase=phase,
+                    canonical_message_id=canonical_message_id,
+                    profile_timezone=fresh.timezone,
+                    weekly_candidate_handoff=False,
+                )
+                delivery = await self._reminder_access(update)
+                if (
+                    delivery is None
+                    or delivery.id != session.owner_id
+                    or delivery.access_version != session.access_version
+                    or delivery.timezone != candidate.timezone
+                ):
+                    await self._reminder_access_changed(context, session, source_message=None)
+                    return False
+                async with self._reminder_ui_lock:
+                    live = await self.reminder_sessions.get_exact(session)
+                    if live is None:
+                        return False
+                    session = live
+                    text_value, markup = await self._reminder_screen(live)
+                    exact = await self.reminder_sessions.get_exact(live)
+                    if exact is None:
+                        return False
+                    await context.bot.edit_message_text(
+                        chat_id=exact.chat_id,
+                        message_id=exact.canonical_message_id,
+                        text=text_value,
+                        reply_markup=markup,
+                    )
+                bind_status = getattr(
+                    self,
+                    "nova_companion_bind_pending_reminder_status",
+                    None,
+                )
+                if callable(bind_status):
+                    bind_status(session, candidate)
+                return True
+        except BaseException as exc:
+            if session is not None:
+                exc.__dict__[_COMPANION_REMINDER_SESSION_ATTR] = session
+            raise
 
     async def _reminder_weekly_return_markup(
         self,
@@ -337,6 +446,33 @@ class ReminderHandlers:
                     )
                 return True
 
+            status_hook = getattr(
+                self,
+                "nova_companion_pending_reminder_status_answer",
+                None,
+            )
+            if current is not None and callable(status_hook):
+                status_answer = status_hook(text)
+                if isinstance(status_answer, str):
+                    try:
+                        if candidate_message is not None and hasattr(
+                            candidate_message, "edit_text"
+                        ):
+                            await candidate_message.edit_text(
+                                status_answer,
+                                reply_markup=None,
+                            )
+                        else:
+                            await update.effective_message.reply_text(status_answer)
+                    except asyncio.CancelledError:
+                        raise
+                    except TelegramError as exc:
+                        logger.warning(
+                            "Reminder status delivery failed error_type=%s",
+                            type(exc).__name__,
+                        )
+                    return True
+
             fresh = self.reminder_intent_parser.parse(text, user.timezone)
             replacement = (
                 current is not None and fresh.status is not ReminderIntentStatus.NOT_REMINDER
@@ -352,12 +488,33 @@ class ReminderHandlers:
                 parse_text = text
                 if current.phase is ReminderFlowPhase.TIME and _TIME_ONLY.fullmatch(text):
                     parse_text = f"в {text.strip()}"
+                elif current.phase is ReminderFlowPhase.TIME:
+                    bare_clock = _BARE_CLOCK_FRAGMENT.search(text)
+                    if bare_clock is not None and not text[
+                        : bare_clock.start()
+                    ].rstrip().casefold().endswith("в"):
+                        parse_text = (
+                            text[: bare_clock.start()]
+                            + "в "
+                            + bare_clock.group(0)
+                            + text[bare_clock.end() :]
+                        )
                 result = self.reminder_intent_parser.parse(
                     parse_text,
                     user.timezone,
                     continuation=True,
                     previous=current.parser_state(),
                 )
+                if (
+                    current.phase is ReminderFlowPhase.TIME
+                    and current.title is not None
+                    and result.title is not None
+                ):
+                    # A continuation may repeat the grounded subject together
+                    # with the missing time ("На стрижку завтра 19:00").  The
+                    # reminder handoff already owns the verified title; only
+                    # the missing slot should be filled here.
+                    result = replace(result, title=current.title)
             else:
                 result = fresh
 
@@ -1573,6 +1730,13 @@ class ReminderHandlers:
             # cannot be undone, but no stale private preview remains visible.
             await self._reminder_access_changed(context, session, source_message=query.message)
             return
+        record_status = getattr(
+            self,
+            "nova_companion_record_confirmed_reminder",
+            None,
+        )
+        if callable(record_status):
+            record_status(session, result.inbox_item)
         await self.reminder_sessions.clear(
             owner_id=session.owner_id,
             telegram_user_id=session.telegram_user_id,

@@ -45,7 +45,7 @@ NOVA_COMPANION_CONTEXT_MAX_PAYLOAD_BYTES = COMPANION_PROMPT_CONTEXT_MAX_BYTES
 NOVA_COMPANION_PROFILE_LIST_MAX_ITEMS = 5
 NOVA_COMPANION_VISION_MAX_ITEMS = 6
 NOVA_COMPANION_GOAL_MAX_ITEMS = 5
-NOVA_COMPANION_RECENT_MESSAGE_MAX_ITEMS = 8
+NOVA_COMPANION_RECENT_MESSAGE_MAX_ITEMS = 20
 NOVA_COMPANION_VISION_QUERY_LIMIT = 24
 NOVA_COMPANION_GOAL_QUERY_LIMIT = 20
 NOVA_COMPANION_CONVERSATION_QUERY_LIMIT = 20
@@ -66,6 +66,9 @@ _WEEKLY_STEP_MAX_CHARS = 200
 _CONVERSATION_TOPIC_MAX_CHARS = 200
 _CONVERSATION_SUMMARY_MAX_CHARS = 600
 _CONVERSATION_MESSAGE_MAX_CHARS = 600
+_IDENTITY_NAME_MAX_CHARS = 120
+_IDENTITY_CITY_MAX_CHARS = 120
+_IDENTITY_TIMEZONE_MAX_CHARS = 64
 _VISION_CATEGORY_ORDER = {
     "health_energy": 0,
     "relationships_family": 1,
@@ -207,6 +210,8 @@ class NovaCompanionContextSnapshot:
 @dataclass(frozen=True, slots=True)
 class _NovaCompanionSources:
     owner_id: int
+    display_name: str | None = field(repr=False)
+    location_city: str | None = field(repr=False)
     timezone_name: str
     local_week_start: date
     profile: VisionProfile | None = field(repr=False)
@@ -282,12 +287,18 @@ class NovaCompanionContextService:
                 weekly_focus=sources.weekly_focus,
                 confirmed_memory=confirmed_memory,
                 conversation_context=conversation_context,
+                display_name=sources.display_name,
+                location_city=sources.location_city,
+                timezone_name=sources.timezone_name,
             )
             conversation_fence: CompanionConversationFence | None = None
             if chat_id is not None and current_conversation is not None:
                 conversation_payload_max_bytes = _conversation_payload_max_bytes(
                     sources.profile,
                     sources.weekly_focus,
+                    display_name=sources.display_name,
+                    location_city=sources.location_city,
+                    timezone_name=sources.timezone_name,
                 )
                 projected_conversation = fit_companion_prompt_context(
                     current_conversation,
@@ -417,7 +428,12 @@ class NovaCompanionContextService:
         now: datetime,
         expected_owner_id: int | None = None,
     ) -> _NovaCompanionSources | None:
-        actor_query = select(User.id, User.timezone).where(
+        actor_query = select(
+            User.id,
+            User.display_name,
+            User.location_city,
+            User.timezone,
+        ).where(
             User.telegram_id == telegram_actor_id,
             User.access_tier == expected_tier,
             User.access_version == expected_access_version,
@@ -428,7 +444,7 @@ class NovaCompanionContextService:
         actor = (await session.execute(actor_query)).one_or_none()
         if actor is None:
             return None
-        owner_id, timezone_name = actor
+        owner_id, display_name, location_city, timezone_name = actor
         week_start = current_week_start(timezone_name, now=now)
         profile = await session.scalar(
             select(VisionProfile).where(VisionProfile.user_id == owner_id)
@@ -464,6 +480,8 @@ class NovaCompanionContextService:
         )
         return _NovaCompanionSources(
             owner_id=owner_id,
+            display_name=_optional_text(display_name, _IDENTITY_NAME_MAX_CHARS),
+            location_city=_optional_text(location_city, _IDENTITY_CITY_MAX_CHARS),
             timezone_name=timezone_name,
             local_week_start=week_start,
             profile=profile,
@@ -539,6 +557,8 @@ def _context_source_revision(sources: _NovaCompanionSources) -> str:
         }
     manifest = {
         "owner": sources.owner_id,
+        "display_name": sources.display_name,
+        "location_city": sources.location_city,
         "timezone": sources.timezone_name,
         "local_week_start": sources.local_week_start.isoformat(),
         "profile": profile_manifest,
@@ -552,10 +572,17 @@ def _context_source_revision(sources: _NovaCompanionSources) -> str:
 def _conversation_payload_max_bytes(
     profile: _ProfileSource | None,
     weekly_focus: _WeeklyFocusSource | None,
+    *,
+    display_name: str | None = None,
+    location_city: str | None = None,
+    timezone_name: str | None = None,
 ) -> int:
     """Freeze the exact recent-conversation value budget used by provider fitting."""
 
     base: dict[str, object] = {}
+    identity = _identity_payload(display_name, location_city, timezone_name)
+    if identity:
+        base["confirmed_identity"] = identity
     profile_payload, _profile_omitted = _profile_payload(profile)
     if profile_payload:
         base["profile"] = profile_payload
@@ -573,6 +600,21 @@ def _conversation_payload_max_bytes(
     )
 
 
+def _identity_payload(
+    display_name: str | None,
+    location_city: str | None,
+    timezone_name: str | None,
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    name = _optional_text(display_name, _IDENTITY_NAME_MAX_CHARS)
+    city = _optional_text(location_city, _IDENTITY_CITY_MAX_CHARS)
+    timezone = _optional_text(timezone_name, _IDENTITY_TIMEZONE_MAX_CHARS)
+    _put_optional(result, "display_name", name)
+    _put_optional(result, "location_city", city)
+    _put_optional(result, "timezone", timezone)
+    return result
+
+
 def build_nova_companion_context_projection(
     *,
     profile: _ProfileSource | None,
@@ -581,10 +623,17 @@ def build_nova_companion_context_projection(
     weekly_focus: _WeeklyFocusSource | None = None,
     confirmed_memory: NovaMemoryProjection | None = None,
     conversation_context: Mapping[str, object] | None = None,
+    display_name: str | None = None,
+    location_city: str | None = None,
+    timezone_name: str | None = None,
 ) -> NovaCompanionContextProjection:
     """Build a deterministic projection containing only the public provider contract."""
     payload: dict[str, object] = {}
     omitted_count = 0
+
+    identity = _identity_payload(display_name, location_city, timezone_name)
+    if identity:
+        payload["confirmed_identity"] = identity
 
     profile_payload, profile_omitted = _profile_payload(profile)
     omitted_count += profile_omitted
@@ -907,6 +956,7 @@ def _validate_projection_payload_shape(
     payload: dict[str, object], projection: NovaCompanionContextProjection
 ) -> None:
     allowed = {
+        "confirmed_identity",
         "profile",
         "current_weekly_focus",
         "recent_conversation",
@@ -917,6 +967,7 @@ def _validate_projection_payload_shape(
     if not set(payload).issubset(allowed):
         _invalid_projection()
 
+    _validate_projection_identity(payload.get("confirmed_identity"))
     _validate_projection_profile(payload.get("profile"))
     _validate_projection_weekly_focus(payload.get("current_weekly_focus"))
     _validate_projection_recent_conversation(
@@ -930,6 +981,24 @@ def _validate_projection_payload_shape(
         "current_weekly_focus" in payload
     ):
         _invalid_projection()
+
+
+def _validate_projection_identity(value: object) -> None:
+    if value is None:
+        return
+    identity = _projection_mapping(
+        value,
+        required=frozenset(),
+        allowed=frozenset({"display_name", "location_city", "timezone"}),
+    )
+    if not identity:
+        _invalid_projection()
+    if "display_name" in identity:
+        _projection_text(identity["display_name"], _IDENTITY_NAME_MAX_CHARS)
+    if "location_city" in identity:
+        _projection_text(identity["location_city"], _IDENTITY_CITY_MAX_CHARS)
+    if "timezone" in identity:
+        _projection_text(identity["timezone"], _IDENTITY_TIMEZONE_MAX_CHARS)
 
 
 def _validate_projection_profile(value: object) -> None:

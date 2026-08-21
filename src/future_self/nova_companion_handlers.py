@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from .access import FULL_ACCESS_TIERS
+from .ai import NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
 from .conversation import ConversationExchangeReceipt
 from .domain import temporal_context
-from .models import User
+from .models import DraftInboxItem, InboxItem, TaskReminder, User
 from .nova_companion import (
     NovaCompanionContextFence,
     NovaCompanionContextService,
@@ -29,6 +34,10 @@ from .nova_companion_flow import (
     NovaCompanionCaptureStore,
     NovaCompanionCaptureTemporal,
     NovaCompanionPolicy,
+    NovaCompanionReminderCandidate,
+    NovaCompanionReminderCapability,
+    NovaCompanionReminderScreen,
+    NovaCompanionReminderStore,
     validate_capture_suggestion,
 )
 from .nova_memory_application import (
@@ -36,6 +45,7 @@ from .nova_memory_application import (
     NovaMemoryProjectionError,
     build_nova_memory_projection,
 )
+from .reminder_flow import ReminderFlowSession
 from .reminder_intent import ReminderIntentStatus
 from .schemas import ParsedThought
 
@@ -53,13 +63,138 @@ NOVA_COMPANION_UNAVAILABLE_TEXT = (
 NOVA_COMPANION_CAPTURE_FAILED_TEXT = (
     "Не удалось открыть preview. Ничего не сохранено — попробуй ещё раз."
 )
+NOVA_COMPANION_NOT_EXECUTED_TEXT = "Пока ничего не создано — я не выполняла это действие."
+NOVA_COMPANION_REMINDER_OFFER_ACTION_TEXT = (
+    "Пока ничего не создано. Могу поставить настоящее напоминание — нажми кнопку."
+)
+NOVA_COMPANION_NO_ACTIVE_REMINDER_OFFER_TEXT = (
+    "Сейчас нет активного предложения напоминания. Скажи, что и когда напомнить."
+)
 
 _COMPANION_DRAIN_TIMEOUT_SECONDS = 30.0
 _COMPANION_CANCEL_TIMEOUT_SECONDS = 5.0
 _COMPANION_CANCEL_RETRY_SECONDS = 0.1
 _COMPANION_CLEANUP_SCHEDULED_ATTR = "nova_companion_cleanup_scheduled"
+_COMPANION_REMINDER_SESSION_ATTR = "nova_companion_reminder_session"
+
+_IDENTITY_NAME_QUESTION = re.compile(
+    r"^(?:а\s+)?(?:ты\s+)?(?:не\s+)?знал[аи]?[,\s]+как\s+меня\s+зовут[?!.…]*$|"
+    r"^(?:а\s+)?(?:ты\s+)?знаешь[,\s]+как\s+меня\s+зовут[?!.…]*$|"
+    r"^как\s+меня\s+зовут[?!.…]*$",
+    re.IGNORECASE,
+)
+_IDENTITY_CITY_QUESTION = re.compile(
+    r"^(?:а\s+)?(?:ты\s+)?(?:знаешь[,\s]+)?где\s+я\s+живу[?!.…]*$",
+    re.IGNORECASE,
+)
+_REMINDER_STATUS_QUESTION = re.compile(
+    r"^(?:в\s+смысле[?!.…]*\s*)?(?:ты\s+)?(?:"
+    r"записала\s+напоминание|поставила\s+напоминание|создала\s+напоминание|"
+    r"напомнишь|а\s+мне\s+напомнишь|оно\s+уже\s+создано|"
+    r"напоминание\s+(?:уже\s+)?(?:создано|готово)|готово\s+с\s+напоминанием"
+    r")[?!.…]*$",
+    re.IGNORECASE,
+)
+_CAPTURE_STATUS_QUESTION = re.compile(
+    r"^(?:ты\s+)?(?:сохранила|записала|добавила|создала)\s+"
+    r"(?:задачу|заметку|идею)[?!.…]*$",
+    re.IGNORECASE,
+)
+_REMINDER_ACCEPT = re.compile(
+    r"^(?:да|давай|поставь|поставь\s+плиз|напомни|сделай\s+напоминание)[!.,…]*$",
+    re.IGNORECASE,
+)
+_REMINDER_DECLINE = re.compile(
+    r"^(?:нет|не\s+надо|не\s+сейчас|не\s+ставь)[!.,…]*$",
+    re.IGNORECASE,
+)
+_REMINDER_WEAK_CONTINUATION = re.compile(
+    r"^(?:да|давай|нет|не\s+надо|не\s+сейчас)[!.,…]*$",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_STATUS_QUESTION = re.compile(
+    r"^(?:ну\s+что[,:]?\s*)?(?:вс[её]\s+)?готово\?+[!.…]*$",
+    re.IGNORECASE,
+)
+_USER_SUBJECT_OPERATIONAL_CLAIM = re.compile(
+    r"\bты(?:\s+(?:уже|сама?|самостоятельно))*\s+(?:"
+    r"поставил[а]?|создал[а]?|записал[а]?|сохранил[а]?|добавил[а]?|"
+    r"отметил[а]?|уч(?:е|ё)?л[а]?|зафиксировал[а]?"
+    r")\b",
+    re.IGNORECASE,
+)
+_UNTRUSTED_OPERATIONAL_CLAIM = re.compile(
+    r"\b(?:(?:я\s+)?(?:уже\s+)?(?:поставил[а]?|создал[а]?|записал[а]?|сохранил[а]?|добавил[а]?)|"
+    r"(?:я\s+)?(?:поставлю|создам|запишу|сохраню|добавлю)|"
+    r"(?:напоминание|задача|заметка|идея|черновик|стрижка)\s+(?:уже\s+)?"
+    r"(?:создан[ао]?|сохранен[ао]?|сохранён[ао]?|записан[ао]?|поставлен[ао]?|"
+    r"установлен[ао]?|отмечен[ао]?)|"
+    r"(?:я\s+)?(?:вс[её]\s+)?(?:отметил[а]?|уч(?:е|ё)?л[а]?|зафиксировал[а]?)|"
+    r"напомню|(?:я\s+не\s+забуд(?:у|ем)|(?:я\s+)?(?:точно|обязательно)\s+не\s+забуд(?:у|ем))"
+    r"(?:\s+(?:про|об?|тебе))?|"
+    r"буду\s+напоминать|уже\s+в\s+голове\s+отмечено|"
+    r"считай[,:;.!?—\s]+(?:что\s+)?напоминан\w*(?:\s+уже)?\s+готов\w*|"
+    r"напоминан\w*\s+(?:уже\s+)?(?:готов\w*|поставлен\w*)|"
+    r"(?:у\s+меня|держу[\s\S]{0,80})\s+(?:на|под)\s+контрол\w*|"
+    r"возьм\w*[\s\S]{0,100}\b(?:на|под)\s+контрол\w*|"
+    r"буду\s+держать\b[\s\S]{0,100}\b(?:в\s+уме|в\s+голове)|"
+    r"буду\s+иметь\b[\s\S]{0,100}\bв\s+виду|"
+    r"(?:я\s+)?буду\s+помнить\b|(?:я\s+)?прослежу\b)\b",
+    re.IGNORECASE,
+)
+_UNTRUSTED_MEMORY_OR_RETURN_CLAIM = re.compile(
+    r"\b(?:"
+    r"(?:я\s+)?запомнил[аи]?(?:\s|[,:;.!?—-])|"
+    r"(?:я\s+)?держу\b[\s\S]{0,100}\b(?:в\s+контекст\w*|как\s+напоминан\w*|в\s+голове)|"
+    r"(?:я\s+)?(?:обязательно\s+)?вернусь\s+к\s+(?:этому|этому\s+вопросу|нему|ней)|"
+    r"напоминан\w*\b[\s\S]{0,80}\b(?:у\s+меня\b[\s\S]{0,30}\bв\s+голове|в\s+голове)|"
+    r"готово\b[\s\S]{0,100}\b(?:отмечен[аоы]?|записан[аоы]?|создан[аоы]?)"
+    r")",
+    re.IGNORECASE,
+)
+_ELLIPTICAL_OPERATIONAL_CLAIM = re.compile(
+    r"^(?:(?:да|конечно|ну\s+вс[её]|считай)[,:;.!?—\s]+)?(?:что\s+)?"
+    r"(?:вс[её]\s+)?готово(?:\s*[—-]\s*напоминан\w*(?:\s+на\s+завтра)?)?[.!…]*$",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_OPERATIONAL_COMMITMENT = re.compile(
+    r"^(?:да[,:;.!?—\s]+|конечно[,:;.!?—\s]+)?(?:можешь\s+)?на\s+меня\s+рассчитывать[.!…]*$",
+    re.IGNORECASE,
+)
+_ACTION_CONTEXT = re.compile(
+    r"\b(?:напоминан\w*|напомн\w*|уведом\w*|задач\w*|заметк\w*|иде[яию]\w*|"
+    r"черновик\w*|сохран\w*|запиш\w*|добав\w*|созда\w*|постав\w*|"
+    r"забуд\w*|сегодня|завтра|послезавтра|\d{1,2}[:.]\d{2})\b",
+    re.IGNORECASE,
+)
+
+_STATUS_RECEIPT_UNSET = object()
 
 type _CompanionCheck = Literal["ready", "access_changed", "context_changed", "unavailable"]
+
+
+def _has_untrusted_operational_claim(
+    answer: object,
+    *,
+    user_text: object = "",
+    action_context: bool = False,
+) -> bool:
+    if not isinstance(answer, str):
+        return False
+    normalized = " ".join(unicodedata.normalize("NFKC", answer).split())
+    subject_fenced = _USER_SUBJECT_OPERATIONAL_CLAIM.sub("", normalized)
+    normalized_user_text = (
+        " ".join(unicodedata.normalize("NFKC", user_text).split())
+        if isinstance(user_text, str)
+        else ""
+    )
+    has_action_context = action_context or bool(_ACTION_CONTEXT.search(normalized_user_text))
+    return bool(
+        _UNTRUSTED_OPERATIONAL_CLAIM.search(subject_fenced)
+        or _UNTRUSTED_MEMORY_OR_RETURN_CLAIM.search(subject_fenced)
+        or (has_action_context and _ELLIPTICAL_OPERATIONAL_CLAIM.fullmatch(normalized))
+        or (has_action_context and _CONTEXTUAL_OPERATIONAL_COMMITMENT.fullmatch(normalized))
+    )
 
 
 class _NovaCompanionDrainError(RuntimeError):
@@ -89,7 +224,43 @@ class _PreparedCompanionAnswer:
     user_text: str = field(default="", repr=False)
     source: str = "text"
     temporal: NovaCompanionCaptureTemporal | None = field(default=None, repr=False)
+    reminder_candidate: NovaCompanionReminderCandidate | None = field(default=None, repr=False)
     persist_exchange: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _CompanionPendingCaptureStatus:
+    owner_id: int = field(repr=False)
+    telegram_user_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    access_version: int = field(repr=False)
+    draft_id: str = field(repr=False)
+    draft_version: int = field(repr=False)
+    canonical_message_id: int = field(repr=False)
+    kind: Literal["task", "note", "idea"]
+    title: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _CompanionPendingReminderStatus:
+    owner_id: int = field(repr=False)
+    telegram_user_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    access_version: int = field(repr=False)
+    session_id: str = field(repr=False)
+    title: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _CompanionStatusReceipt:
+    kind: Literal["task", "note", "idea", "reminder"]
+    owner_id: int = field(repr=False)
+    telegram_user_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    access_version: int = field(repr=False)
+    inbox_item_id: int = field(repr=False)
+    inbox_item_version: int = field(repr=False)
+    title: str = field(repr=False)
 
 
 class NovaCompanionHandlers:
@@ -101,7 +272,16 @@ class NovaCompanionHandlers:
             conversation_message_limit=self.settings.conversation_context_messages,
         )
         self.nova_companion_captures = NovaCompanionCaptureStore()
+        self.nova_companion_reminders = NovaCompanionReminderStore()
+        self._nova_companion_reminder_ui_lock = asyncio.Lock()
         self._nova_companion_tasks: set[asyncio.Task[bool]] = set()
+        self._nova_companion_pending_capture_status: dict[str, _CompanionPendingCaptureStatus] = {}
+        self._nova_companion_pending_reminder_status: dict[
+            str, _CompanionPendingReminderStatus
+        ] = {}
+        self._nova_companion_status_receipts: dict[
+            tuple[int, int, int], _CompanionStatusReceipt
+        ] = {}
 
     def nova_companion_policy(self) -> NovaCompanionPolicy:
         return NovaCompanionPolicy(
@@ -124,12 +304,21 @@ class NovaCompanionHandlers:
         delivery_message: Any | None = None,
         resolved_date: Any | None = None,
         temporal_resolution: Any | None = None,
+        status_receipt_preinvalidated: bool = False,
     ) -> bool:
         """Handle an eligible ordinary message without invoking the legacy router."""
 
         policy = self.nova_companion_policy()
         if not policy.allows_actor(user):
             return False
+        status_receipt_anchor = (
+            None
+            if status_receipt_preinvalidated
+            else self.nova_companion_status_receipt_anchor(
+                user.telegram_id,
+                update.effective_chat.id,
+            )
+        )
         address = NovaAddressClassifier.classify(text)
         if address.is_local_response:
             await self._nova_companion_local_response(
@@ -145,6 +334,37 @@ class NovaCompanionHandlers:
             if address.kind is NovaAddressKind.VOCATIVE and address.content is not None
             else text.strip()
         )
+        identity_response = self._nova_companion_identity_answer(semantic_text, user)
+        if identity_response is not None:
+            await self._nova_companion_local_response(
+                update,
+                context,
+                delivery_message,
+                identity_response,
+                user=user,
+            )
+            return True
+        status_response = await self._nova_companion_status_answer(
+            semantic_text,
+            user=user,
+            chat_id=update.effective_chat.id,
+        )
+        if status_response is not None:
+            await self._nova_companion_local_response(
+                update,
+                context,
+                delivery_message,
+                status_response,
+                user=user,
+            )
+            return True
+        if not status_receipt_preinvalidated:
+            self.nova_companion_invalidate_status_for_input(
+                user.telegram_id,
+                update.effective_chat.id,
+                semantic_text,
+                expected_receipt=status_receipt_anchor,
+            )
         explicit = ExplicitCaptureClassifier.classify(semantic_text)
         if explicit is not None:
             if explicit.kind == "task" and resolved_date is None and temporal_resolution is None:
@@ -174,21 +394,41 @@ class NovaCompanionHandlers:
                 temporal_resolution=temporal_resolution,
             )
             return True
-        reminder_probe = self.reminder_intent_parser.parse(semantic_text, user.timezone)
-        if reminder_probe.status is not ReminderIntentStatus.NOT_REMINDER:
-            return await self._reminder_question_gate(
+        continuation = self._nova_companion_reminder_continuation_action(semantic_text)
+        if continuation is not None:
+            if await self._nova_companion_handle_reminder_continuation(
                 update,
                 context,
-                semantic_text,
-                candidate_message=delivery_message,
-                expected_access_version=(
-                    user.access_version if delivery_message is not None else None
-                ),
-                expected_session=None,
-                voice_fenced=delivery_message is not None,
-                voice_state=None,
-                weekly_candidate_handoff=False,
-            )
+                delivery_message,
+                user=user,
+                action=continuation,
+            ):
+                return True
+            if not self._nova_companion_reminder_continuation_requires_anchor(semantic_text):
+                await self._nova_companion_local_response(
+                    update,
+                    context,
+                    delivery_message,
+                    NOVA_COMPANION_NO_ACTIVE_REMINDER_OFFER_TEXT,
+                    user=user,
+                )
+                return True
+        else:
+            reminder_probe = self.reminder_intent_parser.parse(semantic_text, user.timezone)
+            if reminder_probe.status is not ReminderIntentStatus.NOT_REMINDER:
+                return await self._reminder_question_gate(
+                    update,
+                    context,
+                    semantic_text,
+                    candidate_message=delivery_message,
+                    expected_access_version=(
+                        user.access_version if delivery_message is not None else None
+                    ),
+                    expected_session=None,
+                    voice_fenced=delivery_message is not None,
+                    voice_state=None,
+                    weekly_candidate_handoff=False,
+                )
         await self._nova_companion_prepare_and_deliver(
             update,
             context,
@@ -200,6 +440,847 @@ class NovaCompanionHandlers:
         )
         return True
 
+    @staticmethod
+    def _nova_companion_identity_answer(text: str, user: User) -> str | None:
+        if _IDENTITY_NAME_QUESTION.fullmatch(text.strip()):
+            name = " ".join((user.display_name or "").split())
+            return f"Да, тебя зовут {name}." if name else "Пока не знаю, как тебя зовут."
+        if _IDENTITY_CITY_QUESTION.fullmatch(text.strip()):
+            city = " ".join((user.location_city or "").split())
+            return (
+                f"Да, ты живёшь в городе {city}."
+                if city
+                else "Подтверждённый город пока не указан."
+            )
+        return None
+
+    @staticmethod
+    def _nova_companion_status_key(
+        owner_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> tuple[int, int, int]:
+        return owner_id, telegram_user_id, chat_id
+
+    def _nova_companion_status_input_is_read_only(
+        self,
+        text: str,
+        telegram_user_id: int | None = None,
+        chat_id: int | None = None,
+    ) -> bool:
+        cleaned = text.strip()
+        address = NovaAddressClassifier.classify(cleaned)
+        semantic_text = (
+            address.content
+            if address.kind is NovaAddressKind.VOCATIVE and address.content is not None
+            else cleaned
+        )
+        exact_status = bool(
+            _REMINDER_STATUS_QUESTION.fullmatch(semantic_text)
+            or _CAPTURE_STATUS_QUESTION.fullmatch(semantic_text)
+            or _IDENTITY_NAME_QUESTION.fullmatch(semantic_text)
+            or _IDENTITY_CITY_QUESTION.fullmatch(semantic_text)
+            or address.is_local_response
+        )
+        if exact_status:
+            return True
+        return bool(
+            _CONTEXTUAL_STATUS_QUESTION.fullmatch(semantic_text)
+            and isinstance(telegram_user_id, int)
+            and isinstance(chat_id, int)
+            and self._nova_companion_has_status_anchor_hint(telegram_user_id, chat_id)
+        )
+
+    def _nova_companion_has_status_anchor_hint(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> bool:
+        if self.nova_companion_status_receipt_anchor(telegram_user_id, chat_id) is not None:
+            return True
+        return any(
+            pending.telegram_user_id == telegram_user_id and pending.chat_id == chat_id
+            for pending in (
+                *self._nova_companion_pending_capture_status.values(),
+                *self._nova_companion_pending_reminder_status.values(),
+            )
+        )
+
+    def nova_companion_status_receipt_anchor(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+    ) -> object | None:
+        for key, receipt in self._nova_companion_status_receipts.items():
+            if key[1] == telegram_user_id and key[2] == chat_id:
+                return receipt
+        return None
+
+    def nova_companion_invalidate_status_for_input(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        text: str,
+        *,
+        expected_receipt: object = _STATUS_RECEIPT_UNSET,
+    ) -> bool:
+        if self._nova_companion_status_input_is_read_only(
+            text,
+            telegram_user_id,
+            chat_id,
+        ):
+            return False
+        return self.nova_companion_invalidate_status_receipt_exact(
+            telegram_user_id,
+            chat_id,
+            expected_receipt=expected_receipt,
+        )
+
+    def nova_companion_invalidate_status_receipt_exact(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_receipt: object = _STATUS_RECEIPT_UNSET,
+    ) -> bool:
+        removed = False
+        for key, receipt in tuple(self._nova_companion_status_receipts.items()):
+            if key[1] != telegram_user_id or key[2] != chat_id:
+                continue
+            if expected_receipt is not _STATUS_RECEIPT_UNSET and receipt is not expected_receipt:
+                continue
+            if self._nova_companion_status_receipts.get(key) is receipt:
+                self._nova_companion_status_receipts.pop(key, None)
+                removed = True
+        return removed
+
+    @staticmethod
+    def _nova_companion_capture_status_kind(
+        text: str,
+    ) -> Literal["task", "note", "idea"]:
+        normalized = text.casefold()
+        if "заметк" in normalized:
+            return "note"
+        if "иде" in normalized:
+            return "idea"
+        return "task"
+
+    @staticmethod
+    def _nova_companion_capture_status_text(
+        kind: Literal["task", "note", "idea"],
+        *,
+        confirmed: bool,
+    ) -> str:
+        nouns = {
+            "task": ("задача", "сохранена", "создана"),
+            "note": ("заметка", "сохранена", "создана"),
+            "idea": ("идея", "сохранена", "создана"),
+        }
+        noun, saved, created = nouns[kind]
+        return f"Да, {noun} {saved}." if confirmed else f"Пока нет — {noun} ещё не {created}."
+
+    @staticmethod
+    def _nova_companion_trim_private_map(values: dict[Any, Any], *, limit: int = 512) -> None:
+        while len(values) > limit:
+            values.pop(next(iter(values)), None)
+
+    def _nova_companion_bind_pending_capture_status(
+        self,
+        user: User,
+        chat_id: int,
+        draft: Any,
+        *,
+        canonical_message_id: int,
+    ) -> None:
+        kind = getattr(draft, "kind", None)
+        draft_id = getattr(draft, "id", None)
+        draft_version = getattr(draft, "version", None)
+        title = getattr(draft, "title", None)
+        if (
+            kind not in {"task", "note", "idea"}
+            or not isinstance(draft_id, str)
+            or not draft_id
+            or not isinstance(draft_version, int)
+            or draft_version < 1
+            or not isinstance(title, str)
+            or not title
+            or type(canonical_message_id) is not int
+            or canonical_message_id <= 0
+        ):
+            return
+        self._nova_companion_pending_capture_status[draft_id] = _CompanionPendingCaptureStatus(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=chat_id,
+            access_version=user.access_version,
+            draft_id=draft_id,
+            draft_version=draft_version,
+            canonical_message_id=canonical_message_id,
+            kind=kind,
+            title=title,
+        )
+        self._nova_companion_trim_private_map(self._nova_companion_pending_capture_status)
+
+    def nova_companion_pending_capture_anchor(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        draft_id: str,
+        draft_version: int,
+        canonical_message_id: int,
+    ) -> _CompanionPendingCaptureStatus | None:
+        pending = self._nova_companion_pending_capture_status.get(draft_id)
+        if (
+            pending is None
+            or pending.telegram_user_id != telegram_user_id
+            or pending.chat_id != chat_id
+            or pending.draft_version != draft_version
+            or pending.canonical_message_id != canonical_message_id
+        ):
+            return None
+        return pending
+
+    def nova_companion_clear_pending_capture_exact(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        draft_id: str,
+        draft_version: int,
+        *,
+        expected_pending: _CompanionPendingCaptureStatus,
+    ) -> bool:
+        pending = self._nova_companion_pending_capture_status.get(draft_id)
+        if (
+            pending is None
+            or pending is not expected_pending
+            or pending.telegram_user_id != telegram_user_id
+            or pending.chat_id != chat_id
+            or pending.draft_version != draft_version
+        ):
+            return False
+        if self._nova_companion_pending_capture_status.get(draft_id) is not pending:
+            return False
+        self._nova_companion_pending_capture_status.pop(draft_id, None)
+        return True
+
+    def nova_companion_record_terminal_capture(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        outcome: Any,
+        *,
+        expected_pending: _CompanionPendingCaptureStatus | None,
+    ) -> bool:
+        result = getattr(outcome, "result", None)
+        draft = getattr(result, "draft", None)
+        draft_id = getattr(draft, "id", None)
+        draft_version = getattr(draft, "version", None)
+        if not isinstance(draft_id, str) or not isinstance(draft_version, int):
+            return False
+        pending = self._nova_companion_pending_capture_status.get(draft_id)
+        if (
+            pending is None
+            or pending is not expected_pending
+            or (
+                pending.kind != getattr(draft, "kind", None)
+                or pending.title != getattr(draft, "title", None)
+            )
+        ):
+            return False
+        return self.nova_companion_clear_pending_capture_exact(
+            telegram_user_id,
+            chat_id,
+            draft_id,
+            draft_version,
+            expected_pending=pending,
+        )
+
+    async def _nova_companion_has_active_capture_pending(
+        self,
+        user: User,
+        chat_id: int,
+        kind: Literal["task", "note", "idea"],
+    ) -> bool:
+        candidates = tuple(
+            pending
+            for pending in self._nova_companion_pending_capture_status.values()
+            if pending.owner_id == user.id
+            and pending.telegram_user_id == user.telegram_id
+            and pending.chat_id == chat_id
+            and pending.access_version == user.access_version
+            and pending.kind == kind
+        )
+        if not candidates:
+            return False
+        try:
+            async with self.db.sessions() as session:
+                drafts = tuple(
+                    await session.scalars(
+                        select(DraftInboxItem).where(
+                            DraftInboxItem.id.in_(
+                                tuple(pending.draft_id for pending in candidates)
+                            ),
+                            DraftInboxItem.user_id == user.id,
+                            DraftInboxItem.telegram_user_id == user.telegram_id,
+                            DraftInboxItem.chat_id == chat_id,
+                        )
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=capture_pending error_type=%s",
+                type(exc).__name__,
+            )
+            return True
+        now = datetime.now(UTC)
+        exact_drafts = {draft.id: draft for draft in drafts}
+        active = False
+        for pending in candidates:
+            draft = exact_drafts.get(pending.draft_id)
+            expires_at = getattr(draft, "expires_at", None)
+            if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            is_active = bool(
+                draft is not None
+                and draft.version == pending.draft_version
+                and draft.preview_message_id == pending.canonical_message_id
+                and draft.kind == pending.kind
+                and draft.title == pending.title
+                and draft.status in {"preview", "editing"}
+                and isinstance(expires_at, datetime)
+                and expires_at > now
+            )
+            if is_active:
+                active = True
+            elif self._nova_companion_pending_capture_status.get(pending.draft_id) is pending:
+                self._nova_companion_pending_capture_status.pop(pending.draft_id, None)
+        return active
+
+    def nova_companion_bind_pending_reminder_status(
+        self,
+        session: ReminderFlowSession,
+        candidate: NovaCompanionReminderCandidate,
+    ) -> None:
+        if session.title != candidate.title:
+            return
+        self._nova_companion_pending_reminder_status[session.id] = _CompanionPendingReminderStatus(
+            owner_id=session.owner_id,
+            telegram_user_id=session.telegram_user_id,
+            chat_id=session.chat_id,
+            access_version=session.access_version,
+            session_id=session.id,
+            title=candidate.title,
+        )
+        self._nova_companion_trim_private_map(self._nova_companion_pending_reminder_status)
+
+    def nova_companion_record_confirmed_capture(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        outcome: Any,
+        *,
+        expected_pending: _CompanionPendingCaptureStatus | None,
+    ) -> None:
+        result = getattr(outcome, "result", None)
+        draft = getattr(result, "draft", None)
+        draft_id = getattr(draft, "id", None)
+        draft_version = getattr(draft, "version", None)
+        if not isinstance(draft_id, str) or not isinstance(draft_version, int):
+            return
+        pending = self._nova_companion_pending_capture_status.get(draft_id)
+        if (
+            pending is None
+            or pending is not expected_pending
+            or pending.telegram_user_id != telegram_user_id
+            or pending.chat_id != chat_id
+            or pending.draft_version != draft_version
+            or pending.kind != getattr(draft, "kind", None)
+            or pending.title != getattr(draft, "title", None)
+        ):
+            return
+        if self._nova_companion_pending_capture_status.get(draft_id) is not pending:
+            return
+        self._nova_companion_pending_capture_status.pop(draft_id, None)
+        item = getattr(result, "inbox_item", None)
+        if item is None or bool(getattr(result, "duplicate", False)):
+            return
+        if (
+            pending.kind != getattr(item, "kind", None)
+            or pending.title != getattr(item, "title", None)
+            or pending.owner_id != getattr(item, "user_id", None)
+            or draft_id != getattr(item, "draft_id", None)
+        ):
+            return
+        key = self._nova_companion_status_key(
+            pending.owner_id,
+            pending.telegram_user_id,
+            pending.chat_id,
+        )
+        self._nova_companion_status_receipts[key] = _CompanionStatusReceipt(
+            kind=pending.kind,
+            owner_id=pending.owner_id,
+            telegram_user_id=pending.telegram_user_id,
+            chat_id=pending.chat_id,
+            access_version=pending.access_version,
+            inbox_item_id=item.id,
+            inbox_item_version=item.version,
+            title=item.title,
+        )
+        self._nova_companion_trim_private_map(self._nova_companion_status_receipts)
+
+    def nova_companion_record_confirmed_reminder(
+        self,
+        session: ReminderFlowSession,
+        item: InboxItem,
+    ) -> None:
+        pending = self._nova_companion_pending_reminder_status.pop(session.id, None)
+        if (
+            pending is None
+            or pending.owner_id != session.owner_id
+            or pending.telegram_user_id != session.telegram_user_id
+            or pending.chat_id != session.chat_id
+            or pending.access_version != session.access_version
+            or pending.title != session.title
+            or item.user_id != session.owner_id
+            or item.title != session.title
+            or item.kind != "task"
+            or item.status != "confirmed"
+        ):
+            return
+        key = self._nova_companion_status_key(
+            pending.owner_id,
+            pending.telegram_user_id,
+            pending.chat_id,
+        )
+        self._nova_companion_status_receipts[key] = _CompanionStatusReceipt(
+            kind="reminder",
+            owner_id=pending.owner_id,
+            telegram_user_id=pending.telegram_user_id,
+            chat_id=pending.chat_id,
+            access_version=pending.access_version,
+            inbox_item_id=item.id,
+            inbox_item_version=item.version,
+            title=item.title,
+        )
+        self._nova_companion_trim_private_map(self._nova_companion_status_receipts)
+
+    async def _nova_companion_status_answer(
+        self,
+        text: str,
+        *,
+        user: User,
+        chat_id: int,
+    ) -> str | None:
+        cleaned = text.strip()
+        key = self._nova_companion_status_key(user.id, user.telegram_id, chat_id)
+        receipt = self._nova_companion_status_receipts.get(key)
+        contextual = bool(_CONTEXTUAL_STATUS_QUESTION.fullmatch(cleaned))
+        capture_kind: Literal["task", "note", "idea"] | None = None
+        reminder_question = bool(_REMINDER_STATUS_QUESTION.fullmatch(cleaned))
+        if _CAPTURE_STATUS_QUESTION.fullmatch(cleaned):
+            capture_kind = self._nova_companion_capture_status_kind(cleaned)
+        elif contextual and receipt is not None and receipt.access_version == user.access_version:
+            if receipt.kind in {"task", "note", "idea"}:
+                capture_kind = receipt.kind
+            elif receipt.kind == "reminder":
+                reminder_question = True
+        elif contextual:
+            pending_kinds = tuple(
+                kind
+                for kind in ("task", "note", "idea")
+                if any(
+                    pending.owner_id == user.id
+                    and pending.telegram_user_id == user.telegram_id
+                    and pending.chat_id == chat_id
+                    and pending.access_version == user.access_version
+                    and pending.kind == kind
+                    for pending in self._nova_companion_pending_capture_status.values()
+                )
+            )
+            for kind in pending_kinds:
+                if await self._nova_companion_has_active_capture_pending(user, chat_id, kind):
+                    return self._nova_companion_capture_status_text(kind, confirmed=False)
+            current_reminder = await self.reminder_sessions.current(
+                owner_id=user.id,
+                telegram_user_id=user.telegram_id,
+                chat_id=chat_id,
+            )
+            pending_reminder = await self.nova_companion_reminders.active(
+                owner_id=user.id,
+                telegram_user_id=user.telegram_id,
+                chat_id=chat_id,
+                access_tier=user.access_tier,
+                access_version=user.access_version,
+            )
+            if current_reminder is None and pending_reminder is None:
+                return None
+            reminder_question = True
+        if capture_kind is not None:
+            kind = capture_kind
+            pending = await self._nova_companion_has_active_capture_pending(
+                user,
+                chat_id,
+                kind,
+            )
+            if (
+                pending
+                or receipt is None
+                or receipt.kind != kind
+                or receipt.access_version != user.access_version
+            ):
+                return self._nova_companion_capture_status_text(kind, confirmed=False)
+            if not await self._nova_companion_actor_is_current(user):
+                self._nova_companion_status_receipts.pop(key, None)
+                return self._nova_companion_capture_status_text(kind, confirmed=False)
+            try:
+                async with self.db.sessions() as session:
+                    saved_item = await session.scalar(
+                        select(InboxItem.id).where(
+                            InboxItem.id == receipt.inbox_item_id,
+                            InboxItem.user_id == receipt.owner_id,
+                            InboxItem.kind == receipt.kind,
+                            InboxItem.status == "confirmed",
+                            InboxItem.version == receipt.inbox_item_version,
+                            InboxItem.title == receipt.title,
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Nova companion failed operation=capture_status error_type=%s",
+                    type(exc).__name__,
+                )
+                return "Не могу сейчас надёжно проверить статус сохранения."
+            if saved_item is None:
+                self._nova_companion_status_receipts.pop(key, None)
+            return self._nova_companion_capture_status_text(
+                kind,
+                confirmed=saved_item is not None,
+            )
+        if not reminder_question:
+            return None
+        current = await self.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=chat_id,
+        )
+        pending = await self.nova_companion_reminders.active(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=chat_id,
+            access_tier=user.access_tier,
+            access_version=user.access_version,
+        )
+        if current is not None or pending is not None:
+            return "Пока нет — напоминание ещё не создано."
+        if (
+            receipt is None
+            or receipt.kind != "reminder"
+            or receipt.access_version != user.access_version
+        ):
+            return "Пока нет — напоминание ещё не создано."
+        if not await self._nova_companion_actor_is_current(user):
+            self._nova_companion_status_receipts.pop(key, None)
+            return "Пока нет — напоминание ещё не создано."
+        try:
+            async with self.db.sessions() as session:
+                reminder = await session.scalar(
+                    select(TaskReminder)
+                    .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
+                    .where(
+                        InboxItem.id == receipt.inbox_item_id,
+                        InboxItem.user_id == receipt.owner_id,
+                        InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
+                        InboxItem.version == receipt.inbox_item_version,
+                        InboxItem.title == receipt.title,
+                        TaskReminder.telegram_user_id == receipt.telegram_user_id,
+                        TaskReminder.chat_id == receipt.chat_id,
+                        TaskReminder.status.in_(("pending", "sent")),
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=reminder_status error_type=%s",
+                type(exc).__name__,
+            )
+            return "Не могу сейчас надёжно проверить статус напоминания."
+        if reminder is None:
+            self._nova_companion_status_receipts.pop(key, None)
+            return "Пока нет — напоминание ещё не создано."
+        event_at = reminder.event_at
+        if event_at.tzinfo is None:
+            event_at = event_at.replace(tzinfo=UTC)
+        local = event_at.astimezone(ZoneInfo(reminder.timezone))
+        today = self._reminder_now().astimezone(ZoneInfo(reminder.timezone)).date()
+        day = "завтра" if local.date() == today + timedelta(days=1) else local.strftime("%d.%m.%Y")
+        return f"Да, напоминание создано на {day}, {local.strftime('%H:%M')}."
+
+    @staticmethod
+    def nova_companion_pending_reminder_status_answer(text: str) -> str | None:
+        if _REMINDER_STATUS_QUESTION.fullmatch(text.strip()):
+            return "Пока нет — напоминание ещё не создано."
+        return None
+
+    @staticmethod
+    def _nova_companion_reminder_continuation_action(
+        text: str,
+    ) -> Literal["accept", "not_now"] | None:
+        cleaned = text.strip()
+        if _REMINDER_ACCEPT.fullmatch(cleaned):
+            return "accept"
+        if _REMINDER_DECLINE.fullmatch(cleaned):
+            return "not_now"
+        return None
+
+    @staticmethod
+    def _nova_companion_reminder_continuation_requires_anchor(text: str) -> bool:
+        return _REMINDER_WEAK_CONTINUATION.fullmatch(text.strip()) is not None
+
+    async def _nova_companion_handle_reminder_continuation(
+        self,
+        update: Any,
+        context: Any,
+        delivery_message: Any | None,
+        *,
+        user: User,
+        action: Literal["accept", "not_now"],
+    ) -> bool:
+        capability = await self.nova_companion_reminders.active(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=update.effective_chat.id,
+            access_tier=user.access_tier,
+            access_version=user.access_version,
+            action=action,
+        )
+        if capability is None:
+            return False
+        if not await self._nova_companion_reminder_capability_is_current(user, capability):
+            return False
+        if not await self.nova_companion_reminders.consume(capability):
+            return False
+        coroutine = self._nova_companion_reminder_action_lifecycle(
+            update,
+            context,
+            delivery_message,
+            user=user,
+            capability=capability,
+        )
+        try:
+            task = asyncio.create_task(
+                coroutine,
+                name="nova-companion-reminder-text-lifecycle",
+            )
+        except BaseException:
+            coroutine.close()
+            raise
+        self._track_nova_companion_task(task)
+        await asyncio.shield(task)
+        return True
+
+    async def _nova_companion_reminder_action_lifecycle(
+        self,
+        update: Any,
+        context: Any,
+        delivery_message: Any | None,
+        *,
+        user: User,
+        capability: NovaCompanionReminderCapability,
+    ) -> bool:
+        try:
+            return await self._nova_companion_reminder_action_inner(
+                update,
+                context,
+                delivery_message,
+                user=user,
+                capability=capability,
+            )
+        except asyncio.CancelledError as exc:
+            exact_session = exc.__dict__.get(_COMPANION_REMINDER_SESSION_ATTR)
+            coroutine = self._nova_companion_reminder_consumed_cleanup(
+                context,
+                capability,
+                exact_session=(
+                    exact_session if isinstance(exact_session, ReminderFlowSession) else None
+                ),
+            )
+            try:
+                task = asyncio.create_task(
+                    coroutine,
+                    name="nova-companion-reminder-consumed-cleanup",
+                )
+            except BaseException:
+                coroutine.close()
+            else:
+                self._track_nova_companion_task(task)
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=reminder_action error_type=%s",
+                type(exc).__name__,
+            )
+            exact_session = exc.__dict__.get(_COMPANION_REMINDER_SESSION_ATTR)
+            await self._nova_companion_reminder_consumed_cleanup(
+                context,
+                capability,
+                exact_session=(
+                    exact_session if isinstance(exact_session, ReminderFlowSession) else None
+                ),
+            )
+            return False
+
+    async def _nova_companion_reminder_action_inner(
+        self,
+        update: Any,
+        context: Any,
+        delivery_message: Any | None,
+        *,
+        user: User,
+        capability: NovaCompanionReminderCapability,
+    ) -> bool:
+        async with self._nova_companion_reminder_ui_lock:
+            if not await self.nova_companion_reminders.consumed_screen_is_current(capability):
+                return False
+            if not await self._nova_companion_reminder_capability_is_current(user, capability):
+                await self._nova_companion_neutralize_reminder_offer_locked(
+                    context, capability, NOVA_COMPANION_ACCESS_CHANGED_TEXT
+                )
+                return False
+            if delivery_message is not None:
+                try:
+                    await delivery_message.delete()
+                except asyncio.CancelledError:
+                    raise
+                except TelegramError as exc:
+                    logger.warning(
+                        "Nova companion failed operation=reminder_voice_cleanup error_type=%s",
+                        type(exc).__name__,
+                    )
+            if capability.action == "not_now":
+                await self._nova_companion_edit_markup(
+                    context,
+                    None,
+                    chat_id=capability.chat_id,
+                    message_id=capability.canonical_message_id,
+                    markup=None,
+                )
+                return True
+            if capability.canonical_message_id is None:
+                return False
+            handled = await self.reminder_from_companion_candidate(
+                update,
+                context,
+                candidate=capability.candidate,
+                canonical_message_id=capability.canonical_message_id,
+                expected_access_version=capability.access_version,
+            )
+            if not handled:
+                current = await self._nova_companion_reminder_capability_is_current(
+                    user,
+                    capability,
+                )
+                await self._nova_companion_neutralize_reminder_offer_locked(
+                    context,
+                    capability,
+                    (
+                        NOVA_COMPANION_CONTEXT_CHANGED_TEXT
+                        if current
+                        else NOVA_COMPANION_ACCESS_CHANGED_TEXT
+                    ),
+                )
+            return handled
+
+    async def _nova_companion_reminder_consumed_cleanup(
+        self,
+        context: Any,
+        capability: NovaCompanionReminderCapability,
+        *,
+        exact_session: ReminderFlowSession | None = None,
+    ) -> bool:
+        try:
+            async with self._nova_companion_reminder_ui_lock:
+                if exact_session is not None:
+                    cleared = await self.reminder_sessions.clear_exact(exact_session)
+                    if not cleared:
+                        return False
+                return await self._nova_companion_neutralize_reminder_offer_locked(
+                    context,
+                    capability,
+                    NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=reminder_cleanup error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    async def nova_companion_reminder_callback(self, update: Any, context: Any) -> None:
+        query = update.callback_query
+        if query is None or update.effective_user is None or update.effective_chat is None:
+            return
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        user = await self._nova_companion_lookup_actor(update.effective_user.id)
+        message_id = self._positive_companion_message_id(
+            getattr(getattr(query, "message", None), "message_id", None)
+        )
+        capability = None
+        if user is not None and message_id is not None:
+            capability = await self.nova_companion_reminders.peek_bound_identity(
+                query.data,
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+                canonical_message_id=message_id,
+            )
+        await self._nova_companion_answer_query(query)
+        if capability is None:
+            return
+        assert user is not None
+        current = await self._nova_companion_reminder_capability_is_current(user, capability)
+        if not await self.nova_companion_reminders.consume(capability):
+            return
+        if not current:
+            await self._nova_companion_neutralize_reminder_offer(
+                context,
+                capability,
+                NOVA_COMPANION_ACCESS_CHANGED_TEXT,
+            )
+            return
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
+        coroutine = self._nova_companion_reminder_action_lifecycle(
+            update,
+            context,
+            None,
+            user=user,
+            capability=capability,
+        )
+        try:
+            task = asyncio.create_task(
+                coroutine,
+                name="nova-companion-reminder-callback-lifecycle",
+            )
+        except BaseException:
+            coroutine.close()
+            raise
+        self._track_nova_companion_task(task)
+        await asyncio.shield(task)
+
     async def _nova_companion_local_response(
         self,
         update: Any,
@@ -209,7 +1290,6 @@ class NovaCompanionHandlers:
         *,
         user: User,
     ) -> None:
-        message = delivery_message or update.effective_message
         if delivery_message is not None:
             coroutine = self._nova_companion_local_voice_lifecycle(
                 context,
@@ -230,21 +1310,75 @@ class NovaCompanionHandlers:
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
-                if not task.done():
-                    task.cancel()
                 raise
             return
-        if not await self._nova_companion_actor_is_current(user):
-            return
+        coroutine = self._nova_companion_local_text_lifecycle(
+            update,
+            context,
+            response,
+            user=user,
+        )
         try:
-            await message.reply_text(response)
-        except asyncio.CancelledError:
+            task = asyncio.create_task(
+                coroutine,
+                name="nova-companion-local-text-lifecycle",
+            )
+        except BaseException:
+            coroutine.close()
             raise
-        except TelegramError as exc:
+        self._track_nova_companion_task(task)
+        await asyncio.shield(task)
+
+    async def _nova_companion_local_text_lifecycle(
+        self,
+        update: Any,
+        context: Any,
+        response: str,
+        *,
+        user: User,
+    ) -> bool:
+        sent = None
+        message_id = None
+        try:
+            if not await self._nova_companion_actor_is_current(user):
+                return False
+            sent = await update.effective_message.reply_text(response)
+            message_id = self._positive_companion_message_id(getattr(sent, "message_id", None))
+            if message_id is None:
+                raise ValueError("Missing local companion message id")
+            if not await self._nova_companion_actor_is_current(user):
+                await self._nova_companion_compensate(
+                    context,
+                    sent,
+                    chat_id=update.effective_chat.id,
+                    message_id=message_id,
+                    neutral_text=NOVA_COMPANION_ACCESS_CHANGED_TEXT,
+                )
+                return False
+            return True
+        except asyncio.CancelledError:
+            if sent is not None and message_id is not None:
+                self._nova_companion_schedule_pre_delivery_cleanup(
+                    context,
+                    sent,
+                    chat_id=update.effective_chat.id,
+                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
+            raise
+        except Exception as exc:
             logger.warning(
                 "Nova companion failed operation=local_delivery error_type=%s",
                 type(exc).__name__,
             )
+            if sent is not None and message_id is not None:
+                await self._nova_companion_compensate(
+                    context,
+                    sent,
+                    chat_id=update.effective_chat.id,
+                    message_id=message_id,
+                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
+            return False
 
     async def _nova_companion_local_voice_lifecycle(
         self,
@@ -534,6 +1668,12 @@ class NovaCompanionHandlers:
                     neutral_text=NOVA_COMPANION_ACCESS_CHANGED_TEXT,
                 )
                 return False
+            self._nova_companion_bind_pending_capture_status(
+                user,
+                update.effective_chat.id,
+                draft,
+                canonical_message_id=preview_message_id,
+            )
             return True
         except asyncio.CancelledError as exc:
             if preview is None and accepted_previews:
@@ -884,6 +2024,7 @@ class NovaCompanionHandlers:
             context_fence=materialized.fence,
             memory_revision=memory_revision,
         )
+        generation_timezone = materialized.fence.timezone_name
         try:
             pre_provider_check = await self._nova_companion_current_check(generation)
         except asyncio.CancelledError:
@@ -905,10 +2046,10 @@ class NovaCompanionHandlers:
         capture_temporal: NovaCompanionCaptureTemporal | None = None
         temporal_failed = False
         try:
-            date_resolution = self.date_resolver.resolve(text, user.timezone)
+            date_resolution = self.date_resolver.resolve(text, generation_timezone)
             if date_resolution.status in {"resolved", "conflict"}:
                 capture_temporal = NovaCompanionCaptureTemporal(
-                    timezone=user.timezone,
+                    timezone=generation_timezone,
                     resolution=date_resolution,
                     local_time=self.date_resolver.extract_local_time(text),
                 )
@@ -924,7 +2065,7 @@ class NovaCompanionHandlers:
         try:
             result = await self.ai.companion_message(
                 text,
-                temporal_context(user.timezone),
+                temporal_context(generation_timezone),
                 materialized.projection,
             )
         except asyncio.CancelledError:
@@ -970,6 +2111,7 @@ class NovaCompanionHandlers:
             )
         else:
             suggestion = None
+            reminder_candidate = None
             if result.capture is not None:
                 suggestion = validate_capture_suggestion(
                     kind=result.capture.kind,
@@ -979,9 +2121,65 @@ class NovaCompanionHandlers:
                 )
                 if suggestion is not None and suggestion.kind == "task" and temporal_failed:
                     suggestion = None
+            reminder_offer_attempted = result.reminder_offer is not None
+            if result.reminder_offer is not None:
+                try:
+                    reminder_resolution = self.date_resolver.resolve(
+                        result.reminder_offer.evidence,
+                        generation_timezone,
+                    )
+                    reminder_temporal = None
+                    if reminder_resolution.status == "resolved":
+                        reminder_temporal = NovaCompanionCaptureTemporal(
+                            timezone=generation_timezone,
+                            resolution=reminder_resolution,
+                            local_time=self.date_resolver.extract_local_time(
+                                result.reminder_offer.evidence
+                            ),
+                        )
+                    elif (
+                        reminder_resolution.status == "conflict"
+                        or result.reminder_offer.schedule_wording is not None
+                    ):
+                        raise ValueError("ambiguous reminder offer")
+                    reminder_candidate = NovaCompanionReminderCandidate(
+                        title=result.reminder_offer.title,
+                        schedule_wording=result.reminder_offer.schedule_wording,
+                        evidence=result.reminder_offer.evidence,
+                        timezone=generation_timezone,
+                        temporal=reminder_temporal,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (TypeError, ValueError):
+                    reminder_candidate = None
+            answer = (
+                NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
+                if reminder_offer_attempted and reminder_candidate is None
+                else result.answer
+            )
+            if _has_untrusted_operational_claim(
+                answer,
+                user_text=text,
+                action_context=(
+                    reminder_offer_attempted
+                    or result.capture is not None
+                    or self._nova_companion_has_status_anchor_hint(
+                        user.telegram_id,
+                        update.effective_chat.id,
+                    )
+                ),
+            ):
+                answer = (
+                    NOVA_COMPANION_REMINDER_OFFER_ACTION_TEXT
+                    if reminder_candidate is not None
+                    else NOVA_COMPANION_NOT_EXECUTED_TEXT
+                )
+                suggestion = None
             prepared = _PreparedCompanionAnswer(
-                answer=result.answer,
+                answer=answer,
                 suggestion=suggestion,
+                reminder_candidate=reminder_candidate,
                 user_text=text,
                 source=source,
                 generation=generation,
@@ -1223,6 +2421,9 @@ class NovaCompanionHandlers:
                         User.access_tier == user.access_tier,
                         User.access_tier.in_(FULL_ACCESS_TIERS),
                         User.access_version == user.access_version,
+                        User.display_name == user.display_name,
+                        User.location_city == user.location_city,
+                        User.timezone == user.timezone,
                     )
                 )
             return owner_id == user.id and self.nova_companion_policy().allows_tier(
@@ -1265,14 +2466,28 @@ class NovaCompanionHandlers:
         delivery_message: Any | None,
         prepared: _PreparedCompanionAnswer,
     ) -> bool:
-        stage: NovaCompanionCaptureScreen | None = None
-        screen: NovaCompanionCaptureScreen | None = None
+        stage: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None = None
+        screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None = None
         exchange_receipt: ConversationExchangeReceipt | None = None
+        active_reminder_anchor: NovaCompanionReminderCapability | None = None
         sent: Any | None = delivery_message
         message_id = self._positive_companion_message_id(
             getattr(delivery_message, "message_id", None)
         )
         try:
+            if prepared.reminder_candidate is None:
+                candidate_anchor = await self.nova_companion_reminders.active(
+                    owner_id=prepared.generation.owner_id,
+                    telegram_user_id=prepared.generation.telegram_actor_id,
+                    chat_id=prepared.generation.chat_id,
+                    access_tier=prepared.generation.tier,
+                    access_version=prepared.generation.access_version,
+                )
+                if (
+                    candidate_anchor is not None
+                    and await self._nova_companion_reminder_generation_is_current(candidate_anchor)
+                ):
+                    active_reminder_anchor = candidate_anchor
             if prepared.suggestion is not None:
                 stage = await self.nova_companion_captures.stage(
                     prepared.suggestion,
@@ -1283,10 +2498,21 @@ class NovaCompanionHandlers:
                     access_version=prepared.generation.access_version,
                     temporal=prepared.temporal,
                 )
+            elif prepared.reminder_candidate is not None:
+                stage = await self.nova_companion_reminders.stage(
+                    prepared.reminder_candidate,
+                    owner_id=prepared.generation.owner_id,
+                    telegram_user_id=prepared.generation.telegram_actor_id,
+                    chat_id=prepared.generation.chat_id,
+                    access_tier=prepared.generation.tier,
+                    access_version=prepared.generation.access_version,
+                    context_fence=prepared.generation.context_fence,
+                    memory_revision=prepared.generation.memory_revision,
+                )
             check = await self._nova_companion_current_check(prepared.generation)
             if check != "ready":
                 if stage is not None:
-                    await self.nova_companion_captures.revoke_screen(stage)
+                    await self._nova_companion_revoke_offer_screen(stage)
                 if delivery_message is not None:
                     await self._nova_companion_neutralize_existing(
                         context,
@@ -1305,7 +2531,7 @@ class NovaCompanionHandlers:
             check = await self._nova_companion_current_check(prepared.generation)
             if check != "ready":
                 if stage is not None:
-                    await self.nova_companion_captures.revoke_screen(stage)
+                    await self._nova_companion_revoke_offer_screen(stage)
                 await self._nova_companion_compensate(
                     context,
                     sent,
@@ -1315,48 +2541,13 @@ class NovaCompanionHandlers:
                 )
                 return False
             if stage is not None:
-                screen = await self.nova_companion_captures.bind(
-                    stage,
-                    canonical_message_id=message_id,
+                offer_lock = (
+                    self._nova_companion_reminder_ui_lock
+                    if isinstance(stage, NovaCompanionReminderScreen)
+                    else asyncio.Lock()
                 )
-                if screen is not None:
-                    check = await self._nova_companion_current_check(prepared.generation)
-                    if check != "ready":
-                        await self._nova_companion_delivery_cleanup(
-                            context,
-                            prepared,
-                            sent=sent,
-                            message_id=message_id,
-                            stage=stage,
-                            screen=screen,
-                            exchange_receipt=None,
-                            neutral_text=self._nova_companion_neutral_text(check),
-                        )
-                        return False
-                    try:
-                        await self._nova_companion_edit_markup(
-                            context,
-                            sent,
-                            chat_id=prepared.generation.chat_id,
-                            message_id=message_id,
-                            markup=self._nova_companion_capture_markup(screen),
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning(
-                            "Nova companion failed operation=suggestion_edit error_type=%s",
-                            type(exc).__name__,
-                        )
-                        await self.nova_companion_captures.revoke_screen(screen)
-                        await self._nova_companion_edit_markup(
-                            context,
-                            sent,
-                            chat_id=prepared.generation.chat_id,
-                            message_id=message_id,
-                            markup=None,
-                        )
-                        screen = None
+                async with offer_lock:
+                    screen = await self._nova_companion_bind_offer_screen(stage, message_id)
                     if screen is not None:
                         check = await self._nova_companion_current_check(prepared.generation)
                         if check != "ready":
@@ -1369,8 +2560,61 @@ class NovaCompanionHandlers:
                                 screen=screen,
                                 exchange_receipt=None,
                                 neutral_text=self._nova_companion_neutral_text(check),
+                                reminder_lock_held=True,
                             )
                             return False
+                        try:
+                            await self._nova_companion_edit_markup(
+                                context,
+                                sent,
+                                chat_id=prepared.generation.chat_id,
+                                message_id=message_id,
+                                markup=self._nova_companion_offer_markup(screen),
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Nova companion failed operation=suggestion_edit error_type=%s",
+                                type(exc).__name__,
+                            )
+                            if isinstance(screen, NovaCompanionReminderScreen):
+                                await self._nova_companion_delivery_cleanup(
+                                    context,
+                                    prepared,
+                                    sent=sent,
+                                    message_id=message_id,
+                                    stage=stage,
+                                    screen=screen,
+                                    exchange_receipt=None,
+                                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                                    reminder_lock_held=True,
+                                )
+                                return False
+                            await self._nova_companion_revoke_offer_screen(screen)
+                            await self._nova_companion_edit_markup(
+                                context,
+                                sent,
+                                chat_id=prepared.generation.chat_id,
+                                message_id=message_id,
+                                markup=None,
+                            )
+                            screen = None
+                        if screen is not None:
+                            check = await self._nova_companion_current_check(prepared.generation)
+                            if check != "ready":
+                                await self._nova_companion_delivery_cleanup(
+                                    context,
+                                    prepared,
+                                    sent=sent,
+                                    message_id=message_id,
+                                    stage=stage,
+                                    screen=screen,
+                                    exchange_receipt=None,
+                                    neutral_text=self._nova_companion_neutral_text(check),
+                                    reminder_lock_held=True,
+                                )
+                                return False
             if prepared.persist_exchange:
                 exchange_receipt = await self._nova_companion_append_exchange(prepared)
                 if exchange_receipt is None:
@@ -1388,6 +2632,31 @@ class NovaCompanionHandlers:
                         neutral_text=self._nova_companion_neutral_text(check),
                     )
                     return False
+                if isinstance(screen, NovaCompanionReminderScreen):
+                    advanced = await self.nova_companion_reminders.attach_exchange(
+                        screen,
+                        exchange_receipt,
+                    )
+                    if advanced is None:
+                        await self._nova_companion_delivery_cleanup(
+                            context,
+                            prepared,
+                            sent=sent,
+                            message_id=message_id,
+                            stage=stage,
+                            screen=screen,
+                            exchange_receipt=exchange_receipt,
+                            neutral_text=NOVA_COMPANION_CONTEXT_CHANGED_TEXT,
+                        )
+                        return False
+                    screen = advanced
+                elif active_reminder_anchor is not None:
+                    await self.nova_companion_reminders.advance_context(
+                        active_reminder_anchor,
+                        context_fence=prepared.generation.context_fence,
+                        memory_revision=prepared.generation.memory_revision,
+                        exchange_receipt=exchange_receipt,
+                    )
             check = await self._nova_companion_current_check(
                 prepared.generation,
                 exchange_receipt=exchange_receipt,
@@ -1441,8 +2710,8 @@ class NovaCompanionHandlers:
         *,
         sent: Any | None,
         message_id: int | None,
-        stage: NovaCompanionCaptureScreen | None,
-        screen: NovaCompanionCaptureScreen | None,
+        stage: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None,
+        screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None,
         exchange_receipt: ConversationExchangeReceipt | None,
         neutral_text: str,
     ) -> None:
@@ -1477,18 +2746,36 @@ class NovaCompanionHandlers:
         *,
         sent: Any | None,
         message_id: int | None,
-        stage: NovaCompanionCaptureScreen | None,
-        screen: NovaCompanionCaptureScreen | None,
+        stage: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None,
+        screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None,
         exchange_receipt: ConversationExchangeReceipt | None,
         neutral_text: str,
+        reminder_lock_held: bool = False,
     ) -> bool:
+        reminder_screen = isinstance(
+            screen if screen is not None else stage,
+            NovaCompanionReminderScreen,
+        )
+        if reminder_screen and not reminder_lock_held:
+            async with self._nova_companion_reminder_ui_lock:
+                return await self._nova_companion_delivery_cleanup(
+                    context,
+                    prepared,
+                    sent=sent,
+                    message_id=message_id,
+                    stage=stage,
+                    screen=screen,
+                    exchange_receipt=exchange_receipt,
+                    neutral_text=neutral_text,
+                    reminder_lock_held=True,
+                )
         clean = True
         canonical_owned = True
         try:
             if screen is not None:
-                canonical_owned = await self.nova_companion_captures.revoke_screen(screen)
+                canonical_owned = await self._nova_companion_revoke_offer_screen(screen)
             elif stage is not None:
-                await self.nova_companion_captures.revoke_screen(stage)
+                await self._nova_companion_revoke_offer_screen(stage)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1552,6 +2839,10 @@ class NovaCompanionHandlers:
         query = update.callback_query
         if query is None:
             return
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         user = await self._nova_companion_lookup_actor(update.effective_user.id)
         message_id = self._positive_companion_message_id(
             getattr(getattr(query, "message", None), "message_id", None)
@@ -1575,6 +2866,7 @@ class NovaCompanionHandlers:
             query,
             user,
             capability,
+            status_receipt=status_receipt,
         )
         try:
             task = asyncio.create_task(coroutine, name="nova-companion-callback-lifecycle")
@@ -1617,6 +2909,8 @@ class NovaCompanionHandlers:
         query: Any,
         user: User,
         capability: NovaCompanionCaptureCapability,
+        *,
+        status_receipt: object | None,
     ) -> bool:
         try:
             if not await self.nova_companion_captures.consumed_screen_is_current(capability):
@@ -1629,6 +2923,11 @@ class NovaCompanionHandlers:
                     NOVA_COMPANION_ACCESS_CHANGED_TEXT,
                 )
                 return False
+            self.nova_companion_invalidate_status_receipt_exact(
+                capability.telegram_user_id,
+                capability.chat_id,
+                expected_receipt=status_receipt,
+            )
             if capability.action == "not_now":
                 if await self._nova_companion_clear_query_markup(query, context):
                     return True
@@ -1931,6 +3230,12 @@ class NovaCompanionHandlers:
                     focus_capability=capability,
                 )
                 return False
+            self._nova_companion_bind_pending_capture_status(
+                user,
+                capability.chat_id,
+                draft,
+                canonical_message_id=preview_message_id,
+            )
             return True
         except asyncio.CancelledError as exc:
             if preview is None and accepted_previews:
@@ -2278,6 +3583,149 @@ class NovaCompanionHandlers:
             )
             return False
 
+    async def _nova_companion_reminder_capability_is_current(
+        self,
+        user: User,
+        capability: NovaCompanionReminderCapability,
+    ) -> bool:
+        if (
+            not isinstance(capability.context_fence, NovaCompanionContextFence)
+            or user.id != capability.owner_id
+            or user.telegram_id != capability.telegram_user_id
+            or user.access_tier != capability.access_tier
+            or user.access_version != capability.access_version
+            or user.timezone != capability.candidate.timezone
+            or not self.nova_companion_policy().allows_actor(
+                user,
+                expected_access_version=capability.access_version,
+            )
+            or not await self._nova_companion_actor_is_current(user)
+        ):
+            return False
+        receipt = capability.exchange_receipt
+        if receipt is not None and not isinstance(receipt, ConversationExchangeReceipt):
+            return False
+        generation = _CompanionGeneration(
+            owner_id=capability.owner_id,
+            telegram_actor_id=capability.telegram_user_id,
+            chat_id=capability.chat_id,
+            tier=capability.access_tier,
+            access_version=capability.access_version,
+            context_fence=capability.context_fence,
+            memory_revision=capability.memory_revision,
+        )
+        return (
+            await self._nova_companion_current_check(
+                generation,
+                exchange_receipt=receipt,
+            )
+            == "ready"
+        )
+
+    async def _nova_companion_reminder_generation_is_current(
+        self,
+        capability: NovaCompanionReminderCapability,
+    ) -> bool:
+        if (
+            not isinstance(capability.context_fence, NovaCompanionContextFence)
+            or capability.context_fence.owner_id != capability.owner_id
+            or capability.context_fence.telegram_actor_id != capability.telegram_user_id
+            or capability.context_fence.expected_tier != capability.access_tier
+            or capability.context_fence.expected_access_version != capability.access_version
+            or capability.context_fence.timezone_name != capability.candidate.timezone
+        ):
+            return False
+        receipt = capability.exchange_receipt
+        if receipt is not None and not isinstance(receipt, ConversationExchangeReceipt):
+            return False
+        return (
+            await self._nova_companion_current_check(
+                _CompanionGeneration(
+                    owner_id=capability.owner_id,
+                    telegram_actor_id=capability.telegram_user_id,
+                    chat_id=capability.chat_id,
+                    tier=capability.access_tier,
+                    access_version=capability.access_version,
+                    context_fence=capability.context_fence,
+                    memory_revision=capability.memory_revision,
+                ),
+                exchange_receipt=receipt,
+            )
+            == "ready"
+        )
+
+    async def _nova_companion_neutralize_reminder_offer(
+        self,
+        context: Any,
+        capability: NovaCompanionReminderCapability,
+        text: str,
+    ) -> bool:
+        async with self._nova_companion_reminder_ui_lock:
+            return await self._nova_companion_neutralize_reminder_offer_locked(
+                context,
+                capability,
+                text,
+            )
+
+    async def _nova_companion_neutralize_reminder_offer_locked(
+        self,
+        context: Any,
+        capability: NovaCompanionReminderCapability,
+        text: str,
+    ) -> bool:
+        if (
+            capability.canonical_message_id is None
+            or not await self.nova_companion_reminders.consumed_screen_is_current(capability)
+        ):
+            return False
+        try:
+            await context.bot.edit_message_text(
+                chat_id=capability.chat_id,
+                message_id=capability.canonical_message_id,
+                text=text,
+                reply_markup=None,
+                parse_mode=None,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=reminder_neutralize error_type=%s",
+                type(exc).__name__,
+            )
+        try:
+            result = await context.bot.delete_message(
+                chat_id=capability.chat_id,
+                message_id=capability.canonical_message_id,
+            )
+            if result is not False:
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=reminder_delete error_type=%s",
+                type(exc).__name__,
+            )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=capability.chat_id,
+                message_id=capability.canonical_message_id,
+                text=text,
+                reply_markup=None,
+                parse_mode=None,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=reminder_neutralize_fallback error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
     async def _nova_companion_restore_capture(
         self,
         context: Any,
@@ -2585,6 +4033,50 @@ class NovaCompanionHandlers:
                 type(exc).__name__,
             )
             return False
+
+    async def _nova_companion_bind_offer_screen(
+        self,
+        stage: NovaCompanionCaptureScreen | NovaCompanionReminderScreen,
+        message_id: int,
+    ) -> NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None:
+        if isinstance(stage, NovaCompanionReminderScreen):
+            return await self.nova_companion_reminders.bind(stage, canonical_message_id=message_id)
+        return await self.nova_companion_captures.bind(stage, canonical_message_id=message_id)
+
+    async def _nova_companion_revoke_offer_screen(
+        self,
+        screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen,
+    ) -> bool:
+        if isinstance(screen, NovaCompanionReminderScreen):
+            return await self.nova_companion_reminders.revoke_screen(screen)
+        return await self.nova_companion_captures.revoke_screen(screen)
+
+    def _nova_companion_offer_markup(
+        self,
+        screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen,
+    ) -> InlineKeyboardMarkup:
+        if isinstance(screen, NovaCompanionReminderScreen):
+            return self._nova_companion_reminder_markup(screen)
+        return self._nova_companion_capture_markup(screen)
+
+    @staticmethod
+    def _nova_companion_reminder_markup(
+        screen: NovaCompanionReminderScreen,
+    ) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔔 Напомнить",
+                        callback_data=screen.callback_data("accept"),
+                    ),
+                    InlineKeyboardButton(
+                        "Не сейчас",
+                        callback_data=screen.callback_data("not_now"),
+                    ),
+                ]
+            ]
+        )
 
     @staticmethod
     def _nova_companion_capture_markup(

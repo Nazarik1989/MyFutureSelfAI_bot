@@ -766,6 +766,12 @@ class FutureSelfBot(
         )
         app.add_handler(
             CallbackQueryHandler(
+                self.nova_companion_reminder_callback,
+                pattern=r"^nrem:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
                 self.nova_memory_callback,
                 pattern=r"^nmem:[A-Za-z0-9_-]+$",
             )
@@ -1049,6 +1055,7 @@ class FutureSelfBot(
     async def _cleanup_nova_companion_capabilities_safely(self) -> None:
         try:
             await self.nova_companion_captures.cleanup()
+            await self.nova_companion_reminders.cleanup()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2469,7 +2476,13 @@ class FutureSelfBot(
             return
         if await self.knowledge_pending_text(update, text, "text"):
             return
-        await self._route_message(update, context, text, "text")
+        await self._route_message(
+            update,
+            context,
+            text,
+            "text",
+            companion_status_preinvalidated=True,
+        )
 
     async def system_action_text_gate(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2477,7 +2490,16 @@ class FutureSelfBot(
         """Route safe destructive controls before any stateful text handler."""
 
         text = update.effective_message.text or ""
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         if await self._try_system_action(update, context, text):
+            self.nova_companion_invalidate_status_receipt_exact(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_receipt=status_receipt,
+            )
             raise ApplicationHandlerStop
 
     async def voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
@@ -2645,6 +2667,10 @@ class FutureSelfBot(
             )
             if self.weekly_review_voice_lookup_failed(voice_weekly_session):
                 raise ApplicationHandlerStop
+        voice_status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         voice_nova_session = await self.nova_sessions.current(
             owner_id=voice_user.id,
             telegram_user_id=update.effective_user.id,
@@ -2695,6 +2721,12 @@ class FutureSelfBot(
                 return
             await progress.edit_text(message)
             return
+        self.nova_companion_invalidate_status_for_input(
+            update.effective_user.id,
+            update.effective_chat.id,
+            text,
+            expected_receipt=voice_status_receipt,
+        )
         if await self.nova_memory_voice_pre_route(
             update,
             context,
@@ -2906,12 +2938,20 @@ class FutureSelfBot(
                 user=voice_user,
                 conversation_snapshot=snapshot,
                 delivery_message=progress,
+                status_receipt_preinvalidated=True,
             )
             if handled:
                 return
         heard_text = _truncate_utf16(text, 4_000)
         await progress.edit_text(f"Я услышал: «{heard_text}»")
-        await self._route_message(update, context, text, "voice", frozen_user=voice_user)
+        await self._route_message(
+            update,
+            context,
+            text,
+            "voice",
+            frozen_user=voice_user,
+            companion_status_preinvalidated=True,
+        )
 
     async def _route_voice_durable_flow(
         self,
@@ -2950,7 +2990,13 @@ class FutureSelfBot(
             )
             return True
         if flow in {"draft_action", "draft_edit"}:
-            await self._route_message(update, context, text, "voice")
+            await self._route_message(
+                update,
+                context,
+                text,
+                "voice",
+                companion_status_preinvalidated=True,
+            )
             return True
         return False
 
@@ -3047,6 +3093,7 @@ class FutureSelfBot(
         *,
         frozen_user: User | None = None,
         companion_delivery_message: object | None = None,
+        companion_status_preinvalidated: bool = False,
     ) -> None:
         natural_command = self.natural_command_router.route(text)
         if natural_command is not None:
@@ -3105,6 +3152,7 @@ class FutureSelfBot(
             user=user,
             conversation_snapshot=snapshot,
             delivery_message=companion_delivery_message,
+            status_receipt_preinvalidated=companion_status_preinvalidated,
         ):
             return
         relative_reminder = self.date_resolver.resolve_relative_reminder(text, user.timezone)
@@ -4117,6 +4165,24 @@ class FutureSelfBot(
                 )
                 return
             raw_text = task.description
+        if target is None and action in {"save", "discard", "cancel"}:
+            candidates = await self.draft_service.active_previews(telegram_user_id, chat_id)
+            if len(candidates) == 1:
+                target = candidates[0]
+        target_message_id = getattr(target, "preview_message_id", None)
+        if type(target_message_id) is not int or target_message_id <= 0:
+            target_message_id = None
+        pending_capture = (
+            self.nova_companion_pending_capture_anchor(
+                telegram_user_id,
+                chat_id,
+                target.id,
+                target.version,
+                target_message_id,
+            )
+            if target is not None and target_message_id is not None
+            else None
+        )
         outcome = await self.action_service.execute(
             action,
             telegram_user_id=telegram_user_id,
@@ -4127,6 +4193,10 @@ class FutureSelfBot(
             raw_text=raw_text,
             draft_id=target.id if target else None,
             version=target.version if target else None,
+            expected_preview_message_id=target_message_id,
+            expected_access_version=(
+                pending_capture.access_version if pending_capture is not None else None
+            ),
         )
         if outcome.status == "ambiguous":
             candidates = await self.draft_service.active_previews(telegram_user_id, chat_id)
@@ -4141,12 +4211,24 @@ class FutureSelfBot(
             )
             return
         draft = outcome.result.draft
+        if action in {"discard", "cancel"}:
+            self.nova_companion_record_terminal_capture(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=pending_capture,
+            )
         await self._deactivate_preview_keyboard(context, chat_id, outcome.previous_message_id)
         if action == "save":
             await self.conversation.clear_focus(telegram_user_id, chat_id)
             await self.conversation.set_active_draft(telegram_user_id, chat_id, None)
             channel = "голосовой" if source == "voice" else "текстовой"
-            receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
+            receipt = await self._record_saved_receipt(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_companion_pending=pending_capture,
+            )
             await update.effective_message.reply_text(
                 f"Сохранено в inbox по {channel} команде.\n{receipt}",
                 reply_markup=self._saved_receipt_markup(outcome),
@@ -5480,6 +5562,21 @@ class FutureSelfBot(
         if action != "save":
             await query.answer("Подтверди это действие текстом или голосом", show_alert=True)
             return
+        draft = await self.draft_service.get(draft_id)
+        draft_message_id = getattr(draft, "preview_message_id", None)
+        if type(draft_message_id) is not int or draft_message_id <= 0:
+            draft_message_id = None
+        pending_capture = (
+            self.nova_companion_pending_capture_anchor(
+                update.effective_user.id,
+                update.effective_chat.id,
+                draft_id,
+                version,
+                draft_message_id,
+            )
+            if draft_message_id is not None
+            else None
+        )
         outcome = await self.action_service.execute(
             "save",
             telegram_user_id=update.effective_user.id,
@@ -5487,13 +5584,20 @@ class FutureSelfBot(
             source="callback",
             draft_id=draft_id,
             version=version,
+            expected_preview_message_id=draft_message_id,
+            expected_access_version=(
+                pending_capture.access_version if pending_capture is not None else None
+            ),
         )
         if outcome.status != "ok":
             await self._stale_callback(query)
             return
         await query.answer()
         receipt = await self._record_saved_receipt(
-            update.effective_user.id, update.effective_chat.id, outcome
+            update.effective_user.id,
+            update.effective_chat.id,
+            outcome,
+            expected_companion_pending=pending_capture,
         )
         await query.edit_message_text(
             receipt,
@@ -5614,6 +5718,20 @@ class FutureSelfBot(
         if draft.status != "preview":
             await query.answer("Эта карточка сейчас редактируется", show_alert=True)
             return
+        draft_message_id = getattr(draft, "preview_message_id", None)
+        if type(draft_message_id) is not int or draft_message_id <= 0:
+            draft_message_id = None
+        pending_capture = (
+            self.nova_companion_pending_capture_anchor(
+                telegram_user_id,
+                chat_id,
+                draft.id,
+                draft.version,
+                draft_message_id,
+            )
+            if draft_message_id is not None
+            else None
+        )
         outcome = await self.action_service.execute(
             "save" if action == "save" else "discard",
             telegram_user_id=telegram_user_id,
@@ -5621,18 +5739,33 @@ class FutureSelfBot(
             source="callback",
             draft_id=draft.id,
             version=draft.version,
+            expected_preview_message_id=draft_message_id,
+            expected_access_version=(
+                pending_capture.access_version if pending_capture is not None else None
+            ),
         )
         if outcome.status != "ok":
             await self._stale_callback(query)
             return
         await query.answer()
         if action == "save":
-            receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
+            receipt = await self._record_saved_receipt(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_companion_pending=pending_capture,
+            )
             await query.edit_message_text(
                 receipt,
                 reply_markup=self._saved_receipt_markup(outcome),
             )
         else:
+            self.nova_companion_record_terminal_capture(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=pending_capture,
+            )
             await query.edit_message_text("Черновик удалён.")
         await self.conversation.clear_focus(telegram_user_id, chat_id)
 
@@ -5650,6 +5783,20 @@ class FutureSelfBot(
             return
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+        canonical_message_id = getattr(query.message, "message_id", None)
+        if type(canonical_message_id) is not int or canonical_message_id <= 0:
+            await self._stale_callback(query)
+            return
+        pending_capture = self.nova_companion_pending_capture_anchor(
+            telegram_user_id,
+            chat_id,
+            draft_id,
+            version,
+            canonical_message_id,
+        )
+        expected_access_version = (
+            pending_capture.access_version if pending_capture is not None else None
+        )
         if action == "edit":
             outcome = await self.action_service.execute(
                 "edit",
@@ -5658,6 +5805,8 @@ class FutureSelfBot(
                 source="callback",
                 draft_id=draft_id,
                 version=version,
+                expected_preview_message_id=canonical_message_id,
+                expected_access_version=expected_access_version,
             )
             if outcome.status != "ok":
                 await self._stale_callback(query)
@@ -5673,10 +5822,18 @@ class FutureSelfBot(
                 source="callback",
                 draft_id=draft_id,
                 version=version,
+                expected_preview_message_id=canonical_message_id,
+                expected_access_version=expected_access_version,
             )
             if outcome.status != "ok":
                 await self._stale_callback(query)
                 return
+            self.nova_companion_record_terminal_capture(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=pending_capture,
+            )
             await query.answer()
             await query.edit_message_text("Не сохраняю.")
             await self.conversation.set_active_draft(telegram_user_id, chat_id, None)
@@ -5688,12 +5845,19 @@ class FutureSelfBot(
                 source="callback",
                 draft_id=draft_id,
                 version=version,
+                expected_preview_message_id=canonical_message_id,
+                expected_access_version=expected_access_version,
             )
             if outcome.status != "ok":
                 await self._stale_callback(query)
                 return
             await query.answer()
-            receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
+            receipt = await self._record_saved_receipt(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_companion_pending=pending_capture,
+            )
             await query.edit_message_text(
                 receipt,
                 reply_markup=self._saved_receipt_markup(outcome),
@@ -5733,10 +5897,34 @@ class FutureSelfBot(
         await self.conversation.clear_system_action(
             update.effective_user.id, update.effective_chat.id
         )
+        editing = await self.draft_service.editing(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        editing_message_id = getattr(editing, "preview_message_id", None)
+        editing_pending = (
+            self.nova_companion_pending_capture_anchor(
+                update.effective_user.id,
+                update.effective_chat.id,
+                editing.id,
+                editing.version,
+                editing_message_id,
+            )
+            if editing is not None and type(editing_message_id) is int and editing_message_id > 0
+            else None
+        )
         discarded = await self.draft_service.cancel_editing(
             update.effective_user.id, update.effective_chat.id
         )
         if discarded:
+            if editing is not None:
+                self.nova_companion_clear_pending_capture_exact(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    editing.id,
+                    editing.version,
+                    expected_pending=editing_pending,
+                )
             await self.conversation.set_active_draft(
                 update.effective_user.id, update.effective_chat.id, None
             )
@@ -5836,10 +6024,24 @@ class FutureSelfBot(
         telegram_user_id: int,
         chat_id: int,
         outcome: ActionOutcome,
+        *,
+        expected_companion_pending: object | None = None,
     ) -> str:
         item = outcome.result.inbox_item if outcome.result else None
         if item is None:
             return "Сохранено в inbox."
+        record_companion_status = getattr(
+            self,
+            "nova_companion_record_confirmed_capture",
+            None,
+        )
+        if callable(record_companion_status):
+            record_companion_status(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=expected_companion_pending,
+            )
         if outcome.result and outcome.result.duplicate:
             return (
                 "Такая запись уже есть в Inbox — повторную копию не создаю:\n"

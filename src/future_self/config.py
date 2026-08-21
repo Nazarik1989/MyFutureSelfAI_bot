@@ -92,7 +92,7 @@ class Settings(BaseSettings):
     inbox_draft_ttl_minutes: int = Field(default=60, ge=5, le=1440)
     draft_focus_ttl_minutes: int = Field(default=15, ge=1, le=1440)
     system_action_ttl_minutes: int = Field(default=10, ge=1, le=60)
-    conversation_context_messages: int = Field(default=12, ge=10, le=20)
+    conversation_context_messages: int = Field(default=20, ge=10, le=20)
     conversation_context_ttl_hours: int = Field(default=24, ge=1, le=168)
     task_date_event_hour: int = Field(default=9, ge=0, le=23)
     task_reminder_lead_minutes: int = Field(default=30, ge=0, le=10080)

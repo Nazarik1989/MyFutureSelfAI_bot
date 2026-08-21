@@ -372,6 +372,7 @@ class DraftInboxService:
         chat_id: int,
         *,
         expected_message_id: int | None,
+        expected_access_version: int | None = None,
     ) -> DraftResult:
         """Discard only the exact preview canonical owned by a failed delivery."""
 
@@ -393,11 +394,18 @@ class DraftInboxService:
             if expected_message_id is None
             else DraftInboxItem.preview_message_id == expected_message_id
         )
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(
+                User.access_tier.in_(FULL_ACCESS_TIERS),
+                User.access_version == expected_access_version,
+            )
         async with self.db.session() as session:
             changed = await session.execute(
                 update(DraftInboxItem)
                 .where(
                     DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(owner_filter),
                     DraftInboxItem.version == version,
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
@@ -436,15 +444,48 @@ class DraftInboxService:
             return await session.get(DraftInboxItem, draft_id)
 
     async def begin_edit(
-        self, draft_id: str, version: int, telegram_user_id: int, chat_id: int
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_preview_message_id: int | None = None,
+        expected_access_version: int | None = None,
     ) -> DraftResult:
         now = datetime.now(UTC)
         draft = await self.get(draft_id)
         if not self._matches(draft, version, telegram_user_id, chat_id, "preview"):
             return DraftResult(False)
-        if await self._mark_expired(draft, now):
-            return DraftResult(False)
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(
+                User.access_tier.in_(FULL_ACCESS_TIERS),
+                User.access_version == expected_access_version,
+            )
+        preview_filter = (
+            DraftInboxItem.id == draft_id
+            if expected_preview_message_id is None
+            else DraftInboxItem.preview_message_id == expected_preview_message_id
+        )
         async with self.db.session() as session:
+            changed = await session.execute(
+                update(DraftInboxItem)
+                .where(
+                    DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(owner_filter),
+                    DraftInboxItem.telegram_user_id == telegram_user_id,
+                    DraftInboxItem.chat_id == chat_id,
+                    DraftInboxItem.status == "preview",
+                    DraftInboxItem.version == version,
+                    DraftInboxItem.expires_at > now,
+                    preview_filter,
+                )
+                .values(status="editing")
+                .returning(DraftInboxItem.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                return DraftResult(False)
             await session.execute(
                 update(DraftInboxItem)
                 .where(
@@ -455,24 +496,6 @@ class DraftInboxService:
                 )
                 .values(status="discarded")
             )
-            changed = await session.execute(
-                update(DraftInboxItem)
-                .where(
-                    DraftInboxItem.id == draft_id,
-                    DraftInboxItem.user_id.in_(
-                        select(User.id).where(User.telegram_id == telegram_user_id)
-                    ),
-                    DraftInboxItem.telegram_user_id == telegram_user_id,
-                    DraftInboxItem.chat_id == chat_id,
-                    DraftInboxItem.status == "preview",
-                    DraftInboxItem.version == version,
-                    DraftInboxItem.expires_at > now,
-                )
-                .values(status="editing")
-                .returning(DraftInboxItem.id)
-            )
-            if changed.scalar_one_or_none() is None:
-                return DraftResult(False)
         draft = await self.get(draft_id)
         log_transition(draft_id, telegram_user_id, "preview", "editing", "edit")
         return DraftResult(True, draft=draft)
@@ -797,7 +820,14 @@ class DraftInboxService:
         return draft_id is not None
 
     async def confirm(
-        self, draft_id: str, version: int, telegram_user_id: int, chat_id: int
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_preview_message_id: int | None = None,
+        expected_access_version: int | None = None,
     ) -> DraftResult:
         """The sole atomic path allowed to construct an InboxItem."""
         async with self.db.session() as session:
@@ -807,6 +837,8 @@ class DraftInboxService:
                 version,
                 telegram_user_id,
                 chat_id,
+                expected_preview_message_id=expected_preview_message_id,
+                expected_access_version=expected_access_version,
             )
         if not result.ok:
             return result
@@ -832,6 +864,7 @@ class DraftInboxService:
         allow_saved_dedup: bool = True,
         return_existing: bool = False,
         expected_access_version: int | None = None,
+        expected_preview_message_id: int | None = None,
         now: datetime | None = None,
     ) -> DraftResult:
         """Confirm through the canonical Inbox/Task path inside a caller transaction.
@@ -849,6 +882,11 @@ class DraftInboxService:
                 User.access_tier.in_(FULL_ACCESS_TIERS),
                 User.access_version == expected_access_version,
             )
+        preview_filter = (
+            DraftInboxItem.id == draft_id
+            if expected_preview_message_id is None
+            else DraftInboxItem.preview_message_id == expected_preview_message_id
+        )
         changed = await session.execute(
             update(DraftInboxItem)
             .where(
@@ -859,6 +897,7 @@ class DraftInboxService:
                 DraftInboxItem.status == "preview",
                 DraftInboxItem.version == version,
                 DraftInboxItem.expires_at > current,
+                preview_filter,
             )
             .values(status="confirmed")
             .returning(DraftInboxItem.id)

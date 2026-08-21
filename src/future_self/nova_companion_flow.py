@@ -16,11 +16,13 @@ from .access import ADMIN, is_full_access_tier
 from .dates import WEEKDAYS, DateOption, DateResolution
 
 NOVA_COMPANION_CALLBACK_PREFIX = "ncap:"
+NOVA_COMPANION_REMINDER_CALLBACK_PREFIX = "nrem:"
 NOVA_COMPANION_CAPABILITY_TTL = timedelta(minutes=15)
 NOVA_COMPANION_MAX_CAPABILITIES = 2_000
 
 type CaptureKind = Literal["idea", "task", "desire", "note"]
 type CaptureAction = Literal["add", "not_now", "date_first", "date_second"]
+type ReminderOfferAction = Literal["accept", "not_now"]
 
 CAPTURE_KINDS = frozenset({"idea", "task", "desire", "note"})
 CAPTURE_ACTIONS: tuple[CaptureAction, ...] = ("add", "not_now")
@@ -1313,6 +1315,536 @@ class NovaCompanionCaptureStore:
         return current.astimezone(UTC)
 
 
+@dataclass(frozen=True, slots=True)
+class NovaCompanionReminderCandidate:
+    """Validated server-side reminder proposal; never serialized into callback data."""
+
+    title: str = field(repr=False)
+    schedule_wording: str | None = field(default=None, repr=False)
+    evidence: str = field(default="", repr=False)
+    timezone: str = field(default="UTC", repr=False)
+    temporal: NovaCompanionCaptureTemporal | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        title = _safe_text(self.title, max_chars=200)
+        schedule = (
+            _safe_text(self.schedule_wording, max_chars=160)
+            if self.schedule_wording is not None
+            else None
+        )
+        evidence = _safe_text(self.evidence, max_chars=600)
+        timezone = _safe_text(self.timezone, max_chars=128)
+        if title is None or evidence is None or timezone is None:
+            raise ValueError("invalid grounded reminder candidate")
+        try:
+            timezone = ZoneInfo(timezone).key
+        except (ValueError, ZoneInfoNotFoundError):
+            raise ValueError("invalid grounded reminder timezone") from None
+        if _grounding_text(title) not in _grounding_text(evidence):
+            raise ValueError("reminder title is not grounded")
+        if schedule is not None and _grounding_text(schedule) not in _grounding_text(evidence):
+            raise ValueError("reminder schedule is not grounded")
+        if self.temporal is not None:
+            NovaCompanionCaptureStore._validate_temporal(self.temporal)
+            if self.temporal.timezone != timezone:
+                raise ValueError("reminder temporal timezone changed")
+            if self.temporal.resolution.status != "resolved":
+                raise ValueError("ambiguous reminder candidates are not actionable")
+        object.__setattr__(self, "title", title)
+        object.__setattr__(self, "schedule_wording", schedule)
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "timezone", timezone)
+
+
+@dataclass(frozen=True, slots=True)
+class NovaCompanionReminderCapability:
+    token: str = field(repr=False)
+    screen_id: str = field(repr=False)
+    action: ReminderOfferAction
+    owner_id: int = field(repr=False)
+    telegram_user_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    access_tier: str = field(repr=False)
+    access_version: int = field(repr=False)
+    canonical_message_id: int | None = field(repr=False)
+    candidate: NovaCompanionReminderCandidate = field(repr=False)
+    context_fence: object = field(repr=False)
+    memory_revision: str | None = field(default=None, repr=False)
+    exchange_receipt: object | None = field(default=None, repr=False)
+    screen_order: int = 0
+    expires_at: datetime = field(default_factory=lambda: datetime.now(UTC), repr=False)
+
+    @property
+    def callback_data(self) -> str:
+        return f"{NOVA_COMPANION_REMINDER_CALLBACK_PREFIX}{self.token}"
+
+
+@dataclass(frozen=True, slots=True)
+class NovaCompanionReminderScreen:
+    screen_id: str = field(repr=False)
+    owner_id: int = field(repr=False)
+    telegram_user_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    access_tier: str = field(repr=False)
+    access_version: int = field(repr=False)
+    canonical_message_id: int | None = field(repr=False)
+    candidate: NovaCompanionReminderCandidate = field(repr=False)
+    context_fence: object = field(repr=False)
+    memory_revision: str | None = field(default=None, repr=False)
+    exchange_receipt: object | None = field(default=None, repr=False)
+    screen_order: int = 0
+    expires_at: datetime = field(default_factory=lambda: datetime.now(UTC), repr=False)
+    _callbacks: tuple[tuple[ReminderOfferAction, str], ...] = field(default=(), repr=False)
+
+    @property
+    def is_bound(self) -> bool:
+        return self.canonical_message_id is not None
+
+    @property
+    def callbacks(self) -> MappingProxyType[ReminderOfferAction, str]:
+        return MappingProxyType(dict(self._callbacks))
+
+    def callback_data(self, action: ReminderOfferAction) -> str:
+        for candidate, callback in self._callbacks:
+            if candidate == action:
+                return callback
+        raise KeyError(action)
+
+
+class NovaCompanionReminderStore:
+    """Bounded opaque two-action reminder offers with exact canonical generations."""
+
+    _ACTIONS: tuple[ReminderOfferAction, ...] = ("accept", "not_now")
+
+    def __init__(
+        self,
+        *,
+        ttl: timedelta = NOVA_COMPANION_CAPABILITY_TTL,
+        max_capabilities: int = NOVA_COMPANION_MAX_CAPABILITIES,
+    ) -> None:
+        if ttl < timedelta(seconds=1) or ttl > timedelta(hours=2):
+            raise ValueError("companion reminder ttl must be between 1 second and 2 hours")
+        if not 2 <= max_capabilities <= 20_000:
+            raise ValueError("companion reminder capability limit must be between 2 and 20000")
+        self.ttl = ttl
+        self.max_capabilities = max_capabilities
+        self._capabilities: dict[str, NovaCompanionReminderCapability] = {}
+        self._screens: dict[str, NovaCompanionReminderScreen] = {}
+        self._canonical_generations: dict[tuple[int, int, int, int], tuple[int, datetime]] = {}
+        self._next_screen_order = 0
+        self._lock = asyncio.Lock()
+
+    async def stage(
+        self,
+        candidate: NovaCompanionReminderCandidate,
+        *,
+        owner_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        access_tier: str,
+        access_version: int,
+        context_fence: object,
+        memory_revision: str | None,
+        now: datetime | None = None,
+    ) -> NovaCompanionReminderScreen | None:
+        NovaCompanionCaptureStore._validate_binding(
+            owner_id, telegram_user_id, chat_id, access_version
+        )
+        if not isinstance(candidate, NovaCompanionReminderCandidate):
+            raise ValueError("validated reminder candidate is required")
+        if not isinstance(access_tier, str) or not access_tier or context_fence is None:
+            raise ValueError("exact reminder generation is required")
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            return self._publish_locked(
+                candidate,
+                owner_id=owner_id,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                access_tier=access_tier,
+                access_version=access_version,
+                canonical_message_id=None,
+                context_fence=context_fence,
+                memory_revision=memory_revision,
+                exchange_receipt=None,
+                now=current,
+            )
+
+    async def bind(
+        self,
+        expected: NovaCompanionReminderScreen,
+        *,
+        canonical_message_id: int,
+        now: datetime | None = None,
+    ) -> NovaCompanionReminderScreen | None:
+        NovaCompanionCaptureStore._positive(canonical_message_id, "canonical message id")
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            stored = self._screens.get(expected.screen_id)
+            if stored != expected or stored.is_bound or stored.expires_at <= current:
+                return None
+            bound = replace(stored, canonical_message_id=canonical_message_id)
+            self._screens[bound.screen_id] = bound
+            for token, capability in tuple(self._capabilities.items()):
+                if capability.screen_id == bound.screen_id:
+                    self._capabilities[token] = replace(
+                        capability, canonical_message_id=canonical_message_id
+                    )
+            self._record_generation_locked(bound)
+            obsolete = tuple(
+                screen.screen_id
+                for screen in self._screens.values()
+                if screen.screen_id != bound.screen_id
+                and screen.owner_id == bound.owner_id
+                and screen.telegram_user_id == bound.telegram_user_id
+                and screen.chat_id == bound.chat_id
+                and screen.screen_order < bound.screen_order
+            )
+            for screen_id in obsolete:
+                self._drop_screen_locked(screen_id)
+            return bound
+
+    async def attach_exchange(
+        self,
+        expected: NovaCompanionReminderScreen,
+        exchange_receipt: object,
+        *,
+        now: datetime | None = None,
+    ) -> NovaCompanionReminderScreen | None:
+        if exchange_receipt is None:
+            return None
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            stored = self._screens.get(expected.screen_id)
+            if stored != expected or stored.expires_at <= current:
+                return None
+            updated = replace(stored, exchange_receipt=exchange_receipt)
+            self._screens[updated.screen_id] = updated
+            for token, capability in tuple(self._capabilities.items()):
+                if capability.screen_id == updated.screen_id:
+                    self._capabilities[token] = replace(
+                        capability, exchange_receipt=exchange_receipt
+                    )
+            return updated
+
+    async def advance_context(
+        self,
+        expected: NovaCompanionReminderCapability,
+        *,
+        context_fence: object,
+        memory_revision: str | None,
+        exchange_receipt: object,
+        now: datetime | None = None,
+    ) -> NovaCompanionReminderCapability | None:
+        """Advance one still-live action anchor after an ordinary companion turn."""
+
+        if context_fence is None or exchange_receipt is None:
+            return None
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            stored_capability = self._capabilities.get(expected.token)
+            screen = self._screens.get(expected.screen_id)
+            if (
+                stored_capability != expected
+                or screen is None
+                or stored_capability.expires_at <= current
+            ):
+                return None
+            updated_screen = replace(
+                screen,
+                context_fence=context_fence,
+                memory_revision=memory_revision,
+                exchange_receipt=exchange_receipt,
+            )
+            self._screens[screen.screen_id] = updated_screen
+            result = None
+            for token, capability in tuple(self._capabilities.items()):
+                if capability.screen_id == screen.screen_id:
+                    updated = replace(
+                        capability,
+                        context_fence=context_fence,
+                        memory_revision=memory_revision,
+                        exchange_receipt=exchange_receipt,
+                    )
+                    self._capabilities[token] = updated
+                    if token == expected.token:
+                        result = updated
+            return result
+
+    async def active(
+        self,
+        *,
+        owner_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        access_tier: str,
+        access_version: int,
+        action: ReminderOfferAction = "accept",
+        now: datetime | None = None,
+    ) -> NovaCompanionReminderCapability | None:
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            candidates = [
+                capability
+                for capability in self._capabilities.values()
+                if capability.action == action
+                and capability.canonical_message_id is not None
+                and capability.owner_id == owner_id
+                and capability.telegram_user_id == telegram_user_id
+                and capability.chat_id == chat_id
+                and capability.access_tier == access_tier
+                and capability.access_version == access_version
+            ]
+            return max(candidates, key=lambda item: item.screen_order, default=None)
+
+    async def peek_bound_identity(
+        self,
+        callback_data: object,
+        *,
+        owner_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        canonical_message_id: int,
+        now: datetime | None = None,
+    ) -> NovaCompanionReminderCapability | None:
+        token = self._callback_token(callback_data)
+        if token is None:
+            return None
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            capability = self._capabilities.get(token)
+            if capability is None or capability.canonical_message_id is None:
+                return None
+            if (
+                capability.owner_id != owner_id
+                or capability.telegram_user_id != telegram_user_id
+                or capability.chat_id != chat_id
+                or capability.canonical_message_id != canonical_message_id
+            ):
+                return None
+            return capability
+
+    async def consume(
+        self,
+        expected: NovaCompanionReminderCapability,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            stored = self._capabilities.get(expected.token)
+            if (
+                stored != expected
+                or stored is None
+                or stored.canonical_message_id is None
+                or stored.expires_at <= current
+            ):
+                return False
+            self._drop_screen_locked(stored.screen_id)
+            return True
+
+    async def consumed_screen_is_current(
+        self,
+        expected: NovaCompanionReminderCapability,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if expected.canonical_message_id is None:
+            return False
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            if expected.expires_at <= current:
+                return False
+            latest = self._canonical_generations.get(self._canonical_key(expected))
+            return latest is not None and latest[0] == expected.screen_order
+
+    async def revoke_screen(
+        self,
+        expected: NovaCompanionReminderScreen,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            self._cleanup_locked(current)
+            if self._screens.get(expected.screen_id) != expected:
+                return False
+            self._drop_screen_locked(expected.screen_id)
+            return True
+
+    async def cleanup(self, *, now: datetime | None = None) -> int:
+        injected_now = self._injected_now(now)
+        async with self._lock:
+            current = self._current_locked(injected_now)
+            before = len(self._capabilities) + len(self._canonical_generations)
+            self._cleanup_locked(current)
+            return before - len(self._capabilities) - len(self._canonical_generations)
+
+    def _publish_locked(
+        self,
+        candidate: NovaCompanionReminderCandidate,
+        *,
+        owner_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        access_tier: str,
+        access_version: int,
+        canonical_message_id: int | None,
+        context_fence: object,
+        memory_revision: str | None,
+        exchange_receipt: object | None,
+        now: datetime,
+    ) -> NovaCompanionReminderScreen:
+        screen_id = secrets.token_urlsafe(18)
+        while screen_id in self._screens:
+            screen_id = secrets.token_urlsafe(18)
+        tokens: list[tuple[ReminderOfferAction, str]] = []
+        for action in self._ACTIONS:
+            token = secrets.token_urlsafe(18)
+            while token in self._capabilities or any(value == token for _, value in tokens):
+                token = secrets.token_urlsafe(18)
+            tokens.append((action, token))
+        order = self._next_screen_order + 1
+        expires_at = now + self.ttl
+        callbacks = tuple(
+            (action, f"{NOVA_COMPANION_REMINDER_CALLBACK_PREFIX}{token}")
+            for action, token in tokens
+        )
+        screen = NovaCompanionReminderScreen(
+            screen_id=screen_id,
+            owner_id=owner_id,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            access_tier=access_tier,
+            access_version=access_version,
+            canonical_message_id=canonical_message_id,
+            candidate=candidate,
+            context_fence=context_fence,
+            memory_revision=memory_revision,
+            exchange_receipt=exchange_receipt,
+            screen_order=order,
+            expires_at=expires_at,
+            _callbacks=callbacks,
+        )
+        capabilities = [
+            NovaCompanionReminderCapability(
+                token=token,
+                screen_id=screen_id,
+                action=action,
+                owner_id=owner_id,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                access_tier=access_tier,
+                access_version=access_version,
+                canonical_message_id=canonical_message_id,
+                candidate=candidate,
+                context_fence=context_fence,
+                memory_revision=memory_revision,
+                exchange_receipt=exchange_receipt,
+                screen_order=order,
+                expires_at=expires_at,
+            )
+            for action, token in tokens
+        ]
+        if len(self._capabilities) + len(capabilities) > self.max_capabilities:
+            self._make_room_locked(len(capabilities))
+        self._next_screen_order = order
+        self._screens[screen_id] = screen
+        for capability in capabilities:
+            self._capabilities[capability.token] = capability
+        return screen
+
+    def _record_generation_locked(self, screen: NovaCompanionReminderScreen) -> None:
+        key = self._canonical_key(screen)
+        latest = self._canonical_generations.get(key)
+        if latest is None or latest[0] <= screen.screen_order:
+            self._canonical_generations[key] = (screen.screen_order, screen.expires_at)
+        self._trim_generations_locked()
+
+    def _trim_generations_locked(self) -> None:
+        while len(self._canonical_generations) > self.max_capabilities:
+            live = {
+                self._canonical_key(screen)
+                for screen in self._screens.values()
+                if screen.canonical_message_id is not None
+            }
+            candidate = min(
+                (key for key in self._canonical_generations if key not in live),
+                key=lambda key: (
+                    self._canonical_generations[key][1],
+                    self._canonical_generations[key][0],
+                ),
+            )
+            self._canonical_generations.pop(candidate, None)
+
+    def _make_room_locked(self, needed: int) -> None:
+        while len(self._capabilities) + needed > self.max_capabilities and self._screens:
+            oldest = min(
+                self._screens.values(), key=lambda screen: (screen.expires_at, screen.screen_order)
+            )
+            self._drop_screen_locked(oldest.screen_id)
+
+    def _drop_screen_locked(self, screen_id: str) -> None:
+        self._screens.pop(screen_id, None)
+        for token, capability in tuple(self._capabilities.items()):
+            if capability.screen_id == screen_id:
+                self._capabilities.pop(token, None)
+
+    def _cleanup_locked(self, now: datetime) -> None:
+        for screen in tuple(self._screens.values()):
+            if screen.expires_at <= now:
+                self._drop_screen_locked(screen.screen_id)
+        for key, (_order, expires_at) in tuple(self._canonical_generations.items()):
+            if expires_at <= now:
+                self._canonical_generations.pop(key, None)
+
+    @staticmethod
+    def _injected_now(now: datetime | None) -> datetime | None:
+        """Normalize deterministic clocks before awaiting the store lock."""
+
+        return NovaCompanionCaptureStore._utc(now) if now is not None else None
+
+    @staticmethod
+    def _current_locked(injected_now: datetime | None) -> datetime:
+        """Sample the runtime clock only after the store lock is acquired."""
+
+        return injected_now if injected_now is not None else NovaCompanionCaptureStore._utc(None)
+
+    @staticmethod
+    def _canonical_key(
+        value: NovaCompanionReminderScreen | NovaCompanionReminderCapability,
+    ) -> tuple[int, int, int, int]:
+        if value.canonical_message_id is None:
+            raise ValueError("bound reminder screen is required")
+        return value.owner_id, value.telegram_user_id, value.chat_id, value.canonical_message_id
+
+    @staticmethod
+    def _callback_token(callback_data: object) -> str | None:
+        if not isinstance(callback_data, str) or len(callback_data.encode("utf-8")) > 64:
+            return None
+        if not callback_data.startswith(NOVA_COMPANION_REMINDER_CALLBACK_PREFIX):
+            return None
+        token = callback_data.removeprefix(NOVA_COMPANION_REMINDER_CALLBACK_PREFIX)
+        return token if _TOKEN_PATTERN.fullmatch(token) else None
+
+
 def _capture_kind(value: str) -> CaptureKind | None:
     normalized = value.casefold()
     mapping: dict[str, CaptureKind] = {
@@ -1349,6 +1881,7 @@ __all__ = [
     "CAPTURE_DATE_ACTIONS",
     "CAPTURE_KINDS",
     "NOVA_COMPANION_CALLBACK_PREFIX",
+    "NOVA_COMPANION_REMINDER_CALLBACK_PREFIX",
     "CaptureAction",
     "CaptureKind",
     "CaptureSuggestion",
@@ -1361,6 +1894,10 @@ __all__ = [
     "NovaCompanionCaptureScreen",
     "NovaCompanionCaptureStore",
     "NovaCompanionCaptureTemporal",
+    "NovaCompanionReminderCandidate",
+    "NovaCompanionReminderCapability",
+    "NovaCompanionReminderScreen",
+    "NovaCompanionReminderStore",
     "NovaCompanionPolicy",
     "should_offer_capture",
     "validate_capture_suggestion",

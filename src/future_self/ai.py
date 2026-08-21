@@ -22,6 +22,7 @@ from .schemas import (
     IntentResult,
     NovaCompanionCapture,
     NovaCompanionProviderResponse,
+    NovaCompanionReminderOffer,
     NovaCompanionResponse,
     NovaHelpPlan,
     ParsedThought,
@@ -140,12 +141,67 @@ def _grounding_text(value: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip().casefold()
 
 
+NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT = (
+    "Пока ничего не создано. Уточни одно событие и время, если хочешь поставить "
+    "настоящее напоминание."
+)
+
+
 def _validated_companion_response(
     text: str,
     parsed: object,
+    companion_context: NovaCompanionContextProjection,
 ) -> NovaCompanionResponse:
     provider_result = NovaCompanionProviderResponse.model_validate(parsed)
     suggestion = provider_result.capture
+    reminder_offer = provider_result.reminder_offer
+    if reminder_offer is not None:
+        payload = companion_context.provider_payload()
+        recent = payload.get("recent_conversation")
+        raw_messages = recent.get("recent_messages", []) if isinstance(recent, dict) else []
+        safe_user_messages = [
+            str(item["content"])
+            for item in raw_messages
+            if isinstance(item, dict)
+            and item.get("role") == "user"
+            and isinstance(item.get("content"), str)
+        ]
+        sources = [text, *safe_user_messages]
+        evidence = _grounding_text(reminder_offer.evidence)
+        title = _grounding_text(reminder_offer.title)
+        schedule = (
+            _grounding_text(reminder_offer.schedule_wording)
+            if reminder_offer.schedule_wording
+            else None
+        )
+        exact_sources = [source for source in sources if _grounding_text(source) == evidence]
+        temporal_sources = {
+            _grounding_text(source)
+            for source in safe_user_messages
+            if re.search(
+                r"\b(?:сегодня|завтра|послезавтра|понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|\d{1,2}[:.]\d{2})\b",
+                source,
+                re.IGNORECASE,
+            )
+        }
+        ambiguous_prior = evidence != _grounding_text(text) and len(temporal_sources) > 1
+        if (
+            exact_sources
+            and title
+            and title in evidence
+            and (schedule is None or schedule in evidence)
+            and not ambiguous_prior
+            and evidence not in {"я иногда всё забываю", "а вдруг забуду"}
+        ):
+            return NovaCompanionResponse(
+                answer=provider_result.answer,
+                reminder_offer=NovaCompanionReminderOffer(
+                    title=reminder_offer.title,
+                    schedule_wording=reminder_offer.schedule_wording,
+                    evidence=reminder_offer.evidence,
+                ),
+            )
+        return NovaCompanionResponse(answer=NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT)
     if suggestion is None:
         return NovaCompanionResponse(answer=provider_result.answer)
     message = _grounding_text(text)
@@ -511,7 +567,7 @@ class OpenAICompatibleAIService:
         parsed = response.output_parsed
         if parsed is None:
             raise ValueError("The model returned no structured output")
-        return _validated_companion_response(clean, parsed)
+        return _validated_companion_response(clean, parsed, companion_context)
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan:
         return await self._parse(

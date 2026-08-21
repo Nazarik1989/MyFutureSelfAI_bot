@@ -358,6 +358,17 @@ class ReminderFlowStore:
             self._drop_locked(key)
             return True
 
+    async def clear_exact(self, session: ReminderFlowSession) -> bool:
+        """Clear only the exact immutable session generation."""
+
+        key = self._key(session.owner_id, session.telegram_user_id, session.chat_id)
+        async with self._lock:
+            live = self._sessions.get(key)
+            if not self._same_generation(live, session):
+                return False
+            self._drop_locked(key)
+            return True
+
     async def cleanup(self, *, now: datetime | None = None) -> int:
         current = self._utc(now)
         async with self._lock:

@@ -15,9 +15,32 @@ from future_self.nova_companion_flow import (
     NovaCompanionCaptureStore,
     NovaCompanionCaptureTemporal,
     NovaCompanionPolicy,
+    NovaCompanionReminderCandidate,
+    NovaCompanionReminderStore,
     should_offer_capture,
     validate_capture_suggestion,
 )
+
+
+def _reminder_candidate() -> NovaCompanionReminderCandidate:
+    resolver = DateResolver(now_provider=lambda: datetime(2026, 8, 21, 9, 0, tzinfo=UTC))
+    evidence = "Не забыть бы мне завтра на стрижку в 19:00"
+    resolution = resolver.resolve(
+        evidence,
+        "Europe/Moscow",
+        now=datetime(2026, 8, 21, 9, 0, tzinfo=UTC),
+    )
+    return NovaCompanionReminderCandidate(
+        title="стрижку",
+        schedule_wording="завтра",
+        evidence=evidence,
+        timezone="Europe/Moscow",
+        temporal=NovaCompanionCaptureTemporal(
+            timezone="Europe/Moscow",
+            resolution=resolution,
+            local_time=time(19, 0),
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -78,6 +101,309 @@ def test_nova_vocative_has_text_voice_parity(source: str) -> None:
 )
 def test_nova_address_does_not_broadly_capture_content(text: object) -> None:
     assert NovaAddressClassifier.classify(text).kind is NovaAddressKind.NONE
+
+
+async def test_reminder_offer_store_is_opaque_exact_single_winner_and_ttl_fenced() -> None:
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    store = NovaCompanionReminderStore(ttl=timedelta(minutes=5), max_capabilities=8)
+    fence = object()
+    staged = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="subscriber",
+        access_version=4,
+        context_fence=fence,
+        memory_revision="opaque-memory-revision",
+        now=now,
+    )
+    assert staged is not None and staged.is_bound is False
+    assert all(
+        callback.startswith("nrem:")
+        and "стриж" not in callback
+        and "завтра" not in callback
+        and "19:00" not in callback
+        for callback in staged.callbacks.values()
+    )
+    assert (
+        await store.peek_bound_identity(
+            staged.callback_data("accept"),
+            owner_id=1,
+            telegram_user_id=2,
+            chat_id=3,
+            canonical_message_id=10,
+            now=now,
+        )
+        is None
+    )
+
+    bound = await store.bind(staged, canonical_message_id=10, now=now)
+    assert bound is not None
+    accept = await store.peek_bound_identity(
+        bound.callback_data("accept"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=10,
+        now=now,
+    )
+    decline = await store.peek_bound_identity(
+        bound.callback_data("not_now"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=10,
+        now=now,
+    )
+    assert accept is not None and decline is not None
+    first, second = await asyncio.gather(
+        store.consume(accept, now=now), store.consume(decline, now=now)
+    )
+    assert sorted((first, second)) == [False, True]
+    assert await store.consume(accept, now=now) is False
+    assert await store.consumed_screen_is_current(accept, now=now) is True
+
+    expiring = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="subscriber",
+        access_version=4,
+        context_fence=fence,
+        memory_revision=None,
+        now=now,
+    )
+    assert expiring is not None
+    expiring = await store.bind(expiring, canonical_message_id=11, now=now)
+    assert expiring is not None
+    token = await store.peek_bound_identity(
+        expiring.callback_data("accept"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=11,
+        now=now,
+    )
+    assert token is not None
+    assert await store.consume(token, now=now + timedelta(minutes=5)) is False
+
+
+async def test_reminder_offer_consume_samples_runtime_clock_after_waiting_for_lock(
+    monkeypatch,
+) -> None:
+    issued_at = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    expires_at = issued_at + timedelta(seconds=1)
+    store = NovaCompanionReminderStore(ttl=timedelta(seconds=1), max_capabilities=8)
+    staged = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="subscriber",
+        access_version=4,
+        context_fence=object(),
+        memory_revision=None,
+        now=issued_at,
+    )
+    assert staged is not None
+    bound = await store.bind(staged, canonical_message_id=10, now=issued_at)
+    assert bound is not None
+    token = await store.peek_bound_identity(
+        bound.callback_data("accept"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=10,
+        now=issued_at,
+    )
+    assert token is not None
+
+    await store._lock.acquire()
+    consume_task = asyncio.create_task(store.consume(token))
+    await asyncio.sleep(0)
+    assert consume_task.done() is False
+    monkeypatch.setattr(
+        NovaCompanionCaptureStore,
+        "_utc",
+        staticmethod(lambda _value: expires_at),
+    )
+    store._lock.release()
+
+    assert await consume_task is False
+    assert store._capabilities == {}
+    assert store._screens == {}
+
+
+async def test_reminder_offer_exact_expiry_rejects_old_and_preserves_replacement() -> None:
+    issued_at = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    expires_at = issued_at + timedelta(seconds=1)
+    store = NovaCompanionReminderStore(ttl=timedelta(seconds=1), max_capabilities=8)
+    old_screen = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="subscriber",
+        access_version=4,
+        context_fence=object(),
+        memory_revision=None,
+        now=issued_at,
+    )
+    assert old_screen is not None
+    old_screen = await store.bind(old_screen, canonical_message_id=10, now=issued_at)
+    assert old_screen is not None
+    old_token = await store.peek_bound_identity(
+        old_screen.callback_data("accept"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=10,
+        now=issued_at,
+    )
+    assert old_token is not None
+
+    replacement = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="subscriber",
+        access_version=4,
+        context_fence=object(),
+        memory_revision=None,
+        now=issued_at + timedelta(microseconds=1),
+    )
+    assert replacement is not None
+    replacement = await store.bind(
+        replacement,
+        canonical_message_id=11,
+        now=issued_at + timedelta(microseconds=1),
+    )
+    assert replacement is not None
+
+    assert await store.consume(old_token, now=expires_at) is False
+    live = await store.peek_bound_identity(
+        replacement.callback_data("accept"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=11,
+        now=expires_at,
+    )
+    assert live is not None
+    assert await store.consume(live, now=expires_at) is True
+
+
+async def test_reminder_offer_old_callback_cannot_consume_replacement_generation() -> None:
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    store = NovaCompanionReminderStore(max_capabilities=8)
+    first = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="admin",
+        access_version=1,
+        context_fence=object(),
+        memory_revision=None,
+        now=now,
+    )
+    assert first is not None
+    first = await store.bind(first, canonical_message_id=20, now=now)
+    assert first is not None
+    old = await store.peek_bound_identity(
+        first.callback_data("accept"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=20,
+        now=now,
+    )
+    assert old is not None
+    second = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="admin",
+        access_version=1,
+        context_fence=object(),
+        memory_revision=None,
+        now=now,
+    )
+    assert second is not None
+    second = await store.bind(second, canonical_message_id=20, now=now)
+    assert second is not None
+    assert await store.consume(old, now=now) is False
+    assert await store.consumed_screen_is_current(old, now=now) is False
+    live = await store.active(
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="admin",
+        access_version=1,
+        now=now,
+    )
+    assert live is not None and live.screen_order == second.screen_order
+
+
+async def test_reminder_offer_stage_failure_does_not_evict_live_generation(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    store = NovaCompanionReminderStore(max_capabilities=2)
+    first = await store.stage(
+        _reminder_candidate(),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        access_tier="subscriber",
+        access_version=4,
+        context_fence=object(),
+        memory_revision=None,
+        now=now,
+    )
+    assert first is not None
+    first = await store.bind(first, canonical_message_id=10, now=now)
+    assert first is not None
+    live_token = await store.peek_bound_identity(
+        first.callback_data("accept"),
+        owner_id=1,
+        telegram_user_id=2,
+        chat_id=3,
+        canonical_message_id=10,
+        now=now,
+    )
+    assert live_token is not None
+
+    values = iter(("new-screen", "new-accept"))
+
+    def fail_mid_batch(_size: int) -> str:
+        try:
+            return next(values)
+        except StopIteration:
+            raise OSError("PRIVATE_ENTROPY_FAILURE") from None
+
+    monkeypatch.setattr(
+        "future_self.nova_companion_flow.secrets.token_urlsafe",
+        fail_mid_batch,
+    )
+    with pytest.raises(OSError, match="PRIVATE_ENTROPY_FAILURE"):
+        await store.stage(
+            _reminder_candidate(),
+            owner_id=1,
+            telegram_user_id=2,
+            chat_id=3,
+            access_tier="subscriber",
+            access_version=4,
+            context_fence=object(),
+            memory_revision=None,
+            now=now,
+        )
+
+    assert await store.consume(live_token, now=now) is True
 
 
 def test_address_result_repr_hides_vocative_content() -> None:

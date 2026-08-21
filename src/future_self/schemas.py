@@ -225,6 +225,20 @@ class NovaCompanionProviderCapture(NovaCompanionCapture):
     evidence: str = Field(min_length=1, max_length=500, repr=False, exclude=True)
 
 
+class NovaCompanionReminderOffer(BaseModel):
+    """Server-validated, non-mutating reminder proposal for the UI layer."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    title: str = Field(min_length=1, max_length=200, repr=False)
+    schedule_wording: str | None = Field(default=None, min_length=1, max_length=160, repr=False)
+    evidence: str = Field(min_length=1, max_length=600, repr=False, exclude=True)
+
+
+class NovaCompanionProviderReminderOffer(NovaCompanionReminderOffer):
+    """Untrusted provider proposal; evidence is retained only for server validation."""
+
+
 class NovaCompanionProviderResponse(BaseModel):
     """Private structured-output shape used only at the provider boundary."""
 
@@ -232,6 +246,13 @@ class NovaCompanionProviderResponse(BaseModel):
 
     answer: str = Field(min_length=1, max_length=2000, repr=False)
     capture: NovaCompanionProviderCapture | None = Field(default=None, repr=False)
+    reminder_offer: NovaCompanionProviderReminderOffer | None = Field(default=None, repr=False)
+
+    @model_validator(mode="after")
+    def one_optional_offer(self) -> Self:
+        if self.capture is not None and self.reminder_offer is not None:
+            raise ValueError("capture and reminder_offer are mutually exclusive")
+        return self
 
 
 class NovaCompanionResponse(BaseModel):
@@ -241,6 +262,13 @@ class NovaCompanionResponse(BaseModel):
 
     answer: str = Field(min_length=1, max_length=2000, repr=False)
     capture: NovaCompanionCapture | None = Field(default=None, repr=False)
+    reminder_offer: NovaCompanionReminderOffer | None = Field(default=None, repr=False)
+
+    @model_validator(mode="after")
+    def one_optional_offer(self) -> Self:
+        if self.capture is not None and self.reminder_offer is not None:
+            raise ValueError("capture and reminder_offer are mutually exclusive")
+        return self
 
 
 class TodayPlan(BaseModel):

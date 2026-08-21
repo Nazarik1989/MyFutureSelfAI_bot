@@ -493,7 +493,7 @@ TRANSCRIPTION_PROVIDER=disabled
 Диалоговый контекст хранится в БД и переживает перезапуск процесса. В LLM передаются только последние сообщения в пределах настраиваемого окна; по умолчанию это 12 сообщений и TTL 24 часа:
 
 ```dotenv
-CONVERSATION_CONTEXT_MESSAGES=12
+CONVERSATION_CONTEXT_MESSAGES=20
 CONVERSATION_CONTEXT_TTL_HOURS=24
 ```
 

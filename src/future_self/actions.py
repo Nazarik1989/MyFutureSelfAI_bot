@@ -194,6 +194,8 @@ class DraftActionService:
         user_id: int | None = None,
         raw_text: str | None = None,
         resolved_date: date | None = None,
+        expected_preview_message_id: int | None = None,
+        expected_access_version: int | None = None,
     ) -> ActionOutcome:
         target: DraftInboxItem | None = None
         if draft_id is not None and version is not None:
@@ -223,11 +225,35 @@ class DraftActionService:
 
         previous_message_id = target.preview_message_id
         if action == "save":
-            result = await self.drafts.confirm(draft_id, version, telegram_user_id, chat_id)
+            result = await self.drafts.confirm(
+                draft_id,
+                version,
+                telegram_user_id,
+                chat_id,
+                expected_preview_message_id=expected_preview_message_id,
+                expected_access_version=expected_access_version,
+            )
         elif action in {"discard", "cancel"}:
-            result = await self.drafts.drop(draft_id, version, telegram_user_id, chat_id)
+            if expected_preview_message_id is None:
+                result = await self.drafts.drop(draft_id, version, telegram_user_id, chat_id)
+            else:
+                result = await self.drafts.drop_if_preview_message_current(
+                    draft_id,
+                    version,
+                    telegram_user_id,
+                    chat_id,
+                    expected_message_id=expected_preview_message_id,
+                    expected_access_version=expected_access_version,
+                )
         elif action == "edit":
-            result = await self.drafts.begin_edit(draft_id, version, telegram_user_id, chat_id)
+            result = await self.drafts.begin_edit(
+                draft_id,
+                version,
+                telegram_user_id,
+                chat_id,
+                expected_preview_message_id=expected_preview_message_id,
+                expected_access_version=expected_access_version,
+            )
         elif action == "confirm_date" and task is not None:
             result = await self.drafts.transform(
                 draft_id,

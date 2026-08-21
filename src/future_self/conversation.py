@@ -14,7 +14,7 @@ from .db import Database
 from .models import ConversationMessage, ConversationSession, DraftInboxItem, InboxItem, User
 from .nova_memory import NovaMemoryValidationError, normalize_nova_memory_content
 
-COMPANION_PROMPT_MAX_MESSAGES = 8
+COMPANION_PROMPT_MAX_MESSAGES = 20
 COMPANION_PROMPT_MESSAGE_MAX_CHARS = 600
 COMPANION_PROMPT_CONTEXT_MAX_BYTES = 32 * 1024
 COMPANION_REFERENCE_MAX_CHARS = 2_000

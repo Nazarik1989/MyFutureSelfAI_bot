@@ -917,6 +917,10 @@ class NovaHandlers:
             await self._nova_generic_action_locked(update, context)
 
     async def _nova_generic_action_locked(self, update: Any, context: Any) -> None:
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         claimed = await self._nova_claim_action(update, context)
         if claimed is None:
             return
@@ -928,6 +932,11 @@ class NovaHandlers:
         capability = await self._nova_revalidate_action(update, context, user, capability.id)
         if capability is None:
             return
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
         await self._nova_dispatch_capability(update, context, user, capability)
 
     async def nova_evening_entry(self, update: Any, context: Any) -> int | None:
@@ -993,6 +1002,10 @@ class NovaHandlers:
         handler_name: str,
         back_target: str,
     ) -> int | None:
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         claimed = await self._nova_claim_action(
             update,
             context,
@@ -1009,6 +1022,11 @@ class NovaHandlers:
             await self.nova_memory_public_command_gate(update, context)
             return None
         await self.nova_memory_clear_current(update)
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
         screen = _NovaCallbackMessage(
             self,
             update.callback_query,
