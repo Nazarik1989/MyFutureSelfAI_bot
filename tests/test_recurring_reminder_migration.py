@@ -15,7 +15,7 @@ from sqlalchemy import create_engine
 
 SCHEDULE_TABLE = "recurring_task_reminder_schedules"
 OCCURRENCE_TABLE = "recurring_task_reminder_occurrences"
-EXPECTED_HEAD = "20260817_0027"
+EXPECTED_HEAD = "20260822_0028"
 
 
 def alembic(

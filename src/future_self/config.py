@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     # Nova Companion is an independent, fail-closed conversation pilot.
     enable_nova_companion: bool = False
     nova_companion_admin_only: bool = True
+    enable_nova_conversation_brain: bool = False
+    nova_conversation_brain_admin_only: bool = True
+    nova_conversation_brain_max_memories: int = Field(default=100, ge=1, le=500)
+    nova_conversation_brain_retrieval_items: int = Field(default=6, ge=1, le=12)
+    nova_conversation_brain_context_bytes: int = Field(default=8192, ge=1024, le=32768)
 
     # Nova memory CRUD and answer application use independent fail-closed gates.
     enable_nova_memory: bool = False

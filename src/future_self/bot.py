@@ -772,6 +772,12 @@ class FutureSelfBot(
         )
         app.add_handler(
             CallbackQueryHandler(
+                self.nova_brain_callback,
+                pattern=r"^nbrain:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
                 self.nova_memory_callback,
                 pattern=r"^nmem:[A-Za-z0-9_-]+$",
             )

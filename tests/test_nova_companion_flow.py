@@ -14,12 +14,152 @@ from future_self.nova_companion_flow import (
     NovaAddressKind,
     NovaCompanionCaptureStore,
     NovaCompanionCaptureTemporal,
+    NovaCompanionDiscourseAnchor,
+    NovaCompanionDiscourseReducer,
     NovaCompanionPolicy,
     NovaCompanionReminderCandidate,
     NovaCompanionReminderStore,
     should_offer_capture,
     validate_capture_suggestion,
 )
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "ооо, было бы круто)",
+        "давай",
+        "ну давай",
+        "подбери",
+        "ну давай подбери)",
+        "да, хочу",
+        "помоги тогда",
+    ],
+)
+def test_discourse_reducer_binds_weak_assent_to_one_immediate_offer(reply):
+    anchor = NovaCompanionDiscourseReducer.reduce(
+        reply,
+        [
+            {"role": "user", "content": "Как не улетать в мысли?"},
+            {
+                "role": "assistant",
+                "content": "Если хочешь, можем дальше просто подобрать удобный способ.",
+            },
+        ],
+    )
+
+    assert anchor is not None
+    assert anchor.status == "single"
+    assert anchor.offer_kinds == ("method",)
+    assert anchor.provider_payload() == {
+        "status": "single",
+        "offer_kinds": ["method"],
+        "offer_text": "Если хочешь, можем дальше просто подобрать удобный способ.",
+    }
+    assert "offer_text" not in repr(anchor)
+
+
+def test_discourse_reducer_marks_two_real_offers_ambiguous():
+    anchor = NovaCompanionDiscourseReducer.reduce(
+        "давай",
+        [
+            {
+                "role": "assistant",
+                "content": ("Могу подобрать удобный способ и могу помочь настроить напоминание."),
+            }
+        ],
+    )
+
+    assert anchor is not None
+    assert anchor.status == "ambiguous"
+    assert anchor.offer_kinds == ("method", "reminder_setup")
+
+
+def test_discourse_reducer_keeps_three_real_offers_fail_closed_and_bounded():
+    anchor = NovaCompanionDiscourseReducer.reduce(
+        "да, хочу",
+        [
+            {
+                "role": "assistant",
+                "content": (
+                    "Могу подобрать удобный способ, могу выбрать упражнение и могу помочь "
+                    "настроить напоминание."
+                ),
+            }
+        ],
+    )
+
+    assert anchor is not None
+    assert anchor.status == "ambiguous"
+    assert anchor.offer_kinds == ("method", "exercise", "reminder_setup")
+
+
+@pytest.mark.parametrize(
+    "assistant_text",
+    [
+        "Я не могу подобрать подходящий способ.",
+        "Не можем выбрать упражнение.",
+        "Я не могу предложить упражнение без деталей.",
+        "Не могу помочь настроить напоминание.",
+        "Не могу составить план.",
+        "Ты спрашивал, могу ли я подобрать способ.",
+    ],
+)
+def test_discourse_reducer_rejects_negated_and_reported_assistant_offers(assistant_text):
+    assert (
+        NovaCompanionDiscourseReducer.reduce(
+            "давай",
+            [{"role": "assistant", "content": assistant_text}],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("assistant_text", "expected_kind"),
+    [
+        ("Если хочешь, можем подобрать удобный способ.", "method"),
+        ("Могу предложить короткое упражнение.", "exercise"),
+        ("Могу помочь настроить настоящее напоминание.", "reminder_setup"),
+        ("Можем составить простой план.", "plan"),
+    ],
+)
+def test_discourse_reducer_accepts_only_affirmative_assistant_offers(assistant_text, expected_kind):
+    anchor = NovaCompanionDiscourseReducer.reduce(
+        "давай",
+        [{"role": "assistant", "content": assistant_text}],
+    )
+
+    assert anchor is not None
+    assert anchor.offer_kinds == (expected_kind,)
+
+
+def test_discourse_anchor_rejects_forged_offer_kind():
+    with pytest.raises(ValueError, match="Invalid companion discourse offer"):
+        NovaCompanionDiscourseAnchor(
+            status="single",
+            offer_kinds=("forged",),  # type: ignore[arg-type]
+            offer_text="Могу подобрать способ.",
+        )
+
+
+@pytest.mark.parametrize(
+    ("reply", "messages"),
+    [
+        ("Расскажи про новую тему", [{"role": "assistant", "content": "Могу выбрать способ."}]),
+        ("давай", [{"role": "user", "content": "Могу выбрать способ."}]),
+        (
+            "давай",
+            [
+                {"role": "assistant", "content": "Могу подобрать удобный способ."},
+                {"role": "user", "content": "Новая тема"},
+            ],
+        ),
+        ("давай", [{"role": "assistant", "content": "Могу помочь."}]),
+    ],
+)
+def test_discourse_reducer_fails_closed_without_immediate_single_offer(reply, messages):
+    assert NovaCompanionDiscourseReducer.reduce(reply, messages) is None
 
 
 def _reminder_candidate() -> NovaCompanionReminderCandidate:

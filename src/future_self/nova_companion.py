@@ -177,6 +177,29 @@ class NovaCompanionContextProjection:
     def provider_json(self) -> str:
         return self._payload_json
 
+    def provider_context_payload(self) -> dict[str, object]:
+        """Return authoritative context without embedding recent role history."""
+
+        payload = self.provider_payload()
+        payload.pop("recent_conversation", None)
+        return payload
+
+    def native_messages(self) -> list[dict[str, str]]:
+        """Return a detached bounded native user/assistant sequence."""
+
+        payload = self.provider_payload()
+        recent = payload.get("recent_conversation")
+        messages = recent.get("recent_messages") if isinstance(recent, dict) else None
+        if not isinstance(messages, list):
+            return []
+        return [
+            {"role": str(message["role"]), "content": str(message["content"])}
+            for message in messages
+            if isinstance(message, dict)
+            and message.get("role") in {"user", "assistant"}
+            and isinstance(message.get("content"), str)
+        ]
+
 
 @dataclass(frozen=True, slots=True)
 class NovaCompanionContextFence:

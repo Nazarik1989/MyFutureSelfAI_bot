@@ -68,6 +68,11 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.nova_memory_max_items == 100
     assert configured.enable_nova_companion is False
     assert configured.nova_companion_admin_only is True
+    assert configured.enable_nova_conversation_brain is False
+    assert configured.nova_conversation_brain_admin_only is True
+    assert configured.nova_conversation_brain_max_memories == 100
+    assert configured.nova_conversation_brain_retrieval_items == 6
+    assert configured.nova_conversation_brain_context_bytes == 8192
     assert configured.enable_weekly_review is True
     assert configured.weekly_review_admin_only is True
 
@@ -84,6 +89,21 @@ def test_nova_memory_gates_are_independent_and_item_limit_is_bounded() -> None:
     for value in (0, 101):
         with pytest.raises(ValidationError):
             settings(nova_memory_max_items=value)
+
+
+def test_nova_conversation_brain_gate_is_independent_and_limits_are_bounded() -> None:
+    brain_only = settings(enable_nova_conversation_brain=True)
+    assert brain_only.enable_nova_conversation_brain is True
+    assert brain_only.enable_nova_companion is False
+    assert brain_only.nova_conversation_brain_admin_only is True
+    for field, values in {
+        "nova_conversation_brain_max_memories": (0, 501),
+        "nova_conversation_brain_retrieval_items": (0, 13),
+        "nova_conversation_brain_context_bytes": (1023, 32769),
+    }.items():
+        for value in values:
+            with pytest.raises(ValidationError):
+                settings(**{field: value})
 
 
 @pytest.mark.parametrize("value", [4, 361])
@@ -345,6 +365,11 @@ def test_container_and_build_context_are_hardened() -> None:
     for nova_companion_control in (
         "--env ENABLE_NOVA_COMPANION=false",
         "--env NOVA_COMPANION_ADMIN_ONLY=true",
+        "--env ENABLE_NOVA_CONVERSATION_BRAIN=false",
+        "--env NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true",
+        "--env NOVA_CONVERSATION_BRAIN_MAX_MEMORIES=100",
+        "--env NOVA_CONVERSATION_BRAIN_RETRIEVAL_ITEMS=6",
+        "--env NOVA_CONVERSATION_BRAIN_CONTEXT_BYTES=8192",
     ):
         assert nova_companion_control in runbook
 
@@ -375,7 +400,7 @@ def test_stage_7c_memory_transparency_docs_are_explicit_and_retention_honest() -
 def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260817_0027"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260822_0028"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
     for access_model in (
         "Workspace",

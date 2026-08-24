@@ -102,6 +102,11 @@ docker run -d \
   --env ENABLE_KNOWLEDGE_EXPORT=false \
   --env ENABLE_NOVA_COMPANION=false \
   --env NOVA_COMPANION_ADMIN_ONLY=true \
+  --env ENABLE_NOVA_CONVERSATION_BRAIN=false \
+  --env NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true \
+  --env NOVA_CONVERSATION_BRAIN_MAX_MEMORIES=100 \
+  --env NOVA_CONVERSATION_BRAIN_RETRIEVAL_ITEMS=6 \
+  --env NOVA_CONVERSATION_BRAIN_CONTEXT_BYTES=8192 \
   --env ENABLE_NOVA_MEMORY=false \
   --env NOVA_MEMORY_ADMIN_ONLY=true \
   --env ENABLE_NOVA_MEMORY_APPLICATION=false \
@@ -361,3 +366,41 @@ described above and tested on an isolated snapshot. Keep revision `20260722_0019
 all assets. Do not downgrade or stamp the live database. Restore the coordinated
 pre-cutover DB+asset backup only when an explicit incident decision accepts losing all
 post-cutover Knowledge changes.
+## Stage 8C Nova conversation brain
+
+Stage 8C is controlled independently from the Stage 8B companion. The safe
+defaults are `ENABLE_NOVA_CONVERSATION_BRAIN=false` and
+`NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true`. Do not enable it merely because the
+Stage 8B companion is enabled. A rollout must explicitly verify the configured
+memory/item/byte limits and the database revision before changing either flag.
+
+The runtime uses SQLite as the source of truth for bounded native conversation,
+working state, and observed memory. Provider requests use `store=false`, one
+attempt, and no tools. No production migration or flag change is part of the
+implementation task; schema rollout follows the normal backed-up migration
+runbook only after release approval.
+
+With the brain flag off, or for a tier excluded by the brain pilot, runtime
+behaviour is the exact Stage 8B companion contract: ignore all state/memory
+proposals, preserve the answer and valid capture/reminder proposal, persist the
+normal two-message exchange, and perform zero brain-table DML.
+
+With the flag on, automatic observed memory is limited to server-parsed structured
+fields: an explicitly self-declared display name, grammatical form of address,
+and closed-enum Nova settings for response length (`short/normal/detailed`), tone
+(`calm/direct/supportive`) and reminder style (`gentle/direct/brief`). Arbitrary
+provider evidence is not a semantic source: the server must parse the whole
+current utterance after removing only bounded vocative/polite wrappers and final
+statement punctuation. Quotes, reported speech, questions, negation and mixed
+prefix/suffix text fail closed. Each owner has at most one active response length,
+tone, reminder style and merged identity record, enforced by a partial unique
+semantic-key index; provider supersedes hints have no replacement authority.
+Arbitrary free-text facts, preferences,
+orientations and themes are never eligible for
+automatic persistence; they stay in bounded conversation or go through the
+existing explicit Nova Memory confirmation flow. Observed memory is distinct
+from confirmed Nova Memory and cannot overwrite the profile. Operators can
+verify it through the bounded `Что ты обо мне помнишь?` summary; users remove an
+observation through the revision-fenced `Забудь …`
+confirmation. Confirmed Nova Memory keeps its existing explicit preview and
+confirmation lifecycle.

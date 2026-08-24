@@ -14,7 +14,7 @@ from sqlalchemy import create_engine
 
 ITEM_TABLE = "nova_memory_items"
 CHANGE_TABLE = "nova_memory_changes"
-EXPECTED_HEAD = "20260817_0027"
+EXPECTED_HEAD = "20260822_0028"
 PARENT_REVISION = "20260810_0025"
 
 

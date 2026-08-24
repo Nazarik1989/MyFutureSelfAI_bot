@@ -395,14 +395,61 @@ ENABLE_NOVA_COMPANION=false
 NOVA_COMPANION_ADMIN_ONLY=true
 ```
 
+Stage 8C adds a separate, fail-closed conversation brain. It keeps bounded
+chat-scoped working state and owner-scoped observed memories in SQLite, while
+the existing confirmed profile, Vision, goals, weekly focus, and Nova Memory
+remain authoritative. The provider receives native bounded role messages with
+`store=false`, has no tools or write authority, and may only propose one
+server-validated state update and one observed-memory candidate. Keep the
+feature disabled and admin-only until a dedicated rollout:
+
+```env
+ENABLE_NOVA_CONVERSATION_BRAIN=false
+NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true
+NOVA_CONVERSATION_BRAIN_MAX_MEMORIES=100
+NOVA_CONVERSATION_BRAIN_RETRIEVAL_ITEMS=6
+NOVA_CONVERSATION_BRAIN_CONTEXT_BYTES=8192
+```
+
+Turning Stage 8C off (or denying it for the actor's tier) is an exact Stage 8B
+fallback: provider brain proposals are ignored, the conversational answer,
+capture/reminder offer and two-message exchange are unchanged, and no
+`NovaDialogueState` or `NovaObservedMemory` row is written.
+
+When Stage 8C is enabled for an eligible actor, automatic observed memory accepts
+only server-parsed structured fields: the user's explicitly declared display
+name, grammatical form of address, and closed-enum Nova settings for response
+length (`short/normal/detailed`), tone (`calm/direct/supportive`) and reminder
+style (`gentle/direct/brief`). This happens only after successful Telegram
+delivery and an atomic conversation exchange; access/context changes compensate
+the exact generation. The server parses the whole current user utterance after
+removing only a bounded Nova vocative, polite wrapper and final statement
+punctuation; provider-selected substrings, quotations and reported speech never
+establish automatic memory. Active response length, tone, reminder style and the
+merged identity record are server-enforced owner-scoped singletons; replacement
+is selected from persisted semantic keys, never from a provider supersedes hint.
+Arbitrary free-text facts, preferences, orientations and
+themes are never automatic memory, regardless of their wording or apparent
+sensitivity. They remain in bounded recent conversation or require the existing
+explicit Nova Memory preview-and-confirm flow. Observations are labelled as
+coming from the user's words and never overwrite the authoritative profile.
+
+Confirmed Nova Memory remains a separate explicit preview-and-confirm flow:
+`Nova, запомни …` does not become automatic observed memory. `Что ты обо мне
+помнишь?` shows a bounded, source-labelled summary of the profile, plans,
+confirmed Nova Memory and active observations. `Забудь …` opens an opaque,
+owner/chat/access-fenced confirmation before an observation is removed.
+
 When enabled for an eligible actor, ordinary statements receive a human conversational
 answer instead of being converted immediately into an inbox preview. Explicit capture and
 reminder commands keep their existing preview-and-confirm flows. Nova can offer at most one
 grounded `idea`, `task`, `desire` or `note` suggestion; rejecting it writes nothing, and
 accepting it opens the existing draft preview rather than saving immediately. Confirmed,
-owner-scoped profile, Vision, goals, current weekly focus, Nova Memory and recent
-conversation may be projected within strict bounds. They are treated as data, never as
-instructions, and no automatic long-term memory is created from the conversation.
+owner-scoped profile, Vision, goals, current weekly focus, Nova Memory, recent conversation
+and eligible structured observed settings may be projected within strict bounds. They are
+treated as data, never as instructions. Automatic retention is limited to the closed
+structured policy above; free text requires an existing explicit confirmation flow or is
+not retained beyond bounded conversation.
 
 ### Stage 7C: confirmed My Nova personalization
 

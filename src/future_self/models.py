@@ -161,6 +161,16 @@ class User(TimestampMixin, Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    nova_dialogue_states: Mapped[list[NovaDialogueState]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    nova_observed_memories: Mapped[list[NovaObservedMemory]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class NovaMemoryItem(TimestampMixin, Base):
@@ -718,6 +728,171 @@ class ConversationMessage(Base):
     source: Mapped[str] = mapped_column(String(20), default="text")
     intent: Mapped[str] = mapped_column(String(40))
     session: Mapped[ConversationSession] = relationship(back_populates="messages")
+
+
+class NovaDialogueState(TimestampMixin, Base):
+    __tablename__ = "nova_dialogue_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_user_id",
+            "chat_id",
+            name="uq_nova_dialogue_states_actor_chat",
+        ),
+        CheckConstraint("access_version > 0", name="ck_nova_dialogue_states_access_version"),
+        CheckConstraint("revision > 0", name="ck_nova_dialogue_states_revision"),
+        CheckConstraint(
+            "active_topic IS NULL OR length(active_topic) BETWEEN 1 AND 200",
+            name="ck_nova_dialogue_states_active_topic_length",
+        ),
+        CheckConstraint(
+            "current_user_goal IS NULL OR length(current_user_goal) BETWEEN 1 AND 300",
+            name="ck_nova_dialogue_states_user_goal_length",
+        ),
+        CheckConstraint(
+            "last_assistant_offer IS NULL OR length(last_assistant_offer) BETWEEN 1 AND 600",
+            name="ck_nova_dialogue_states_offer_length",
+        ),
+        CheckConstraint(
+            "unresolved_question IS NULL OR length(unresolved_question) BETWEEN 1 AND 300",
+            name="ck_nova_dialogue_states_question_length",
+        ),
+        CheckConstraint(
+            "requested_action IS NULL OR requested_action IN "
+            "('capture', 'reminder', 'plan', 'memory', 'clarify')",
+            name="ck_nova_dialogue_states_requested_action",
+        ),
+        CheckConstraint(
+            "json_array_length(last_assistant_offer_kinds) BETWEEN 0 AND 4",
+            name="ck_nova_dialogue_states_offer_kinds_count",
+        ),
+        CheckConstraint(
+            "json_array_length(open_loops) BETWEEN 0 AND 5",
+            name="ck_nova_dialogue_states_open_loops_count",
+        ),
+        CheckConstraint(
+            "length(CAST(last_assistant_offer_kinds AS TEXT)) BETWEEN 2 AND 1024",
+            name="ck_nova_dialogue_states_offer_kinds_bytes",
+        ),
+        CheckConstraint(
+            "length(CAST(open_loops AS TEXT)) BETWEEN 2 AND 4096",
+            name="ck_nova_dialogue_states_open_loops_bytes",
+        ),
+        Index(
+            "ix_nova_dialogue_states_owner_expiry",
+            "owner_id",
+            "expires_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    access_version: Mapped[int] = mapped_column(Integer)
+    active_topic: Mapped[str | None] = mapped_column(String(200))
+    current_user_goal: Mapped[str | None] = mapped_column(String(300))
+    last_assistant_offer: Mapped[str | None] = mapped_column(String(600))
+    last_assistant_offer_kinds: Mapped[list[str]] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'"),
+    )
+    unresolved_question: Mapped[str | None] = mapped_column(String(300))
+    requested_action: Mapped[str | None] = mapped_column(String(16))
+    open_loops: Mapped[list[str]] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    owner: Mapped[User] = relationship(back_populates="nova_dialogue_states")
+
+
+class NovaObservedMemory(TimestampMixin, Base):
+    __tablename__ = "nova_observed_memories"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_nova_observed_memories_public_id"),
+        UniqueConstraint(
+            "owner_id",
+            "content_fingerprint",
+            name="uq_nova_observed_memories_owner_fingerprint",
+        ),
+        CheckConstraint(
+            "category IN ('fact', 'preference', 'orientation', 'theme', 'identity')",
+            name="ck_nova_observed_memories_category",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'forgotten')",
+            name="ck_nova_observed_memories_status",
+        ),
+        CheckConstraint(
+            "source_kind IN ('conversation', 'explicit')",
+            name="ck_nova_observed_memories_source_kind",
+        ),
+        CheckConstraint(
+            "length(normalized_value) BETWEEN 1 AND 500",
+            name="ck_nova_observed_memories_value_length",
+        ),
+        CheckConstraint(
+            "length(content_fingerprint) = 64",
+            name="ck_nova_observed_memories_fingerprint_length",
+        ),
+        CheckConstraint(
+            "length(source_receipt) = 64",
+            name="ck_nova_observed_memories_receipt_length",
+        ),
+        CheckConstraint("salience BETWEEN 1 AND 5", name="ck_nova_observed_memories_salience"),
+        CheckConstraint("revision > 0", name="ck_nova_observed_memories_revision"),
+        CheckConstraint(
+            "superseded_by_public_id IS NULL OR length(superseded_by_public_id) = 36",
+            name="ck_nova_observed_memories_superseded_id_length",
+        ),
+        CheckConstraint(
+            "semantic_key IS NULL OR "
+            "(semantic_key = 'identity' AND category = 'identity') OR "
+            "(semantic_key IN ('response_length', 'tone', 'reminder_style') "
+            "AND category = 'preference')",
+            name="ck_nova_observed_memories_semantic_key",
+        ),
+        Index(
+            "ix_nova_observed_memories_owner_active",
+            "owner_id",
+            "status",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "ix_nova_observed_memories_owner_category",
+            "owner_id",
+            "category",
+            "status",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "uq_nova_observed_memories_owner_active_semantic_key",
+            "owner_id",
+            "semantic_key",
+            unique=True,
+            sqlite_where=text("status = 'active' AND semantic_key IS NOT NULL"),
+            postgresql_where=text("status = 'active' AND semantic_key IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    category: Mapped[str] = mapped_column(String(16))
+    semantic_key: Mapped[str | None] = mapped_column(String(32))
+    normalized_value: Mapped[str] = mapped_column(Text)
+    content_fingerprint: Mapped[str] = mapped_column(String(64))
+    source_kind: Mapped[str] = mapped_column(String(16))
+    source_session_id: Mapped[int] = mapped_column(Integer)
+    source_message_id: Mapped[int] = mapped_column(Integer)
+    source_receipt: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
+    salience: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    superseded_by_public_id: Mapped[str | None] = mapped_column(String(36))
+    owner: Mapped[User] = relationship(back_populates="nova_observed_memories")
 
 
 class VisionProfile(TimestampMixin, Base):

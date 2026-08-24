@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -18,6 +18,18 @@ from .ai import NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
 from .conversation import ConversationExchangeReceipt
 from .domain import temporal_context
 from .models import DraftInboxItem, InboxItem, TaskReminder, User
+from .nova_brain import (
+    NovaBrainApplyReceipt,
+    NovaBrainFence,
+    NovaBrainForgetCapability,
+    NovaBrainForgetStore,
+    NovaBrainPolicy,
+    NovaBrainProjection,
+    NovaBrainService,
+    observed_memory_display_value,
+    validate_dialogue_state_update,
+    validate_memory_candidate,
+)
 from .nova_companion import (
     NovaCompanionContextFence,
     NovaCompanionContextService,
@@ -33,6 +45,8 @@ from .nova_companion_flow import (
     NovaCompanionCaptureScreen,
     NovaCompanionCaptureStore,
     NovaCompanionCaptureTemporal,
+    NovaCompanionDiscourseAnchor,
+    NovaCompanionDiscourseReducer,
     NovaCompanionPolicy,
     NovaCompanionReminderCandidate,
     NovaCompanionReminderCapability,
@@ -47,7 +61,11 @@ from .nova_memory_application import (
 )
 from .reminder_flow import ReminderFlowSession
 from .reminder_intent import ReminderIntentStatus
-from .schemas import ParsedThought
+from .schemas import (
+    NovaCompanionDialogueStateUpdate,
+    NovaCompanionMemoryCandidate,
+    ParsedThought,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +88,15 @@ NOVA_COMPANION_REMINDER_OFFER_ACTION_TEXT = (
 NOVA_COMPANION_NO_ACTIVE_REMINDER_OFFER_TEXT = (
     "Сейчас нет активного предложения напоминания. Скажи, что и когда напомнить."
 )
+NOVA_COMPANION_DISCOURSE_AMBIGUOUS_TEXT = (
+    "Ты хочешь подобрать разговорный способ или настроить настоящее напоминание?"
+)
+_DISCOURSE_KIND_LABELS = {
+    "method": "подобрать разговорный способ",
+    "exercise": "выбрать упражнение",
+    "reminder_setup": "настроить настоящее напоминание",
+    "plan": "составить простой план",
+}
 
 _COMPANION_DRAIN_TIMEOUT_SECONDS = 30.0
 _COMPANION_CANCEL_TIMEOUT_SECONDS = 5.0
@@ -116,6 +143,16 @@ _CONTEXTUAL_STATUS_QUESTION = re.compile(
     r"^(?:ну\s+что[,:]?\s*)?(?:вс[её]\s+)?готово\?+[!.…]*$",
     re.IGNORECASE,
 )
+_BRAIN_MEMORY_RECALL = re.compile(
+    r"^(?:что\s+ты\s+(?:обо\s+мне\s+)?(?:помнишь|знаешь)|"
+    r"что\s+ты\s+знаешь\s+о\s+моих\s+целях)[?!.…]*$",
+    re.IGNORECASE,
+)
+_BRAIN_MEMORY_FORGET = re.compile(
+    r"^(?:это\s+уже\s+неактуально|забудь(?:\s+это|\s*,?\s*что\s+я\s+говорил[аи]?\s+о\s+.+)?)"
+    r"[?!.…]*$",
+    re.IGNORECASE,
+)
 _USER_SUBJECT_OPERATIONAL_CLAIM = re.compile(
     r"\bты(?:\s+(?:уже|сама?|самостоятельно))*\s+(?:"
     r"поставил[а]?|создал[а]?|записал[а]?|сохранил[а]?|добавил[а]?|"
@@ -128,18 +165,21 @@ _UNTRUSTED_OPERATIONAL_CLAIM = re.compile(
     r"(?:я\s+)?(?:поставлю|создам|запишу|сохраню|добавлю)|"
     r"(?:напоминание|задача|заметка|идея|черновик|стрижка)\s+(?:уже\s+)?"
     r"(?:создан[ао]?|сохранен[ао]?|сохранён[ао]?|записан[ао]?|поставлен[ао]?|"
-    r"установлен[ао]?|отмечен[ао]?)|"
+    r"установлен[ао]?|настроен[ао]?|отмечен[ао]?)|"
     r"(?:я\s+)?(?:вс[её]\s+)?(?:отметил[а]?|уч(?:е|ё)?л[а]?|зафиксировал[а]?)|"
     r"напомню|(?:я\s+не\s+забуд(?:у|ем)|(?:я\s+)?(?:точно|обязательно)\s+не\s+забуд(?:у|ем))"
     r"(?:\s+(?:про|об?|тебе))?|"
-    r"буду\s+напоминать|уже\s+в\s+голове\s+отмечено|"
+    r"буду(?:\s+\w+){0,2}\s+напоминать|уже\s+в\s+голове\s+отмечено|"
     r"считай[,:;.!?—\s]+(?:что\s+)?напоминан\w*(?:\s+уже)?\s+готов\w*|"
     r"напоминан\w*\s+(?:уже\s+)?(?:готов\w*|поставлен\w*)|"
     r"(?:у\s+меня|держу[\s\S]{0,80})\s+(?:на|под)\s+контрол\w*|"
     r"возьм\w*[\s\S]{0,100}\b(?:на|под)\s+контрол\w*|"
-    r"буду\s+держать\b[\s\S]{0,100}\b(?:в\s+уме|в\s+голове)|"
+    r"буду\s+держать\b[\s\S]{0,100}\b(?:в\s+уме|в\s+голове|в\s+поле\s+внимания)|"
     r"буду\s+иметь\b[\s\S]{0,100}\bв\s+виду|"
-    r"(?:я\s+)?буду\s+помнить\b|(?:я\s+)?прослежу\b)\b",
+    r"(?:я\s+)?буду\s+помнить\b|(?:я\s+)?прослежу\b|"
+    r"(?:я\s+)?не\s+дам\b[\s\S]{0,80}\bзабыть|"
+    r"считай[,:;.!?—\s]+(?:что\s+)?(?:это|вс[её])\s+(?:на|под)\s+контрол\w*|"
+    r"буду\s+возвращать\b[\s\S]{0,80}\bк\s+главн\w*)\b",
     re.IGNORECASE,
 )
 _UNTRUSTED_MEMORY_OR_RETURN_CLAIM = re.compile(
@@ -165,6 +205,12 @@ _ACTION_CONTEXT = re.compile(
     r"\b(?:напоминан\w*|напомн\w*|уведом\w*|задач\w*|заметк\w*|иде[яию]\w*|"
     r"черновик\w*|сохран\w*|запиш\w*|добав\w*|созда\w*|постав\w*|"
     r"забуд\w*|сегодня|завтра|послезавтра|\d{1,2}[:.]\d{2})\b",
+    re.IGNORECASE,
+)
+_DISCOURSE_NONCONTINUATION = re.compile(
+    r"(?:\bчто\s+именно\b[\s\S]{0,80}\b(?:подобрать|выбрать|сделать)\b|"
+    r"\bуточни\b[\s\S]{0,80}\b(?:что|какой|какую)\b|"
+    r"^(?:да|конечно)[,!:.\s]+(?:это\s+)?(?:звучит\s+)?(?:неплохо|круто|хорошо)\b)",
     re.IGNORECASE,
 )
 
@@ -197,6 +243,45 @@ def _has_untrusted_operational_claim(
     )
 
 
+def _companion_discourse_answer(
+    answer: str,
+    anchor: NovaCompanionDiscourseAnchor | None,
+) -> tuple[str, bool]:
+    """Enforce the immediate-offer contract without granting execution rights."""
+
+    if anchor is None:
+        return answer, False
+    if anchor.status == "ambiguous":
+        if anchor.offer_kinds == ("method", "reminder_setup"):
+            return NOVA_COMPANION_DISCOURSE_AMBIGUOUS_TEXT, True
+        labels = [_DISCOURSE_KIND_LABELS[kind] for kind in anchor.offer_kinds]
+        if len(labels) == 2:
+            clarification = f"Ты хочешь {labels[0]} или {labels[1]}?"
+        else:
+            clarification = "Что продолжить: " + ", ".join(labels[:-1]) + f" или {labels[-1]}?"
+        return clarification, True
+    if _DISCOURSE_NONCONTINUATION.search(answer) is None:
+        return answer, False
+    kind = anchor.offer_kinds[0]
+    if kind in {"method", "exercise"}:
+        return (
+            "Тогда предлагаю короткую практику: остановись на пару секунд, сделай один "
+            "спокойный вдох и спроси себя: «Что для меня сейчас действительно важно?». "
+            "Можем подобрать удобный вариант для этого.",
+            True,
+        )
+    if kind == "plan":
+        return (
+            "Тогда начнём с простого плана: выбери один ориентир, один маленький шаг на "
+            "сегодня и короткую проверку вечером.",
+            True,
+        )
+    return (
+        "Давай настроим настоящее напоминание. Что именно и когда тебе напомнить?",
+        True,
+    )
+
+
 class _NovaCompanionDrainError(RuntimeError):
     pass
 
@@ -214,6 +299,7 @@ class _CompanionGeneration:
     access_version: int = field(repr=False)
     context_fence: NovaCompanionContextFence = field(repr=False)
     memory_revision: str | None = field(default=None, repr=False)
+    brain_fence: NovaBrainFence | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +311,11 @@ class _PreparedCompanionAnswer:
     source: str = "text"
     temporal: NovaCompanionCaptureTemporal | None = field(default=None, repr=False)
     reminder_candidate: NovaCompanionReminderCandidate | None = field(default=None, repr=False)
+    dialogue_state_update: NovaCompanionDialogueStateUpdate | None = field(
+        default=None,
+        repr=False,
+    )
+    memory_candidate: NovaCompanionMemoryCandidate | None = field(default=None, repr=False)
     persist_exchange: bool = True
 
 
@@ -273,6 +364,18 @@ class NovaCompanionHandlers:
         )
         self.nova_companion_captures = NovaCompanionCaptureStore()
         self.nova_companion_reminders = NovaCompanionReminderStore()
+        self.nova_brain_service = NovaBrainService(
+            self.db,
+            max_memories=int(getattr(self.settings, "nova_conversation_brain_max_memories", 100)),
+            retrieval_max_items=int(
+                getattr(self.settings, "nova_conversation_brain_retrieval_items", 6)
+            ),
+            context_max_bytes=int(
+                getattr(self.settings, "nova_conversation_brain_context_bytes", 8192)
+            ),
+        )
+        self.nova_brain_forget = NovaBrainForgetStore()
+        self._nova_brain_ui_lock = asyncio.Lock()
         self._nova_companion_reminder_ui_lock = asyncio.Lock()
         self._nova_companion_tasks: set[asyncio.Task[bool]] = set()
         self._nova_companion_pending_capture_status: dict[str, _CompanionPendingCaptureStatus] = {}
@@ -291,6 +394,12 @@ class NovaCompanionHandlers:
 
     def nova_companion_available_for_actor(self, actor: Any | None) -> bool:
         return self.nova_companion_policy().allows_actor(actor)
+
+    def nova_brain_policy(self) -> NovaBrainPolicy:
+        return NovaBrainPolicy(
+            enabled=bool(getattr(self.settings, "enable_nova_conversation_brain", False)),
+            admin_only=bool(getattr(self.settings, "nova_conversation_brain_admin_only", True)),
+        )
 
     async def nova_companion_route(
         self,
@@ -334,7 +443,7 @@ class NovaCompanionHandlers:
             if address.kind is NovaAddressKind.VOCATIVE and address.content is not None
             else text.strip()
         )
-        identity_response = self._nova_companion_identity_answer(semantic_text, user)
+        identity_response = await self._nova_companion_identity_answer(semantic_text, user)
         if identity_response is not None:
             await self._nova_companion_local_response(
                 update,
@@ -357,6 +466,15 @@ class NovaCompanionHandlers:
                 status_response,
                 user=user,
             )
+            return True
+        if await self._nova_brain_memory_control(
+            update,
+            context,
+            delivery_message,
+            user=user,
+            text=semantic_text,
+            conversation_snapshot=conversation_snapshot,
+        ):
             return True
         if not status_receipt_preinvalidated:
             self.nova_companion_invalidate_status_for_input(
@@ -440,11 +558,40 @@ class NovaCompanionHandlers:
         )
         return True
 
-    @staticmethod
-    def _nova_companion_identity_answer(text: str, user: User) -> str | None:
+    async def _nova_companion_identity_answer(self, text: str, user: User) -> str | None:
         if _IDENTITY_NAME_QUESTION.fullmatch(text.strip()):
             name = " ".join((user.display_name or "").split())
-            return f"Да, тебя зовут {name}." if name else "Пока не знаю, как тебя зовут."
+            if name:
+                return f"Да, тебя зовут {name}."
+            policy = self.nova_brain_policy()
+            if policy.allows_actor(user):
+                try:
+                    observed = await self.nova_brain_service.list_current(
+                        telegram_actor_id=user.telegram_id,
+                        expected_access_version=user.access_version,
+                        policy=policy,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Nova companion failed operation=identity_lookup error_type=%s",
+                        type(exc).__name__,
+                    )
+                    observed = ()
+                for memory in observed:
+                    if memory.category != "identity":
+                        continue
+                    matched = re.search(
+                        r"(?:^identity:|;)display_name=([а-яёa-z-]{2,50})(?:;|$)",
+                        memory.value,
+                        re.IGNORECASE,
+                    )
+                    if matched is not None:
+                        declared = matched.group(1)
+                        declared = declared[:1].upper() + declared[1:]
+                        return f"Из твоих слов: тебя зовут {declared}."
+            return "Пока не знаю, как тебя зовут."
         if _IDENTITY_CITY_QUESTION.fullmatch(text.strip()):
             city = " ".join((user.location_city or "").split())
             return (
@@ -453,6 +600,295 @@ class NovaCompanionHandlers:
                 else "Подтверждённый город пока не указан."
             )
         return None
+
+    @staticmethod
+    def _nova_brain_recall_answer(
+        payload: dict[str, object],
+        observed: tuple[Any, ...],
+    ) -> str:
+        sections: list[tuple[str, list[str]]] = []
+        identity = payload.get("confirmed_identity")
+        if isinstance(identity, dict):
+            values: list[str] = []
+            labels = (
+                ("display_name", "имя"),
+                ("location_city", "город"),
+                ("timezone", "часовой пояс"),
+            )
+            for key, label in labels:
+                value = identity.get(key)
+                if isinstance(value, str) and value:
+                    values.append(f"{label}: {value}")
+            if values:
+                sections.append(("Подтверждено в профиле", values))
+
+        profile = payload.get("profile")
+        if isinstance(profile, dict):
+            values = []
+            summary = profile.get("summary")
+            if isinstance(summary, str) and summary:
+                values.append(summary)
+            for key in ("values", "desired_identity"):
+                items = profile.get(key)
+                if isinstance(items, list):
+                    values.extend(item for item in items[:2] if isinstance(item, str))
+            if values:
+                sections.append(("Анкета и профиль", values[:3]))
+
+        plans: list[str] = []
+        weekly = payload.get("current_weekly_focus")
+        if isinstance(weekly, dict) and isinstance(weekly.get("focus"), str):
+            plans.append(f"фокус недели: {weekly['focus']}")
+        goals = payload.get("active_goals")
+        if isinstance(goals, list):
+            plans.extend(
+                f"цель: {item['title']}"
+                for item in goals[:2]
+                if isinstance(item, dict) and isinstance(item.get("title"), str)
+            )
+        visions = payload.get("active_vision_items")
+        if isinstance(visions, list):
+            plans.extend(
+                f"желание: {item['wish_text']}"
+                for item in visions[:2]
+                if isinstance(item, dict) and isinstance(item.get("wish_text"), str)
+            )
+        if plans:
+            sections.append(("Текущие планы и ориентиры", plans[:5]))
+
+        confirmed = payload.get("confirmed_memory")
+        if isinstance(confirmed, list):
+            values = [
+                str(item["content"])
+                for item in confirmed[:4]
+                if isinstance(item, dict) and isinstance(item.get("content"), str)
+            ]
+            if values:
+                sections.append(("Подтверждено тобой в Nova Memory", values))
+        if observed:
+            sections.append(
+                (
+                    "Сохранено из твоих слов",
+                    [observed_memory_display_value(str(memory.value)) for memory in observed[:4]],
+                )
+            )
+        if not sections:
+            return "Пока у меня нет актуальных сведений, которые можно честно перечислить."
+        lines = [
+            "Кратко по актуальным источникам — это не полный экспорт всех данных:",
+        ]
+        for title, values in sections:
+            lines.append(f"\n{title}:")
+            lines.extend(f"• {value}" for value in values)
+        return "\n".join(lines)[:1_900]
+
+    async def _nova_brain_memory_control(
+        self,
+        update: Any,
+        context: Any,
+        delivery_message: Any | None,
+        *,
+        user: User,
+        text: str,
+        conversation_snapshot: Any,
+    ) -> bool:
+        policy = self.nova_brain_policy()
+        if not policy.allows_actor(user):
+            return False
+        cleaned = text.strip()
+        if _BRAIN_MEMORY_RECALL.fullmatch(cleaned):
+            observed = await self.nova_brain_service.list_current(
+                telegram_actor_id=user.telegram_id,
+                expected_access_version=user.access_version,
+                policy=policy,
+            )
+            memory_status, confirmed, _revision = await self._nova_companion_memory_projection(user)
+            materialized = await self.nova_companion_context.snapshot(
+                telegram_actor_id=user.telegram_id,
+                expected_tier=user.access_tier,
+                expected_access_version=user.access_version,
+                conversation_context=conversation_snapshot.for_companion_prompt(),
+                conversation_chat_id=update.effective_chat.id,
+                confirmed_memory=(
+                    confirmed if memory_status == "ready" and confirmed is not None else None
+                ),
+            )
+            if materialized.status != "ready" or materialized.projection is None:
+                await self._nova_companion_local_response(
+                    update,
+                    context,
+                    delivery_message,
+                    self._nova_companion_neutral_text(materialized.status),
+                    user=user,
+                )
+                return True
+            response = self._nova_brain_recall_answer(
+                materialized.projection.provider_context_payload(),
+                observed,
+            )
+            await self._nova_companion_local_response(
+                update,
+                context,
+                delivery_message,
+                response,
+                user=user,
+            )
+            logger.info(
+                "Nova companion trace route=memory_recall provider_called=false "
+                "working_state_revision=0 retrieved_memory_count=%s",
+                len(observed),
+            )
+            return True
+        if _BRAIN_MEMORY_FORGET.fullmatch(cleaned) is None:
+            return False
+        observed = await self.nova_brain_service.list_current(
+            telegram_actor_id=user.telegram_id,
+            expected_access_version=user.access_version,
+            policy=policy,
+        )
+        target = self._nova_brain_forget_target(cleaned, observed)
+        if target is None:
+            response = (
+                "Уточни одним коротким фрагментом, что именно забыть."
+                if observed
+                else "Сейчас нет подходящей сохранённой записи, которую можно забыть."
+            )
+            await self._nova_companion_local_response(
+                update,
+                context,
+                delivery_message,
+                response,
+                user=user,
+            )
+            return True
+        stage = None
+        sent = delivery_message
+        message_id = self._positive_companion_message_id(
+            getattr(delivery_message, "message_id", None)
+        )
+        try:
+            stage = await self.nova_brain_forget.stage(
+                target,
+                owner_id=user.id,
+                telegram_user_id=user.telegram_id,
+                chat_id=update.effective_chat.id,
+                access_version=user.access_version,
+            )
+            markup = self._nova_brain_forget_markup(stage)
+            async with self._nova_brain_ui_lock:
+                if not await self._nova_companion_actor_is_current(user):
+                    await self.nova_brain_forget.revoke(stage)
+                    return True
+                if delivery_message is None:
+                    sent = await update.effective_message.reply_text(
+                        "Забыть выбранную запись?",
+                        reply_markup=markup,
+                    )
+                    message_id = self._positive_companion_message_id(
+                        getattr(sent, "message_id", None)
+                    )
+                else:
+                    await delivery_message.edit_text(
+                        "Забыть выбранную запись?",
+                        reply_markup=markup,
+                    )
+                if sent is None or message_id is None:
+                    raise ValueError("Missing Nova brain confirmation message")
+                bound = await self.nova_brain_forget.bind(
+                    stage,
+                    canonical_message_id=message_id,
+                )
+                if bound is None or not await self._nova_companion_actor_is_current(user):
+                    await self.nova_brain_forget.revoke(bound or stage)
+                    await self._nova_companion_compensate(
+                        context,
+                        sent,
+                        chat_id=update.effective_chat.id,
+                        message_id=message_id,
+                        neutral_text=NOVA_COMPANION_CONTEXT_CHANGED_TEXT,
+                    )
+            return True
+        except asyncio.CancelledError:
+            if stage is not None:
+                await self.nova_brain_forget.revoke(stage)
+            if sent is not None and message_id is not None:
+                self._nova_companion_schedule_pre_delivery_cleanup(
+                    context,
+                    sent,
+                    chat_id=update.effective_chat.id,
+                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=memory_forget_prompt error_type=%s",
+                type(exc).__name__,
+            )
+            if stage is not None:
+                await self.nova_brain_forget.revoke(stage)
+            if sent is not None and message_id is not None:
+                await self._nova_companion_compensate(
+                    context,
+                    sent,
+                    chat_id=update.effective_chat.id,
+                    message_id=message_id,
+                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
+            return True
+
+    @staticmethod
+    def _nova_brain_forget_markup(stage: Any) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Забыть",
+                        callback_data=stage.callback_data("confirm"),
+                    ),
+                    InlineKeyboardButton(
+                        "Отмена",
+                        callback_data=stage.callback_data("cancel"),
+                    ),
+                ]
+            ]
+        )
+
+    @staticmethod
+    def _nova_brain_forget_target(text: str, memories: tuple[Any, ...]) -> Any | None:
+        if not memories:
+            return None
+        if re.search(r"\b(?:это|неактуально)\b", text, re.IGNORECASE):
+            return memories[0] if len(memories) == 1 else None
+        query = re.sub(
+            r"^забудь\s*,?\s*что\s+я\s+говорил[аи]?\s+о\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        query_tokens = set(re.findall(r"[a-zа-яё0-9]{3,}", query.casefold()))
+
+        def token_matches(left: str, right: str) -> bool:
+            return left == right or (len(left) >= 5 and len(right) >= 5 and left[:5] == right[:5])
+
+        scored = [
+            (
+                sum(
+                    any(token_matches(query_token, memory_token) for query_token in query_tokens)
+                    for memory_token in re.findall(
+                        r"[a-zа-яё0-9]{3,}",
+                        observed_memory_display_value(memory.value).casefold(),
+                    )
+                ),
+                memory,
+            )
+            for memory in memories
+        ]
+        scored.sort(key=lambda item: (-item[0], item[1].public_id))
+        if not scored or scored[0][0] == 0:
+            return None
+        if len(scored) > 1 and scored[0][0] == scored[1][0]:
+            return None
+        return scored[0][1]
 
     @staticmethod
     def _nova_companion_status_key(
@@ -1977,6 +2413,53 @@ class NovaCompanionHandlers:
                 neutral_text=self._nova_companion_neutral_text(memory_status),
             )
             return
+        brain_projection: NovaBrainProjection | None = None
+        brain_fence: NovaBrainFence | None = None
+        brain_policy = self.nova_brain_policy()
+        if brain_policy.allows_actor(user):
+            try:
+                brain_snapshot = await self.nova_brain_service.snapshot(
+                    telegram_actor_id=user.telegram_id,
+                    chat_id=update.effective_chat.id,
+                    expected_tier=user.access_tier,
+                    expected_access_version=user.access_version,
+                    current_text=text,
+                    policy=brain_policy,
+                )
+            except asyncio.CancelledError:
+                self._nova_companion_schedule_pre_delivery_cleanup(
+                    context,
+                    delivery_message,
+                    chat_id=update.effective_chat.id,
+                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Nova companion failed operation=brain_snapshot error_type=%s",
+                    type(exc).__name__,
+                )
+                await self._nova_companion_retire_pre_delivery(
+                    context,
+                    delivery_message,
+                    chat_id=update.effective_chat.id,
+                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
+                return
+            if brain_snapshot.status != "ready" or brain_snapshot.fence is None:
+                await self._nova_companion_retire_pre_delivery(
+                    context,
+                    delivery_message,
+                    chat_id=update.effective_chat.id,
+                    neutral_text=(
+                        NOVA_COMPANION_ACCESS_CHANGED_TEXT
+                        if brain_snapshot.status == "access_changed"
+                        else NOVA_COMPANION_UNAVAILABLE_TEXT
+                    ),
+                )
+                return
+            brain_projection = brain_snapshot.projection
+            brain_fence = brain_snapshot.fence
         try:
             materialized = await self.nova_companion_context.snapshot(
                 telegram_actor_id=user.telegram_id,
@@ -2023,6 +2506,7 @@ class NovaCompanionHandlers:
             access_version=user.access_version,
             context_fence=materialized.fence,
             memory_revision=memory_revision,
+            brain_fence=brain_fence,
         )
         generation_timezone = materialized.fence.timezone_name
         try:
@@ -2062,11 +2546,18 @@ class NovaCompanionHandlers:
                 type(exc).__name__,
             )
         provider_failed = False
+        discourse_anchor: NovaCompanionDiscourseAnchor | None = None
         try:
+            provider_context = materialized.projection.provider_payload()
+            recent = provider_context.get("recent_conversation")
+            recent_messages = recent.get("recent_messages") if isinstance(recent, dict) else None
+            discourse_anchor = NovaCompanionDiscourseReducer.reduce(text, recent_messages)
             result = await self.ai.companion_message(
                 text,
                 temporal_context(generation_timezone),
                 materialized.projection,
+                discourse_anchor=discourse_anchor,
+                brain_context=brain_projection,
             )
         except asyncio.CancelledError:
             self._nova_companion_schedule_pre_delivery_cleanup(
@@ -2158,6 +2649,15 @@ class NovaCompanionHandlers:
                 if reminder_offer_attempted and reminder_candidate is None
                 else result.answer
             )
+            answer, discourse_recovered = _companion_discourse_answer(
+                answer,
+                discourse_anchor,
+            )
+            raw_answer_replaced = discourse_recovered
+            if discourse_recovered and discourse_anchor is not None:
+                suggestion = None
+                if discourse_anchor.status == "ambiguous":
+                    reminder_candidate = None
             if _has_untrusted_operational_claim(
                 answer,
                 user_text=text,
@@ -2176,6 +2676,27 @@ class NovaCompanionHandlers:
                     else NOVA_COMPANION_NOT_EXECUTED_TEXT
                 )
                 suggestion = None
+                raw_answer_replaced = True
+            visible_action = (
+                "reminder"
+                if reminder_candidate is not None
+                else "capture"
+                if suggestion is not None
+                else None
+            )
+            dialogue_state_update = None
+            memory_candidate = None
+            if brain_fence is not None and not raw_answer_replaced:
+                dialogue_state_update = validate_dialogue_state_update(
+                    result.dialogue_state_update,
+                    user_text=text,
+                    assistant_answer=answer,
+                    visible_action=visible_action,
+                )
+                memory_candidate = validate_memory_candidate(
+                    result.memory_candidate,
+                    user_text=text,
+                )
             prepared = _PreparedCompanionAnswer(
                 answer=answer,
                 suggestion=suggestion,
@@ -2187,6 +2708,29 @@ class NovaCompanionHandlers:
                     capture_temporal
                     if suggestion is not None and suggestion.kind == "task"
                     else None
+                ),
+                dialogue_state_update=dialogue_state_update,
+                memory_candidate=memory_candidate,
+                persist_exchange=True,
+            )
+            logger.info(
+                "Nova companion trace route=companion provider_called=true "
+                "profile_count=%s vision_count=%s goal_count=%s confirmed_memory_count=%s "
+                "recent_message_count=%s working_state_revision=%s retrieved_memory_count=%s "
+                "raw_answer_replaced=%s proposal_accepted=%s",
+                int(materialized.projection.profile_present),
+                materialized.projection.vision_count,
+                materialized.projection.goal_count,
+                materialized.projection.memory_count,
+                materialized.projection.recent_message_count,
+                brain_projection.working_state.revision if brain_projection is not None else 0,
+                len(brain_projection.memories) if brain_projection is not None else 0,
+                raw_answer_replaced,
+                bool(
+                    suggestion is not None
+                    or reminder_candidate is not None
+                    or dialogue_state_update is not None
+                    or memory_candidate is not None
                 ),
             )
         await self._nova_companion_deliver(
@@ -2372,6 +2916,18 @@ class NovaCompanionHandlers:
                     return "context_changed"
                 if current.status not in {"ready", "empty"}:
                     return "unavailable"
+            if (
+                generation.brain_fence is not None
+                and not await self.nova_brain_service.current_check(
+                    generation.brain_fence,
+                    policy=self.nova_brain_policy(),
+                )
+            ):
+                return (
+                    "context_changed"
+                    if await self._nova_companion_generation_actor_is_current(generation)
+                    else "access_changed"
+                )
             return "ready"
         except asyncio.CancelledError:
             raise
@@ -2469,6 +3025,7 @@ class NovaCompanionHandlers:
         stage: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None = None
         screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None = None
         exchange_receipt: ConversationExchangeReceipt | None = None
+        brain_receipt: NovaBrainApplyReceipt | None = None
         active_reminder_anchor: NovaCompanionReminderCapability | None = None
         sent: Any | None = delivery_message
         message_id = self._positive_companion_message_id(
@@ -2673,6 +3230,66 @@ class NovaCompanionHandlers:
                     neutral_text=self._nova_companion_neutral_text(check),
                 )
                 return False
+            if prepared.dialogue_state_update is not None or prepared.memory_candidate is not None:
+                conversation_fence = prepared.generation.context_fence.conversation_fence
+                source_identity = (
+                    exchange_receipt.source_identity_for(conversation_fence)
+                    if exchange_receipt is not None and conversation_fence is not None
+                    else None
+                )
+                if prepared.generation.brain_fence is None or source_identity is None:
+                    await self._nova_companion_delivery_cleanup(
+                        context,
+                        prepared,
+                        sent=sent,
+                        message_id=message_id,
+                        stage=stage,
+                        screen=screen,
+                        exchange_receipt=exchange_receipt,
+                        neutral_text=NOVA_COMPANION_CONTEXT_CHANGED_TEXT,
+                    )
+                    return False
+                brain_receipt = await self.nova_brain_service.apply_turn(
+                    prepared.generation.brain_fence,
+                    source_identity,
+                    state_update=prepared.dialogue_state_update,
+                    memory_candidate=prepared.memory_candidate,
+                    user_text=prepared.user_text,
+                    policy=self.nova_brain_policy(),
+                )
+                if brain_receipt is None:
+                    await self._nova_companion_delivery_cleanup(
+                        context,
+                        prepared,
+                        sent=sent,
+                        message_id=message_id,
+                        stage=stage,
+                        screen=screen,
+                        exchange_receipt=exchange_receipt,
+                        neutral_text=NOVA_COMPANION_CONTEXT_CHANGED_TEXT,
+                    )
+                    return False
+                result_generation = replace(
+                    prepared.generation,
+                    brain_fence=brain_receipt.result_fence,
+                )
+                check = await self._nova_companion_current_check(
+                    result_generation,
+                    exchange_receipt=exchange_receipt,
+                )
+                if check != "ready":
+                    await self._nova_companion_delivery_cleanup(
+                        context,
+                        prepared,
+                        sent=sent,
+                        message_id=message_id,
+                        stage=stage,
+                        screen=screen,
+                        exchange_receipt=exchange_receipt,
+                        neutral_text=self._nova_companion_neutral_text(check),
+                        brain_receipt=brain_receipt,
+                    )
+                    return False
             return True
         except asyncio.CancelledError:
             self._nova_companion_schedule_delivery_cleanup(
@@ -2684,6 +3301,7 @@ class NovaCompanionHandlers:
                 screen=screen,
                 exchange_receipt=exchange_receipt,
                 neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                brain_receipt=brain_receipt,
             )
             raise
         except Exception as exc:
@@ -2700,6 +3318,7 @@ class NovaCompanionHandlers:
                 screen=screen,
                 exchange_receipt=exchange_receipt,
                 neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                brain_receipt=brain_receipt,
             )
             return False
 
@@ -2714,6 +3333,7 @@ class NovaCompanionHandlers:
         screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None,
         exchange_receipt: ConversationExchangeReceipt | None,
         neutral_text: str,
+        brain_receipt: NovaBrainApplyReceipt | None = None,
     ) -> None:
         coroutine = self._nova_companion_delivery_cleanup(
             context,
@@ -2724,6 +3344,7 @@ class NovaCompanionHandlers:
             screen=screen,
             exchange_receipt=exchange_receipt,
             neutral_text=neutral_text,
+            brain_receipt=brain_receipt,
         )
         try:
             task = asyncio.create_task(
@@ -2750,6 +3371,7 @@ class NovaCompanionHandlers:
         screen: NovaCompanionCaptureScreen | NovaCompanionReminderScreen | None,
         exchange_receipt: ConversationExchangeReceipt | None,
         neutral_text: str,
+        brain_receipt: NovaBrainApplyReceipt | None = None,
         reminder_lock_held: bool = False,
     ) -> bool:
         reminder_screen = isinstance(
@@ -2767,6 +3389,7 @@ class NovaCompanionHandlers:
                     screen=screen,
                     exchange_receipt=exchange_receipt,
                     neutral_text=neutral_text,
+                    brain_receipt=brain_receipt,
                     reminder_lock_held=True,
                 )
         clean = True
@@ -2802,6 +3425,22 @@ class NovaCompanionHandlers:
                     "Nova companion failed operation=exchange_cleanup error_type=%s",
                     type(exc).__name__,
                 )
+        if brain_receipt is not None:
+            try:
+                compensated = await self.nova_brain_service.compensate_turn(brain_receipt)
+                if not compensated:
+                    clean = False
+                    logger.warning(
+                        "Nova companion failed operation=brain_cleanup error_type=StateChanged"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                clean = False
+                logger.warning(
+                    "Nova companion failed operation=brain_cleanup error_type=%s",
+                    type(exc).__name__,
+                )
         if canonical_owned and sent is not None and message_id is not None:
             try:
                 await self._nova_companion_compensate(
@@ -2834,6 +3473,168 @@ class NovaCompanionHandlers:
             assistant_content=prepared.answer,
             user_source=prepared.source,
         )
+
+    async def nova_brain_callback(self, update: Any, context: Any) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        user = await self._nova_companion_lookup_actor(update.effective_user.id)
+        message_id = self._positive_companion_message_id(
+            getattr(getattr(query, "message", None), "message_id", None)
+        )
+        capability = None
+        if user is not None and message_id is not None:
+            capability = await self.nova_brain_forget.peek(
+                query.data,
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+                canonical_message_id=message_id,
+            )
+        await self._nova_companion_answer_query(query)
+        if capability is None or not await self.nova_brain_forget.consume(capability):
+            return
+        assert user is not None
+        coroutine = self._nova_brain_callback_lifecycle(
+            query,
+            context,
+            user,
+            capability,
+        )
+        try:
+            task = asyncio.create_task(coroutine, name="nova-brain-memory-callback")
+        except BaseException:
+            coroutine.close()
+            raise
+        self._track_nova_companion_task(task)
+        await asyncio.shield(task)
+
+    async def _nova_brain_callback_lifecycle(
+        self,
+        query: Any,
+        context: Any,
+        user: User,
+        capability: NovaBrainForgetCapability,
+    ) -> bool:
+        terminal_text: str | None = None
+        try:
+            async with self._nova_brain_ui_lock:
+                if not await self.nova_brain_forget.consumed_screen_is_current(capability):
+                    return False
+                if (
+                    capability.access_version != user.access_version
+                    or not self.nova_brain_policy().allows_actor(
+                        user,
+                        expected_access_version=capability.access_version,
+                    )
+                    or not await self._nova_companion_actor_is_current(user)
+                ):
+                    terminal_text = NOVA_COMPANION_ACCESS_CHANGED_TEXT
+                    await query.edit_message_text(terminal_text, reply_markup=None)
+                    return False
+                if capability.action == "cancel":
+                    terminal_text = "Хорошо, память оставляю."
+                    await query.edit_message_text(terminal_text, reply_markup=None)
+                    return True
+                result = await self.nova_brain_service.forget_exact(
+                    telegram_actor_id=user.telegram_id,
+                    public_id=capability.memory_public_id,
+                    expected_revision=capability.memory_revision,
+                    expected_access_version=capability.access_version,
+                    policy=self.nova_brain_policy(),
+                )
+                if result.status == "applied":
+                    terminal_text = "Забыла выбранную запись."
+                    await query.edit_message_text(terminal_text, reply_markup=None)
+                    return True
+                terminal_text = "Запись уже изменилась или была удалена. Ничего не меняю."
+                await query.edit_message_text(terminal_text, reply_markup=None)
+                return False
+        except asyncio.CancelledError:
+            self._nova_brain_schedule_consumed_cleanup(
+                query,
+                user,
+                capability,
+                terminal_text=terminal_text,
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=memory_forget error_type=%s",
+                type(exc).__name__,
+            )
+            await self._nova_brain_consumed_cleanup(
+                query,
+                user,
+                capability,
+                terminal_text=terminal_text,
+            )
+            return False
+
+    def _nova_brain_schedule_consumed_cleanup(
+        self,
+        query: Any,
+        user: User,
+        capability: NovaBrainForgetCapability,
+        *,
+        terminal_text: str | None,
+    ) -> None:
+        coroutine = self._nova_brain_consumed_cleanup(
+            query,
+            user,
+            capability,
+            terminal_text=terminal_text,
+        )
+        try:
+            task = asyncio.create_task(coroutine, name="nova-brain-memory-cleanup")
+        except BaseException as exc:
+            coroutine.close()
+            logger.warning(
+                "Nova companion failed operation=memory_forget_cleanup_schedule error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        self._track_nova_companion_task(task)
+
+    async def _nova_brain_consumed_cleanup(
+        self,
+        query: Any,
+        user: User,
+        capability: NovaBrainForgetCapability,
+        *,
+        terminal_text: str | None,
+    ) -> bool:
+        try:
+            async with self._nova_brain_ui_lock:
+                if not await self.nova_brain_forget.consumed_screen_is_current(capability):
+                    return False
+                actor_current = await self._nova_companion_actor_is_current(user)
+                if terminal_text is not None or not actor_current:
+                    await query.edit_message_text(
+                        terminal_text or NOVA_COMPANION_ACCESS_CHANGED_TEXT,
+                        reply_markup=None,
+                    )
+                    return True
+                recovered = await self.nova_brain_forget.stage_recovery(capability)
+                if recovered is None:
+                    return False
+                try:
+                    await query.edit_message_text(
+                        "Забыть выбранную запись?",
+                        reply_markup=self._nova_brain_forget_markup(recovered),
+                    )
+                except BaseException:
+                    await self.nova_brain_forget.revoke(recovered)
+                    raise
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=memory_forget_cleanup error_type=%s",
+                type(exc).__name__,
+            )
+            return False
 
     async def nova_companion_callback(self, update: Any, context: Any) -> None:
         query = update.callback_query

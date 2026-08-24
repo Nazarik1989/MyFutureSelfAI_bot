@@ -309,6 +309,51 @@ class ConversationExchangeReceipt:
             return None
         return self._result_fence
 
+    def source_identity_for(
+        self,
+        expected: CompanionConversationFence,
+    ) -> "ConversationExchangeSource | None":
+        """Expose only a content-free provenance receipt for the exact prior fence."""
+
+        if type(expected) is not CompanionConversationFence or expected != self._prior_fence:
+            return None
+        manifest = (
+            f"{self._prior_fence.owner_id}:{self._session_id}:"
+            f"{self._user_message_id}:{self._assistant_message_id}:"
+            f"{self._result_fence.revision}"
+        )
+        return ConversationExchangeSource(
+            session_id=self._session_id,
+            user_message_id=self._user_message_id,
+            assistant_message_id=self._assistant_message_id,
+            receipt=sha256(manifest.encode("ascii")).hexdigest(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationExchangeSource:
+    """Content-free durable provenance for a committed companion exchange."""
+
+    session_id: int = field(repr=False)
+    user_message_id: int = field(repr=False)
+    assistant_message_id: int = field(repr=False)
+    receipt: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                type(value) is not int or value <= 0
+                for value in (
+                    self.session_id,
+                    self.user_message_id,
+                    self.assistant_message_id,
+                )
+            )
+            or len(self.receipt) != 64
+            or any(character not in "0123456789abcdef" for character in self.receipt)
+        ):
+            raise ValueError("Invalid companion exchange source")
+
 
 class _ConversationExchangeChanged(Exception):
     """Content-free sentinel used to roll back an access/context CAS miss."""

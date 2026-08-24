@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from itertools import count
 from types import SimpleNamespace
 from typing import Any
@@ -25,13 +26,20 @@ from future_self.models import (
     DraftInboxItem,
     Goal,
     InboxItem,
+    NovaDialogueState,
+    NovaMemoryItem,
+    NovaObservedMemory,
     TaskReminder,
     User,
+    VisionItem,
+    VisionProfile,
+    WeeklyFocus,
 )
 from future_self.nova_companion_flow import CaptureSuggestion, NovaCompanionCaptureStore
 from future_self.nova_companion_handlers import (
     NOVA_COMPANION_ACCESS_CHANGED_TEXT,
     NOVA_COMPANION_CONTEXT_CHANGED_TEXT,
+    NOVA_COMPANION_DISCOURSE_AMBIGUOUS_TEXT,
     NOVA_COMPANION_NO_ACTIVE_REMINDER_OFFER_TEXT,
     NOVA_COMPANION_NOT_EXECUTED_TEXT,
     NOVA_COMPANION_REMINDER_OFFER_ACTION_TEXT,
@@ -40,10 +48,16 @@ from future_self.nova_companion_handlers import (
 from future_self.reminder_flow import ReminderFlowPhase
 from future_self.schemas import (
     NovaCompanionCapture,
+    NovaCompanionDialogueStateUpdate,
+    NovaCompanionMemoryCandidate,
+    NovaCompanionProviderCapture,
+    NovaCompanionProviderReminderOffer,
+    NovaCompanionProviderResponse,
     NovaCompanionReminderOffer,
     NovaCompanionResponse,
     ParsedThought,
 )
+from future_self.weekly_review import current_week_start
 
 
 class CompanionMessage:
@@ -246,8 +260,16 @@ async def ready_companion_bot(
     ai: Any,
     *,
     telegram_user_id: int = 71_001,
+    enable_brain: bool = False,
+    brain_admin_only: bool = False,
 ) -> tuple[FutureSelfBot, User]:
-    bot = FutureSelfBot(companion_settings(db), db, ai, NoopTranscription())
+    settings = companion_settings(db).model_copy(
+        update={
+            "enable_nova_conversation_brain": enable_brain,
+            "nova_conversation_brain_admin_only": brain_admin_only,
+        }
+    )
+    bot = FutureSelfBot(settings, db, ai, NoopTranscription())
     await bot._user(telegram_user_id)
     await AccessService(db).grant_subscriber(telegram_user_id, source="companion-handler-test")
     async with db.session() as session:
@@ -1890,6 +1912,862 @@ async def test_callback_answer_bad_request_is_private_and_does_not_abort_lifecyc
     assert bot._nova_companion_tasks == set()
 
 
+async def test_nova_brain_successful_delivery_applies_exchange_state_and_memory_atomically(
+    db,
+    fake_ai,
+):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    text = "Я предпочитаю короткие ответы"
+    answer = "Могу предложить короткое упражнение. Какой вариант тебе ближе?"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer=answer,
+        dialogue_state_update=NovaCompanionDialogueStateUpdate(
+            active_topic="короткие ответы",
+            last_assistant_offer="Могу предложить короткое упражнение.",
+            last_assistant_offer_kinds=["exercise"],
+            unresolved_question="Какой вариант тебе ближе?",
+        ),
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="preference",
+            key="response_length",
+            value="short",
+            evidence=text,
+            salience=5,
+        ),
+    )
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+    snapshot = await bot.conversation.get(user.telegram_id, user.telegram_id)
+
+    handled = await bot.nova_companion_route(
+        companion_update(
+            incoming,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+        ),
+        companion_context(),
+        text,
+        "text",
+        user=user,
+        conversation_snapshot=snapshot,
+    )
+
+    assert handled
+    assert len(fake_ai.companion_calls) == 1
+    assert fake_ai.companion_brain_calls[0] is not None
+    assert incoming.replies[0]["text"] == answer
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 2
+        state = await session.scalar(select(NovaDialogueState))
+        memory = await session.scalar(select(NovaObservedMemory))
+        assert state is not None and state.active_topic == "короткие ответы"
+        assert state.revision == 1
+        assert memory is not None and memory.status == "active"
+        assert memory.normalized_value == "response_length=short"
+        assert memory.source_message_id > 0
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_telegram_failure_leaves_no_exchange_state_or_memory(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    text = "Я предпочитаю короткие ответы"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Поняла.",
+        dialogue_state_update=NovaCompanionDialogueStateUpdate(active_topic="короткие ответы"),
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="preference",
+            key="response_length",
+            value="short",
+            evidence=text,
+        ),
+    )
+    incoming = CompanionMessage(
+        text,
+        chat_id=user.telegram_id,
+        reply_error=RuntimeError("PRIVATE_SEND_FAILURE"),
+    )
+
+    await deliver(bot, user, incoming, context=companion_context())
+
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(NovaDialogueState.id))) == 0
+        assert await session.scalar(select(func.count(NovaObservedMemory.id))) == 0
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_concurrent_newer_state_invalidates_blocked_older_response(
+    db,
+    fake_ai,
+):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    text = "Обсудим старую тему"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Старый ответ",
+        dialogue_state_update=NovaCompanionDialogueStateUpdate(active_topic="старую тему"),
+    )
+    fake_ai.companion_release.clear()
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+    snapshot = await bot.conversation.get(user.telegram_id, user.telegram_id)
+    task = asyncio.create_task(
+        bot.nova_companion_route(
+            companion_update(
+                incoming,
+                telegram_user_id=user.telegram_id,
+                chat_id=user.telegram_id,
+            ),
+            companion_context(),
+            text,
+            "text",
+            user=user,
+            conversation_snapshot=snapshot,
+        )
+    )
+    await asyncio.wait_for(fake_ai.companion_started.wait(), timeout=5)
+    async with db.session() as session:
+        session.add(
+            NovaDialogueState(
+                owner_id=user.id,
+                telegram_user_id=user.telegram_id,
+                chat_id=user.telegram_id,
+                access_version=user.access_version,
+                active_topic="новая тема",
+                last_assistant_offer_kinds=[],
+                open_loops=[],
+                revision=1,
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+            )
+        )
+    fake_ai.companion_release.set()
+    await task
+
+    assert incoming.replies == []
+    async with db.sessions() as session:
+        state = await session.scalar(select(NovaDialogueState))
+        assert state is not None and state.active_topic == "новая тема"
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(NovaObservedMemory.id))) == 0
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_recall_and_exact_forget_confirmation_are_provider_free(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    async with db.session() as session:
+        session.add(
+            NovaObservedMemory(
+                owner_id=user.id,
+                category="preference",
+                normalized_value="response_length=short",
+                content_fingerprint="a" * 64,
+                source_kind="conversation",
+                source_session_id=1,
+                source_message_id=1,
+                source_receipt="b" * 64,
+                status="active",
+                salience=5,
+                revision=1,
+            )
+        )
+    recall = CompanionMessage("Что ты обо мне помнишь?", chat_id=user.telegram_id)
+    recall_snapshot = await bot.conversation.get(user.telegram_id, user.telegram_id)
+
+    assert await bot.nova_companion_route(
+        companion_update(
+            recall,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+        ),
+        companion_context(),
+        recall.text or "",
+        "text",
+        user=user,
+        conversation_snapshot=recall_snapshot,
+    )
+    assert "короткие ответы" in recall.replies[0]["text"]
+    assert fake_ai.companion_calls == []
+
+    forget = CompanionMessage("Забудь это", chat_id=user.telegram_id)
+    forget_snapshot = await bot.conversation.get(user.telegram_id, user.telegram_id)
+    assert await bot.nova_companion_route(
+        companion_update(
+            forget,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+        ),
+        companion_context(),
+        forget.text or "",
+        "text",
+        user=user,
+        conversation_snapshot=forget_snapshot,
+    )
+    canonical = forget.replies[0]["message"]
+    callback = callback_by_label(forget.replies[0]["reply_markup"], "Забыть")
+    query = CompanionQuery(callback, canonical)
+    await bot.nova_brain_callback(
+        companion_update(
+            canonical,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+            query=query,
+        ),
+        companion_context(),
+    )
+
+    assert query.answer_attempts == 1
+    assert query.edits[-1]["text"] == "Забыла выбранную запись."
+    async with db.sessions() as session:
+        memory = await session.scalar(select(NovaObservedMemory))
+        assert memory is not None and memory.status == "forgotten"
+    replay = CompanionQuery(callback, canonical)
+    await bot.nova_brain_callback(
+        companion_update(
+            canonical,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+            query=replay,
+        ),
+        companion_context(),
+    )
+    assert replay.answer_attempts == 1
+    assert replay.edits == []
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_recall_is_bounded_and_separates_all_current_source_layers(db, fake_ai):
+    base, user = await ready_companion_bot(
+        db,
+        fake_ai,
+        telegram_user_id=74_100,
+        enable_brain=True,
+    )
+    settings = base.settings.model_copy(
+        update={
+            "enable_nova_memory": True,
+            "nova_memory_admin_only": False,
+            "enable_nova_memory_application": True,
+            "nova_memory_application_admin_only": False,
+        }
+    )
+    bot = FutureSelfBot(settings, db, fake_ai, NoopTranscription())
+    async with db.session() as session:
+        await session.execute(
+            update(User)
+            .where(User.id == user.id)
+            .values(display_name="Назар", location_city="Казань")
+        )
+        session.add_all(
+            [
+                VisionProfile(
+                    user_id=user.id,
+                    raw_answers={},
+                    summary="Хочу жить спокойнее и осознаннее",
+                    values=["самостоятельность"],
+                    desired_identity=["надёжный человек"],
+                    constraints=[],
+                ),
+                VisionItem(
+                    owner_id=user.id,
+                    category="growth_creativity",
+                    wish_text="написать свою книгу",
+                    why_text="важно выразить идеи",
+                    first_step="составить план",
+                    status="active",
+                ),
+                Goal(
+                    user_id=user.id,
+                    life_area="Развитие",
+                    title="подготовить рукопись",
+                    outcome="готовая рукопись",
+                    progress_criterion="десять глав",
+                    horizon="год",
+                    status="active",
+                    priority=5,
+                    vision_link="написать свою книгу",
+                ),
+                WeeklyFocus(
+                    owner_id=user.id,
+                    week_start=current_week_start(
+                        "Europe/Moscow",
+                        now=datetime.now(UTC),
+                    ),
+                    focus="первая глава книги",
+                    approach="писать по утрам",
+                    small_steps=["набросать структуру"],
+                    source="text",
+                ),
+                NovaMemoryItem(
+                    owner_id=user.id,
+                    category="interaction",
+                    content="предпочитает конкретные примеры",
+                    content_fingerprint=sha256(
+                        "предпочитает конкретные примеры".encode()
+                    ).hexdigest(),
+                    important=True,
+                    version=1,
+                ),
+                NovaObservedMemory(
+                    owner_id=user.id,
+                    category="identity",
+                    normalized_value=("identity:display_name=назар;grammatical_address=masculine"),
+                    content_fingerprint=sha256(
+                        "identity:display_name=назар;grammatical_address=masculine".encode()
+                    ).hexdigest(),
+                    source_kind="conversation",
+                    source_session_id=1,
+                    source_message_id=1,
+                    source_receipt="c" * 64,
+                    status="active",
+                    salience=5,
+                    revision=1,
+                ),
+            ]
+        )
+    user = await bot._user(user.telegram_id)
+    incoming = CompanionMessage("Что ты обо мне помнишь?", chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming, context=companion_context())
+
+    answer = incoming.replies[0]["text"]
+    for expected in (
+        "Подтверждено в профиле",
+        "имя: Назар",
+        "город: Казань",
+        "Анкета и профиль",
+        "Текущие планы и ориентиры",
+        "первая глава книги",
+        "подготовить рукопись",
+        "написать свою книгу",
+        "Подтверждено тобой в Nova Memory",
+        "предпочитает конкретные примеры",
+        "Сохранено из твоих слов",
+        "имя: Назар; мужское обращение",
+    ):
+        assert expected in answer
+    assert "Ты говорила" not in answer
+    assert "всё, что хранится" not in answer
+    assert len(answer) <= 1_900
+    assert fake_ai.companion_calls == []
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_post_apply_context_change_compensates_exact_turn(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    text = "Я предпочитаю короткие ответы"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Поняла.",
+        dialogue_state_update=NovaCompanionDialogueStateUpdate(active_topic="короткие ответы"),
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="preference",
+            key="response_length",
+            value="short",
+            evidence=text,
+        ),
+    )
+
+    async def mutate_authoritative_context(_receipt):
+        async with db.session() as session:
+            await session.execute(
+                update(User).where(User.id == user.id).values(display_name="Новая Лена")
+            )
+
+    bot.nova_brain_service._after_apply_commit = mutate_authoritative_context
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+    context = companion_context()
+
+    await deliver(bot, user, incoming, context=context)
+
+    assert len(incoming.replies) == 1
+    assert context.bot.deleted == [(user.telegram_id, incoming.replies[0]["message"].message_id)]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(NovaDialogueState.id))) == 0
+        assert await session.scalar(select(func.count(NovaObservedMemory.id))) == 0
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_disabled_preserves_stage_b_and_ignores_provider_proposals(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=False)
+    text = "Я предпочитаю короткие ответы"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Поняла.",
+        dialogue_state_update=NovaCompanionDialogueStateUpdate(active_topic="короткие ответы"),
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="preference",
+            key="response_length",
+            value="short",
+            evidence=text,
+        ),
+    )
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming, context=companion_context())
+
+    assert incoming.replies[0]["text"] == "Поняла."
+    assert fake_ai.companion_brain_calls == [None]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 2
+        assert await session.scalar(select(func.count(NovaDialogueState.id))) == 0
+        assert await session.scalar(select(func.count(NovaObservedMemory.id))) == 0
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("gate", ["disabled", "tier_ineligible"])
+@pytest.mark.parametrize(
+    "proposal_kind",
+    ["valid_memory", "invalid_memory", "sensitive_memory", "capture", "reminder"],
+)
+async def test_nova_brain_gate_is_strict_stage_b_fallback_for_all_provider_proposals(
+    db,
+    fake_ai,
+    source,
+    gate,
+    proposal_kind,
+):
+    enabled = gate == "tier_ineligible"
+    bot, user = await ready_companion_bot(
+        db,
+        fake_ai,
+        telegram_user_id=72_000
+        + (0 if source == "text" else 100)
+        + (0 if gate == "disabled" else 10)
+        + ["valid_memory", "invalid_memory", "sensitive_memory", "capture", "reminder"].index(
+            proposal_kind
+        ),
+        enable_brain=enabled,
+        brain_admin_only=enabled,
+    )
+    safe_answer = f"Безопасный ответ {proposal_kind}."
+    if proposal_kind == "capture":
+        text = "Я хочу подготовить письмо Марине и открыть документ; у меня диагноз PRIVATE"
+        capture = NovaCompanionProviderCapture(
+            kind="task",
+            title="подготовить письмо Марине",
+            next_step="открыть документ",
+            evidence="подготовить письмо Марине и открыть документ",
+        )
+        reminder = None
+        memory = NovaCompanionMemoryCandidate(
+            category="fact",
+            value="у меня диагноз PRIVATE",
+            evidence="у меня диагноз PRIVATE",
+        )
+    elif proposal_kind == "reminder":
+        text = "Завтра в 10:00 позвонить врачу; у меня диагноз PRIVATE"
+        capture = None
+        reminder = NovaCompanionProviderReminderOffer(
+            title="позвонить врачу",
+            schedule_wording="Завтра в 10:00",
+            evidence=text,
+        )
+        memory = NovaCompanionMemoryCandidate(
+            category="fact",
+            value="у меня диагноз PRIVATE",
+            evidence="у меня диагноз PRIVATE",
+        )
+    elif proposal_kind == "valid_memory":
+        text = "Я предпочитаю короткие ответы"
+        capture = None
+        reminder = None
+        memory = NovaCompanionMemoryCandidate(
+            category="preference",
+            key="response_length",
+            value="short",
+            evidence=text,
+        )
+    elif proposal_kind == "sensitive_memory":
+        text = "У меня депрессия"
+        capture = None
+        reminder = None
+        memory = NovaCompanionMemoryCandidate(
+            category="fact",
+            value=text,
+            evidence=text,
+        )
+    else:
+        text = "Иногда думаю о прогулке"
+        capture = None
+        reminder = None
+        memory = NovaCompanionMemoryCandidate(
+            category="fact",
+            value="прогулка",
+            evidence=text,
+        )
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer=safe_answer,
+        capture=capture,
+        reminder_offer=reminder,
+        dialogue_state_update=NovaCompanionDialogueStateUpdate(active_topic=text[:40]),
+        memory_candidate=memory,
+    )
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+    progress = (
+        CompanionMessage("Распознаю…", chat_id=user.telegram_id) if source == "voice" else None
+    )
+
+    await deliver(
+        bot,
+        user,
+        incoming,
+        source=source,
+        delivery_message=progress,
+        context=companion_context(),
+    )
+
+    delivered = progress.edits[-1]["text"] if progress is not None else incoming.replies[0]["text"]
+    assert delivered == safe_answer
+    assert len(fake_ai.companion_calls) == 1
+    assert fake_ai.companion_brain_calls == [None]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 2
+        assert await session.scalar(select(func.count(NovaDialogueState.id))) == 0
+        assert await session.scalar(select(func.count(NovaObservedMemory.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_rejected_private_memory_never_reaches_ui_exchange_or_logs(
+    db,
+    fake_ai,
+    caplog,
+):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    private = "PRIVATE_DIAGNOSIS_SENTINEL"
+    text = f"У меня диагноз {private}"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer=f"Я запомнила {private}",
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="fact",
+            value=f"у меня диагноз {private}",
+            evidence=text,
+        ),
+    )
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+
+    with caplog.at_level(logging.INFO):
+        await deliver(bot, user, incoming, context=companion_context())
+
+    assert private not in incoming.replies[0]["text"]
+    assert private not in caplog.text
+    async with db.sessions() as session:
+        rows = list((await session.scalars(select(ConversationMessage))).all())
+        assert len(rows) == 2
+        assert rows[0].role == "user" and private in rows[0].content
+        assert rows[1].role == "assistant" and private not in rows[1].content
+        assert await session.scalar(select(func.count(NovaObservedMemory.id))) == 0
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("action", ["capture", "reminder"])
+async def test_nova_brain_rejected_memory_preserves_independent_safe_action_and_exchange(
+    db,
+    fake_ai,
+    source,
+    action,
+):
+    bot, user = await ready_companion_bot(
+        db,
+        fake_ai,
+        telegram_user_id=73_000
+        + (0 if source == "text" else 10)
+        + (0 if action == "capture" else 1),
+        enable_brain=True,
+    )
+    safe_answer = "Я рядом; действие появится только после твоего подтверждения."
+    if action == "capture":
+        text = "Я хочу подготовить письмо Марине и открыть документ; у меня депрессия"
+        capture = NovaCompanionProviderCapture(
+            kind="task",
+            title="подготовить письмо Марине",
+            next_step="открыть документ",
+            evidence="подготовить письмо Марине и открыть документ",
+        )
+        reminder = None
+        expected_prefix = "ncap:"
+    else:
+        text = "Завтра в 10:00 позвонить врачу; у меня депрессия"
+        capture = None
+        reminder = NovaCompanionProviderReminderOffer(
+            title="позвонить врачу",
+            schedule_wording="Завтра в 10:00",
+            evidence=text,
+        )
+        expected_prefix = "nrem:"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer=safe_answer,
+        capture=capture,
+        reminder_offer=reminder,
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="fact",
+            value="у меня депрессия",
+            evidence="у меня депрессия",
+        ),
+    )
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+    progress = (
+        CompanionMessage("Распознаю…", chat_id=user.telegram_id) if source == "voice" else None
+    )
+
+    await deliver(
+        bot,
+        user,
+        incoming,
+        source=source,
+        delivery_message=progress,
+        context=companion_context(),
+    )
+
+    canonical = progress if progress is not None else sent_answer(incoming)
+    delivered = progress.edits[-1]["text"] if progress is not None else incoming.replies[0]["text"]
+    assert delivered == safe_answer
+    assert len(fake_ai.companion_calls) == 1
+    assert canonical.markup_edits
+    callbacks = [
+        button.callback_data for row in canonical.markup_edits[-1].inline_keyboard for button in row
+    ]
+    assert any(value.startswith(expected_prefix) for value in callbacks)
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 2
+        assert await session.scalar(select(func.count(NovaObservedMemory.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_nova_brain_working_state_survives_recent_window_and_service_restart(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    async with db.session() as session:
+        session.add(
+            NovaDialogueState(
+                owner_id=user.id,
+                telegram_user_id=user.telegram_id,
+                chat_id=user.telegram_id,
+                access_version=user.access_version,
+                active_topic="подготовка к важному выступлению",
+                last_assistant_offer="Можем составить простой план.",
+                last_assistant_offer_kinds=["plan"],
+                unresolved_question="Какой первый шаг тебе ближе?",
+                open_loops=["выбрать первый шаг выступления"],
+                revision=7,
+                expires_at=datetime.now(UTC) + timedelta(days=5),
+            )
+        )
+    for index in range(bot.settings.conversation_context_messages + 4):
+        await bot.conversation.append(
+            user.telegram_id,
+            user.telegram_id,
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"безопасная короткая реплика {index}",
+            source="text",
+            intent="companion_user" if index % 2 == 0 else "companion_answer",
+        )
+    restarted = FutureSelfBot(bot.settings, db, fake_ai, NoopTranscription())
+    restarted_user = await restarted._user(user.telegram_id)
+    incoming = CompanionMessage("Что же делать?", chat_id=user.telegram_id)
+
+    await deliver(restarted, restarted_user, incoming, context=companion_context())
+
+    projection = fake_ai.companion_brain_calls[-1]
+    assert projection is not None
+    assert projection.working_state.revision == 7
+    assert projection.working_state.active_topic == "подготовка к важному выступлению"
+    assert projection.working_state.open_loops == ("выбрать первый шаг выступления",)
+
+
+async def test_nova_brain_self_declared_identity_survives_window_and_restart_without_profile_write(
+    db,
+    fake_ai,
+):
+    bot, user = await ready_companion_bot(
+        db,
+        fake_ai,
+        telegram_user_id=74_001,
+        enable_brain=True,
+    )
+    async with db.session() as session:
+        await session.execute(update(User).where(User.id == user.id).values(display_name=None))
+    user = await bot._user(user.telegram_id)
+    declaration = "Меня зовут Назар. Я мужчина"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Назар, рад знакомству. Ты готов продолжить?",
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="identity",
+            key="identity",
+            value="display_name=Назар;grammatical_address=masculine",
+            evidence=declaration,
+            salience=5,
+        ),
+    )
+    first = CompanionMessage(declaration, chat_id=user.telegram_id)
+    await deliver(bot, user, first, context=companion_context())
+
+    async with db.sessions() as session:
+        actor = await session.get(User, user.id)
+        memory = await session.scalar(select(NovaObservedMemory))
+        assert actor is not None and actor.display_name is None
+        assert memory is not None
+        assert memory.category == "identity"
+        assert (
+            memory.normalized_value == "identity:display_name=назар;grammatical_address=masculine"
+        )
+    for index in range(bot.settings.conversation_context_messages + 3):
+        await bot.conversation.append(
+            user.telegram_id,
+            user.telegram_id,
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"безопасная промежуточная реплика {index}",
+            source="text",
+            intent="companion_user" if index % 2 == 0 else "companion_answer",
+        )
+    restarted = FutureSelfBot(bot.settings, db, fake_ai, NoopTranscription())
+    restarted_user = await restarted._user(user.telegram_id)
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Назар, ты готов выбрать следующий шаг?",
+    )
+    follow_up = CompanionMessage("Продолжим?", chat_id=user.telegram_id)
+
+    await deliver(restarted, restarted_user, follow_up, context=companion_context())
+
+    projection = fake_ai.companion_brain_calls[-1]
+    assert projection is not None
+    assert [item.category for item in projection.memories] == ["identity"]
+    assert (
+        projection.memories[0].value == "identity:display_name=назар;grammatical_address=masculine"
+    )
+    assert follow_up.replies[0]["text"] == "Назар, ты готов выбрать следующий шаг?"
+    provider_calls = len(fake_ai.companion_calls)
+    identity_question = CompanionMessage("Как меня зовут?", chat_id=user.telegram_id)
+    await deliver(
+        restarted,
+        restarted_user,
+        identity_question,
+        context=companion_context(),
+    )
+    assert identity_question.replies[0]["text"] == "Из твоих слов: тебя зовут Назар."
+    assert len(fake_ai.companion_calls) == provider_calls
+    assert restarted._nova_companion_tasks == set()
+
+
+async def test_nova_brain_forget_direct_cancellation_recovers_same_exact_generation(
+    db,
+    fake_ai,
+):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    async with db.session() as session:
+        session.add(
+            NovaObservedMemory(
+                owner_id=user.id,
+                category="preference",
+                normalized_value="response_length=short",
+                content_fingerprint="c" * 64,
+                source_kind="conversation",
+                source_session_id=1,
+                source_message_id=1,
+                source_receipt="d" * 64,
+                status="active",
+                salience=5,
+                revision=1,
+            )
+        )
+    prompt = CompanionMessage("Забудь это", chat_id=user.telegram_id)
+    await deliver(bot, user, prompt, context=companion_context())
+    canonical = prompt.replies[0]["message"]
+    callback = callback_by_label(prompt.replies[0]["reply_markup"], "Забыть")
+    query = CompanionQuery(callback, canonical)
+
+    async def cancel_forget(**_kwargs):
+        raise asyncio.CancelledError
+
+    bot.nova_brain_service.forget_exact = cancel_forget
+    with pytest.raises(asyncio.CancelledError):
+        await bot.nova_brain_callback(
+            companion_update(
+                canonical,
+                telegram_user_id=user.telegram_id,
+                chat_id=user.telegram_id,
+                query=query,
+            ),
+            companion_context(),
+        )
+    await bot._drain_nova_companion_tasks()
+
+    assert query.answer_attempts == 1
+    assert query.edits[-1]["text"] == "Забыть выбранную запись?"
+    recovered = callback_by_label(query.edits[-1]["reply_markup"], "Забыть")
+    assert recovered != callback
+    assert bot._nova_companion_tasks == set()
+    async with db.sessions() as session:
+        memory = await session.scalar(select(NovaObservedMemory))
+        assert memory is not None and memory.status == "active"
+
+
+async def test_nova_brain_forget_forged_cross_user_chat_and_replay_are_inert(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    other = await bot._user(71_099)
+    await AccessService(db).grant_subscriber(other.telegram_id, source="brain-cross-user")
+    other = await bot._user(other.telegram_id)
+    async with db.session() as session:
+        session.add(
+            NovaObservedMemory(
+                owner_id=user.id,
+                category="preference",
+                normalized_value="response_length=short",
+                content_fingerprint="e" * 64,
+                source_kind="conversation",
+                source_session_id=1,
+                source_message_id=1,
+                source_receipt="f" * 64,
+                status="active",
+                salience=5,
+                revision=1,
+            )
+        )
+    prompt = CompanionMessage("Забудь это", chat_id=user.telegram_id)
+    await deliver(bot, user, prompt, context=companion_context())
+    canonical = prompt.replies[0]["message"]
+    callback = callback_by_label(prompt.replies[0]["reply_markup"], "Забыть")
+    for actor_id, chat_id, data in (
+        (other.telegram_id, other.telegram_id, callback),
+        (user.telegram_id, user.telegram_id + 1, callback),
+        (user.telegram_id, user.telegram_id, "nbrain:forged_token_value_123456"),
+    ):
+        query = CompanionQuery(data, canonical)
+        await bot.nova_brain_callback(
+            companion_update(
+                canonical,
+                telegram_user_id=actor_id,
+                chat_id=chat_id,
+                query=query,
+            ),
+            companion_context(),
+        )
+        assert query.answer_attempts == 1
+        assert query.edits == []
+    owner_query = CompanionQuery(callback, canonical)
+    await bot.nova_brain_callback(
+        companion_update(
+            canonical,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+            query=owner_query,
+        ),
+        companion_context(),
+    )
+    replay = CompanionQuery(callback, canonical)
+    await bot.nova_brain_callback(
+        companion_update(
+            canonical,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+            query=replay,
+        ),
+        companion_context(),
+    )
+    assert owner_query.edits[-1]["text"] == "Забыла выбранную запись."
+    assert replay.edits == []
+
+
 @pytest.mark.parametrize(
     ("question", "expected"),
     [
@@ -1919,6 +2797,38 @@ async def test_confirmed_identity_questions_are_local_and_domain_read_only(
     assert sent_answer(incoming).text == expected
     assert fake_ai.companion_calls == []
     assert await companion_counts(db) == (0, 0, 0)
+
+
+async def test_authoritative_profile_name_precedes_structured_observed_identity(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, enable_brain=True)
+    structured = "identity:display_name=назар;grammatical_address=masculine"
+    async with db.session() as session:
+        await session.execute(update(User).where(User.id == user.id).values(display_name="Елена"))
+        session.add(
+            NovaObservedMemory(
+                owner_id=user.id,
+                category="identity",
+                normalized_value=structured,
+                content_fingerprint=sha256(structured.encode()).hexdigest(),
+                source_kind="conversation",
+                source_session_id=1,
+                source_message_id=1,
+                source_receipt="7" * 64,
+                status="active",
+                salience=5,
+                revision=1,
+            )
+        )
+    user = await bot._user(user.telegram_id)
+    incoming = CompanionMessage("Как меня зовут?", chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming)
+
+    assert sent_answer(incoming).text == "Да, тебя зовут Елена."
+    assert fake_ai.companion_calls == []
+    async with db.sessions() as session:
+        memory = await session.scalar(select(NovaObservedMemory))
+        assert memory is not None and memory.normalized_value == structured
 
 
 async def test_task_status_never_uses_unrelated_confirmed_inbox_state(db, fake_ai):
@@ -2235,6 +3145,306 @@ async def test_grounded_reminder_offer_survives_conversation_and_text_consent_ha
     assert session.phase is ReminderFlowPhase.TIME
     assert context.bot.neutralized[-1]["message_id"] == offer_message.message_id
     assert await companion_counts(db) == (4, 0, 0)
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_grounded_course_offer_without_schedule_enters_existing_when_phase(
+    db,
+    fake_ai,
+    source,
+):
+    evidence = (
+        "Мне нужно напоминать о самом главном, чтобы в суете я не забывал курс, "
+        "по которому я могу стать лучше."
+    )
+    current = "Вот поэтому мне нужно вспоминать об этом почаще, а ты могла бы мне помогать в этом."
+    fake_ai.companion_result = NovaCompanionResponse(
+        answer=(
+            "Понимаю: ты хочешь возвращаться к своему курсу среди потока информации. "
+            "Давай настроим настоящее напоминание и выберем расписание."
+        ),
+        reminder_offer=NovaCompanionReminderOffer(
+            title="курс, по которому я могу стать лучше",
+            schedule_wording=None,
+            evidence=evidence,
+        ),
+    )
+    bot, user = await ready_companion_bot(db, fake_ai)
+    await bot.conversation.append(
+        user.telegram_id,
+        user.telegram_id,
+        role="user",
+        content=evidence,
+        source="text",
+        intent="companion_user",
+    )
+    incoming = CompanionMessage(current, chat_id=user.telegram_id)
+    progress = (
+        CompanionMessage("Распознаю…", chat_id=user.telegram_id) if source == "voice" else None
+    )
+    context = companion_context()
+
+    await deliver(
+        bot,
+        user,
+        incoming,
+        source=source,
+        delivery_message=progress,
+        context=context,
+    )
+
+    canonical = sent_answer(incoming) if progress is None else progress
+    callbacks = [
+        button.callback_data for row in canonical.markup_edits[-1].inline_keyboard for button in row
+    ]
+    assert len(callbacks) == 2
+    assert all(str(callback).startswith("nrem:") for callback in callbacks)
+    assert len(fake_ai.companion_calls) == 1
+    assert await companion_counts(db) == (3, 0, 0)
+
+    consent = CompanionMessage("давай", chat_id=user.telegram_id)
+    await deliver(bot, user, consent, context=context)
+
+    session = await bot.reminder_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=user.telegram_id,
+    )
+    assert session is not None
+    assert session.phase is ReminderFlowPhase.WHEN
+    assert session.title == "курс, по которому я могу стать лучше"
+    assert context.bot.neutralized[-1]["text"] == "🔔 Когда напомнить?"
+    labels = [
+        button.text
+        for row in context.bot.neutralized[-1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert "Завтра" in labels
+    assert "🔁 Каждый день" in labels
+    assert len(fake_ai.companion_calls) == 1
+    async with db.sessions() as session_db:
+        assert await session_db.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session_db.scalar(select(func.count(InboxItem.id))) == 0
+    assert bot._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize(
+    "vague_schedule",
+    ["постоянно", "почаще", "на первое время", "пока не привыкну"],
+)
+async def test_vague_frequency_is_never_accepted_as_a_real_schedule(
+    db,
+    fake_ai,
+    vague_schedule,
+):
+    evidence = f"Хочу вспоминать о своём курсе {vague_schedule}"
+    fake_ai.companion_result = NovaCompanionResponse(
+        answer="Я буду постоянно напоминать — всё настроено.",
+        reminder_offer=NovaCompanionReminderOffer(
+            title="своём курсе",
+            schedule_wording=vague_schedule,
+            evidence=evidence,
+        ),
+    )
+    bot, user = await ready_companion_bot(db, fake_ai)
+    incoming = CompanionMessage(evidence, chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming)
+
+    answer = sent_answer(incoming)
+    assert answer.text == NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
+    assert answer.markup_edits == []
+    assert (
+        await bot.nova_companion_reminders.active(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+            access_tier=user.access_tier,
+            access_version=user.access_version,
+        )
+        is None
+    )
+    async with db.sessions() as session:
+        contents = tuple(await session.scalars(select(ConversationMessage.content)))
+        assert "Я буду постоянно напоминать — всё настроено." not in contents
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+    assert len(fake_ai.companion_calls) == 1
+    assert bot._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_weak_assent_uses_exact_immediate_offer_and_blocks_meta_question(
+    db,
+    fake_ai,
+    source,
+):
+    bot, user = await ready_companion_bot(db, fake_ai)
+    await bot.conversation.append(
+        user.telegram_id,
+        user.telegram_id,
+        role="user",
+        content="Как не улетать в мысли постоянно?",
+        source="text",
+        intent="companion_user",
+    )
+    offer = "Если хочешь, можем дальше просто подобрать удобный способ."
+    await bot.conversation.append(
+        user.telegram_id,
+        user.telegram_id,
+        role="assistant",
+        content=offer,
+        source="text",
+        intent="companion_answer",
+    )
+    raw_failure = "Только уточни: что именно подобрать — вариант, план или упражнение?"
+    fake_ai.companion_result = NovaCompanionResponse(answer=raw_failure)
+    incoming = CompanionMessage("ооо, было бы круто)", chat_id=user.telegram_id)
+    progress = (
+        CompanionMessage("Распознаю…", chat_id=user.telegram_id) if source == "voice" else None
+    )
+
+    await deliver(bot, user, incoming, source=source, delivery_message=progress)
+
+    answer = sent_answer(incoming).text if progress is None else progress.edits[-1]["text"]
+    assert "короткую практику" in answer
+    assert "Что для меня сейчас действительно важно?" in answer
+    assert raw_failure not in answer
+    anchor = fake_ai.companion_discourse_calls[-1]
+    assert anchor is not None
+    assert anchor.status == "single"
+    assert anchor.offer_kinds == ("method",)
+    async with db.sessions() as session:
+        contents = tuple(await session.scalars(select(ConversationMessage.content)))
+        assert raw_failure not in contents
+        assert answer in contents
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+    assert len(fake_ai.companion_calls) == 1
+
+    fake_ai.companion_result = NovaCompanionResponse(answer="Поговорим о новой теме спокойно.")
+    new_topic = CompanionMessage("А теперь поговорим о сне", chat_id=user.telegram_id)
+    await deliver(bot, user, new_topic)
+    assert fake_ai.companion_discourse_calls[-1] is None
+    assert len(fake_ai.companion_calls) == 2
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_two_immediate_offers_produce_one_local_clarification_without_capability(
+    db,
+    fake_ai,
+):
+    bot, user = await ready_companion_bot(db, fake_ai)
+    await bot.conversation.append(
+        user.telegram_id,
+        user.telegram_id,
+        role="assistant",
+        content="Могу подобрать удобный способ и могу помочь настроить напоминание.",
+        source="text",
+        intent="companion_answer",
+    )
+    fake_ai.companion_result = NovaCompanionResponse(
+        answer="Да, звучит неплохо.",
+        reminder_offer=NovaCompanionReminderOffer(
+            title="способ",
+            evidence="давай",
+        ),
+    )
+    incoming = CompanionMessage("давай", chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming)
+
+    answer = sent_answer(incoming)
+    assert answer.text == NOVA_COMPANION_DISCOURSE_AMBIGUOUS_TEXT
+    assert answer.markup_edits == []
+    anchor = fake_ai.companion_discourse_calls[-1]
+    assert anchor is not None and anchor.status == "ambiguous"
+    assert (
+        await bot.nova_companion_reminders.active(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=user.telegram_id,
+            access_tier=user.access_tier,
+            access_version=user.access_version,
+        )
+        is None
+    )
+    assert await companion_counts(db) == (3, 0, 0)
+    assert len(fake_ai.companion_calls) == 1
+    assert bot._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_concurrent_new_topic_invalidates_inflight_discourse_anchor(
+    db,
+    fake_ai,
+    source,
+):
+    bot, user = await ready_companion_bot(db, fake_ai)
+    await bot.conversation.append(
+        user.telegram_id,
+        user.telegram_id,
+        role="assistant",
+        content="Если хочешь, можем подобрать удобный способ.",
+        source="text",
+        intent="companion_answer",
+    )
+    private_answer = "PRIVATE_STALE_ANCHOR_ANSWER"
+    fake_ai.companion_result = NovaCompanionResponse(answer=private_answer)
+    fake_ai.companion_release.clear()
+    incoming = CompanionMessage("давай", chat_id=user.telegram_id)
+    progress = (
+        CompanionMessage("Распознаю…", chat_id=user.telegram_id) if source == "voice" else None
+    )
+    context = companion_context()
+    task = asyncio.create_task(
+        deliver(
+            bot,
+            user,
+            incoming,
+            context=context,
+            source=source,
+            delivery_message=progress,
+        )
+    )
+    await fake_ai.companion_started.wait()
+
+    await bot.conversation.append(
+        user.telegram_id,
+        user.telegram_id,
+        role="user",
+        content="Теперь хочу поговорить о сне.",
+        source="text",
+        intent="companion_user",
+    )
+    await bot.conversation.append(
+        user.telegram_id,
+        user.telegram_id,
+        role="assistant",
+        content="Давай обсудим сон.",
+        source="text",
+        intent="companion_answer",
+    )
+    fake_ai.companion_release.set()
+    await task
+
+    assert fake_ai.companion_discourse_calls[-1] is not None
+    if progress is None:
+        assert incoming.replies == []
+    else:
+        assert context.bot.deleted == [(user.telegram_id, progress.message_id)] or (
+            context.bot.neutralized
+            and context.bot.neutralized[-1]["text"] == NOVA_COMPANION_CONTEXT_CHANGED_TEXT
+        )
+    async with db.sessions() as session:
+        contents = tuple(await session.scalars(select(ConversationMessage.content)))
+        assert private_answer not in contents
+        assert "Теперь хочу поговорить о сне." in contents
+        assert "Давай обсудим сон." in contents
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+    assert bot._nova_companion_tasks == set()
 
 
 async def test_reminder_callback_answer_delay_to_ttl_boundary_fails_closed(
@@ -3020,6 +4230,13 @@ async def test_cancelled_reminder_handoff_preserves_exact_replacement_session(
         "Я зафиксировала это.",
         "Буду иметь это в виду до завтра.",
         "Можешь на меня рассчитывать.",
+        "Буду постоянно напоминать.",
+        "Буду держать это в поле внимания.",
+        "Не дам тебе забыть.",
+        "Возьму это на контроль.",
+        "Считай, это под контролем.",
+        "Напоминание настроено.",
+        "Буду возвращать тебя к главному.",
     ],
 )
 async def test_untrusted_operational_claim_is_never_delivered_or_persisted(
@@ -3177,6 +4394,13 @@ async def test_grounded_conversational_memory_claim_is_delivered_and_persisted(
         "Я зафиксировала это.",
         "Буду иметь это в виду до завтра.",
         "Можешь на меня рассчитывать.",
+        "Буду постоянно напоминать.",
+        "Буду держать это в поле внимания.",
+        "Не дам тебе забыть.",
+        "Возьму это на контроль.",
+        "Считай, это под контролем.",
+        "Напоминание настроено.",
+        "Буду возвращать тебя к главному.",
     ],
 )
 async def test_untrusted_claim_with_valid_offer_keeps_only_real_offer_action(

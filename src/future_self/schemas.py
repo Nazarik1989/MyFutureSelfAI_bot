@@ -239,6 +239,101 @@ class NovaCompanionProviderReminderOffer(NovaCompanionReminderOffer):
     """Untrusted provider proposal; evidence is retained only for server validation."""
 
 
+NovaDialogueAction = Literal["capture", "reminder", "plan", "memory", "clarify"]
+NovaDialogueOfferKind = Literal["method", "exercise", "reminder_setup", "plan"]
+NovaMemoryCategory = Literal["fact", "preference", "orientation", "theme", "identity"]
+NovaObservedMemoryKey = Literal[
+    "identity",
+    "response_length",
+    "tone",
+    "reminder_style",
+]
+
+
+class NovaCompanionDialogueStateUpdate(BaseModel):
+    """Untrusted bounded working-state proposal; never an execution capability."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    active_topic: str | None = Field(default=None, min_length=1, max_length=200, repr=False)
+    current_user_goal: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=300,
+        repr=False,
+    )
+    last_assistant_offer: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=600,
+        repr=False,
+    )
+    last_assistant_offer_kinds: list[NovaDialogueOfferKind] = Field(
+        default_factory=list,
+        max_length=4,
+        repr=False,
+    )
+    unresolved_question: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=300,
+        repr=False,
+    )
+    requested_action: NovaDialogueAction | None = None
+    open_loops: list[Annotated[str, StringConstraints(min_length=1, max_length=200)]] = Field(
+        default_factory=list,
+        max_length=5,
+        repr=False,
+    )
+    clear_fields: list[
+        Literal[
+            "active_topic",
+            "current_user_goal",
+            "last_assistant_offer",
+            "unresolved_question",
+            "requested_action",
+            "open_loops",
+        ]
+    ] = Field(default_factory=list, max_length=6, repr=False)
+
+    @model_validator(mode="after")
+    def validate_offer_and_clear_fields(self) -> Self:
+        if bool(self.last_assistant_offer) != bool(self.last_assistant_offer_kinds):
+            raise ValueError("assistant offer text and kinds must be supplied together")
+        if len(set(self.last_assistant_offer_kinds)) != len(self.last_assistant_offer_kinds):
+            raise ValueError("assistant offer kinds must be unique")
+        if len(set(self.clear_fields)) != len(self.clear_fields):
+            raise ValueError("dialogue clear fields must be unique")
+        supplied = []
+        for name in self.clear_fields:
+            value = getattr(self, name, None)
+            if (name == "open_loops" and bool(value)) or (
+                name != "open_loops" and value is not None
+            ):
+                supplied.append(name)
+        if supplied:
+            raise ValueError("dialogue field cannot be updated and cleared together")
+        return self
+
+
+class NovaCompanionMemoryCandidate(BaseModel):
+    """One untrusted structured-memory proposal grounded in the current user turn."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    category: NovaMemoryCategory
+    key: NovaObservedMemoryKey | None = None
+    value: str = Field(min_length=1, max_length=500, repr=False)
+    evidence: str = Field(min_length=1, max_length=600, repr=False, exclude=True)
+    salience: int = Field(default=3, ge=1, le=5)
+    supersedes_value: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        repr=False,
+    )
+
+
 class NovaCompanionProviderResponse(BaseModel):
     """Private structured-output shape used only at the provider boundary."""
 
@@ -247,6 +342,11 @@ class NovaCompanionProviderResponse(BaseModel):
     answer: str = Field(min_length=1, max_length=2000, repr=False)
     capture: NovaCompanionProviderCapture | None = Field(default=None, repr=False)
     reminder_offer: NovaCompanionProviderReminderOffer | None = Field(default=None, repr=False)
+    dialogue_state_update: NovaCompanionDialogueStateUpdate | None = Field(
+        default=None,
+        repr=False,
+    )
+    memory_candidate: NovaCompanionMemoryCandidate | None = Field(default=None, repr=False)
 
     @model_validator(mode="after")
     def one_optional_offer(self) -> Self:
@@ -263,6 +363,12 @@ class NovaCompanionResponse(BaseModel):
     answer: str = Field(min_length=1, max_length=2000, repr=False)
     capture: NovaCompanionCapture | None = Field(default=None, repr=False)
     reminder_offer: NovaCompanionReminderOffer | None = Field(default=None, repr=False)
+    dialogue_state_update: NovaCompanionDialogueStateUpdate | None = Field(
+        default=None,
+        repr=False,
+    )
+    memory_candidate: NovaCompanionMemoryCandidate | None = Field(default=None, repr=False)
+    memory_rejected: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="after")
     def one_optional_offer(self) -> Self:

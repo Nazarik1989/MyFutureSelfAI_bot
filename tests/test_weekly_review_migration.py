@@ -21,8 +21,9 @@ from sqlalchemy.schema import CreateTable
 
 from future_self.models import WeeklyReviewSession
 
-EXPECTED_HEAD = "20260817_0027"
+EXPECTED_HEAD = "20260822_0028"
 PARENT_REVISION = "20260811_0026"
+WEEKLY_REVIEW_REVISION = "20260817_0027"
 FOCUS_TABLE = "weekly_focuses"
 AUDIT_TABLE = "weekly_focus_changes"
 SESSION_TABLE = "weekly_review_sessions"
@@ -450,7 +451,7 @@ def test_weekly_review_is_single_head_and_migration_has_no_private_payload_colum
     config = Config(str(project_root / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
     assert script.get_heads() == [EXPECTED_HEAD]
-    assert script.get_revision(EXPECTED_HEAD).down_revision == PARENT_REVISION
+    assert script.get_revision(WEEKLY_REVIEW_REVISION).down_revision == PARENT_REVISION
     source = (project_root / "alembic/versions/20260817_0027_weekly_review.py").read_text(
         encoding="utf-8"
     )

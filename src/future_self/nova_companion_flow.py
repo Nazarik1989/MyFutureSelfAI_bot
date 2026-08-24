@@ -5,6 +5,7 @@ import hashlib
 import re
 import secrets
 import unicodedata
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
@@ -23,6 +24,7 @@ NOVA_COMPANION_MAX_CAPABILITIES = 2_000
 type CaptureKind = Literal["idea", "task", "desire", "note"]
 type CaptureAction = Literal["add", "not_now", "date_first", "date_second"]
 type ReminderOfferAction = Literal["accept", "not_now"]
+type DiscourseOfferKind = Literal["method", "exercise", "reminder_setup", "plan"]
 
 CAPTURE_KINDS = frozenset({"idea", "task", "desire", "note"})
 CAPTURE_ACTIONS: tuple[CaptureAction, ...] = ("add", "not_now")
@@ -38,6 +40,53 @@ _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _NOVA_NAME = r"(?:nova|нова)"
 _TRAILING_PUNCTUATION = r"[?!.…]*"
+_DISCOURSE_ASSENT = re.compile(
+    r"^(?:о+\s+)?(?:было\s+бы\s+круто|(?:ну\s+)?давай(?:\s+подбери)?|"
+    r"подбери|да\s+хочу|помоги\s+тогда)$",
+    re.IGNORECASE,
+)
+_DISCOURSE_OFFER_MARKERS: tuple[tuple[DiscourseOfferKind, re.Pattern[str]], ...] = (
+    (
+        "method",
+        re.compile(
+            r"\b(?:могу|можем)\b[^.!?…]{0,120}\b(?:подобрать|выбрать)\b"
+            r"[^.!?…]{0,80}\b(?:способ|подход|вариант)\w*\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "exercise",
+        re.compile(
+            r"\b(?:могу|можем)\b[^.!?…]{0,120}\b(?:подобрать|выбрать|предложить)\b"
+            r"[^.!?…]{0,80}\b(?:упражнен|практик)\w*\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "reminder_setup",
+        re.compile(
+            r"\b(?:могу|можем)\b[^.!?…]{0,120}\b(?:помочь\s+)?настроить\b"
+            r"[^.!?…]{0,80}\bнапоминан\w*\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "plan",
+        re.compile(
+            r"\b(?:могу|можем)\b[^.!?…]{0,120}\b(?:подобрать|выбрать|составить)\b"
+            r"[^.!?…]{0,80}\bплан\w*\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+_DISCOURSE_REPORTED_PREFIX = re.compile(
+    r"\b(?:спрашивал(?:а|и)?|спросил(?:а|и)?|говорил(?:а|и)?|сказал(?:а|и)?|"
+    r"писал(?:а|и)?|написал(?:а|и)?|цитировал(?:а|и)?)\b[^.!?…]{0,100}$",
+    re.IGNORECASE,
+)
+_DISCOURSE_NEGATED_MODAL = re.compile(r"\bне\s+(?:могу|можем)\s*$", re.IGNORECASE)
+_DISCOURSE_REPORTED_MODAL = re.compile(r"^(?:могу|можем)\s+ли\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +204,98 @@ class NovaAddressClassifier:
             if content
             else NovaAddressResult(NovaAddressKind.WAKE)
         )
+
+
+@dataclass(frozen=True, slots=True)
+class NovaCompanionDiscourseAnchor:
+    """One bounded immediate assistant offer, never an execution capability."""
+
+    status: Literal["single", "ambiguous"]
+    offer_kinds: tuple[DiscourseOfferKind, ...]
+    offer_text: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        clean_text = _safe_text(self.offer_text, max_chars=600)
+        if clean_text is None or clean_text != self.offer_text:
+            raise ValueError("Invalid companion discourse offer")
+        if not self.offer_kinds or len(self.offer_kinds) > len(_DISCOURSE_OFFER_MARKERS):
+            raise ValueError("Invalid companion discourse offer")
+        allowed_kinds = {kind for kind, _pattern in _DISCOURSE_OFFER_MARKERS}
+        if not set(self.offer_kinds).issubset(allowed_kinds):
+            raise ValueError("Invalid companion discourse offer")
+        if len(set(self.offer_kinds)) != len(self.offer_kinds):
+            raise ValueError("Invalid companion discourse offer")
+        expected_status = "single" if len(self.offer_kinds) == 1 else "ambiguous"
+        if self.status != expected_status:
+            raise ValueError("Invalid companion discourse offer")
+
+    def provider_payload(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "offer_kinds": list(self.offer_kinds),
+            "offer_text": self.offer_text,
+        }
+
+
+class NovaCompanionDiscourseReducer:
+    """Resolve weak assent only against the immediate safe assistant turn."""
+
+    @classmethod
+    def reduce(
+        cls,
+        user_text: object,
+        recent_messages: object,
+    ) -> NovaCompanionDiscourseAnchor | None:
+        normalized_user = cls._normalized_words(user_text)
+        if normalized_user is None or _DISCOURSE_ASSENT.fullmatch(normalized_user) is None:
+            return None
+        if not isinstance(recent_messages, Sequence) or isinstance(recent_messages, (str, bytes)):
+            return None
+        if not recent_messages:
+            return None
+        last = recent_messages[-1]
+        if not isinstance(last, Mapping) or last.get("role") != "assistant":
+            return None
+        offer_text = _safe_text(last.get("content"), max_chars=600)
+        if offer_text is None:
+            return None
+        kinds = tuple(
+            kind
+            for kind, pattern in _DISCOURSE_OFFER_MARKERS
+            if cls._has_affirmative_offer(offer_text, pattern)
+        )
+        if not kinds:
+            return None
+        return NovaCompanionDiscourseAnchor(
+            status="single" if len(kinds) == 1 else "ambiguous",
+            offer_kinds=kinds,
+            offer_text=offer_text,
+        )
+
+    @staticmethod
+    def _normalized_words(value: object) -> str | None:
+        clean = _safe_text(value, max_chars=200)
+        if clean is None:
+            return None
+        normalized = re.sub(r"[^a-zа-я0-9]+", " ", clean.casefold()).strip()
+        return re.sub(r"\s+", " ", normalized)
+
+    @staticmethod
+    def _has_affirmative_offer(text: str, pattern: re.Pattern[str]) -> bool:
+        """Accept only Nova's own affirmative offer, never negated/reported modality."""
+
+        for match in pattern.finditer(text):
+            prefix = text[: match.start()]
+            modal_and_tail = text[match.start() :]
+            if _DISCOURSE_NEGATED_MODAL.search(f"{prefix}{match.group(0).split()[0]}"):
+                continue
+            if _DISCOURSE_REPORTED_MODAL.match(modal_and_tail):
+                continue
+            clause_prefix = re.split(r"[.!?…]", prefix)[-1]
+            if _DISCOURSE_REPORTED_PREFIX.search(clause_prefix):
+                continue
+            return True
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1894,6 +2035,8 @@ __all__ = [
     "NovaCompanionCaptureScreen",
     "NovaCompanionCaptureStore",
     "NovaCompanionCaptureTemporal",
+    "NovaCompanionDiscourseAnchor",
+    "NovaCompanionDiscourseReducer",
     "NovaCompanionReminderCandidate",
     "NovaCompanionReminderCapability",
     "NovaCompanionReminderScreen",
