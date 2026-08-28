@@ -248,6 +248,14 @@ NovaObservedMemoryKey = Literal[
     "tone",
     "reminder_style",
 ]
+NovaCompanionDiagnosticCode = Literal[
+    "invalid_answer",
+    "invalid_capture",
+    "invalid_reminder_offer",
+    "invalid_dialogue_state",
+    "invalid_memory_candidate",
+    "conflicting_actions",
+]
 
 
 class NovaCompanionDialogueStateUpdate(BaseModel):
@@ -355,6 +363,18 @@ class NovaCompanionProviderResponse(BaseModel):
         return self
 
 
+class NovaCompanionProviderTransport(BaseModel):
+    """Shallow provider envelope; proposals are independently encoded JSON values."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    answer: str = Field(min_length=1, max_length=2000, repr=False)
+    capture: str | None = Field(default=None, repr=False)
+    reminder_offer: str | None = Field(default=None, repr=False)
+    dialogue_state_update: str | None = Field(default=None, repr=False)
+    memory_candidate: str | None = Field(default=None, repr=False)
+
+
 class NovaCompanionResponse(BaseModel):
     """One conversation-first answer with at most one non-mutating capture offer."""
 
@@ -369,6 +389,12 @@ class NovaCompanionResponse(BaseModel):
     )
     memory_candidate: NovaCompanionMemoryCandidate | None = Field(default=None, repr=False)
     memory_rejected: bool = Field(default=False, exclude=True)
+    diagnostic_codes: tuple[NovaCompanionDiagnosticCode, ...] = Field(
+        default=(),
+        max_length=5,
+        repr=False,
+        exclude=True,
+    )
 
     @model_validator(mode="after")
     def one_optional_offer(self) -> Self:

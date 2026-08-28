@@ -100,6 +100,7 @@ from .natural_commands import NaturalAction, NaturalCommandRouter
 from .navigation import NavigationFlowStore
 from .navigation_handlers import NavigationHandlers
 from .nova import NovaSessionStore, is_explicit_nova_invocation
+from .nova_companion_flow import ExplicitCaptureClassifier
 from .nova_companion_handlers import NovaCompanionHandlers
 from .nova_handlers import NovaHandlers
 from .nova_memory import (
@@ -3106,13 +3107,21 @@ class FutureSelfBot(
             await self.nova_memory_clear_current(update)
             await self._handle_natural_command(update, context, natural_command.action)
             return
-        if await self.handle_collection_natural(update, context, text, source):
-            return
+        user = frozen_user
+        reserved_capture = ExplicitCaptureClassifier.classify(text)
+        if reserved_capture is not None and user is None:
+            user = await self._user(update.effective_user.id)
+        companion_owns_capture = (
+            reserved_capture is not None and self.nova_companion_available_for_actor(user)
+        )
+        if not companion_owns_capture:
+            if await self.handle_collection_natural(update, context, text, source):
+                return
         if self.natural_command_router.is_explicit_navigation_request(text):
             await self.nova_memory_clear_current(update)
             await self.help_command(update, context)
             return
-        user = frozen_user or await self._user(update.effective_user.id)
+        user = user or await self._user(update.effective_user.id)
         access_generation = self._nova_memory_access_generation(
             context,
             telegram_actor_id=update.effective_user.id,

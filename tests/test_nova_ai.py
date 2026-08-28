@@ -11,7 +11,6 @@ import future_self.ai as ai_module
 from future_self import prompts
 from future_self.ai import (
     NOVA_COMPANION_MAX_INPUT_CHARS,
-    NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT,
     NOVA_COMPANION_TIMEOUT_SECONDS,
     NOVA_HELP_MAX_INPUT_CHARS,
     NOVA_HELP_TIMEOUT_SECONDS,
@@ -32,6 +31,7 @@ from future_self.schemas import (
     NovaCompanionProviderCapture,
     NovaCompanionProviderReminderOffer,
     NovaCompanionProviderResponse,
+    NovaCompanionProviderTransport,
     NovaHelpPlan,
 )
 
@@ -431,7 +431,7 @@ async def test_nova_companion_uses_one_no_retry_call_and_minimal_bounded_payload
     assert len(responses.parse_calls) == 1
     call = responses.parse_calls[0]
     assert call["model"] == "nova-test-model"
-    assert call["text_format"] is NovaCompanionProviderResponse
+    assert call["text_format"] is NovaCompanionProviderTransport
     assert call["timeout"] == NOVA_COMPANION_TIMEOUT_SECONDS == 30.0
     assert call["input"][0] == {
         "role": "system",
@@ -806,8 +806,8 @@ async def test_nova_companion_rejects_prior_reminder_evidence_when_title_has_two
     )
 
     assert result.reminder_offer is None
-    assert result.answer == NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
-    assert raw not in result.answer
+    assert result.answer == raw
+    assert result.diagnostic_codes == ("invalid_reminder_offer",)
 
 
 async def test_nova_companion_rejects_unrelated_turn_even_with_one_unique_prior_subject():
@@ -834,8 +834,8 @@ async def test_nova_companion_rejects_unrelated_turn_even_with_one_unique_prior_
     )
 
     assert result.reminder_offer is None
-    assert result.answer == NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
-    assert raw not in result.answer
+    assert result.answer == raw
+    assert result.diagnostic_codes == ("invalid_reminder_offer",)
 
 
 @pytest.mark.parametrize(
@@ -872,8 +872,8 @@ async def test_nova_companion_rejects_assistant_only_or_forged_reminder_evidence
     )
 
     assert result.reminder_offer is None
-    assert result.answer == NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
-    assert raw_answer not in result.answer
+    assert result.answer == raw_answer
+    assert result.diagnostic_codes == ("invalid_reminder_offer",)
     assert evidence not in result.answer
 
 
@@ -908,8 +908,8 @@ async def test_nova_companion_ambiguous_prior_events_return_one_local_clarificat
     )
 
     assert result.reminder_offer is None
-    assert result.answer == NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
-    assert raw_answer not in result.answer
+    assert result.answer == raw_answer
+    assert result.diagnostic_codes == ("invalid_reminder_offer",)
     assert haircut not in result.answer
     assert doctor not in result.answer
 
@@ -1106,3 +1106,199 @@ async def test_nova_companion_does_not_route_through_mutating_or_legacy_ai_metho
     ):
         getattr(service, method_name).assert_not_awaited()
     assert len(responses.parse_calls) == 1
+
+
+async def test_nova_companion_transport_keeps_answer_independent_from_json_proposals():
+    text = "Хочу собрать клуб чтения"
+    output = NovaCompanionProviderTransport(
+        answer="Давай начнём с небольшой группы.",
+        capture=json.dumps(
+            {
+                "kind": "idea",
+                "title": "клуб чтения",
+                "next_step": "собрать клуб чтения",
+                "evidence": text,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    service, client, responses = service_with_fake(output_parsed=output)
+
+    result = await service.companion_message(
+        text,
+        {"timezone": "Europe/Moscow"},
+        companion_projection(),
+    )
+
+    assert result.answer == output.answer
+    assert result.capture is not None and result.capture.title == "клуб чтения"
+    assert result.diagnostic_codes == ()
+    assert client.with_options_calls == [{"max_retries": 0}]
+    assert len(responses.parse_calls) == 1
+    assert responses.parse_calls[0]["text_format"] is NovaCompanionProviderTransport
+    assert "tools" not in responses.parse_calls[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "payload", "diagnostic"),
+    [
+        (
+            "capture",
+            {"kind": "idea", "title": "идея", "evidence": "идея", "extra": True},
+            "invalid_capture",
+        ),
+        (
+            "reminder_offer",
+            {"title": ["врач"], "evidence": "Позвони врачу завтра"},
+            "invalid_reminder_offer",
+        ),
+        (
+            "dialogue_state_update",
+            {"requested_action": "execute"},
+            "invalid_dialogue_state",
+        ),
+        (
+            "memory_candidate",
+            {
+                "category": "secret",
+                "key": "identity",
+                "value": "display_name=Ольга",
+                "evidence": "Меня зовут Ольга",
+            },
+            "invalid_memory_candidate",
+        ),
+    ],
+)
+def test_nova_companion_malformed_optional_proposal_preserves_valid_answer(
+    field,
+    payload,
+    diagnostic,
+):
+    safe_answer = "Безопасный разговорный ответ."
+    result = ai_module.validate_nova_companion_response(
+        "Позвони врачу завтра",
+        {"answer": safe_answer, field: json.dumps(payload, ensure_ascii=False)},
+        companion_projection(),
+        brain_enabled=True,
+    )
+
+    assert result.answer == safe_answer
+    assert result.capture is None
+    assert result.reminder_offer is None
+    assert result.dialogue_state_update is None
+    assert result.memory_candidate is None
+    assert diagnostic in result.diagnostic_codes
+
+
+@pytest.mark.parametrize(
+    ("value", "diagnostic"),
+    [
+        ("{", "invalid_capture"),
+        (json.dumps({"nested": {"a": {"b": {"c": {"d": 1}}}}}), "invalid_capture"),
+        (json.dumps({"kind": "idea", "title": "x" * 5000}), "invalid_capture"),
+    ],
+)
+def test_nova_companion_bounded_transport_rejects_malformed_deep_and_oversized_values(
+    value,
+    diagnostic,
+):
+    result = ai_module.validate_nova_companion_response(
+        "Обычная беседа",
+        {"answer": "Ответ остаётся доступен.", "capture": value},
+        companion_projection(),
+    )
+
+    assert result.answer == "Ответ остаётся доступен."
+    assert result.capture is None
+    assert diagnostic in result.diagnostic_codes
+
+
+def test_nova_companion_invalid_memory_does_not_cancel_valid_capture():
+    text = "Хочу собрать клуб чтения"
+    result = ai_module.validate_nova_companion_response(
+        text,
+        {
+            "answer": "Хорошая конкретная идея.",
+            "capture": json.dumps(
+                {
+                    "kind": "idea",
+                    "title": "клуб чтения",
+                    "next_step": "собрать клуб чтения",
+                    "evidence": text,
+                },
+                ensure_ascii=False,
+            ),
+            "memory_candidate": json.dumps(
+                {
+                    "category": "fact",
+                    "key": None,
+                    "value": "PRIVATE",
+                    "evidence": text,
+                },
+                ensure_ascii=False,
+            ),
+        },
+        companion_projection(),
+        brain_enabled=True,
+    )
+
+    assert result.capture is not None
+    assert result.memory_candidate is None
+    assert result.diagnostic_codes == ("invalid_memory_candidate",)
+
+
+def test_nova_companion_invalid_dialogue_does_not_cancel_valid_reminder_offer():
+    text = "Позвони врачу завтра"
+    result = ai_module.validate_nova_companion_response(
+        text,
+        {
+            "answer": "Могу предложить настоящее напоминание.",
+            "reminder_offer": json.dumps(
+                {"title": "Позвони врачу", "schedule_wording": "завтра", "evidence": text},
+                ensure_ascii=False,
+            ),
+            "dialogue_state_update": json.dumps(
+                {"active_topic": 123},
+                ensure_ascii=False,
+            ),
+        },
+        companion_projection(),
+        brain_enabled=True,
+    )
+
+    assert result.reminder_offer is not None
+    assert result.dialogue_state_update is None
+    assert result.diagnostic_codes == ("invalid_dialogue_state",)
+
+
+def test_nova_companion_conflicting_actions_fail_closed_without_losing_answer():
+    text = "Хочу записать идею и завтра позвонить врачу"
+    result = ai_module.validate_nova_companion_response(
+        text,
+        {
+            "answer": "Давай сначала спокойно определим один следующий шаг.",
+            "capture": json.dumps(
+                {"kind": "idea", "title": "идею", "evidence": text},
+                ensure_ascii=False,
+            ),
+            "reminder_offer": json.dumps(
+                {"title": "позвонить врачу", "schedule_wording": "завтра", "evidence": text},
+                ensure_ascii=False,
+            ),
+        },
+        companion_projection(),
+    )
+
+    assert result.answer == "Давай сначала спокойно определим один следующий шаг."
+    assert result.capture is None and result.reminder_offer is None
+    assert "conflicting_actions" in result.diagnostic_codes
+
+
+@pytest.mark.parametrize("answer", [None, 42, "", " " * 5, "x" * 2001])
+def test_nova_companion_invalid_answer_remains_a_terminal_boundary_failure(answer):
+    with pytest.raises(ai_module.NovaCompanionBoundaryError, match="invalid_answer"):
+        ai_module.validate_nova_companion_response(
+            "Обычная беседа",
+            {"answer": answer, "capture": None},
+            companion_projection(),
+        )

@@ -308,13 +308,21 @@ class ExplicitCaptureIntent:
 class ExplicitCaptureClassifier:
     """Match only unequivocal capture commands; reflections stay unmatched."""
 
-    _KIND = r"(?:идею|идея|задачу|задача|желание|желания|заметку|заметка|запись)"
+    _KIND = (
+        r"(?:мысль|мысли|идею|идея|идеи|задачу|задача|задачи|желание|желания|"
+        r"заметку|заметка|заметки|запись)"
+    )
     _CREATE = re.compile(
         rf"^создай\s+(?P<kind>{_KIND})(?:(?:\s*[:—-]\s*|\s+)(?P<content>.+))?$",
         re.IGNORECASE,
     )
     _ADD_AS = re.compile(
         rf"^добавь\s+(?:(?P<reference>это)\s+)?как\s+(?P<kind>{_KIND})"
+        rf"(?:(?:\s*[:—-]\s*|\s+)(?P<content>.+))?$",
+        re.IGNORECASE,
+    )
+    _ADD_TO_RESERVED = re.compile(
+        rf"^добавь\s+в\s+(?P<kind>{_KIND})"
         rf"(?:(?:\s*[:—-]\s*|\s+)(?P<content>.+))?$",
         re.IGNORECASE,
     )
@@ -369,6 +377,9 @@ class ExplicitCaptureClassifier:
                 result,
                 references_context=bool(match.group("reference")) or result.content is None,
             )
+        match = cls._ADD_TO_RESERVED.fullmatch(cleaned)
+        if match is not None:
+            return cls._result(match.group("kind"), match.group("content"))
         match = cls._DIRECT_TYPED.fullmatch(cleaned)
         if match is not None:
             return cls._result(match.group("kind"), match.group("content"))
@@ -1989,14 +2000,19 @@ class NovaCompanionReminderStore:
 def _capture_kind(value: str) -> CaptureKind | None:
     normalized = value.casefold()
     mapping: dict[str, CaptureKind] = {
+        "мысль": "note",
+        "мысли": "note",
         "идею": "idea",
         "идея": "idea",
+        "идеи": "idea",
         "задачу": "task",
         "задача": "task",
+        "задачи": "task",
         "желание": "desire",
         "желания": "desire",
         "заметку": "note",
         "заметка": "note",
+        "заметки": "note",
         "запись": "note",
     }
     return mapping.get(normalized)

@@ -47,6 +47,12 @@ class ReminderIntentCode(StrEnum):
     PAST_ONCE = "past_once"
 
 
+class ConversationRecallIntent(StrEnum):
+    NONE = "none"
+    RECALL = "recall"
+    AMBIGUOUS = "ambiguous"
+
+
 @dataclass(frozen=True, slots=True)
 class ReminderIntentResult:
     """A privacy-safe, serializable description of a reminder command.
@@ -177,6 +183,81 @@ _EDGE_FILLER_PATTERN = re.compile(
     r"(?:(?:мне|пожалуйста)\b[\s,;:—-]*)+$",
     re.IGNORECASE,
 )
+_RECALL_VOCATIVE = re.compile(r"^(?:nova|нова)\b[\s,;:—-]*", re.IGNORECASE)
+_CONVERSATION_RECALL_PATTERNS = (
+    re.compile(
+        r"^(?:пожалуйста[\s,]+)?напомни(?:\s+мне)?[\s,]+(?:про\s+)?"
+        r"(?:наш(?:\s+с\s+тобой)?\s+)?разговор\b[\s\S]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:пожалуйста[\s,]+)?напомни(?:\s+мне)?[\s,]+(?:о\s+ч[её]м\s+мы\s+говорили|"
+        r"что(?:\s+именно)?\s+мы\s+обсуждали)[?!.…]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:пожалуйста[\s,]+)?вспомни(?:\s+про)?\s+(?:наш(?:\s+с\s+тобой)?\s+)?"
+        r"разговор\b[\s\S]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:(?:мы\s+недавно\s+разговаривали\b[\s\S]{0,300}[.!?…]\s*)?"
+        r"(?:ты\s+)?помнишь\s+(?:наш(?:\s+с\s+тобой)?\s+)?разговор)[?!.…]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:ты\s+)?помнишь[\s,]+о\s+ч[её]м\s+мы\s+говорили[?!.…]*$",
+        re.IGNORECASE,
+    ),
+)
+_AMBIGUOUS_RECALL_OR_REMINDER = re.compile(
+    r"^напомни(?:\s+мне)?[\s,]+(?:плиз|пожалуйста)[?!.…]*$",
+    re.IGNORECASE,
+)
+
+
+def _has_explicit_reminder_schedule(text: str) -> bool:
+    if not any(pattern.search(text) for pattern in _COMMAND_PATTERNS):
+        return False
+    lowered = text.casefold().replace("ё", "е")
+    relative = _RELATIVE_DATE_PATTERN.search(lowered)
+    if relative is not None:
+        return True
+    if re.search(r"\bпослезавтра\b", lowered):
+        return True
+    return any(
+        pattern.search(lowered)
+        for pattern in (
+            _DAILY_PATTERN,
+            _NAMED_DATE_PATTERN,
+            _NUMERIC_DATE_PATTERN,
+            _ISO_DATE_PATTERN,
+            _CLOCK_TIME_PATTERN,
+            _HOUR_WORD_TIME_PATTERN,
+            _SPACED_TIME_PATTERN,
+            _INVALID_CLOCK_PATTERN,
+            _INVALID_SPACED_TIME_PATTERN,
+            _INVALID_HOUR_WORD_PATTERN,
+        )
+    )
+
+
+def classify_conversation_recall(text: object) -> ConversationRecallIntent:
+    """Conservatively separate conversational recall from executable reminders."""
+
+    if not isinstance(text, str):
+        return ConversationRecallIntent.NONE
+    cleaned = _normalize(text)
+    cleaned = _RECALL_VOCATIVE.sub("", cleaned, count=1).strip()
+    if not cleaned:
+        return ConversationRecallIntent.NONE
+    if _has_explicit_reminder_schedule(cleaned):
+        return ConversationRecallIntent.NONE
+    if any(pattern.fullmatch(cleaned) for pattern in _CONVERSATION_RECALL_PATTERNS):
+        return ConversationRecallIntent.RECALL
+    if _AMBIGUOUS_RECALL_OR_REMINDER.fullmatch(cleaned):
+        return ConversationRecallIntent.AMBIGUOUS
+    return ConversationRecallIntent.NONE
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -763,6 +844,7 @@ def parse_reminder_intent(
 
 
 __all__ = [
+    "ConversationRecallIntent",
     "DAILY_AMBIGUOUS_FOLD",
     "DailyOccurrence",
     "ReminderIntentCode",
@@ -773,6 +855,7 @@ __all__ = [
     "ReminderTimezoneSource",
     "ReminderTimezoneHint",
     "calculate_daily_occurrence",
+    "classify_conversation_recall",
     "first_daily_occurrence_utc",
     "format_schedule_time",
     "next_daily_occurrence_utc",

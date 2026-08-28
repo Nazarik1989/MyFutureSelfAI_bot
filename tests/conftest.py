@@ -49,6 +49,7 @@ class FakeAI:
             answer="Я рядом. Расскажи, что сейчас для тебя важно."
         )
         self.companion_provider_result: NovaCompanionProviderResponse | None = None
+        self.companion_provider_raw_result: object | None = None
         self.companion_error: BaseException | None = None
         self.companion_started = asyncio.Event()
         self.companion_release = asyncio.Event()
@@ -292,6 +293,13 @@ class FakeAI:
         await self.companion_release.wait()
         if self.companion_error is not None:
             raise self.companion_error
+        if self.companion_provider_raw_result is not None:
+            return validate_nova_companion_response(
+                text,
+                self.companion_provider_raw_result,
+                companion_context,
+                brain_enabled=brain_context is not None,
+            )
         if self.companion_provider_result is not None:
             return validate_nova_companion_response(
                 text,

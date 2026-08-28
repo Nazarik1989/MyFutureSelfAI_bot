@@ -9,8 +9,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import MessageLimit
 from telegram.error import TelegramError
 
 from .access import FULL_ACCESS_TIERS
@@ -60,8 +62,13 @@ from .nova_memory_application import (
     build_nova_memory_projection,
 )
 from .reminder_flow import ReminderFlowSession
-from .reminder_intent import ReminderIntentStatus
+from .reminder_intent import (
+    ConversationRecallIntent,
+    ReminderIntentStatus,
+    classify_conversation_recall,
+)
 from .schemas import (
+    NovaCompanionDiagnosticCode,
     NovaCompanionDialogueStateUpdate,
     NovaCompanionMemoryCandidate,
     ParsedThought,
@@ -75,9 +82,7 @@ NOVA_COMPANION_ACCESS_CHANGED_TEXT = (
 NOVA_COMPANION_CONTEXT_CHANGED_TEXT = (
     "Контекст успел измениться. Ничего не сохранено — напиши сообщение ещё раз."
 )
-NOVA_COMPANION_UNAVAILABLE_TEXT = (
-    "Сейчас не получилось ответить. Ничего не сохранено — попробуй ещё раз."
-)
+NOVA_COMPANION_UNAVAILABLE_TEXT = "Сейчас не получилось ответить — попробуй ещё раз."
 NOVA_COMPANION_CAPTURE_FAILED_TEXT = (
     "Не удалось открыть preview. Ничего не сохранено — попробуй ещё раз."
 )
@@ -87,6 +92,14 @@ NOVA_COMPANION_REMINDER_OFFER_ACTION_TEXT = (
 )
 NOVA_COMPANION_NO_ACTIVE_REMINDER_OFFER_TEXT = (
     "Сейчас нет активного предложения напоминания. Скажи, что и когда напомнить."
+)
+NOVA_COMPANION_RECALL_CLARIFICATION_TEXT = (
+    "Ты хочешь вспомнить содержание разговора или поставить настоящее напоминание?"
+)
+NOVA_COMPANION_RECALL_UNAVAILABLE_TEXT = "Деталей того разговора в доступном контексте сейчас нет."
+NOVA_COMPANION_RECALL_ACTION_SUPPRESSED_TEXT = (
+    "В режиме воспоминания я могу только пересказать доступный контекст разговора — "
+    "без кнопок и действий."
 )
 NOVA_COMPANION_DISCOURSE_AMBIGUOUS_TEXT = (
     "Ты хочешь подобрать разговорный способ или настроить настоящее напоминание?"
@@ -103,15 +116,17 @@ _COMPANION_CANCEL_TIMEOUT_SECONDS = 5.0
 _COMPANION_CANCEL_RETRY_SECONDS = 0.1
 _COMPANION_CLEANUP_SCHEDULED_ATTR = "nova_companion_cleanup_scheduled"
 _COMPANION_REMINDER_SESSION_ATTR = "nova_companion_reminder_session"
+_COMPANION_RECALL_TOPIC_MAX_CHARS = 160
+_COMPANION_RECALL_TOPIC_MAX_BYTES = 512
 
 _IDENTITY_NAME_QUESTION = re.compile(
-    r"^(?:а\s+)?(?:ты\s+)?(?:не\s+)?знал[аи]?[,\s]+как\s+меня\s+зовут[?!.…]*$|"
-    r"^(?:а\s+)?(?:ты\s+)?знаешь[,\s]+как\s+меня\s+зовут[?!.…]*$|"
-    r"^как\s+меня\s+зовут[?!.…]*$",
+    r"(?:^|[.!?…»]\s*)(?:а\s+)?(?:(?:ты\s+)?(?:не\s+)?знал[аи]?[,\s]+|"
+    r"ты\s+знаешь[,\s]+)?как\s+меня\s+зовут[?!.…]*$",
     re.IGNORECASE,
 )
 _IDENTITY_CITY_QUESTION = re.compile(
-    r"^(?:а\s+)?(?:ты\s+)?(?:знаешь[,\s]+)?где\s+я\s+живу[?!.…]*$",
+    r"^(?:а\s+)?(?:ты\s+)?(?:знаешь[,\s]+)?(?:где\s+я\s+живу|"
+    r"в\s+каком\s+городе\s+я\s+живу)[?!.…]*$",
     re.IGNORECASE,
 )
 _REMINDER_STATUS_QUESTION = re.compile(
@@ -128,7 +143,7 @@ _CAPTURE_STATUS_QUESTION = re.compile(
     re.IGNORECASE,
 )
 _REMINDER_ACCEPT = re.compile(
-    r"^(?:да|давай|поставь|поставь\s+плиз|напомни|сделай\s+напоминание)[!.,…]*$",
+    r"^(?:да|давай|поставь|поставь\s+плиз|напомни(?:\s+плиз)?|сделай\s+напоминание)[!.,…]*$",
     re.IGNORECASE,
 )
 _REMINDER_DECLINE = re.compile(
@@ -145,6 +160,7 @@ _CONTEXTUAL_STATUS_QUESTION = re.compile(
 )
 _BRAIN_MEMORY_RECALL = re.compile(
     r"^(?:что\s+ты\s+(?:обо\s+мне\s+)?(?:помнишь|знаешь)|"
+    r"что\s+ты\s+(?:помнишь|знаешь)\s+обо\s+мне|"
     r"что\s+ты\s+знаешь\s+о\s+моих\s+целях)[?!.…]*$",
     re.IGNORECASE,
 )
@@ -207,6 +223,34 @@ _ACTION_CONTEXT = re.compile(
     r"забуд\w*|сегодня|завтра|послезавтра|\d{1,2}[:.]\d{2})\b",
     re.IGNORECASE,
 )
+_SUPPRESSED_ACTION_DEPENDENCY = re.compile(
+    r"(?:\bкнопк\w*\b|"
+    r"\b(?:нажм|выбер|подтверд|использу)\w*\b|"
+    r"\bмогу\b[\s\S]{0,32}\b(?:постав|созда|сохран|добав|запи|откр|настро)\w*\b|"
+    r"\b(?:постав|созда|сохран|добав|запи|откр|настро)\w*\b[\s\S]{0,32}"
+    r"\b(?:ниже|рядом)\b)",
+    re.IGNORECASE,
+)
+_SUPPRESSED_VISIBLE_ACTION = re.compile(
+    r"\b(?:напоминан|напомн|постав|сохран|запи|добав|созда|откр|настро|"
+    r"задач|заметк|иде[яию]|черновик)\w*\b",
+    re.IGNORECASE,
+)
+_SUPPRESSED_UI_OR_AVAILABILITY_CUE = re.compile(
+    r"(?:\b(?:ниже|рядом|можно|доступ\w*|вариант\w*|действи\w*|кнопк\w*|"
+    r"нажм\w*|выбер\w*|подтверд\w*|использу\w*)\b|"
+    r"\bпод\s+сообщени\w*\b)",
+    re.IGNORECASE,
+)
+_RECENT_RECALL_TOPIC = re.compile(
+    r"\bнедавно\s+разговаривали\s+о\s+(?P<topic>.+?)[.!?…]\s*"
+    r"(?:ты\s+)?помнишь\s+(?:наш(?:\s+с\s+тобой)?\s+)?разговор",
+    re.IGNORECASE,
+)
+_CONVERSATION_RECALL_TOPIC = re.compile(
+    r"\bразговор(?:а)?\s+о\s+(?P<topic>.+?)(?:[,;:]\s*(?:что|о\s+ч[её]м)|[?!.…]|$)",
+    re.IGNORECASE,
+)
 _DISCOURSE_NONCONTINUATION = re.compile(
     r"(?:\bчто\s+именно\b[\s\S]{0,80}\b(?:подобрать|выбрать|сделать)\b|"
     r"\bуточни\b[\s\S]{0,80}\b(?:что|какой|какую)\b|"
@@ -241,6 +285,41 @@ def _has_untrusted_operational_claim(
         or (has_action_context and _ELLIPTICAL_OPERATIONAL_CLAIM.fullmatch(normalized))
         or (has_action_context and _CONTEXTUAL_OPERATIONAL_COMMITMENT.fullmatch(normalized))
     )
+
+
+def _has_suppressed_action_dependency(answer: object, *, user_text: object = "") -> bool:
+    if not isinstance(answer, str):
+        return False
+    normalized = " ".join(unicodedata.normalize("NFKC", answer).split())
+    return bool(
+        _SUPPRESSED_ACTION_DEPENDENCY.search(normalized)
+        or any(
+            _SUPPRESSED_VISIBLE_ACTION.search(clause)
+            and _SUPPRESSED_UI_OR_AVAILABILITY_CUE.search(clause)
+            for clause in re.split(r"[.!?…;]+", normalized)
+        )
+        or _has_untrusted_operational_claim(
+            normalized,
+            user_text=user_text,
+            action_context=True,
+        )
+    )
+
+
+def _bounded_recall_topic(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", value)
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        return None
+    normalized = " ".join(normalized.split()).strip(" ,.!?…")
+    if (
+        not normalized
+        or len(normalized) > _COMPANION_RECALL_TOPIC_MAX_CHARS
+        or len(normalized.encode("utf-8")) > _COMPANION_RECALL_TOPIC_MAX_BYTES
+    ):
+        return None
+    return normalized
 
 
 def _companion_discourse_answer(
@@ -513,6 +592,7 @@ class NovaCompanionHandlers:
             )
             return True
         continuation = self._nova_companion_reminder_continuation_action(semantic_text)
+        recall_intent = classify_conversation_recall(semantic_text)
         if continuation is not None:
             if await self._nova_companion_handle_reminder_continuation(
                 update,
@@ -522,6 +602,42 @@ class NovaCompanionHandlers:
                 action=continuation,
             ):
                 return True
+        recall_anchor = self._nova_companion_has_recall_anchor(
+            conversation_snapshot,
+            semantic_text,
+        )
+        if recall_intent is ConversationRecallIntent.AMBIGUOUS:
+            if not recall_anchor:
+                await self._nova_companion_local_response(
+                    update,
+                    context,
+                    delivery_message,
+                    NOVA_COMPANION_RECALL_CLARIFICATION_TEXT,
+                    user=user,
+                )
+                return True
+        elif recall_intent is ConversationRecallIntent.RECALL and not recall_anchor:
+            await self._nova_companion_local_response(
+                update,
+                context,
+                delivery_message,
+                self._nova_companion_recall_unavailable_answer(semantic_text),
+                user=user,
+            )
+            return True
+        if recall_intent is not ConversationRecallIntent.NONE:
+            await self._nova_companion_prepare_and_deliver(
+                update,
+                context,
+                delivery_message,
+                user=user,
+                snapshot=conversation_snapshot,
+                text=semantic_text,
+                source=source,
+                suppress_proposals=True,
+            )
+            return True
+        if continuation is not None:
             if not self._nova_companion_reminder_continuation_requires_anchor(semantic_text):
                 await self._nova_companion_local_response(
                     update,
@@ -558,8 +674,99 @@ class NovaCompanionHandlers:
         )
         return True
 
+    @staticmethod
+    def _nova_companion_has_recall_anchor(snapshot: Any, text: str) -> bool:
+        if classify_conversation_recall(text) is ConversationRecallIntent.AMBIGUOUS:
+            return NovaCompanionHandlers._nova_companion_has_immediate_recall_anchor(snapshot)
+        helper = getattr(snapshot, "for_companion_prompt", None)
+        if not callable(helper):
+            return False
+        context = helper()
+        messages = context.get("recent_messages") if isinstance(context, dict) else None
+        if not isinstance(messages, list):
+            return False
+        roles = {
+            message.get("role")
+            for message in messages
+            if isinstance(message, dict) and isinstance(message.get("content"), str)
+        }
+        if not {"user", "assistant"}.issubset(roles):
+            return False
+        topic = NovaCompanionHandlers._nova_companion_recall_topic(text)
+        if topic is None:
+            return not NovaCompanionHandlers._nova_companion_has_explicit_recall_topic(text)
+        normalized_topic = " ".join(unicodedata.normalize("NFKC", topic).casefold().split())
+        return any(
+            normalized_topic
+            in " ".join(unicodedata.normalize("NFKC", str(message["content"])).casefold().split())
+            for message in messages
+            if isinstance(message, dict) and isinstance(message.get("content"), str)
+        )
+
+    @staticmethod
+    def _nova_companion_has_immediate_recall_anchor(snapshot: Any) -> bool:
+        messages = getattr(snapshot, "messages", None)
+        if not isinstance(messages, list) or len(messages) < 2:
+            return False
+        user_message, assistant_message = messages[-2:]
+        if not isinstance(user_message, dict) or not isinstance(assistant_message, dict):
+            return False
+        if (
+            user_message.get("role") != "user"
+            or user_message.get("intent") != "companion_user"
+            or assistant_message.get("role") != "assistant"
+            or assistant_message.get("intent") != "companion_answer"
+        ):
+            return False
+        user_content = user_message.get("content")
+        assistant_content = assistant_message.get("content")
+        if (
+            not isinstance(user_content, str)
+            or not isinstance(assistant_content, str)
+            or classify_conversation_recall(user_content) is not ConversationRecallIntent.RECALL
+        ):
+            return False
+        helper = getattr(snapshot, "for_companion_prompt", None)
+        if not callable(helper):
+            return False
+        context = helper()
+        projected = context.get("recent_messages") if isinstance(context, dict) else None
+        if not isinstance(projected, list) or len(projected) < 2:
+            return False
+        return projected[-2:] == [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content},
+        ]
+
+    @staticmethod
+    def _nova_companion_recall_topic(text: str) -> str | None:
+        recent_topic = _RECENT_RECALL_TOPIC.search(text)
+        if recent_topic is not None:
+            return _bounded_recall_topic(recent_topic.group("topic"))
+        topic_match = _CONVERSATION_RECALL_TOPIC.search(text)
+        if topic_match is None:
+            return None
+        return _bounded_recall_topic(topic_match.group("topic"))
+
+    @staticmethod
+    def _nova_companion_has_explicit_recall_topic(text: str) -> bool:
+        return bool(_RECENT_RECALL_TOPIC.search(text) or _CONVERSATION_RECALL_TOPIC.search(text))
+
+    @staticmethod
+    def _nova_companion_recall_unavailable_answer(text: str) -> str:
+        topic = NovaCompanionHandlers._nova_companion_recall_topic(text)
+        if topic is None:
+            return NOVA_COMPANION_RECALL_UNAVAILABLE_TEXT
+        answer = (
+            f"Я вижу, что речь была о {topic}, но деталей того разговора "
+            "в доступном контексте сейчас нет."
+        )
+        if len(answer.encode("utf-16-le")) // 2 > int(MessageLimit.MAX_TEXT_LENGTH):
+            return NOVA_COMPANION_RECALL_UNAVAILABLE_TEXT
+        return answer
+
     async def _nova_companion_identity_answer(self, text: str, user: User) -> str | None:
-        if _IDENTITY_NAME_QUESTION.fullmatch(text.strip()):
+        if _IDENTITY_NAME_QUESTION.search(text.strip()):
             name = " ".join((user.display_name or "").split())
             if name:
                 return f"Да, тебя зовут {name}."
@@ -2390,6 +2597,7 @@ class NovaCompanionHandlers:
         snapshot: Any,
         text: str,
         source: str,
+        suppress_proposals: bool = False,
     ) -> None:
         try:
             (
@@ -2569,10 +2777,18 @@ class NovaCompanionHandlers:
             raise
         except Exception as exc:
             provider_failed = True
-            logger.warning(
-                "Nova companion failed operation=provider error_type=%s",
-                type(exc).__name__,
-            )
+            diagnostic_code = getattr(exc, "diagnostic_code", None)
+            if diagnostic_code == "invalid_answer" or isinstance(exc, ValidationError):
+                logger.warning(
+                    "Nova companion failed operation=provider error_type=%s "
+                    "diagnostic_code=invalid_answer",
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "Nova companion failed operation=provider error_type=%s",
+                    type(exc).__name__,
+                )
             result = None
         try:
             post_provider_check = await self._nova_companion_current_check(generation)
@@ -2601,9 +2817,15 @@ class NovaCompanionHandlers:
                 persist_exchange=False,
             )
         else:
+            diagnostic_codes: list[NovaCompanionDiagnosticCode] = list(result.diagnostic_codes)
+
+            def reject_proposal(code: NovaCompanionDiagnosticCode) -> None:
+                if code not in diagnostic_codes:
+                    diagnostic_codes.append(code)
+
             suggestion = None
             reminder_candidate = None
-            if result.capture is not None:
+            if result.capture is not None and not suppress_proposals:
                 suggestion = validate_capture_suggestion(
                     kind=result.capture.kind,
                     title=result.capture.title,
@@ -2612,8 +2834,10 @@ class NovaCompanionHandlers:
                 )
                 if suggestion is not None and suggestion.kind == "task" and temporal_failed:
                     suggestion = None
-            reminder_offer_attempted = result.reminder_offer is not None
-            if result.reminder_offer is not None:
+                if suggestion is None:
+                    reject_proposal("invalid_capture")
+            reminder_offer_attempted = result.reminder_offer is not None and not suppress_proposals
+            if reminder_offer_attempted:
                 try:
                     reminder_resolution = self.date_resolver.resolve(
                         result.reminder_offer.evidence,
@@ -2644,16 +2868,50 @@ class NovaCompanionHandlers:
                     raise
                 except (TypeError, ValueError):
                     reminder_candidate = None
+                if reminder_candidate is None:
+                    reject_proposal("invalid_reminder_offer")
+            conflicting_action_proposals = (
+                not suppress_proposals
+                and result.capture is not None
+                and result.reminder_offer is not None
+            )
+            if conflicting_action_proposals:
+                suggestion = None
+                reminder_candidate = None
+                reject_proposal("conflicting_actions")
+            rejected_reminder_offer = not suppress_proposals and (
+                (reminder_offer_attempted and reminder_candidate is None)
+                or "invalid_reminder_offer" in diagnostic_codes
+                or "conflicting_actions" in diagnostic_codes
+                or conflicting_action_proposals
+            )
+            suppressed_action_dependency = suppress_proposals and (
+                _has_suppressed_action_dependency(result.answer, user_text=text)
+            )
             answer = (
-                NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
-                if reminder_offer_attempted and reminder_candidate is None
-                else result.answer
+                NOVA_COMPANION_RECALL_ACTION_SUPPRESSED_TEXT
+                if suppressed_action_dependency
+                else (
+                    (
+                        NOVA_COMPANION_NOT_EXECUTED_TEXT
+                        if _has_untrusted_operational_claim(
+                            result.answer,
+                            user_text=text,
+                            action_context=True,
+                        )
+                        else NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
+                    )
+                    if rejected_reminder_offer
+                    else result.answer
+                )
             )
             answer, discourse_recovered = _companion_discourse_answer(
                 answer,
                 discourse_anchor,
             )
-            raw_answer_replaced = discourse_recovered
+            raw_answer_replaced = (
+                suppressed_action_dependency or rejected_reminder_offer or discourse_recovered
+            )
             if discourse_recovered and discourse_anchor is not None:
                 suggestion = None
                 if discourse_anchor.status == "ambiguous":
@@ -2686,7 +2944,7 @@ class NovaCompanionHandlers:
             )
             dialogue_state_update = None
             memory_candidate = None
-            if brain_fence is not None and not raw_answer_replaced:
+            if brain_fence is not None and not raw_answer_replaced and not suppress_proposals:
                 dialogue_state_update = validate_dialogue_state_update(
                     result.dialogue_state_update,
                     user_text=text,
@@ -2696,6 +2954,11 @@ class NovaCompanionHandlers:
                 memory_candidate = validate_memory_candidate(
                     result.memory_candidate,
                     user_text=text,
+                )
+            if diagnostic_codes:
+                logger.warning(
+                    "Nova companion provider proposal rejected diagnostic_codes=%s",
+                    ",".join(diagnostic_codes),
                 )
             prepared = _PreparedCompanionAnswer(
                 answer=answer,

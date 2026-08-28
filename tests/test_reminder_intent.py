@@ -4,6 +4,7 @@ import pytest
 
 from future_self.reminder_intent import (
     DAILY_AMBIGUOUS_FOLD,
+    ConversationRecallIntent,
     ReminderIntentCode,
     ReminderIntentParser,
     ReminderIntentStatus,
@@ -11,6 +12,7 @@ from future_self.reminder_intent import (
     ReminderTimezoneHint,
     ReminderTimezoneSource,
     calculate_daily_occurrence,
+    classify_conversation_recall,
     first_daily_occurrence_utc,
     format_schedule_time,
     next_daily_occurrence_utc,
@@ -19,6 +21,82 @@ from future_self.reminder_intent import (
 )
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)  # 15:00 in Moscow
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected"),
+    [
+        ("напомни плиз", ConversationRecallIntent.AMBIGUOUS),
+        (
+            "напомни про наш с тобой разговор о ментальных тренировках, что именно мы обсуждали?",
+            ConversationRecallIntent.RECALL,
+        ),
+        ("напомни, о чём мы говорили", ConversationRecallIntent.RECALL),
+        ("напомни, что именно мы обсуждали", ConversationRecallIntent.RECALL),
+        ("вспомни наш разговор", ConversationRecallIntent.RECALL),
+        ("Ты помнишь наш разговор?", ConversationRecallIntent.RECALL),
+        ("Помнишь, о чём мы говорили?", ConversationRecallIntent.RECALL),
+        (
+            "Мы недавно разговаривали о ментальных тренировках. Ты помнишь наш разговор?",
+            ConversationRecallIntent.RECALL,
+        ),
+        ("Нова, ты помнишь наш разговор?", ConversationRecallIntent.RECALL),
+        ("Nova, помнишь, о чём мы говорили?", ConversationRecallIntent.RECALL),
+        (
+            "напомни про наш разговор завтра в 19:00",
+            ConversationRecallIntent.NONE,
+        ),
+        ("напомни про наш разговор сегодня", ConversationRecallIntent.NONE),
+        ("напомни про наш разговор на сегодня", ConversationRecallIntent.NONE),
+        ("напомни сегодня про наш разговор", ConversationRecallIntent.NONE),
+        ("напомни про наш разговор сегодня в 19:00", ConversationRecallIntent.NONE),
+        (
+            "напомни про нашу встречу завтра в 19:00",
+            ConversationRecallIntent.NONE,
+        ),
+        (
+            "напомни о нашем разговоре 27 августа в 10:00",
+            ConversationRecallIntent.NONE,
+        ),
+        ("напомни завтра позвонить врачу", ConversationRecallIntent.NONE),
+        ("напомни в 19:00 про стрижку", ConversationRecallIntent.NONE),
+        ("поставь напоминание", ConversationRecallIntent.NONE),
+        ("напоминай каждый день", ConversationRecallIntent.NONE),
+    ],
+)
+def test_conversation_recall_classifier_is_conservative(phrase, expected):
+    assert classify_conversation_recall(phrase) is expected
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_status"),
+    [
+        (
+            "напомни про наш разговор завтра в 19:00",
+            ReminderIntentStatus.COMPLETE,
+        ),
+        ("напомни про наш разговор сегодня", ReminderIntentStatus.NEEDS_TIME),
+        ("напомни про наш разговор на сегодня", ReminderIntentStatus.NEEDS_TIME),
+        ("напомни сегодня про наш разговор", ReminderIntentStatus.NEEDS_TIME),
+        (
+            "напомни про наш разговор сегодня в 19:00",
+            ReminderIntentStatus.COMPLETE,
+        ),
+        (
+            "напомни про нашу встречу завтра в 19:00",
+            ReminderIntentStatus.COMPLETE,
+        ),
+        (
+            "напомни о нашем разговоре 27 августа в 10:00",
+            ReminderIntentStatus.COMPLETE,
+        ),
+        ("напомни завтра позвонить врачу", ReminderIntentStatus.NEEDS_TIME),
+    ],
+)
+def test_temporal_conversation_wording_remains_a_reminder(phrase, expected_status):
+    result = ReminderIntentParser(now_provider=lambda: NOW).parse(phrase, "Europe/Moscow")
+
+    assert result.status is expected_status
 
 
 @pytest.mark.parametrize(

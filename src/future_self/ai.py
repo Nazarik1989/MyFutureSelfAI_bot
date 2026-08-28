@@ -4,10 +4,11 @@ import asyncio
 import json
 import re
 import unicodedata
-from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeVar
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, StringConstraints, TypeAdapter, ValidationError
 
 from . import prompts
 from .config import Settings
@@ -26,7 +27,13 @@ from .schemas import (
     GuestThoughtBreakdown,
     IntentResult,
     NovaCompanionCapture,
+    NovaCompanionDiagnosticCode,
+    NovaCompanionDialogueStateUpdate,
+    NovaCompanionMemoryCandidate,
+    NovaCompanionProviderCapture,
+    NovaCompanionProviderReminderOffer,
     NovaCompanionProviderResponse,
+    NovaCompanionProviderTransport,
     NovaCompanionReminderOffer,
     NovaCompanionResponse,
     NovaHelpPlan,
@@ -80,6 +87,41 @@ NOVA_COMPANION_TEMPORAL_CONTEXT_FIELDS = frozenset(
         "tomorrow_weekday",
     }
 )
+NOVA_COMPANION_PROPOSAL_MAX_BYTES = 4096
+NOVA_COMPANION_PROPOSAL_MAX_DEPTH = 4
+NOVA_COMPANION_PROPOSAL_MAX_ITEMS = 32
+NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT = (
+    "Пока ничего не создано. Уточни одно событие и время, если хочешь поставить "
+    "настоящее напоминание."
+)
+_NOVA_COMPANION_ANSWER_ADAPTER = TypeAdapter(
+    Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+)
+_NOVA_COMPANION_PROPOSAL_KEYS = {
+    "capture": frozenset({"kind", "title", "next_step", "evidence"}),
+    "reminder_offer": frozenset({"title", "schedule_wording", "evidence"}),
+    "dialogue_state_update": frozenset(
+        {
+            "active_topic",
+            "current_user_goal",
+            "last_assistant_offer",
+            "last_assistant_offer_kinds",
+            "unresolved_question",
+            "requested_action",
+            "open_loops",
+            "clear_fields",
+        }
+    ),
+    "memory_candidate": frozenset(
+        {"category", "key", "value", "evidence", "salience", "supersedes_value"}
+    ),
+}
+_NOVA_COMPANION_DIAGNOSTIC_BY_PROPOSAL: dict[str, NovaCompanionDiagnosticCode] = {
+    "capture": "invalid_capture",
+    "reminder_offer": "invalid_reminder_offer",
+    "dialogue_state_update": "invalid_dialogue_state",
+    "memory_candidate": "invalid_memory_candidate",
+}
 
 
 def _guest_demo_input(text: str) -> str:
@@ -152,10 +194,167 @@ _PRIOR_REMINDER_REFERENCE = re.compile(
 )
 
 
-NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT = (
-    "Пока ничего не создано. Уточни одно событие и время, если хочешь поставить "
-    "настоящее напоминание."
-)
+class NovaCompanionBoundaryError(ValueError):
+    """Privacy-safe terminal validation error for the provider answer envelope."""
+
+    diagnostic_code: NovaCompanionDiagnosticCode = "invalid_answer"
+
+    def __init__(self) -> None:
+        super().__init__(self.diagnostic_code)
+
+
+def _proposal_model_value(value: BaseModel, allowed_keys: frozenset[str]) -> dict[str, object]:
+    """Read test/provider models without leaking fields marked ``exclude=True``."""
+
+    return {key: getattr(value, key) for key in allowed_keys if hasattr(value, key)}
+
+
+def _provider_response_parts(parsed: object) -> tuple[object, dict[str, object | None]]:
+    fields = tuple(_NOVA_COMPANION_PROPOSAL_KEYS)
+    if isinstance(parsed, NovaCompanionProviderResponse | NovaCompanionProviderTransport):
+        return parsed.answer, {field: getattr(parsed, field) for field in fields}
+    if not isinstance(parsed, Mapping):
+        raise NovaCompanionBoundaryError
+    allowed = {"answer", *fields}
+    if any(not isinstance(key, str) for key in parsed) or set(parsed) - allowed:
+        raise NovaCompanionBoundaryError
+    return parsed.get("answer"), {field: parsed.get(field) for field in fields}
+
+
+def _bounded_json_item_count(value: object, *, depth: int = 1) -> int:
+    if depth > NOVA_COMPANION_PROPOSAL_MAX_DEPTH:
+        raise ValueError("proposal_depth")
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("proposal_key_type")
+        count = len(value)
+        for item in value.values():
+            count += _bounded_json_item_count(item, depth=depth + 1)
+        return count
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        count = len(value)
+        for item in value:
+            count += _bounded_json_item_count(item, depth=depth + 1)
+        return count
+    if value is None or type(value) in {str, int, float, bool}:
+        return 1
+    raise ValueError("proposal_value_type")
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("proposal_constant")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("proposal_duplicate_key")
+        value[key] = item
+    return value
+
+
+def _bounded_proposal_value(name: str, value: object | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        decoded: object = _proposal_model_value(value, _NOVA_COMPANION_PROPOSAL_KEYS[name])
+    elif isinstance(value, str):
+        if not value or len(value.encode("utf-8")) > NOVA_COMPANION_PROPOSAL_MAX_BYTES:
+            raise ValueError("proposal_size")
+        decoded = json.loads(
+            value,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+    else:
+        decoded = value
+    if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
+        raise ValueError("proposal_type")
+    if set(decoded) - _NOVA_COMPANION_PROPOSAL_KEYS[name]:
+        raise ValueError("proposal_keys")
+    if _bounded_json_item_count(decoded) > NOVA_COMPANION_PROPOSAL_MAX_ITEMS:
+        raise ValueError("proposal_items")
+    serialized = json.dumps(
+        decoded,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if len(serialized.encode("utf-8")) > NOVA_COMPANION_PROPOSAL_MAX_BYTES:
+        raise ValueError("proposal_size")
+    return decoded
+
+
+def _validated_provider_model[ModelT: BaseModel](
+    name: str,
+    value: object | None,
+    schema: type[ModelT],
+) -> tuple[ModelT | None, bool]:
+    if value is None:
+        return None, False
+    try:
+        decoded = _bounded_proposal_value(name, value)
+        assert decoded is not None
+        return schema.model_validate(decoded, strict=True), False
+    except (AssertionError, TypeError, ValueError, ValidationError, json.JSONDecodeError):
+        return None, True
+
+
+def _validated_reminder_offer(
+    text: str,
+    offer: NovaCompanionProviderReminderOffer,
+    companion_context: NovaCompanionContextProjection,
+) -> NovaCompanionReminderOffer | None:
+    payload = companion_context.provider_payload()
+    recent = payload.get("recent_conversation")
+    raw_messages = recent.get("recent_messages", []) if isinstance(recent, dict) else []
+    safe_user_messages = [
+        str(item["content"])
+        for item in raw_messages
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and isinstance(item.get("content"), str)
+    ]
+    evidence = _grounding_text(offer.evidence)
+    title = _grounding_text(offer.title)
+    schedule = _grounding_text(offer.schedule_wording) if offer.schedule_wording else None
+    current_exact = _grounding_text(text) == evidence
+    prior_exact = [source for source in safe_user_messages if _grounding_text(source) == evidence]
+    prior_title_matches = [
+        source for source in safe_user_messages if title in _grounding_text(source)
+    ]
+    temporal_sources = {
+        _grounding_text(source)
+        for source in safe_user_messages
+        if re.search(
+            r"\b(?:сегодня|завтра|послезавтра|понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|\d{1,2}[:.]\d{2})\b",
+            source,
+            re.IGNORECASE,
+        )
+    }
+    ambiguous_prior = evidence != _grounding_text(text) and len(temporal_sources) > 1
+    if not (
+        (
+            current_exact
+            or (
+                len(prior_exact) == 1
+                and len(prior_title_matches) == 1
+                and _PRIOR_REMINDER_REFERENCE.search(text) is not None
+            )
+        )
+        and title
+        and title in evidence
+        and (schedule is None or schedule in evidence)
+        and not ambiguous_prior
+        and evidence not in {"я иногда всё забываю", "а вдруг забуду"}
+    ):
+        return None
+    return NovaCompanionReminderOffer(
+        title=offer.title,
+        schedule_wording=offer.schedule_wording,
+        evidence=offer.evidence,
+    )
 
 
 def validate_nova_companion_response(
@@ -165,142 +364,123 @@ def validate_nova_companion_response(
     *,
     brain_enabled: bool = False,
 ) -> NovaCompanionResponse:
-    provider_result = NovaCompanionProviderResponse.model_validate(parsed)
-    validated_memory = (
-        validate_memory_candidate(
-            provider_result.memory_candidate,
-            user_text=text,
-        )
-        if brain_enabled
-        else None
-    )
-    memory_rejected = (
-        brain_enabled and provider_result.memory_candidate is not None and validated_memory is None
-    )
-    answer = provider_result.answer
+    try:
+        raw_answer, raw_proposals = _provider_response_parts(parsed)
+        answer = _NOVA_COMPANION_ANSWER_ADAPTER.validate_python(raw_answer, strict=True)
+    except (TypeError, ValueError, ValidationError):
+        raise NovaCompanionBoundaryError from None
 
-    def brain_proposals(*, visible_action: str | None) -> dict[str, object]:
-        if not brain_enabled:
-            return {
-                "dialogue_state_update": None,
-                "memory_candidate": None,
-                "memory_rejected": False,
-            }
-        return {
-            "dialogue_state_update": validate_dialogue_state_update(
-                provider_result.dialogue_state_update,
-                user_text=text,
-                assistant_answer=answer,
-                visible_action=visible_action,
-            ),
-            "memory_candidate": validated_memory,
-            "memory_rejected": memory_rejected,
-        }
+    diagnostics: list[NovaCompanionDiagnosticCode] = []
 
-    suggestion = provider_result.capture
-    reminder_offer = provider_result.reminder_offer
-    if reminder_offer is not None:
-        payload = companion_context.provider_payload()
-        recent = payload.get("recent_conversation")
-        raw_messages = recent.get("recent_messages", []) if isinstance(recent, dict) else []
-        safe_user_messages = [
-            str(item["content"])
-            for item in raw_messages
-            if isinstance(item, dict)
-            and item.get("role") == "user"
-            and isinstance(item.get("content"), str)
-        ]
-        evidence = _grounding_text(reminder_offer.evidence)
-        title = _grounding_text(reminder_offer.title)
-        schedule = (
-            _grounding_text(reminder_offer.schedule_wording)
-            if reminder_offer.schedule_wording
-            else None
-        )
-        current_exact = _grounding_text(text) == evidence
-        prior_exact = [
-            source for source in safe_user_messages if _grounding_text(source) == evidence
-        ]
-        prior_title_matches = [
-            source for source in safe_user_messages if title in _grounding_text(source)
-        ]
-        temporal_sources = {
-            _grounding_text(source)
-            for source in safe_user_messages
-            if re.search(
-                r"\b(?:сегодня|завтра|послезавтра|понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|\d{1,2}[:.]\d{2})\b",
-                source,
-                re.IGNORECASE,
-            )
-        }
-        ambiguous_prior = evidence != _grounding_text(text) and len(temporal_sources) > 1
-        if (
-            (
-                current_exact
-                or (
-                    len(prior_exact) == 1
-                    and len(prior_title_matches) == 1
-                    and _PRIOR_REMINDER_REFERENCE.search(text) is not None
-                )
-            )
+    def reject(code: NovaCompanionDiagnosticCode) -> None:
+        if code not in diagnostics:
+            diagnostics.append(code)
+
+    capture, capture_invalid = _validated_provider_model(
+        "capture", raw_proposals["capture"], NovaCompanionProviderCapture
+    )
+    reminder, reminder_invalid = _validated_provider_model(
+        "reminder_offer",
+        raw_proposals["reminder_offer"],
+        NovaCompanionProviderReminderOffer,
+    )
+    dialogue, dialogue_invalid = _validated_provider_model(
+        "dialogue_state_update",
+        raw_proposals["dialogue_state_update"],
+        NovaCompanionDialogueStateUpdate,
+    )
+    memory, memory_invalid = _validated_provider_model(
+        "memory_candidate",
+        raw_proposals["memory_candidate"],
+        NovaCompanionMemoryCandidate,
+    )
+    for field, invalid in (
+        ("capture", capture_invalid),
+        ("reminder_offer", reminder_invalid),
+        ("dialogue_state_update", dialogue_invalid),
+        ("memory_candidate", memory_invalid),
+    ):
+        if invalid:
+            reject(_NOVA_COMPANION_DIAGNOSTIC_BY_PROPOSAL[field])
+
+    suggestion: NovaCompanionCapture | None = None
+    if capture is not None:
+        message = _grounding_text(text)
+        evidence = _grounding_text(capture.evidence)
+        title = _grounding_text(capture.title)
+        next_step = _grounding_text(capture.next_step) if capture.next_step else None
+        grounded = bool(
+            evidence
+            and evidence in message
             and title
             and title in evidence
-            and (schedule is None or schedule in evidence)
-            and not ambiguous_prior
-            and evidence not in {"я иногда всё забываю", "а вдруг забуду"}
-        ):
-            return NovaCompanionResponse(
-                answer=answer,
-                reminder_offer=NovaCompanionReminderOffer(
-                    title=reminder_offer.title,
-                    schedule_wording=reminder_offer.schedule_wording,
-                    evidence=reminder_offer.evidence,
-                ),
-                **brain_proposals(visible_action="reminder"),
+            and (next_step is None or next_step in evidence)
+        )
+        validated = (
+            validate_capture_suggestion(
+                kind=capture.kind,
+                title=capture.title,
+                next_step=capture.next_step,
+                user_text=text,
             )
-        return NovaCompanionResponse(
-            answer=NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT,
-            memory_rejected=memory_rejected,
+            if grounded
+            else None
         )
-    if suggestion is None:
-        return NovaCompanionResponse(
-            answer=answer,
-            **brain_proposals(visible_action=None),
-        )
-    message = _grounding_text(text)
-    evidence = _grounding_text(suggestion.evidence)
-    title = _grounding_text(suggestion.title)
-    next_step = _grounding_text(suggestion.next_step) if suggestion.next_step else None
-    if (
-        not evidence
-        or evidence not in message
-        or not title
-        or title not in evidence
-        or (next_step is not None and next_step not in evidence)
-    ):
-        return NovaCompanionResponse(
-            answer=answer,
-            **brain_proposals(visible_action=None),
-        )
-    validated = validate_capture_suggestion(
-        kind=suggestion.kind,
-        title=suggestion.title,
-        next_step=suggestion.next_step,
-        user_text=text,
+        if validated is None:
+            reject("invalid_capture")
+        else:
+            suggestion = NovaCompanionCapture(
+                kind=validated.kind,
+                title=validated.title,
+                next_step=validated.next_step,
+            )
+
+    reminder_offer = (
+        _validated_reminder_offer(text, reminder, companion_context)
+        if reminder is not None
+        else None
     )
-    if validated is None:
-        return NovaCompanionResponse(
-            answer=answer,
-            **brain_proposals(visible_action=None),
+    if reminder is not None and reminder_offer is None:
+        reject("invalid_reminder_offer")
+
+    if raw_proposals["capture"] is not None and raw_proposals["reminder_offer"] is not None:
+        suggestion = None
+        reminder_offer = None
+        reject("conflicting_actions")
+
+    visible_action = (
+        "reminder" if reminder_offer is not None else "capture" if suggestion is not None else None
+    )
+    validated_dialogue = (
+        validate_dialogue_state_update(
+            dialogue,
+            user_text=text,
+            assistant_answer=answer,
+            visible_action=visible_action,
         )
+        if dialogue is not None
+        else None
+    )
+    if dialogue is not None and validated_dialogue is None:
+        reject("invalid_dialogue_state")
+    validated_memory = (
+        validate_memory_candidate(memory, user_text=text) if memory is not None else None
+    )
+    if memory is not None and validated_memory is None:
+        reject("invalid_memory_candidate")
+
+    dialogue_state_update = validated_dialogue if brain_enabled else None
+    memory_candidate = validated_memory if brain_enabled else None
+    memory_rejected = brain_enabled and memory is not None and validated_memory is None
+
     return NovaCompanionResponse(
         answer=answer,
-        capture=NovaCompanionCapture(
-            kind=validated.kind,
-            title=validated.title,
-            next_step=validated.next_step,
-        ),
-        **brain_proposals(visible_action="capture"),
+        capture=suggestion,
+        reminder_offer=reminder_offer,
+        dialogue_state_update=dialogue_state_update,
+        memory_candidate=memory_candidate,
+        memory_rejected=memory_rejected,
+        diagnostic_codes=tuple(diagnostics),
     )
 
 
@@ -667,7 +847,7 @@ class OpenAICompatibleAIService:
             response = await client.responses.parse(
                 model=self.model,
                 input=native_input,
-                text_format=NovaCompanionProviderResponse,
+                text_format=NovaCompanionProviderTransport,
                 timeout=NOVA_COMPANION_TIMEOUT_SECONDS,
                 **({"store": False} if brain_context is not None else {}),
             )

@@ -31,6 +31,7 @@ from .reminder_flow import (
     ReminderFlowSession,
 )
 from .reminder_intent import (
+    ConversationRecallIntent,
     ReminderIntentCode,
     ReminderIntentResult,
     ReminderIntentStatus,
@@ -38,6 +39,7 @@ from .reminder_intent import (
     ReminderTimezoneHint,
     ReminderTimezoneSource,
     calculate_daily_occurrence,
+    classify_conversation_recall,
     first_daily_occurrence_utc,
     reminder_explicit_timezone_spans,
     reminder_relative_day_offset,
@@ -338,8 +340,11 @@ class ReminderHandlers:
         voice_state: ReminderVoiceGateState | None,
         weekly_candidate_handoff: bool,
     ) -> bool:
+        recall_intent = classify_conversation_recall(text)
         binding = await self._reminder_access(update)
         if binding is None:
+            if recall_intent is not ConversationRecallIntent.NONE:
+                return False
             relative = self.date_resolver.resolve_relative_reminder(text, "UTC")
             if expected_session is None and relative:
                 if voice_fenced and expected_access_version is not None:
@@ -395,6 +400,8 @@ class ReminderHandlers:
             ):
                 await self._reminder_retire_voice_candidate(candidate_message)
                 return True
+            if current is None and recall_intent is not ConversationRecallIntent.NONE:
+                return False
             fresh_binding = await self._reminder_access(update)
             if (
                 fresh_binding is None

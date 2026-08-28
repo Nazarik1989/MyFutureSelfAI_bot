@@ -574,7 +574,7 @@ async def test_context_service_loads_only_current_owner_confirmed_active_data(db
         "telegram",
     ):
         assert forbidden not in serialized
-    assert await service.current_check(result.fence) is True
+    assert await service.current_check(result.fence, now=NOW) is True
     assert repr(result.fence) == "NovaCompanionContextFence()"
     assert "OWNER_" not in repr(result)
 
