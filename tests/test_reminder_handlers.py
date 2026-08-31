@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from itertools import count
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from future_self.models import (
     TaskState,
     User,
 )
+from future_self.nova_companion_flow import NovaCompanionReminderCandidate
 from future_self.nova_memory_flow import NovaMemoryFlowPhase
 from future_self.reminder_flow import ReminderFlowPhase, ReminderFlowStore
 from future_self.reminder_handlers import REMINDER_STALE_TEXT
@@ -250,6 +252,101 @@ async def test_complete_once_uses_one_canonical_and_existing_task_reminder_path(
         assert await session.scalar(select(func.count(InboxItem.id))) == 1
         assert await session.scalar(select(func.count(TaskReminder.id))) == 1
         assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_confirm_records_exact_read_only_completion_receipt(db, fake_ai):
+    user = await subscriber(db, 6_191)
+    bot = deterministic_bot(db, fake_ai)
+    bot.settings.enable_nova_companion = True
+    bot.settings.nova_companion_admin_only = False
+    incoming = ReminderMessage("Напомни завтра в 19:00 позвонить врачу")
+    context = reminder_context()
+
+    assert await bot.reminder_text_gate(
+        reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9_191),
+        context,
+    )
+    canonical = incoming.replies[0]["message"]
+    confirm = callback_for(latest_markup(canonical), "✅ Создать")
+    await bot.reminder_callback(
+        reminder_update(
+            canonical,
+            telegram_user_id=user.telegram_id,
+            chat_id=9_191,
+            query=ReminderQuery(confirm, canonical),
+        ),
+        context,
+    )
+
+    key = (user.id, user.telegram_id, 9_191)
+    receipt = bot._nova_companion_status_receipts[key]
+    assert receipt.owner_id == user.id
+    assert receipt.telegram_user_id == user.telegram_id
+    assert receipt.chat_id == 9_191
+    assert receipt.access_version == user.access_version
+    assert receipt.task_reminder_id is not None
+    assert receipt.inbox_item_id > 0
+    assert receipt.title == "позвонить врачу"
+    assert receipt.timezone == "Europe/Moscow"
+    assert receipt.schedule_kind == "once"
+    assert receipt.local_date == date(2026, 8, 11)
+    assert receipt.local_time == time(19)
+
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        answer = await bot._nova_companion_status_answer(
+            "Ты уже создала напоминание?",
+            user=await bot._user(user.telegram_id),
+            chat_id=9_191,
+        )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert answer == "Да, напоминание создано на завтра, 19:00."
+    assert bot._nova_companion_status_receipts[key] is receipt
+    assert fake_ai.companion_calls == []
+    assert not any(
+        statement.lstrip().split(maxsplit=1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}
+        for statement in statements
+        if statement.strip()
+    )
+
+    bot._nova_companion_status_receipts.pop(key)
+    assert (
+        await bot._nova_companion_status_answer(
+            "Ты уже создала напоминание?",
+            user=await bot._user(user.telegram_id),
+            chat_id=9_191,
+        )
+        == "Пока нет — напоминание ещё не создано."
+    )
+    other = await subscriber(db, 6_194)
+    bot._nova_companion_status_receipts[key] = receipt
+    assert (
+        await bot._nova_companion_status_answer(
+            "Ты уже создала напоминание?",
+            user=other,
+            chat_id=9_191,
+        )
+        == "Пока нет — напоминание ещё не создано."
+    )
+    forged = replace(receipt, local_time=time(18))
+    bot._nova_companion_status_receipts[key] = forged
+    assert (
+        await bot._nova_companion_status_answer(
+            "Ты уже создала напоминание?",
+            user=await bot._user(user.telegram_id),
+            chat_id=9_191,
+        )
+        == "Пока нет — напоминание ещё не создано."
+    )
+    assert key not in bot._nova_companion_status_receipts
 
 
 @pytest.mark.asyncio
@@ -566,6 +663,8 @@ async def test_weekly_duplicate_query_requires_exact_active_task_scope(
 async def test_daily_confirm_is_atomic_single_use_and_has_no_one_shot_reminder(db, fake_ai):
     user = await subscriber(db, 6102)
     bot = deterministic_bot(db, fake_ai)
+    bot.settings.enable_nova_companion = True
+    bot.settings.nova_companion_admin_only = False
     incoming = ReminderMessage("Каждый день напоминай в 20:30 заполнить дневник")
     update = reminder_update(incoming, telegram_user_id=user.telegram_id, chat_id=9102)
     context = reminder_context()
@@ -608,6 +707,57 @@ async def test_daily_confirm_is_atomic_single_use_and_has_no_one_shot_reminder(d
         item = await session.scalar(select(InboxItem))
         assert item.resolved_date is None
         assert item.temporal_resolution is None
+    key = (user.id, user.telegram_id, 9102)
+    receipt = bot._nova_companion_status_receipts[key]
+    assert receipt.schedule_kind == "daily"
+    assert receipt.recurring_schedule_id is not None
+    assert receipt.recurring_schedule_version == 1
+    assert receipt.local_time == time(20, 30)
+    assert receipt.local_date is not None
+    assert (
+        await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=9102,
+        )
+        is None
+    )
+    async with db.sessions() as session:
+        schedule = await session.get(
+            RecurringTaskReminderSchedule,
+            receipt.recurring_schedule_id,
+        )
+        saved_item = await session.get(InboxItem, receipt.inbox_item_id)
+    assert schedule is not None and saved_item is not None
+    assert schedule.owner_id == receipt.owner_id
+    assert schedule.inbox_item_id == receipt.inbox_item_id
+    assert schedule.recurrence_kind == "daily"
+    assert schedule.local_time == receipt.local_time
+    assert schedule.timezone == receipt.timezone
+    assert schedule.start_local_date == receipt.local_date
+    assert schedule.version == receipt.recurring_schedule_version
+    assert schedule.status == "active"
+    assert saved_item.user_id == receipt.owner_id
+    assert saved_item.kind == "task"
+    assert saved_item.status == "confirmed"
+    assert saved_item.version == receipt.inbox_item_version
+    assert saved_item.title == receipt.title
+    sql_trace: list[tuple[str, object]] = []
+
+    def record_sql(_conn, _cursor, statement, parameters, _context, _executemany):
+        sql_trace.append((statement, parameters))
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_sql)
+    try:
+        status_answer = await bot._nova_companion_status_answer(
+            "Ты уже создала напоминание?",
+            user=await bot._user(user.telegram_id),
+            chat_id=9102,
+        )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_sql)
+    assert status_answer == "Да, ежедневное напоминание создано на 20:30.", sql_trace
+    assert bot._nova_companion_status_receipts[key] is receipt
 
 
 @pytest.mark.asyncio
@@ -929,6 +1079,145 @@ async def test_past_today_and_unsupported_weekly_are_explicit(db, fake_ai):
     weekly_update = reminder_update(weekly, telegram_user_id=user.telegram_id, chat_id=9108)
     assert await bot.reminder_text_gate(weekly_update, reminder_context()) is True
     assert "только разовые и ежедневные" in weekly.replies[0]["text"]
+
+
+@pytest.mark.parametrize("corrected", ["22:00", "22:00, сорри"])
+@pytest.mark.asyncio
+async def test_past_time_continuation_keeps_event_date_and_time_phase(
+    db,
+    fake_ai,
+    corrected,
+):
+    user = await subscriber(db, 6_192)
+    bot = deterministic_bot(db, fake_ai)
+    chat_id = 9_192
+    context = reminder_context()
+    initial = ReminderMessage("Напомни про наш разговор сегодня")
+
+    assert await bot.reminder_text_gate(
+        reminder_update(initial, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    first = await current_session(bot, user, chat_id)
+    assert first is not None and first.phase is ReminderFlowPhase.TIME
+    assert first.title == "про наш разговор"
+    assert first.local_date == date(2026, 8, 10)
+    old_cancel = callback_for(latest_markup(initial.replies[0]["message"]), "Отмена")
+
+    past = ReminderMessage("10:00")
+    assert await bot.reminder_text_gate(
+        reminder_update(past, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    rejected = await current_session(bot, user, chat_id)
+    assert rejected is not None and rejected.phase is ReminderFlowPhase.TIME
+    assert rejected.id != first.id
+    assert rejected.title == first.title
+    assert rejected.local_date == first.local_date
+    assert rejected.local_time is None
+    assert rejected.past_time_rejected is True
+    assert "уже прошло" in context.bot.edits[-1]["text"]
+    assert "Во сколько" in context.bot.edits[-1]["text"]
+
+    stale = ReminderQuery(old_cancel, initial.replies[0]["message"])
+    await bot.reminder_callback(
+        reminder_update(
+            initial.replies[0]["message"],
+            telegram_user_id=user.telegram_id,
+            chat_id=chat_id,
+            query=stale,
+        ),
+        context,
+    )
+    assert_stale_alert(stale)
+
+    correction = ReminderMessage(corrected)
+    assert await bot.reminder_text_gate(
+        reminder_update(correction, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    preview = await current_session(bot, user, chat_id)
+    assert preview is not None and preview.phase is ReminderFlowPhase.PREVIEW
+    assert preview.title == first.title
+    assert preview.local_date == first.local_date
+    assert preview.local_time == time(22)
+    assert preview.past_time_rejected is False
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_guided_recurrence_collects_slots_and_fails_closed_to_supported_daily_option(
+    db,
+    fake_ai,
+):
+    user = await subscriber(db, 6_193)
+    bot = deterministic_bot(db, fake_ai)
+    chat_id = 9_193
+    canonical = ReminderMessage(message_id=89_193)
+    context = reminder_context()
+    candidate = NovaCompanionReminderCandidate(
+        title="возвращаться к главному",
+        evidence="Напоминай мне почаще возвращаться к главному",
+        timezone="Europe/Moscow",
+        guided_recurrence=True,
+    )
+
+    assert await bot.reminder_from_companion_candidate(
+        reminder_update(canonical, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+        candidate=candidate,
+        canonical_message_id=canonical.message_id,
+        expected_access_version=user.access_version,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_FREQUENCY
+    assert current.title == "возвращаться к главному"
+    assert current.schedule_kind is None
+    assert current.local_date is None and current.local_time is None
+
+    frequency = ReminderMessage("В течение дня нужно раз десять, наверное")
+    assert await bot.reminder_text_gate(
+        reminder_update(frequency, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_DAYS
+    assert current.recurrence_frequency_per_day == 10
+    assert current.recurrence_active_period == "day"
+
+    premature = ReminderMessage("Самое время создать")
+    assert await bot.reminder_text_gate(
+        reminder_update(premature, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_DAYS
+    assert "диапазоне дат" in context.bot.edits[-1]["text"]
+
+    days = ReminderMessage("Каждый день")
+    assert await bot.reminder_text_gate(
+        reminder_update(days, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_TIMES
+
+    times = ReminderMessage("09:00, 11:00, 13:00")
+    assert await bot.reminder_text_gate(
+        reminder_update(times, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_SINGLE_TIME
+    assert "только одно ежедневное" in context.bot.edits[-1]["text"]
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
 
 
 @pytest.mark.asyncio

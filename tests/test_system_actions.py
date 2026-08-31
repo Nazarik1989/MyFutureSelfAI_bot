@@ -82,6 +82,11 @@ def test_command_shaped_negated_cleanup_is_quarantined(phrase):
     assert (route.kind, route.action) == ("clarify", None)
 
 
+def test_direct_negative_delete_command_is_an_explicit_noop():
+    route = SystemActionRouter().route("Не удаляй мои записи", pending_action=None)
+    assert (route.kind, route.action) == ("negative", None)
+
+
 @pytest.mark.parametrize(
     "phrase",
     [

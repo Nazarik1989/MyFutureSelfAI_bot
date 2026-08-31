@@ -3559,6 +3559,9 @@ class FutureSelfBot(
     ) -> None:
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+        if route.kind == "negative":
+            await update.effective_message.reply_text("Ничего не удаляю и не изменяю.")
+            return
         if route.kind == "clarify":
             if snapshot.system_pending_action:
                 await self.conversation.clear_system_action(

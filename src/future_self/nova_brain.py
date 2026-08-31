@@ -27,6 +27,20 @@ NOVA_BRAIN_WORKING_STATE_TTL = timedelta(days=30)
 NOVA_BRAIN_CALLBACK_PREFIX = "nbrain:"
 NOVA_BRAIN_CAPABILITY_TTL = timedelta(minutes=15)
 
+_STRUCTURED_SETTING_ORDER = (
+    "response_length",
+    "tone",
+    "reminder_style",
+    "display_name",
+    "grammatical_address",
+)
+_STRUCTURED_SETTING_VALUES = {
+    "response_length": frozenset({"short", "normal", "detailed"}),
+    "tone": frozenset({"calm", "direct", "supportive"}),
+    "reminder_style": frozenset({"gentle", "direct", "brief"}),
+    "grammatical_address": frozenset({"masculine", "feminine", "neutral"}),
+}
+
 type NovaBrainStatus = Literal["ready", "access_changed", "unavailable"]
 type NovaBrainMutationStatus = Literal[
     "applied",
@@ -291,6 +305,39 @@ def _structured_memory_from_user_text(key: str, user_text: str) -> str | None:
     return f"{key}={matched}" if matched is not None else None
 
 
+def grounded_structured_memory(user_text: str) -> tuple[str, str] | None:
+    """Return the one exact server-parsed identity/setting declaration in a turn."""
+
+    matches = tuple(
+        (key, value)
+        for key in ("identity", "response_length", "tone", "reminder_style")
+        if (value := _structured_memory_from_user_text(key, user_text)) is not None
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def effective_structured_settings(values: tuple[str, ...]) -> dict[str, str]:
+    """Project validated singleton settings without exposing historical values."""
+
+    result: dict[str, str] = {}
+    for value in values:
+        if value.startswith("identity:"):
+            for part in value.removeprefix("identity:").split(";"):
+                name, separator, field_value = part.partition("=")
+                if separator and name in {"display_name", "grammatical_address"}:
+                    result.setdefault(name, field_value)
+            continue
+        key, separator, field_value = value.partition("=")
+        if separator and key in {"response_length", "tone", "reminder_style"}:
+            result.setdefault(key, field_value)
+    return result
+
+
+def _effective_structured_setting_items(values: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    settings = effective_structured_settings(values)
+    return tuple((key, settings[key]) for key in _STRUCTURED_SETTING_ORDER if key in settings)
+
+
 def _is_structured_observed_memory(category: str, value: str) -> bool:
     if value.startswith("identity:"):
         return category == "identity" and _canonical_memory_value("identity", value[9:]) == value
@@ -488,6 +535,7 @@ class NovaObservedMemoryView:
 class NovaBrainProjection:
     working_state: NovaDialogueStateView = field(repr=False)
     memories: tuple[NovaObservedMemoryView, ...] = field(default=(), repr=False)
+    structured_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     payload_bytes: int = 0
 
     def __post_init__(self) -> None:
@@ -499,6 +547,30 @@ class NovaBrainProjection:
             type(memory) is not NovaObservedMemoryView for memory in self.memories
         ):
             raise ValueError("Invalid Nova brain projection")
+        if (
+            not isinstance(self.structured_settings, tuple)
+            or len(self.structured_settings) > len(_STRUCTURED_SETTING_ORDER)
+            or tuple(key for key, _value in self.structured_settings)
+            != tuple(
+                key for key in _STRUCTURED_SETTING_ORDER if key in dict(self.structured_settings)
+            )
+            or len(dict(self.structured_settings)) != len(self.structured_settings)
+        ):
+            raise ValueError("Invalid Nova brain structured settings")
+        for key, value in self.structured_settings:
+            if (
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not value
+                or len(value.encode("utf-8")) > 200
+                or any(unicodedata.category(character).startswith("C") for character in value)
+                or (key == "display_name" and _clean_text(value, maximum=50) != value)
+                or (
+                    key != "display_name"
+                    and value not in _STRUCTURED_SETTING_VALUES.get(key, frozenset())
+                )
+            ):
+                raise ValueError("Invalid Nova brain structured settings")
         actual = len(
             json.dumps(
                 self.provider_payload(),
@@ -519,6 +591,8 @@ class NovaBrainProjection:
             payload["relevant_observed_memories"] = [
                 memory.provider_payload() for memory in self.memories
             ]
+        if self.structured_settings:
+            payload["active_structured_settings"] = dict(self.structured_settings)
         return payload
 
 
@@ -1155,7 +1229,8 @@ class NovaBrainService:
         )
         memory_views = self._memory_views(memories)
         selected = self._retrieve(current_text, state_view, memory_views)
-        projection = self._fit_projection(state_view, selected)
+        structured_settings = self._active_structured_setting_items(memories)
+        projection = self._fit_projection(state_view, selected, structured_settings)
         fence = NovaBrainFence(
             owner_id=actor.id,
             telegram_user_id=telegram_actor_id,
@@ -1817,11 +1892,16 @@ class NovaBrainService:
         self,
         state: NovaDialogueStateView,
         memories: tuple[NovaObservedMemoryView, ...],
+        structured_settings: tuple[tuple[str, str], ...] = (),
     ) -> NovaBrainProjection:
         selected = list(memories)
         fitted_state = state
         while True:
-            projection = NovaBrainProjection(fitted_state, tuple(selected))
+            projection = NovaBrainProjection(
+                fitted_state,
+                tuple(selected),
+                structured_settings=structured_settings,
+            )
             if projection.payload_bytes <= self.context_max_bytes:
                 return projection
             if selected:
@@ -1895,13 +1975,33 @@ class NovaBrainService:
             semantic_key = _structured_memory_semantic_key(row.category, row.normalized_value)
             if (
                 semantic_key is None
-                or row.semantic_key not in {None, semantic_key}
+                or row.semantic_key != semantic_key
                 or semantic_key in seen_keys
             ):
                 continue
             seen_keys.add(semantic_key)
             views.append(NovaBrainService._memory_view(row))
         return tuple(views)
+
+    @staticmethod
+    def _active_structured_setting_items(
+        rows: list[NovaObservedMemory],
+    ) -> tuple[tuple[str, str], ...]:
+        values: list[str] = []
+        seen_keys: set[str] = set()
+        for row in rows:
+            semantic_key = _structured_memory_semantic_key(row.category, row.normalized_value)
+            if (
+                semantic_key is None
+                or row.status != "active"
+                or row.semantic_key != semantic_key
+                or semantic_key in seen_keys
+                or semantic_key not in {"response_length", "tone", "reminder_style", "identity"}
+            ):
+                continue
+            seen_keys.add(semantic_key)
+            values.append(row.normalized_value)
+        return _effective_structured_setting_items(tuple(values))
 
     @staticmethod
     def _memory_revision(owner_id: int, rows: tuple[NovaObservedMemoryView, ...]) -> str:

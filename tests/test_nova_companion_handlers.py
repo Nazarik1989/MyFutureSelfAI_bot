@@ -40,6 +40,7 @@ from future_self.nova_companion_handlers import (
     NOVA_COMPANION_ACCESS_CHANGED_TEXT,
     NOVA_COMPANION_CONTEXT_CHANGED_TEXT,
     NOVA_COMPANION_DISCOURSE_AMBIGUOUS_TEXT,
+    NOVA_COMPANION_NEUTRAL_ADDRESS_REPLACEMENT_TEXT,
     NOVA_COMPANION_NO_ACTIVE_REMINDER_OFFER_TEXT,
     NOVA_COMPANION_NOT_EXECUTED_TEXT,
     NOVA_COMPANION_RECALL_ACTION_SUPPRESSED_TEXT,
@@ -48,6 +49,7 @@ from future_self.nova_companion_handlers import (
     NOVA_COMPANION_REMINDER_OFFER_ACTION_TEXT,
     NOVA_COMPANION_UNAVAILABLE_TEXT,
     NovaCompanionHandlers,
+    _has_mismatched_direct_address,
 )
 from future_self.reminder_flow import ReminderFlowPhase
 from future_self.schemas import (
@@ -2060,6 +2062,7 @@ async def test_nova_brain_recall_and_exact_forget_confirmation_are_provider_free
             NovaObservedMemory(
                 owner_id=user.id,
                 category="preference",
+                semantic_key="response_length",
                 normalized_value="response_length=short",
                 content_fingerprint="a" * 64,
                 source_kind="conversation",
@@ -2211,6 +2214,7 @@ async def test_nova_brain_recall_is_bounded_and_separates_all_current_source_lay
                 NovaObservedMemory(
                     owner_id=user.id,
                     category="identity",
+                    semantic_key="identity",
                     normalized_value=("identity:display_name=назар;grammatical_address=masculine"),
                     content_fingerprint=sha256(
                         "identity:display_name=назар;grammatical_address=masculine".encode()
@@ -2663,6 +2667,7 @@ async def test_nova_brain_forget_direct_cancellation_recovers_same_exact_generat
             NovaObservedMemory(
                 owner_id=user.id,
                 category="preference",
+                semantic_key="response_length",
                 normalized_value="response_length=short",
                 content_fingerprint="c" * 64,
                 source_kind="conversation",
@@ -2716,6 +2721,7 @@ async def test_nova_brain_forget_forged_cross_user_chat_and_replay_are_inert(db,
             NovaObservedMemory(
                 owner_id=user.id,
                 category="preference",
+                semantic_key="response_length",
                 normalized_value="response_length=short",
                 content_fingerprint="e" * 64,
                 source_kind="conversation",
@@ -3627,7 +3633,7 @@ async def test_grounded_reminder_offer_survives_conversation_and_text_consent_ha
 
 
 @pytest.mark.parametrize("source", ["text", "voice"])
-async def test_grounded_course_offer_without_schedule_enters_existing_when_phase(
+async def test_grounded_course_offer_with_pochashche_enters_guided_frequency_phase(
     db,
     fake_ai,
     source,
@@ -3690,16 +3696,15 @@ async def test_grounded_course_offer_without_schedule_enters_existing_when_phase
         chat_id=user.telegram_id,
     )
     assert session is not None
-    assert session.phase is ReminderFlowPhase.WHEN
+    assert session.phase is ReminderFlowPhase.RECURRENCE_FREQUENCY
     assert session.title == "курс, по которому я могу стать лучше"
-    assert context.bot.neutralized[-1]["text"] == "🔔 Когда напомнить?"
+    assert "Как часто напоминать" in context.bot.neutralized[-1]["text"]
     labels = [
         button.text
         for row in context.bot.neutralized[-1]["reply_markup"].inline_keyboard
         for button in row
     ]
-    assert "Завтра" in labels
-    assert "🔁 Каждый день" in labels
+    assert labels == ["Отмена"]
     assert len(fake_ai.companion_calls) == 1
     async with db.sessions() as session_db:
         assert await session_db.scalar(select(func.count(TaskReminder.id))) == 0
@@ -4682,6 +4687,311 @@ async def test_strong_unanchored_reminder_command_is_local_and_domain_read_only(
         )
         is None
     )
+    assert bot._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize(
+    ("setting", "answer"),
+    [
+        ("masculine", "Ты, похоже, устала и растерялась"),
+        ("feminine", "Ты, кажется, устал и растерялся"),
+        ("neutral", "Ты, вероятно, устал и растерялся"),
+        ("masculine", "Ты наверняка устала"),
+        ("feminine", "Ты, видимо, был уставшим"),
+        ("masculine", "Ты, наверное, устала"),
+        ("masculine", "Ты, возможно, похоже, уже немного устала"),
+        ("masculine", "Ты, скорее всего, устала"),
+    ],
+)
+def test_gender_guard_detects_bounded_modal_direct_address(setting, answer):
+    assert _has_mismatched_direct_address(answer, setting) is True
+
+
+@pytest.mark.parametrize(
+    ("setting", "answer"),
+    [
+        ("masculine", "Ты знаешь, Марина устала"),
+        ("feminine", "Ты говоришь, что Иван устал"),
+        ("masculine", "Я была рада помочь"),
+        ("masculine", "Марина сказала: “Ты устала”"),
+        ("masculine", "Ты, похоже, Марина устала"),
+        ("masculine", "Ты, похоже. Марина устала"),
+    ],
+)
+def test_gender_guard_stops_before_subject_sentence_and_quote(setting, answer):
+    assert _has_mismatched_direct_address(answer, setting) is False
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_structured_settings_query_uses_only_effective_singletons_and_active_gender(
+    db,
+    fake_ai,
+    source,
+):
+    bot, user = await ready_companion_bot(
+        db,
+        fake_ai,
+        telegram_user_id=79_200 + (source == "voice"),
+        enable_brain=True,
+    )
+    async with db.session() as session:
+        session.add_all(
+            [
+                NovaObservedMemory(
+                    owner_id=user.id,
+                    category="preference",
+                    semantic_key="response_length",
+                    normalized_value="response_length=short",
+                    content_fingerprint="1" * 64,
+                    source_kind="conversation",
+                    source_session_id=1,
+                    source_message_id=1,
+                    source_receipt="2" * 64,
+                    status="superseded",
+                    salience=4,
+                    revision=2,
+                ),
+                NovaObservedMemory(
+                    owner_id=user.id,
+                    category="preference",
+                    semantic_key="tone",
+                    normalized_value="tone=calm",
+                    content_fingerprint="3" * 64,
+                    source_kind="conversation",
+                    source_session_id=1,
+                    source_message_id=2,
+                    source_receipt="4" * 64,
+                    status="superseded",
+                    salience=4,
+                    revision=2,
+                ),
+                NovaObservedMemory(
+                    owner_id=user.id,
+                    category="preference",
+                    semantic_key="response_length",
+                    normalized_value="response_length=detailed",
+                    content_fingerprint="5" * 64,
+                    source_kind="conversation",
+                    source_session_id=1,
+                    source_message_id=3,
+                    source_receipt="6" * 64,
+                    status="active",
+                    salience=4,
+                    revision=1,
+                ),
+                NovaObservedMemory(
+                    owner_id=user.id,
+                    category="preference",
+                    semantic_key="tone",
+                    normalized_value="tone=direct",
+                    content_fingerprint="7" * 64,
+                    source_kind="conversation",
+                    source_session_id=1,
+                    source_message_id=4,
+                    source_receipt="8" * 64,
+                    status="active",
+                    salience=4,
+                    revision=1,
+                ),
+                NovaObservedMemory(
+                    owner_id=user.id,
+                    category="identity",
+                    semantic_key="identity",
+                    normalized_value="identity:grammatical_address=masculine",
+                    content_fingerprint="9" * 64,
+                    source_kind="conversation",
+                    source_session_id=1,
+                    source_message_id=5,
+                    source_receipt="a" * 64,
+                    status="active",
+                    salience=5,
+                    revision=1,
+                ),
+            ]
+        )
+    incoming = CompanionMessage(
+        "Какие настройки общения ты обо мне помнишь?",
+        chat_id=user.telegram_id,
+    )
+    progress = (
+        CompanionMessage("Распознаю…", chat_id=user.telegram_id) if source == "voice" else None
+    )
+
+    await deliver(bot, user, incoming, source=source, delivery_message=progress)
+
+    answer = sent_answer(incoming).text if progress is None else progress.edits[-1]["text"]
+    assert answer == (
+        "Ты попросил отвечать подробно, говорить прямо и обращаться к тебе в мужском роде"
+    )
+    assert "коротко" not in answer and "спокойно" not in answer
+    assert fake_ai.companion_calls == []
+
+    gender = CompanionMessage(
+        "В каком роде ты должна ко мне обращаться?",
+        chat_id=user.telegram_id,
+    )
+    await deliver(bot, user, gender)
+    assert sent_answer(gender).text == "Я должна обращаться к тебе в мужском роде."
+    assert fake_ai.companion_calls == []
+
+    feminine_answer = "Ты просила продолжить разговор прямо."
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(answer=feminine_answer)
+    continuation = CompanionMessage("Давай продолжим", chat_id=user.telegram_id)
+    await deliver(bot, user, continuation)
+    corrected_answer = sent_answer(continuation).text
+    assert corrected_answer == NOVA_COMPANION_NEUTRAL_ADDRESS_REPLACEMENT_TEXT
+    assert feminine_answer not in corrected_answer
+
+    ironic = "Опана, я женщина значит...))"
+    raw = "Да, ты просила обращаться к тебе в женском роде."
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer=raw,
+        memory_candidate=NovaCompanionMemoryCandidate(
+            category="identity",
+            key="identity",
+            value="grammatical_address=feminine",
+            evidence=ironic,
+        ),
+    )
+    message = CompanionMessage(ironic, chat_id=user.telegram_id)
+    await deliver(bot, user, message)
+    delivered = sent_answer(message).text
+    assert delivered == (
+        "Не меняю настройку по неоднозначной реплике: активным остаётся мужской род."
+    )
+    assert raw not in delivered
+    async with db.sessions() as session:
+        active = tuple(
+            await session.scalars(
+                select(NovaObservedMemory.normalized_value)
+                .where(NovaObservedMemory.status == "active")
+                .order_by(NovaObservedMemory.id)
+            )
+        )
+        contents = tuple(await session.scalars(select(ConversationMessage.content)))
+    assert active == (
+        "response_length=detailed",
+        "tone=direct",
+        "identity:grammatical_address=masculine",
+    )
+    assert "identity:grammatical_address=feminine" not in active
+    assert raw not in contents
+    assert feminine_answer not in contents
+    assert corrected_answer in contents
+    assert delivered in contents
+    assert len(fake_ai.companion_calls) == 2
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_weekly_focus_question_never_substitutes_goals_or_vision(db, fake_ai):
+    bot, user = await ready_companion_bot(db, fake_ai, telegram_user_id=79_210)
+    async with db.session() as session:
+        session.add(
+            Goal(
+                user_id=user.id,
+                life_area="Развитие",
+                title="Закончить книгу",
+                outcome="Рукопись готова",
+                progress_criterion="10 глав",
+                horizon="год",
+                status="active",
+                priority=5,
+                vision_link="",
+            )
+        )
+        session.add(
+            VisionItem(
+                owner_id=user.id,
+                category="growth_creativity",
+                wish_text="Написать книгу",
+                why_text=None,
+                first_step=None,
+                status="active",
+            )
+        )
+    incoming = CompanionMessage("Какой у меня фокус недели?", chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming)
+
+    assert sent_answer(incoming).text == ("У тебя сейчас нет подтверждённого фокуса недели.")
+    assert fake_ai.companion_calls == []
+    assert await companion_counts(db) == (0, 0, 0)
+
+
+async def test_ordinary_need_for_more_frequent_return_is_not_status_denial(db, fake_ai):
+    text = "Мне нужно чаще возвращаться к главному"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Пока ничего не создано.",
+        reminder_offer=NovaCompanionProviderReminderOffer(
+            title="возвращаться к главному",
+            evidence=text,
+        ),
+    )
+    bot, user = await ready_companion_bot(db, fake_ai, telegram_user_id=79_211)
+    incoming = CompanionMessage(text, chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming)
+
+    answer = sent_answer(incoming)
+    assert answer.text == (
+        "Похоже, тебе важно регулярно возвращаться к этому. Можно настроить настоящее напоминание."
+    )
+    assert "Пока ничего не создано" not in answer.text
+    assert answer.markup_edits[-1] is not None
+    assert len(fake_ai.companion_calls) == 1
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+    assert bot._nova_companion_tasks == set()
+
+
+async def test_prior_grounded_subject_and_current_vague_recurrence_start_guided_flow(
+    db,
+    fake_ai,
+):
+    subject = "Давай сегодня будем возвращать внимание к дыханию и физическим ощущениям"
+    request = "Может первое время ты будешь помогать регулярными напоминаниями?"
+    title = "возвращать внимание к дыханию и физическим ощущениям"
+    bot, user = await ready_companion_bot(db, fake_ai, telegram_user_id=79_212)
+    context = companion_context()
+    fake_ai.companion_result = NovaCompanionResponse(
+        answer="Да, это может помочь мягко возвращаться к выбранному ориентиру."
+    )
+    await deliver(
+        bot,
+        user,
+        CompanionMessage(subject, chat_id=user.telegram_id),
+        context=context,
+    )
+    fake_ai.companion_result = NovaCompanionResponse(
+        answer="Можно настроить настоящее напоминание и отдельно выбрать режим.",
+        reminder_offer=NovaCompanionReminderOffer(
+            title=title,
+            evidence=subject,
+        ),
+    )
+    incoming = CompanionMessage(request, chat_id=user.telegram_id)
+
+    await deliver(bot, user, incoming, context=context)
+
+    live = await bot.nova_companion_reminders.active(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=user.telegram_id,
+        access_tier=user.access_tier,
+        access_version=user.access_version,
+    )
+    assert live is not None
+    assert live.candidate.title == title
+    assert live.candidate.guided_recurrence is True
+    assert live.candidate.schedule_wording is None
+    assert live.candidate.temporal is None
+    assert len(fake_ai.companion_calls) == 2
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
     assert bot._nova_companion_tasks == set()
 
 

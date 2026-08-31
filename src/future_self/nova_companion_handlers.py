@@ -5,7 +5,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -19,7 +19,14 @@ from .access import FULL_ACCESS_TIERS
 from .ai import NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
 from .conversation import ConversationExchangeReceipt
 from .domain import temporal_context
-from .models import DraftInboxItem, InboxItem, TaskReminder, User
+from .models import (
+    DraftInboxItem,
+    InboxItem,
+    RecurringTaskReminderSchedule,
+    TaskReminder,
+    User,
+    WeeklyFocus,
+)
 from .nova_brain import (
     NovaBrainApplyReceipt,
     NovaBrainFence,
@@ -28,6 +35,8 @@ from .nova_brain import (
     NovaBrainPolicy,
     NovaBrainProjection,
     NovaBrainService,
+    effective_structured_settings,
+    grounded_structured_memory,
     observed_memory_display_value,
     validate_dialogue_state_update,
     validate_memory_candidate,
@@ -73,6 +82,7 @@ from .schemas import (
     NovaCompanionMemoryCandidate,
     ParsedThought,
 )
+from .weekly_review import current_week_start
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +110,12 @@ NOVA_COMPANION_RECALL_UNAVAILABLE_TEXT = "Деталей того разгово
 NOVA_COMPANION_RECALL_ACTION_SUPPRESSED_TEXT = (
     "В режиме воспоминания я могу только пересказать доступный контекст разговора — "
     "без кнопок и действий."
+)
+NOVA_COMPANION_GUIDED_REMINDER_FALLBACK_TEXT = (
+    "Похоже, тебе важно регулярно возвращаться к этому. Можно настроить настоящее напоминание."
+)
+NOVA_COMPANION_GUIDED_REMINDER_CLARIFY_TEXT = (
+    "Что именно тебе напоминать? Назови один конкретный предмет напоминания."
 )
 NOVA_COMPANION_DISCOURSE_AMBIGUOUS_TEXT = (
     "Ты хочешь подобрать разговорный способ или настроить настоящее напоминание?"
@@ -129,9 +145,21 @@ _IDENTITY_CITY_QUESTION = re.compile(
     r"в\s+каком\s+городе\s+я\s+живу)[?!.…]*$",
     re.IGNORECASE,
 )
+_COMMUNICATION_SETTINGS_QUESTION = re.compile(
+    r"^(?:нова[,!]?\s*)?какие\s+настройки\s+общения\s+ты\s+обо\s+мне\s+помнишь[?!.…]*$",
+    re.IGNORECASE,
+)
+_GRAMMATICAL_ADDRESS_QUESTION = re.compile(
+    r"^(?:нова[,!]?\s*)?в\s+каком\s+роде\s+ты\s+должна\s+ко\s+мне\s+обращаться[?!.…]*$",
+    re.IGNORECASE,
+)
+_WEEKLY_FOCUS_QUESTION = re.compile(
+    r"^(?:нова[,!]?\s*)?какой\s+у\s+меня\s+(?:сейчас\s+)?фокус\s+недели[?!.…]*$",
+    re.IGNORECASE,
+)
 _REMINDER_STATUS_QUESTION = re.compile(
     r"^(?:в\s+смысле[?!.…]*\s*)?(?:ты\s+)?(?:"
-    r"записала\s+напоминание|поставила\s+напоминание|создала\s+напоминание|"
+    r"(?:уже\s+)?(?:записала|поставила|создала)\s+напоминание|"
     r"напомнишь|а\s+мне\s+напомнишь|оно\s+уже\s+создано|"
     r"напоминание\s+(?:уже\s+)?(?:создано|готово)|готово\s+с\s+напоминанием"
     r")[?!.…]*$",
@@ -158,6 +186,145 @@ _CONTEXTUAL_STATUS_QUESTION = re.compile(
     r"^(?:ну\s+что[,:]?\s*)?(?:вс[её]\s+)?готово\?+[!.…]*$",
     re.IGNORECASE,
 )
+_VAGUE_RECURRENCE = re.compile(
+    r"\b(?:регулярн\w*|почаще|чаще|постоянно|на\s+первое\s+время|"
+    r"пока\s+не\s+привыкн\w*|раз\s+(?:\d+|[а-яё]+))\b",
+    re.IGNORECASE,
+)
+_VAGUE_REMINDER_REQUEST = re.compile(
+    r"\b(?:напоминай\w*|напоминан\w*)\b",
+    re.IGNORECASE,
+)
+_GUIDED_TITLE_PREFIX = re.compile(
+    r"^(?:напоминай\s+мне\s+)?(?:регулярно\s+|почаще\s+|чаще\s+|постоянно\s+)?",
+    re.IGNORECASE,
+)
+_GUIDED_IMPERATIVE = re.compile(
+    r"^\s*(?:(?:нова|nova)\s*[,;:—-]?\s*)?напоминай(?:те)?(?:\s+мне)?\b",
+    re.IGNORECASE,
+)
+_GROUNDED_CONTEXT_SUBJECT = re.compile(
+    r"^\s*(?:давай\s+)?(?:сегодня\s+)?(?:(?:мы\s+)?будем|я\s+буду|"
+    r"я\s+хочу|хочу|мне\s+нужно|я\s+решил[а]?)\s+(?P<title>.+?)\s*[.!…]*$",
+    re.IGNORECASE,
+)
+_GROUNDED_CONTEXT_INFINITIVE = re.compile(
+    r"^(?:(?:снова|чаще|меньше|больше|регулярно)\s+)?[а-яё-]+(?:ть|ться)\b",
+    re.IGNORECASE,
+)
+_UNTRUSTED_CAPABILITY_DENIAL = re.compile(
+    r"(?:\bпока\s+ничего\s+не\s+создано\b|"
+    r"\b(?:я\s+)?не\s+(?:могу|умею)\b[\s\S]{0,60}\b(?:созда|став|настраива)\w*\s+напоминан\w*)",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_IDENTITY_LANGUAGE = re.compile(
+    r"\b(?:я\s+(?:мужчина|женщина)|мужск\w*\s+род|женск\w*\s+род|"
+    r"нейтральн\w*\s+(?:род|обращен\w*))\b",
+    re.IGNORECASE,
+)
+_FEMININE_ADDRESS_FORMS = frozenset(
+    {
+        "была",
+        "выбрала",
+        "готова",
+        "должна",
+        "знакома",
+        "начала",
+        "написала",
+        "настроила",
+        "перегружена",
+        "подумала",
+        "попросила",
+        "права",
+        "продолжила",
+        "просила",
+        "рада",
+        "растерялась",
+        "решила",
+        "сделала",
+        "сказала",
+        "согласна",
+        "сосредоточена",
+        "способна",
+        "уверена",
+        "указала",
+        "упомянула",
+        "устала",
+        "уставшей",
+        "хотела",
+    }
+)
+_MASCULINE_ADDRESS_FORMS = frozenset(
+    {
+        "был",
+        "выбрал",
+        "готов",
+        "должен",
+        "знаком",
+        "начал",
+        "написал",
+        "настроил",
+        "перегружен",
+        "подумал",
+        "попросил",
+        "прав",
+        "продолжил",
+        "просил",
+        "рад",
+        "растерялся",
+        "решил",
+        "сделал",
+        "сказал",
+        "согласен",
+        "сосредоточен",
+        "способен",
+        "уверен",
+        "указал",
+        "упомянул",
+        "устал",
+        "уставшим",
+        "хотел",
+    }
+)
+NOVA_COMPANION_NEUTRAL_ADDRESS_REPLACEMENT_TEXT = "Продолжим с учётом твоих настроек общения."
+_QUOTED_ADDRESS_SPAN = re.compile(
+    r"«[^»]*»|„[^“]*“|“[^”]*”|\"[^\"]*\"|'[^']*'",
+    re.DOTALL,
+)
+_ADDRESS_LEADING_MODIFIERS = frozenset(
+    {
+        "ведь",
+        "всё",
+        "все",
+        "действительно",
+        "ещё",
+        "немного",
+        "опять",
+        "очень",
+        "по-прежнему",
+        "прямо",
+        "сама",
+        "сам",
+        "сейчас",
+        "сегодня",
+        "слишком",
+        "снова",
+        "уже",
+        "явно",
+    }
+)
+_ADDRESS_MODAL_WRAPPERS = frozenset(
+    {
+        "видимо",
+        "возможно",
+        "кажется",
+        "наверное",
+        "наверняка",
+        "похоже",
+        "вероятно",
+    }
+)
+_ADDRESS_MAX_PREFIX_WORDS = 8
 _BRAIN_MEMORY_RECALL = re.compile(
     r"^(?:что\s+ты\s+(?:обо\s+мне\s+)?(?:помнишь|знаешь)|"
     r"что\s+ты\s+(?:помнишь|знаешь)\s+обо\s+мне|"
@@ -306,6 +473,157 @@ def _has_suppressed_action_dependency(answer: object, *, user_text: object = "")
     )
 
 
+def _guided_recurrence_title(
+    title: str,
+    evidence: str,
+    current_text: str,
+) -> tuple[str, bool]:
+    guided = bool(_VAGUE_RECURRENCE.search(evidence) or _VAGUE_RECURRENCE.search(current_text))
+    if not guided:
+        return title, False
+    cleaned = _GUIDED_TITLE_PREFIX.sub("", title.strip(), count=1).strip(" ,:;—-")
+    return (cleaned or title), True
+
+
+def _guided_context_subject(snapshot: object) -> str | None:
+    messages = getattr(snapshot, "messages", None)
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+    user_message, assistant_message = messages[-2:]
+    if (
+        not isinstance(user_message, dict)
+        or not isinstance(assistant_message, dict)
+        or user_message.get("role") != "user"
+        or user_message.get("intent") != "companion_user"
+        or assistant_message.get("role") != "assistant"
+        or assistant_message.get("intent") != "companion_answer"
+    ):
+        return None
+    content = user_message.get("content")
+    if not isinstance(content, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", content)
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        return None
+    normalized = " ".join(normalized.split())
+    matched = _GROUNDED_CONTEXT_SUBJECT.fullmatch(normalized)
+    if matched is None:
+        return None
+    title = " ".join(matched.group("title").split()).strip(" ,:;—-.!?…")
+    if (
+        not title
+        or len(title) > 200
+        or "?" in title
+        or _GROUNDED_CONTEXT_INFINITIVE.search(title) is None
+    ):
+        return None
+    return title
+
+
+def _server_grounded_guided_candidate(
+    title: str,
+    *,
+    timezone: str,
+) -> NovaCompanionReminderCandidate:
+    return NovaCompanionReminderCandidate(
+        title=title,
+        schedule_wording=None,
+        evidence=title,
+        timezone=timezone,
+        temporal=None,
+        guided_recurrence=True,
+    )
+
+
+def _active_structured_settings(projection: NovaBrainProjection | None) -> dict[str, str]:
+    if projection is None:
+        return {}
+    return dict(projection.structured_settings)
+
+
+def _grounded_setting_acknowledgement(user_text: str) -> str | None:
+    grounded = grounded_structured_memory(user_text)
+    if grounded is None:
+        return None
+    key, value = grounded
+    if key != "identity":
+        return None
+    fields = effective_structured_settings((value,))
+    grammatical = fields.get("grammatical_address")
+    if grammatical is not None:
+        label = {
+            "masculine": "в мужском роде",
+            "feminine": "в женском роде",
+            "neutral": "нейтрально",
+        }[grammatical]
+        return f"Хорошо, буду обращаться к тебе {label}."
+    display_name = fields.get("display_name")
+    if display_name:
+        return f"Хорошо, буду обращаться к тебе как {display_name[:1].upper() + display_name[1:]}."
+    return None
+
+
+def _has_mismatched_direct_address(answer: str, grammatical: str) -> bool:
+    forbidden_forms = (
+        _FEMININE_ADDRESS_FORMS
+        if grammatical == "masculine"
+        else _MASCULINE_ADDRESS_FORMS
+        if grammatical == "feminine"
+        else _FEMININE_ADDRESS_FORMS | _MASCULINE_ADDRESS_FORMS
+        if grammatical == "neutral"
+        else frozenset()
+    )
+    normalized_answer = unicodedata.normalize("NFKC", answer)
+    unquoted_answer = _QUOTED_ADDRESS_SPAN.sub(" ", normalized_answer)
+    allowed_single_words = _ADDRESS_LEADING_MODIFIERS | _ADDRESS_MODAL_WRAPPERS
+    for direct_address in re.finditer(r"\bты\b", unquoted_answer, re.IGNORECASE):
+        tail = unquoted_answer[direct_address.end() :]
+        tail = re.split(r"[.!?…;:\n\r]", tail, maxsplit=1)[0]
+        words = [word.casefold() for word in re.findall(r"[а-яё-]+", tail, re.IGNORECASE)]
+        index = 0
+        consumed = 0
+        while index < len(words):
+            word = words[index]
+            if word in forbidden_forms:
+                return True
+            if consumed >= _ADDRESS_MAX_PREFIX_WORDS:
+                break
+            if word in allowed_single_words:
+                index += 1
+                consumed += 1
+                continue
+            if word == "скорее" and index + 1 < len(words) and words[index + 1] == "всего":
+                index += 2
+                consumed += 2
+                continue
+            break
+    return False
+
+
+def _apply_grammatical_address(
+    answer: str,
+    *,
+    user_text: str,
+    settings: dict[str, str],
+) -> str:
+    grammatical = settings.get("grammatical_address")
+    if grammatical is None:
+        return answer
+    if (
+        _AMBIGUOUS_IDENTITY_LANGUAGE.search(user_text)
+        and grounded_structured_memory(user_text) is None
+    ):
+        label = {
+            "masculine": "мужской род",
+            "feminine": "женский род",
+            "neutral": "нейтральное обращение",
+        }[grammatical]
+        return f"Не меняю настройку по неоднозначной реплике: активным остаётся {label}."
+    if _has_mismatched_direct_address(answer, grammatical):
+        return NOVA_COMPANION_NEUTRAL_ADDRESS_REPLACEMENT_TEXT
+    return answer
+
+
 def _bounded_recall_topic(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -431,6 +749,13 @@ class _CompanionStatusReceipt:
     inbox_item_id: int = field(repr=False)
     inbox_item_version: int = field(repr=False)
     title: str = field(repr=False)
+    task_reminder_id: int | None = field(default=None, repr=False)
+    recurring_schedule_id: int | None = field(default=None, repr=False)
+    recurring_schedule_version: int | None = field(default=None, repr=False)
+    timezone: str | None = field(default=None, repr=False)
+    schedule_kind: Literal["once", "daily"] | None = None
+    local_date: date | None = field(default=None, repr=False)
+    local_time: time | None = field(default=None, repr=False)
 
 
 class NovaCompanionHandlers:
@@ -529,6 +854,19 @@ class NovaCompanionHandlers:
                 context,
                 delivery_message,
                 identity_response,
+                user=user,
+            )
+            return True
+        grounded_response = await self._nova_companion_grounded_projection_answer(
+            semantic_text,
+            user=user,
+        )
+        if grounded_response is not None:
+            await self._nova_companion_local_response(
+                update,
+                context,
+                delivery_message,
+                grounded_response,
                 user=user,
             )
             return True
@@ -648,8 +986,11 @@ class NovaCompanionHandlers:
                 )
                 return True
         else:
-            reminder_probe = self.reminder_intent_parser.parse(semantic_text, user.timezone)
-            if reminder_probe.status is not ReminderIntentStatus.NOT_REMINDER:
+            guided_request = bool(
+                _VAGUE_RECURRENCE.search(semantic_text)
+                and _VAGUE_REMINDER_REQUEST.search(semantic_text)
+            )
+            if guided_request and _GUIDED_IMPERATIVE.search(semantic_text):
                 return await self._reminder_question_gate(
                     update,
                     context,
@@ -663,6 +1004,34 @@ class NovaCompanionHandlers:
                     voice_state=None,
                     weekly_candidate_handoff=False,
                 )
+            guided_fallback_title = (
+                _guided_context_subject(conversation_snapshot) if guided_request else None
+            )
+            if guided_request and guided_fallback_title is None:
+                await self._nova_companion_local_response(
+                    update,
+                    context,
+                    delivery_message,
+                    NOVA_COMPANION_GUIDED_REMINDER_CLARIFY_TEXT,
+                    user=user,
+                )
+                return True
+            if not guided_request:
+                reminder_probe = self.reminder_intent_parser.parse(semantic_text, user.timezone)
+                if reminder_probe.status is not ReminderIntentStatus.NOT_REMINDER:
+                    return await self._reminder_question_gate(
+                        update,
+                        context,
+                        semantic_text,
+                        candidate_message=delivery_message,
+                        expected_access_version=(
+                            user.access_version if delivery_message is not None else None
+                        ),
+                        expected_session=None,
+                        voice_fenced=delivery_message is not None,
+                        voice_state=None,
+                        weekly_candidate_handoff=False,
+                    )
         await self._nova_companion_prepare_and_deliver(
             update,
             context,
@@ -671,6 +1040,9 @@ class NovaCompanionHandlers:
             snapshot=conversation_snapshot,
             text=semantic_text,
             source=source,
+            guided_recurrence_fallback_title=(
+                guided_fallback_title if continuation is None else None
+            ),
         )
         return True
 
@@ -807,6 +1179,97 @@ class NovaCompanionHandlers:
                 else "Подтверждённый город пока не указан."
             )
         return None
+
+    async def _nova_companion_grounded_projection_answer(
+        self,
+        text: str,
+        *,
+        user: User,
+    ) -> str | None:
+        cleaned = text.strip()
+        if _WEEKLY_FOCUS_QUESTION.fullmatch(cleaned):
+            try:
+                week_start = current_week_start(user.timezone, now=self._reminder_now())
+                async with self.db.sessions() as session:
+                    focus = await session.scalar(
+                        select(WeeklyFocus.focus).where(
+                            WeeklyFocus.owner_id == user.id,
+                            WeeklyFocus.week_start == week_start,
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Nova companion failed operation=weekly_focus_lookup error_type=%s",
+                    type(exc).__name__,
+                )
+                return NOVA_COMPANION_UNAVAILABLE_TEXT
+            return (
+                f"Твой подтверждённый фокус недели: {focus}."
+                if isinstance(focus, str) and focus.strip()
+                else "У тебя сейчас нет подтверждённого фокуса недели."
+            )
+        settings_question = _COMMUNICATION_SETTINGS_QUESTION.fullmatch(cleaned)
+        grammatical_question = _GRAMMATICAL_ADDRESS_QUESTION.fullmatch(cleaned)
+        if settings_question is None and grammatical_question is None:
+            return None
+        policy = self.nova_brain_policy()
+        if not policy.allows_actor(user):
+            return "У меня нет активных сохранённых настроек общения."
+        try:
+            observed = await self.nova_brain_service.list_current(
+                telegram_actor_id=user.telegram_id,
+                expected_access_version=user.access_version,
+                policy=policy,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=settings_lookup error_type=%s",
+                type(exc).__name__,
+            )
+            return NOVA_COMPANION_UNAVAILABLE_TEXT
+        effective = effective_structured_settings(tuple(item.value for item in observed))
+        grammatical = effective.get("grammatical_address")
+        if grammatical_question is not None:
+            label = {
+                "masculine": "в мужском роде",
+                "feminine": "в женском роде",
+                "neutral": "нейтрально",
+            }.get(grammatical)
+            return (
+                f"Я должна обращаться к тебе {label}."
+                if label is not None
+                else "Активная настройка рода обращения пока не задана."
+            )
+        clauses: list[str] = []
+        response_length = {
+            "short": "отвечать коротко",
+            "normal": "отвечать обычной длиной",
+            "detailed": "отвечать подробно",
+        }.get(effective.get("response_length", ""))
+        tone = {
+            "calm": "говорить спокойно",
+            "direct": "говорить прямо",
+            "supportive": "говорить поддерживающе",
+        }.get(effective.get("tone", ""))
+        address = {
+            "masculine": "обращаться к тебе в мужском роде",
+            "feminine": "обращаться к тебе в женском роде",
+            "neutral": "обращаться к тебе нейтрально",
+        }.get(grammatical or "")
+        clauses.extend(item for item in (response_length, tone, address) if item is not None)
+        if not clauses:
+            return "У меня нет активных сохранённых настроек общения."
+        prefix = {
+            "masculine": "Ты попросил",
+            "feminine": "Ты попросила",
+        }.get(grammatical or "", "Ты попросил(а)")
+        if len(clauses) == 1:
+            return f"{prefix} {clauses[0]}"
+        return f"{prefix} {', '.join(clauses[:-1])} и {clauses[-1]}"
 
     @staticmethod
     def _nova_brain_recall_answer(
@@ -1477,35 +1940,93 @@ class NovaCompanionHandlers:
         self,
         session: ReminderFlowSession,
         item: InboxItem,
+        *,
+        reminder: TaskReminder | None,
+        recurring: Any | None,
     ) -> None:
         pending = self._nova_companion_pending_reminder_status.pop(session.id, None)
+        recurring_schedule = getattr(recurring, "schedule", None)
+        schedule_kind = getattr(session.schedule_kind, "value", None)
         if (
-            pending is None
-            or pending.owner_id != session.owner_id
+            item.user_id != session.owner_id
+            or item.title != session.title
+            or item.kind != "task"
+            or item.status != "confirmed"
+            or schedule_kind not in {"once", "daily"}
+            or session.local_time is None
+            or not session.timezone
+        ):
+            return
+        if pending is not None and (
+            pending.owner_id != session.owner_id
             or pending.telegram_user_id != session.telegram_user_id
             or pending.chat_id != session.chat_id
             or pending.access_version != session.access_version
             or pending.title != session.title
-            or item.user_id != session.owner_id
-            or item.title != session.title
-            or item.kind != "task"
-            or item.status != "confirmed"
         ):
             return
+        task_reminder_id = None
+        recurring_schedule_id = None
+        recurring_schedule_version = None
+        receipt_local_date = session.local_date
+        if schedule_kind == "once":
+            if (
+                not isinstance(reminder, TaskReminder)
+                or reminder.inbox_item_id != item.id
+                or reminder.telegram_user_id != session.telegram_user_id
+                or reminder.chat_id != session.chat_id
+                or reminder.timezone != session.timezone
+                or reminder.task_version != item.version
+            ):
+                return
+            event_at = reminder.event_at
+            if event_at.tzinfo is None:
+                event_at = event_at.replace(tzinfo=UTC)
+            local_event = event_at.astimezone(ZoneInfo(session.timezone))
+            if (
+                local_event.date() != session.local_date
+                or local_event.time().replace(tzinfo=None, second=0, microsecond=0)
+                != session.local_time
+            ):
+                return
+            task_reminder_id = reminder.id
+        else:
+            if (
+                recurring_schedule is None
+                or getattr(recurring_schedule, "owner_id", None) != session.owner_id
+                or getattr(recurring_schedule, "inbox_item_id", None) != item.id
+                or getattr(recurring_schedule, "recurrence_kind", None) != "daily"
+                or getattr(recurring_schedule, "local_time", None) != session.local_time
+                or getattr(recurring_schedule, "timezone", None) != session.timezone
+                or type(getattr(recurring_schedule, "id", None)) is not int
+                or type(getattr(recurring_schedule, "version", None)) is not int
+                or not isinstance(getattr(recurring_schedule, "start_local_date", None), date)
+            ):
+                return
+            recurring_schedule_id = recurring_schedule.id
+            recurring_schedule_version = recurring_schedule.version
+            receipt_local_date = recurring_schedule.start_local_date
         key = self._nova_companion_status_key(
-            pending.owner_id,
-            pending.telegram_user_id,
-            pending.chat_id,
+            session.owner_id,
+            session.telegram_user_id,
+            session.chat_id,
         )
         self._nova_companion_status_receipts[key] = _CompanionStatusReceipt(
             kind="reminder",
-            owner_id=pending.owner_id,
-            telegram_user_id=pending.telegram_user_id,
-            chat_id=pending.chat_id,
-            access_version=pending.access_version,
+            owner_id=session.owner_id,
+            telegram_user_id=session.telegram_user_id,
+            chat_id=session.chat_id,
+            access_version=session.access_version,
             inbox_item_id=item.id,
             inbox_item_version=item.version,
             title=item.title,
+            task_reminder_id=task_reminder_id,
+            recurring_schedule_id=recurring_schedule_id,
+            recurring_schedule_version=recurring_schedule_version,
+            timezone=session.timezone,
+            schedule_kind=schedule_kind,
+            local_date=receipt_local_date,
+            local_time=session.local_time,
         )
         self._nova_companion_trim_private_map(self._nova_companion_status_receipts)
 
@@ -1630,21 +2151,55 @@ class NovaCompanionHandlers:
             return "Пока нет — напоминание ещё не создано."
         try:
             async with self.db.sessions() as session:
-                reminder = await session.scalar(
-                    select(TaskReminder)
-                    .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
-                    .where(
-                        InboxItem.id == receipt.inbox_item_id,
-                        InboxItem.user_id == receipt.owner_id,
-                        InboxItem.kind == "task",
-                        InboxItem.status == "confirmed",
-                        InboxItem.version == receipt.inbox_item_version,
-                        InboxItem.title == receipt.title,
-                        TaskReminder.telegram_user_id == receipt.telegram_user_id,
-                        TaskReminder.chat_id == receipt.chat_id,
-                        TaskReminder.status.in_(("pending", "sent")),
+                if receipt.schedule_kind == "once" and receipt.task_reminder_id is not None:
+                    reminder = await session.scalar(
+                        select(TaskReminder)
+                        .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
+                        .where(
+                            TaskReminder.id == receipt.task_reminder_id,
+                            InboxItem.id == receipt.inbox_item_id,
+                            InboxItem.user_id == receipt.owner_id,
+                            InboxItem.kind == "task",
+                            InboxItem.status == "confirmed",
+                            InboxItem.version == receipt.inbox_item_version,
+                            InboxItem.title == receipt.title,
+                            TaskReminder.telegram_user_id == receipt.telegram_user_id,
+                            TaskReminder.chat_id == receipt.chat_id,
+                            TaskReminder.timezone == receipt.timezone,
+                            TaskReminder.task_version == receipt.inbox_item_version,
+                            TaskReminder.status.in_(("pending", "sent")),
+                        )
                     )
-                )
+                    recurring_schedule = None
+                elif receipt.schedule_kind == "daily" and receipt.recurring_schedule_id is not None:
+                    reminder = None
+                    recurring_schedule = await session.scalar(
+                        select(RecurringTaskReminderSchedule)
+                        .join(
+                            InboxItem,
+                            InboxItem.id == RecurringTaskReminderSchedule.inbox_item_id,
+                        )
+                        .where(
+                            RecurringTaskReminderSchedule.id == receipt.recurring_schedule_id,
+                            RecurringTaskReminderSchedule.owner_id == receipt.owner_id,
+                            RecurringTaskReminderSchedule.inbox_item_id == receipt.inbox_item_id,
+                            RecurringTaskReminderSchedule.recurrence_kind == "daily",
+                            RecurringTaskReminderSchedule.local_time == receipt.local_time,
+                            RecurringTaskReminderSchedule.timezone == receipt.timezone,
+                            RecurringTaskReminderSchedule.start_local_date == receipt.local_date,
+                            RecurringTaskReminderSchedule.version
+                            == receipt.recurring_schedule_version,
+                            RecurringTaskReminderSchedule.status == "active",
+                            InboxItem.user_id == receipt.owner_id,
+                            InboxItem.kind == "task",
+                            InboxItem.status == "confirmed",
+                            InboxItem.version == receipt.inbox_item_version,
+                            InboxItem.title == receipt.title,
+                        )
+                    )
+                else:
+                    reminder = None
+                    recurring_schedule = None
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1653,13 +2208,25 @@ class NovaCompanionHandlers:
                 type(exc).__name__,
             )
             return "Не могу сейчас надёжно проверить статус напоминания."
-        if reminder is None:
+        if reminder is None and recurring_schedule is None:
             self._nova_companion_status_receipts.pop(key, None)
             return "Пока нет — напоминание ещё не создано."
+        if recurring_schedule is not None:
+            return (
+                "Да, ежедневное напоминание создано на "
+                f"{recurring_schedule.local_time.strftime('%H:%M')}."
+            )
+        assert reminder is not None
         event_at = reminder.event_at
         if event_at.tzinfo is None:
             event_at = event_at.replace(tzinfo=UTC)
         local = event_at.astimezone(ZoneInfo(reminder.timezone))
+        if (
+            local.date() != receipt.local_date
+            or local.time().replace(tzinfo=None, second=0, microsecond=0) != receipt.local_time
+        ):
+            self._nova_companion_status_receipts.pop(key, None)
+            return "Пока нет — напоминание ещё не создано."
         today = self._reminder_now().astimezone(ZoneInfo(reminder.timezone)).date()
         day = "завтра" if local.date() == today + timedelta(days=1) else local.strftime("%d.%m.%Y")
         return f"Да, напоминание создано на {day}, {local.strftime('%H:%M')}."
@@ -2598,6 +3165,7 @@ class NovaCompanionHandlers:
         text: str,
         source: str,
         suppress_proposals: bool = False,
+        guided_recurrence_fallback_title: str | None = None,
     ) -> None:
         try:
             (
@@ -2809,23 +3377,48 @@ class NovaCompanionHandlers:
             )
             return
         if provider_failed or result is None:
+            reminder_candidate = (
+                _server_grounded_guided_candidate(
+                    guided_recurrence_fallback_title,
+                    timezone=generation_timezone,
+                )
+                if guided_recurrence_fallback_title is not None
+                else None
+            )
             prepared = _PreparedCompanionAnswer(
-                answer=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                answer=(
+                    NOVA_COMPANION_GUIDED_REMINDER_FALLBACK_TEXT
+                    if reminder_candidate is not None
+                    else NOVA_COMPANION_UNAVAILABLE_TEXT
+                ),
                 user_text=text,
                 source=source,
                 generation=generation,
-                persist_exchange=False,
+                reminder_candidate=reminder_candidate,
+                persist_exchange=reminder_candidate is not None,
             )
         else:
             diagnostic_codes: list[NovaCompanionDiagnosticCode] = list(result.diagnostic_codes)
+            guided_server_authoritative = guided_recurrence_fallback_title is not None
 
             def reject_proposal(code: NovaCompanionDiagnosticCode) -> None:
                 if code not in diagnostic_codes:
                     diagnostic_codes.append(code)
 
             suggestion = None
-            reminder_candidate = None
-            if result.capture is not None and not suppress_proposals:
+            reminder_candidate = (
+                _server_grounded_guided_candidate(
+                    guided_recurrence_fallback_title,
+                    timezone=generation_timezone,
+                )
+                if guided_server_authoritative
+                else None
+            )
+            if (
+                result.capture is not None
+                and not suppress_proposals
+                and not guided_server_authoritative
+            ):
                 suggestion = validate_capture_suggestion(
                     kind=result.capture.kind,
                     title=result.capture.title,
@@ -2837,32 +3430,42 @@ class NovaCompanionHandlers:
                 if suggestion is None:
                     reject_proposal("invalid_capture")
             reminder_offer_attempted = result.reminder_offer is not None and not suppress_proposals
-            if reminder_offer_attempted:
+            if reminder_offer_attempted and not guided_server_authoritative:
                 try:
-                    reminder_resolution = self.date_resolver.resolve(
+                    reminder_title, guided_recurrence = _guided_recurrence_title(
+                        result.reminder_offer.title,
                         result.reminder_offer.evidence,
-                        generation_timezone,
+                        text,
                     )
                     reminder_temporal = None
-                    if reminder_resolution.status == "resolved":
-                        reminder_temporal = NovaCompanionCaptureTemporal(
-                            timezone=generation_timezone,
-                            resolution=reminder_resolution,
-                            local_time=self.date_resolver.extract_local_time(
-                                result.reminder_offer.evidence
-                            ),
+                    if guided_recurrence:
+                        if result.reminder_offer.schedule_wording is not None:
+                            raise ValueError("guided recurrence cannot inherit a schedule")
+                    else:
+                        reminder_resolution = self.date_resolver.resolve(
+                            result.reminder_offer.evidence,
+                            generation_timezone,
                         )
-                    elif (
-                        reminder_resolution.status == "conflict"
-                        or result.reminder_offer.schedule_wording is not None
-                    ):
-                        raise ValueError("ambiguous reminder offer")
+                        if reminder_resolution.status == "resolved":
+                            reminder_temporal = NovaCompanionCaptureTemporal(
+                                timezone=generation_timezone,
+                                resolution=reminder_resolution,
+                                local_time=self.date_resolver.extract_local_time(
+                                    result.reminder_offer.evidence
+                                ),
+                            )
+                        elif (
+                            reminder_resolution.status == "conflict"
+                            or result.reminder_offer.schedule_wording is not None
+                        ):
+                            raise ValueError("ambiguous reminder offer")
                     reminder_candidate = NovaCompanionReminderCandidate(
-                        title=result.reminder_offer.title,
+                        title=reminder_title,
                         schedule_wording=result.reminder_offer.schedule_wording,
                         evidence=result.reminder_offer.evidence,
                         timezone=generation_timezone,
                         temporal=reminder_temporal,
+                        guided_recurrence=guided_recurrence,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -2875,15 +3478,40 @@ class NovaCompanionHandlers:
                 and result.capture is not None
                 and result.reminder_offer is not None
             )
-            if conflicting_action_proposals:
+            if conflicting_action_proposals and not guided_server_authoritative:
                 suggestion = None
                 reminder_candidate = None
                 reject_proposal("conflicting_actions")
+            if guided_server_authoritative:
+                suggestion = None
+            guided_valid_provider_action = bool(
+                guided_server_authoritative
+                and (result.capture is not None or result.reminder_offer is not None)
+                and not any(
+                    code
+                    in {
+                        "invalid_capture",
+                        "invalid_reminder_offer",
+                        "conflicting_actions",
+                    }
+                    for code in diagnostic_codes
+                )
+            )
+            guided_server_fallback = bool(
+                guided_server_authoritative
+                and (
+                    not guided_valid_provider_action
+                    or _has_suppressed_action_dependency(result.answer, user_text=text)
+                )
+            )
             rejected_reminder_offer = not suppress_proposals and (
-                (reminder_offer_attempted and reminder_candidate is None)
-                or "invalid_reminder_offer" in diagnostic_codes
-                or "conflicting_actions" in diagnostic_codes
-                or conflicting_action_proposals
+                not guided_server_authoritative
+                and (
+                    (reminder_offer_attempted and reminder_candidate is None)
+                    or "invalid_reminder_offer" in diagnostic_codes
+                    or "conflicting_actions" in diagnostic_codes
+                    or conflicting_action_proposals
+                )
             )
             suppressed_action_dependency = suppress_proposals and (
                 _has_suppressed_action_dependency(result.answer, user_text=text)
@@ -2892,25 +3520,57 @@ class NovaCompanionHandlers:
                 NOVA_COMPANION_RECALL_ACTION_SUPPRESSED_TEXT
                 if suppressed_action_dependency
                 else (
-                    (
-                        NOVA_COMPANION_NOT_EXECUTED_TEXT
-                        if _has_untrusted_operational_claim(
-                            result.answer,
-                            user_text=text,
-                            action_context=True,
+                    NOVA_COMPANION_GUIDED_REMINDER_FALLBACK_TEXT
+                    if guided_server_fallback
+                    else (
+                        (
+                            NOVA_COMPANION_NOT_EXECUTED_TEXT
+                            if _has_untrusted_operational_claim(
+                                result.answer,
+                                user_text=text,
+                                action_context=True,
+                            )
+                            else NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
                         )
-                        else NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT
+                        if rejected_reminder_offer
+                        else result.answer
                     )
-                    if rejected_reminder_offer
-                    else result.answer
                 )
             )
+            active_settings = _active_structured_settings(brain_projection)
+            grounded_acknowledgement = (
+                _grounded_setting_acknowledgement(text) if brain_fence is not None else None
+            )
+            grammatical_address_replaced = False
+            if grounded_acknowledgement is not None:
+                answer = grounded_acknowledgement
+            else:
+                addressed_answer = _apply_grammatical_address(
+                    answer,
+                    user_text=text,
+                    settings=active_settings,
+                )
+                grammatical_address_replaced = addressed_answer != answer
+                answer = addressed_answer
+            capability_denial_replaced = bool(
+                _UNTRUSTED_CAPABILITY_DENIAL.search(answer) and reminder_candidate is not None
+            )
+            if capability_denial_replaced:
+                answer = (
+                    "Похоже, тебе важно регулярно возвращаться к этому. "
+                    "Можно настроить настоящее напоминание."
+                )
             answer, discourse_recovered = _companion_discourse_answer(
                 answer,
                 discourse_anchor,
             )
             raw_answer_replaced = (
-                suppressed_action_dependency or rejected_reminder_offer or discourse_recovered
+                suppressed_action_dependency
+                or guided_server_fallback
+                or rejected_reminder_offer
+                or capability_denial_replaced
+                or grammatical_address_replaced
+                or discourse_recovered
             )
             if discourse_recovered and discourse_anchor is not None:
                 suggestion = None

@@ -17,7 +17,7 @@ SystemAction = Literal[
 
 @dataclass(slots=True, frozen=True)
 class SystemActionRoute:
-    kind: Literal["none", "action", "confirm", "cancel", "pending", "clarify"]
+    kind: Literal["none", "action", "confirm", "cancel", "pending", "clarify", "negative"]
     action: SystemAction | None = None
 
 
@@ -336,6 +336,8 @@ class SystemActionRouter:
             return SystemActionRoute(kind="pending")
         if question_or_capture:
             return SystemActionRoute(kind="none")
+        if negated_delete and self._is_direct_negative_noop(normalized):
+            return SystemActionRoute(kind="negative")
         if negated_delete or negated_keep:
             return SystemActionRoute(kind="clarify")
         if (
@@ -511,6 +513,17 @@ class SystemActionRouter:
             if (preceding and preceding[-1] == "не") or preceding == ["не", "да"]:
                 return True
         return False
+
+    @staticmethod
+    def _is_direct_negative_noop(normalized: str) -> bool:
+        return bool(
+            re.fullmatch(
+                r"(?:пожалуйста\s+)?не\s+(?:удаляй|удалите|убирай|убирайте|"
+                r"стирай|стирайте|очищай|очищайте)\s+"
+                r"(?:мои\s+)?(?:записи|задачи|заметки|идеи|черновики)[.!?]*",
+                normalized,
+            )
+        )
 
     @staticmethod
     def _has_excluded_stale_selector(normalized: str) -> bool:

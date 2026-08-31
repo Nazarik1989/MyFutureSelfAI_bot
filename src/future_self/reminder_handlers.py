@@ -6,7 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
@@ -79,10 +79,107 @@ _UNSUPPORTED_RECURRENCE = re.compile(
     r"через\s+день|раз\s+в\s+\d+\s+дн)\b",
     re.IGNORECASE,
 )
+_NATURAL_GUIDED_RECURRENCE_REQUEST = re.compile(
+    r"(?=.*\b(?:напоминай\w*|напоминан\w*)\b)"
+    r"(?=.*\b(?:регулярн\w*|почаще|чаще|постоянно|на\s+первое\s+время|"
+    r"пока\s+не\s+привыкн\w*|раз\s+(?:\d+|[а-яё]+))\b)",
+    re.IGNORECASE,
+)
+_NATURAL_GUIDED_RECURRENCE_IMPERATIVE = re.compile(
+    r"^\s*(?:(?:нова|nova)\s*[,;:—-]?\s*)?"
+    r"напоминай(?:те)?(?:\s+мне)?\b",
+    re.IGNORECASE,
+)
+_NATURAL_GUIDED_RECURRENCE_CUE = re.compile(
+    r"\b(?:регулярн\w*|почаще|чаще|постоянно|на\s+первое\s+время|"
+    r"пока\s+не\s+привыкн\w*|раз\s+(?:\d+|[а-яё]+))\b",
+    re.IGNORECASE,
+)
+_NATURAL_GUIDED_AMBIGUOUS_SUBJECT = re.compile(
+    r"^(?:(?:об?|про|к|ко|для)\s+)?(?:это|этого|этому|этим|этом|том|тому|"
+    r"нему|ней|них|такое|всё|все|главное)\b",
+    re.IGNORECASE,
+)
+_NATURAL_GUIDED_CLARIFY_TEXT = (
+    "Что именно тебе напоминать? Назови один конкретный предмет напоминания."
+)
+_GUIDED_RECURRENCE_PHASES = frozenset(
+    {
+        ReminderFlowPhase.RECURRENCE_FREQUENCY,
+        ReminderFlowPhase.RECURRENCE_PERIOD,
+        ReminderFlowPhase.RECURRENCE_DAYS,
+        ReminderFlowPhase.RECURRENCE_TIMES,
+        ReminderFlowPhase.RECURRENCE_SINGLE_TIME,
+    }
+)
+_RECURRENCE_FREQUENCY = re.compile(
+    r"(?:\b(?P<digits>\d{1,2})\s*раз(?:а)?\b|\bраз\s+(?P<words>[а-яё-]+)\b)",
+    re.IGNORECASE,
+)
+_RECURRENCE_PERIODS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("day", re.compile(r"\b(?:в\s+течение\s+дня|за\s+день)\b", re.IGNORECASE)),
+    ("morning", re.compile(r"\b(?:утром|в\s+течение\s+утра)\b", re.IGNORECASE)),
+    ("afternoon", re.compile(r"\b(?:днём|днем|после\s+обеда)\b", re.IGNORECASE)),
+    ("evening", re.compile(r"\b(?:вечером|в\s+течение\s+вечера)\b", re.IGNORECASE)),
+)
+_RECURRENCE_DAYS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("daily", re.compile(r"\b(?:каждый\s+день|ежедневно|все\s+дни)\b", re.IGNORECASE)),
+    ("weekdays", re.compile(r"\b(?:по\s+будням|в\s+будни)\b", re.IGNORECASE)),
+    ("weekends", re.compile(r"\b(?:по\s+выходным|в\s+выходные)\b", re.IGNORECASE)),
+    (
+        "date_range",
+        re.compile(
+            r"\b(?:с\s+\d{1,2}[./]\d{1,2}\s+по\s+\d{1,2}[./]\d{1,2}|на\s+\d+\s+дн)\b", re.IGNORECASE
+        ),
+    ),
+)
+_NUMBER_WORDS = {
+    "один": 1,
+    "однажды": 1,
+    "два": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "одиннадцать": 11,
+    "двенадцать": 12,
+}
 
 
 class _ReminderPastAtSave(RuntimeError):
     pass
+
+
+def _natural_guided_recurrence_title(text: object) -> str | None:
+    if not isinstance(text, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", text)
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        return None
+    normalized = " ".join(normalized.split()).strip()
+    imperative = _NATURAL_GUIDED_RECURRENCE_IMPERATIVE.match(normalized)
+    if imperative is None:
+        return None
+    remainder = normalized[imperative.end() :].strip(" ,:;—-")
+    cues = tuple(_NATURAL_GUIDED_RECURRENCE_CUE.finditer(remainder))
+    if len(cues) != 1:
+        return None
+    cue = cues[0]
+    title = f"{remainder[: cue.start()]} {remainder[cue.end() :]}"
+    title = " ".join(title.split()).strip(" ,:;—-.!?…")
+    title = re.sub(r"^(?:пожалуйста\s+)?(?:об?|про)\s+", "", title, count=1, flags=re.I)
+    if (
+        not title
+        or len(title) > 200
+        or "?" in title
+        or _NATURAL_GUIDED_AMBIGUOUS_SUBJECT.search(title)
+    ):
+        return None
+    return title
 
 
 @dataclass(slots=True)
@@ -187,12 +284,16 @@ class ReminderHandlers:
         schedule_kind = ReminderScheduleKind.ONCE if temporal is not None else None
         local_date = temporal.resolution.target_date if temporal is not None else None
         local_time = temporal.local_time if temporal is not None else None
-        phase = self._reminder_fields_phase(
-            title=candidate.title,
-            schedule_kind=schedule_kind,
-            local_date=local_date,
-            local_time=local_time,
-            timezone=candidate.timezone,
+        phase = (
+            ReminderFlowPhase.RECURRENCE_FREQUENCY
+            if candidate.guided_recurrence
+            else self._reminder_fields_phase(
+                title=candidate.title,
+                schedule_kind=schedule_kind,
+                local_date=local_date,
+                local_time=local_time,
+                timezone=candidate.timezone,
+            )
         )
         session: ReminderFlowSession | None = None
         try:
@@ -222,6 +323,7 @@ class ReminderHandlers:
                     canonical_message_id=canonical_message_id,
                     profile_timezone=fresh.timezone,
                     weekly_candidate_handoff=False,
+                    guided_recurrence=candidate.guided_recurrence,
                 )
                 delivery = await self._reminder_access(update)
                 if (
@@ -360,7 +462,10 @@ class ReminderHandlers:
                 )
                 return True
             probe = self.reminder_intent_parser.parse(text, "UTC")
-            handled = probe.status is not ReminderIntentStatus.NOT_REMINDER
+            handled = (
+                probe.status is not ReminderIntentStatus.NOT_REMINDER
+                or _NATURAL_GUIDED_RECURRENCE_IMPERATIVE.search(text) is not None
+            )
             if handled and voice_fenced:
                 await self._reminder_edit_access_candidate(candidate_message)
             elif (
@@ -402,6 +507,42 @@ class ReminderHandlers:
                 return True
             if current is None and recall_intent is not ConversationRecallIntent.NONE:
                 return False
+            guided_title = None
+            guided_imperative = bool(
+                current is None
+                and _NATURAL_GUIDED_RECURRENCE_REQUEST.search(text)
+                and _NATURAL_GUIDED_RECURRENCE_IMPERATIVE.search(text)
+            )
+            if guided_imperative:
+                guided_title = _natural_guided_recurrence_title(text)
+                if guided_title is None:
+                    delivery_binding = await self._reminder_access(update)
+                    if (
+                        delivery_binding is None
+                        or delivery_binding.id != user.id
+                        or delivery_binding.access_version != user.access_version
+                    ):
+                        if voice_fenced:
+                            await self._reminder_edit_access_candidate(candidate_message)
+                        return True
+                    try:
+                        if candidate_message is not None and hasattr(
+                            candidate_message, "edit_text"
+                        ):
+                            await candidate_message.edit_text(
+                                _NATURAL_GUIDED_CLARIFY_TEXT,
+                                reply_markup=None,
+                            )
+                        else:
+                            await update.effective_message.reply_text(_NATURAL_GUIDED_CLARIFY_TEXT)
+                    except asyncio.CancelledError:
+                        raise
+                    except TelegramError as exc:
+                        logger.warning(
+                            "Reminder guided clarification failed error_type=%s",
+                            type(exc).__name__,
+                        )
+                    return True
             fresh_binding = await self._reminder_access(update)
             if (
                 fresh_binding is None
@@ -419,7 +560,11 @@ class ReminderHandlers:
                     )
                     return True
                 relative = self.date_resolver.resolve_relative_reminder(text, user.timezone)
-                handled = bool(relative) or probe.status is not ReminderIntentStatus.NOT_REMINDER
+                handled = (
+                    bool(relative)
+                    or probe.status is not ReminderIntentStatus.NOT_REMINDER
+                    or guided_imperative
+                )
                 if handled and voice_fenced:
                     await self._reminder_edit_access_candidate(candidate_message)
                 elif voice_fenced and voice_state is not None and voice_state.access_expected:
@@ -435,7 +580,9 @@ class ReminderHandlers:
                     probe = self.reminder_intent_parser.parse(text, user.timezone)
                     relative = self.date_resolver.resolve_relative_reminder(text, user.timezone)
                     handled = (
-                        bool(relative) or probe.status is not ReminderIntentStatus.NOT_REMINDER
+                        bool(relative)
+                        or probe.status is not ReminderIntentStatus.NOT_REMINDER
+                        or guided_imperative
                     )
                     if not handled:
                         if voice_fenced and voice_state is not None and voice_state.access_expected:
@@ -480,7 +627,48 @@ class ReminderHandlers:
                         )
                     return True
 
-            fresh = self.reminder_intent_parser.parse(text, user.timezone)
+            if current is not None and current.phase in _GUIDED_RECURRENCE_PHASES:
+                await self.nova_memory_clear_current(update)
+                await self.nova_clear_bound(user.id, chat_id)
+                updated = await self._reminder_guided_recurrence_turn(current, text)
+                if updated is None:
+                    await self._reminder_retire_voice_candidate(candidate_message)
+                    return True
+                delivery_binding = await self._reminder_access(update)
+                if (
+                    delivery_binding is None
+                    or delivery_binding.id != updated.owner_id
+                    or delivery_binding.access_version != updated.access_version
+                ):
+                    await self._reminder_access_changed(
+                        context,
+                        updated,
+                        source_message=candidate_message or update.effective_message,
+                    )
+                    return True
+                if candidate_message is not None:
+                    await self._reminder_retire_voice_candidate(candidate_message)
+                async with self._reminder_ui_lock:
+                    live = await self.reminder_sessions.get_exact(updated)
+                    if live is not None:
+                        await self._reminder_edit_canonical(
+                            context,
+                            live,
+                            source_message=update.effective_message,
+                        )
+                return True
+
+            fresh = (
+                ReminderIntentResult(
+                    status=ReminderIntentStatus.NEEDS_WHEN,
+                    title=guided_title,
+                    timezone=user.timezone,
+                    timezone_source=ReminderTimezoneSource.PROFILE,
+                    error_code=ReminderIntentCode.MISSING_WHEN,
+                )
+                if guided_title is not None
+                else self.reminder_intent_parser.parse(text, user.timezone)
+            )
             replacement = (
                 current is not None and fresh.status is not ReminderIntentStatus.NOT_REMINDER
             )
@@ -538,7 +726,30 @@ class ReminderHandlers:
                 )
                 return True
 
-            phase = self._reminder_phase(result)
+            past_time_rejected = bool(
+                current is not None
+                and not replacement
+                and current.phase is ReminderFlowPhase.TIME
+                and result.status is ReminderIntentStatus.INVALID
+                and result.error_code is ReminderIntentCode.PAST_ONCE
+                and current.schedule_kind is ReminderScheduleKind.ONCE
+                and current.local_date is not None
+            )
+            if guided_title is not None:
+                phase = ReminderFlowPhase.RECURRENCE_FREQUENCY
+            elif past_time_rejected:
+                result = replace(
+                    result,
+                    title=current.title,
+                    schedule_kind=current.schedule_kind,
+                    local_date=current.local_date,
+                    local_time=None,
+                    timezone=current.timezone,
+                    timezone_source=current.timezone_source,
+                )
+                phase = ReminderFlowPhase.TIME
+            else:
+                phase = self._reminder_phase(result)
             await self.nova_clear_bound(user.id, chat_id)
             canonical_message_id = current.canonical_message_id if current is not None else None
             if candidate_message is not None:
@@ -568,6 +779,8 @@ class ReminderHandlers:
                         current is not None and not replacement and current.weekly_candidate_handoff
                     )
                 ),
+                past_time_rejected=past_time_rejected,
+                guided_recurrence=guided_title is not None,
             )
             # Retire memory only while this exact reminder generation remains
             # current. If a concurrent memory launch already retired it, its
@@ -1743,7 +1956,12 @@ class ReminderHandlers:
             None,
         )
         if callable(record_status):
-            record_status(session, result.inbox_item)
+            record_status(
+                session,
+                result.inbox_item,
+                reminder=result.reminder,
+                recurring=recurring,
+            )
         await self.reminder_sessions.clear(
             owner_id=session.owner_id,
             telegram_user_id=session.telegram_user_id,
@@ -2224,11 +2442,154 @@ class ReminderHandlers:
                 source_message=source_message,
             )
 
+    async def _reminder_guided_recurrence_turn(
+        self,
+        session: ReminderFlowSession,
+        text: str,
+    ) -> ReminderFlowSession | None:
+        frequency = self._reminder_recurrence_frequency(text)
+        period = self._reminder_recurrence_period(text)
+        days = self._reminder_recurrence_days(text)
+        phase = session.phase
+        if phase is ReminderFlowPhase.RECURRENCE_FREQUENCY:
+            if frequency is None:
+                return await self.reminder_sessions.update(session, phase=phase)
+            if period is None:
+                next_phase = ReminderFlowPhase.RECURRENCE_PERIOD
+            elif days is None:
+                next_phase = ReminderFlowPhase.RECURRENCE_DAYS
+            else:
+                next_phase = ReminderFlowPhase.RECURRENCE_TIMES
+            return await self.reminder_sessions.update(
+                session,
+                recurrence_frequency_per_day=frequency,
+                recurrence_active_period=period,
+                recurrence_days=days,
+                phase=next_phase,
+            )
+        if phase is ReminderFlowPhase.RECURRENCE_PERIOD:
+            if period is None:
+                return await self.reminder_sessions.update(session, phase=phase)
+            return await self.reminder_sessions.update(
+                session,
+                recurrence_active_period=period,
+                recurrence_days=days,
+                phase=(
+                    ReminderFlowPhase.RECURRENCE_TIMES
+                    if days is not None
+                    else ReminderFlowPhase.RECURRENCE_DAYS
+                ),
+            )
+        if phase is ReminderFlowPhase.RECURRENCE_DAYS:
+            if days is None:
+                return await self.reminder_sessions.update(session, phase=phase)
+            return await self.reminder_sessions.update(
+                session,
+                recurrence_days=days,
+                phase=ReminderFlowPhase.RECURRENCE_TIMES,
+            )
+        clocks = tuple(
+            time(hour=int(match.group("hour")), minute=int(match.group("minute")))
+            for match in _BARE_CLOCK_FRAGMENT.finditer(text)
+        )
+        if phase is ReminderFlowPhase.RECURRENCE_SINGLE_TIME:
+            if len(clocks) != 1:
+                return await self.reminder_sessions.update(session, phase=phase)
+            return await self.reminder_sessions.update(
+                session,
+                schedule_kind=ReminderScheduleKind.DAILY,
+                local_date=None,
+                local_time=clocks[0],
+                recurrence_frequency_per_day=1,
+                recurrence_days="daily",
+                phase=ReminderFlowPhase.PREVIEW,
+            )
+        if not clocks:
+            return await self.reminder_sessions.update(session, phase=phase)
+        if (
+            len(clocks) != 1
+            or session.recurrence_frequency_per_day != 1
+            or session.recurrence_days != "daily"
+        ):
+            return await self.reminder_sessions.update(
+                session,
+                local_time=None,
+                phase=ReminderFlowPhase.RECURRENCE_SINGLE_TIME,
+            )
+        return await self.reminder_sessions.update(
+            session,
+            schedule_kind=ReminderScheduleKind.DAILY,
+            local_date=None,
+            local_time=clocks[0],
+            phase=ReminderFlowPhase.PREVIEW,
+        )
+
+    @staticmethod
+    def _reminder_recurrence_frequency(text: str) -> int | None:
+        matched = _RECURRENCE_FREQUENCY.search(text)
+        if matched is None:
+            return 1 if re.search(r"\b(?:один\s+раз|раз\s+в\s+день)\b", text, re.I) else None
+        value = (
+            int(matched.group("digits"))
+            if matched.group("digits") is not None
+            else _NUMBER_WORDS.get((matched.group("words") or "").casefold())
+        )
+        return value if value is not None and 1 <= value <= 24 else None
+
+    @staticmethod
+    def _reminder_recurrence_period(
+        text: str,
+    ) -> Literal["day", "morning", "afternoon", "evening"] | None:
+        matches = {value for value, pattern in _RECURRENCE_PERIODS if pattern.search(text)}
+        return next(iter(matches)) if len(matches) == 1 else None  # type: ignore[return-value]
+
+    @staticmethod
+    def _reminder_recurrence_days(
+        text: str,
+    ) -> Literal["daily", "weekdays", "weekends", "date_range"] | None:
+        matches = {value for value, pattern in _RECURRENCE_DAYS if pattern.search(text)}
+        return next(iter(matches)) if len(matches) == 1 else None  # type: ignore[return-value]
+
     async def _reminder_screen(
         self,
         session: ReminderFlowSession,
     ) -> tuple[str, InlineKeyboardMarkup | None]:
         phase = session.phase
+        if phase is ReminderFlowPhase.RECURRENCE_FREQUENCY:
+            tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            return (
+                "🔁 Как часто напоминать в активный период?\n\n"
+                "Укажи точное число, например: «раз десять».",
+                self._cancel_keyboard(tokens["cancel"]),
+            )
+        if phase is ReminderFlowPhase.RECURRENCE_PERIOD:
+            tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            return (
+                "🔁 В какой части дня должны действовать напоминания?\n\n"
+                "Например: утром, вечером или в течение дня.",
+                self._cancel_keyboard(tokens["cancel"]),
+            )
+        if phase is ReminderFlowPhase.RECURRENCE_DAYS:
+            tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            return (
+                "🔁 В какие дни или в каком диапазоне дат напоминать?\n\n"
+                "Например: каждый день, по будням или с 1.09 по 14.09.",
+                self._cancel_keyboard(tokens["cancel"]),
+            )
+        if phase is ReminderFlowPhase.RECURRENCE_TIMES:
+            tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            return (
+                "🔁 Назови точное время или времена напоминаний.\n\nНапример: 10:00, 14:00, 18:00.",
+                self._cancel_keyboard(tokens["cancel"]),
+            )
+        if phase is ReminderFlowPhase.RECURRENCE_SINGLE_TIME:
+            tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            return (
+                "Сейчас поддерживается только одно ежедневное напоминание в точное время. "
+                "Несколько срабатываний, отдельные дни и конечный диапазон пока недоступны.\n\n"
+                "Если подходит доступный вариант, укажи одно время, например: 19:00.",
+                self._cancel_keyboard(tokens["cancel"]),
+            )
         if phase is ReminderFlowPhase.TIMEZONE_RESOLVING:
             tokens = await self.reminder_sessions.issue(session, ("cancel",))
             return (
@@ -2309,8 +2670,14 @@ class ReminderHandlers:
             )
         if phase is ReminderFlowPhase.TIME:
             tokens = await self.reminder_sessions.issue(session, ("cancel",))
+            prefix = (
+                "Выбранное время сегодня уже прошло. Дату сохраняю и ничего не переношу "
+                "автоматически.\n\n"
+                if session.past_time_rejected
+                else ""
+            )
             return (
-                "🕒 Во сколько напомнить?\n\n"
+                f"{prefix}🕒 Во сколько напомнить?\n\n"
                 "Напиши или скажи время, например: 19:30.\n"
                 f"Использую твой часовой пояс: {self._reminder_timezone_label(session.timezone)}.",
                 self._cancel_keyboard(tokens["cancel"]),

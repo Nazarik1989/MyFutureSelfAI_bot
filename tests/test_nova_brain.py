@@ -1437,6 +1437,13 @@ async def test_nova_brain_retrieval_is_relevant_deterministic_diverse_and_bounde
                     public_id=f"00000000-0000-0000-0000-{index:012d}",
                     owner_id=actor.id,
                     category=category,
+                    semantic_key=(
+                        "response_length"
+                        if category == "preference"
+                        else "identity"
+                        if category == "identity"
+                        else None
+                    ),
                     normalized_value=value,
                     content_fingerprint=sha256(value.encode()).hexdigest(),
                     source_kind="conversation",

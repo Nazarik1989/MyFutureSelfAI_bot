@@ -1476,6 +1476,7 @@ class NovaCompanionReminderCandidate:
     evidence: str = field(default="", repr=False)
     timezone: str = field(default="UTC", repr=False)
     temporal: NovaCompanionCaptureTemporal | None = field(default=None, repr=False)
+    guided_recurrence: bool = False
 
     def __post_init__(self) -> None:
         title = _safe_text(self.title, max_chars=200)
@@ -1502,6 +1503,10 @@ class NovaCompanionReminderCandidate:
                 raise ValueError("reminder temporal timezone changed")
             if self.temporal.resolution.status != "resolved":
                 raise ValueError("ambiguous reminder candidates are not actionable")
+        if type(self.guided_recurrence) is not bool:
+            raise ValueError("invalid guided recurrence marker")
+        if self.guided_recurrence and (schedule is not None or self.temporal is not None):
+            raise ValueError("guided recurrence cannot contain a guessed schedule")
         object.__setattr__(self, "title", title)
         object.__setattr__(self, "schedule_wording", schedule)
         object.__setattr__(self, "evidence", evidence)

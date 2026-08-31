@@ -43,6 +43,11 @@ class ReminderFlowPhase(StrEnum):
     TIMEZONE_RESOLVING = "timezone_resolving"
     TIMEZONE_CLARIFY = "timezone_clarify"
     TIMEZONE_RETRY = "timezone_retry"
+    RECURRENCE_FREQUENCY = "recurrence_frequency"
+    RECURRENCE_PERIOD = "recurrence_period"
+    RECURRENCE_DAYS = "recurrence_days"
+    RECURRENCE_TIMES = "recurrence_times"
+    RECURRENCE_SINGLE_TIME = "recurrence_single_time"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +72,11 @@ class ReminderFlowSession:
     relative_day_offset: int | None = None
     calendar_anchor_utc: datetime | None = None
     weekly_candidate_handoff: bool = False
+    past_time_rejected: bool = False
+    guided_recurrence: bool = False
+    recurrence_frequency_per_day: int | None = None
+    recurrence_active_period: Literal["day", "morning", "afternoon", "evening"] | None = None
+    recurrence_days: Literal["daily", "weekdays", "weekends", "date_range"] | None = None
 
     def parser_state(self) -> ReminderIntentResult:
         if self.phase is ReminderFlowPhase.WHEN:
@@ -143,6 +153,11 @@ class ReminderFlowStore:
         relative_day_offset: int | None = None,
         calendar_anchor_utc: datetime | None = None,
         weekly_candidate_handoff: bool = False,
+        past_time_rejected: bool = False,
+        guided_recurrence: bool = False,
+        recurrence_frequency_per_day: int | None = None,
+        recurrence_active_period: Literal["day", "morning", "afternoon", "evening"] | None = None,
+        recurrence_days: Literal["daily", "weekdays", "weekends", "date_range"] | None = None,
         now: datetime | None = None,
     ) -> ReminderFlowSession:
         current = self._utc(now)
@@ -179,6 +194,11 @@ class ReminderFlowStore:
                 if calendar_anchor_utc is not None
                 else None,
                 weekly_candidate_handoff=bool(weekly_candidate_handoff),
+                past_time_rejected=bool(past_time_rejected),
+                guided_recurrence=bool(guided_recurrence),
+                recurrence_frequency_per_day=self._frequency(recurrence_frequency_per_day),
+                recurrence_active_period=self._active_period(recurrence_active_period),
+                recurrence_days=self._recurrence_days(recurrence_days),
             )
             self._sessions[key] = session
             return session
@@ -225,6 +245,15 @@ class ReminderFlowStore:
         timezone_fragment_fingerprint: str | None | object = ...,
         relative_day_offset: int | None | object = ...,
         calendar_anchor_utc: datetime | None | object = ...,
+        past_time_rejected: bool | object = ...,
+        guided_recurrence: bool | object = ...,
+        recurrence_frequency_per_day: int | None | object = ...,
+        recurrence_active_period: (
+            Literal["day", "morning", "afternoon", "evening"] | None | object
+        ) = ...,
+        recurrence_days: (
+            Literal["daily", "weekdays", "weekends", "date_range"] | None | object
+        ) = ...,
         now: datetime | None = None,
     ) -> ReminderFlowSession | None:
         current = self._utc(now)
@@ -265,6 +294,24 @@ class ReminderFlowStore:
                     self._utc(calendar_anchor_utc)
                     if isinstance(calendar_anchor_utc, datetime)
                     else None
+                )
+            if past_time_rejected is not ...:
+                values["past_time_rejected"] = bool(past_time_rejected)
+            if guided_recurrence is not ...:
+                values["guided_recurrence"] = bool(guided_recurrence)
+            if recurrence_frequency_per_day is not ...:
+                values["recurrence_frequency_per_day"] = self._frequency(
+                    recurrence_frequency_per_day
+                    if isinstance(recurrence_frequency_per_day, int)
+                    else None
+                )
+            if recurrence_active_period is not ...:
+                values["recurrence_active_period"] = self._active_period(
+                    recurrence_active_period if isinstance(recurrence_active_period, str) else None
+                )
+            if recurrence_days is not ...:
+                values["recurrence_days"] = self._recurrence_days(
+                    recurrence_days if isinstance(recurrence_days, str) else None
                 )
             updated = replace(live, **values)
             self._sessions[key] = updated
@@ -440,6 +487,34 @@ class ReminderFlowStore:
         if value.tzinfo is not None or value.second or value.microsecond:
             raise ValueError("local_time must be a naive minute-precision time")
         return value
+
+    @staticmethod
+    def _frequency(value: int | None) -> int | None:
+        if value is None:
+            return None
+        if type(value) is not int or not 1 <= value <= 24:
+            raise ValueError("recurrence frequency must be between 1 and 24")
+        return value
+
+    @staticmethod
+    def _active_period(
+        value: str | None,
+    ) -> Literal["day", "morning", "afternoon", "evening"] | None:
+        if value is None:
+            return None
+        if value not in {"day", "morning", "afternoon", "evening"}:
+            raise ValueError("invalid recurrence active period")
+        return value  # type: ignore[return-value]
+
+    @staticmethod
+    def _recurrence_days(
+        value: str | None,
+    ) -> Literal["daily", "weekdays", "weekends", "date_range"] | None:
+        if value is None:
+            return None
+        if value not in {"daily", "weekdays", "weekends", "date_range"}:
+            raise ValueError("invalid recurrence days")
+        return value  # type: ignore[return-value]
 
     @staticmethod
     def _utc(value: datetime | None) -> datetime:
