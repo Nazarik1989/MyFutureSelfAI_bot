@@ -318,14 +318,15 @@ async def test_direct_confirm_records_exact_read_only_completion_receipt(db, fak
     )
 
     bot._nova_companion_status_receipts.pop(key)
-    assert (
-        await bot._nova_companion_status_answer(
-            "Ты уже создала напоминание?",
-            user=await bot._user(user.telegram_id),
-            chat_id=9_191,
+    for _attempt in range(2):
+        assert (
+            await bot._nova_companion_status_answer(
+                "Ты уже создала напоминание?",
+                user=await bot._user(user.telegram_id),
+                chat_id=9_191,
+            )
+            == "Пока нет — напоминание ещё не создано."
         )
-        == "Пока нет — напоминание ещё не создано."
-    )
     other = await subscriber(db, 6_194)
     bot._nova_companion_status_receipts[key] = receipt
     assert (
@@ -1178,24 +1179,45 @@ async def test_guided_recurrence_collects_slots_and_fails_closed_to_supported_da
     assert current.schedule_kind is None
     assert current.local_date is None and current.local_time is None
 
-    frequency = ReminderMessage("В течение дня нужно раз десять, наверное")
+    frequency = ReminderMessage("раз десять")
     assert await bot.reminder_text_gate(
         reminder_update(frequency, telegram_user_id=user.telegram_id, chat_id=chat_id),
         context,
     )
     current = await current_session(bot, user, chat_id)
-    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_DAYS
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_PERIOD
     assert current.recurrence_frequency_per_day == 10
+
+    rejected_version = current.version
+    wrong_period = ReminderMessage("раз в час")
+    assert await bot.reminder_text_gate(
+        reminder_update(wrong_period, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_PERIOD
+    assert current.version == rejected_version
+    assert "часть дня" in wrong_period.replies[-1]["text"]
+
+    period = ReminderMessage("в течение дня")
+    assert await bot.reminder_text_gate(
+        reminder_update(period, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_DAYS
     assert current.recurrence_active_period == "day"
 
     premature = ReminderMessage("Самое время создать")
+    rejected_version = current.version
     assert await bot.reminder_text_gate(
         reminder_update(premature, telegram_user_id=user.telegram_id, chat_id=chat_id),
         context,
     )
     current = await current_session(bot, user, chat_id)
     assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_DAYS
-    assert "диапазоне дат" in context.bot.edits[-1]["text"]
+    assert current.version == rejected_version
+    assert "каждый день" in premature.replies[-1]["text"]
 
     days = ReminderMessage("Каждый день")
     assert await bot.reminder_text_gate(
@@ -1213,11 +1235,113 @@ async def test_guided_recurrence_collects_slots_and_fails_closed_to_supported_da
     current = await current_session(bot, user, chat_id)
     assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_SINGLE_TIME
     assert "только одно ежедневное" in context.bot.edits[-1]["text"]
+
+    fallback = ReminderMessage("19:00")
+    assert await bot.reminder_text_gate(
+        reminder_update(fallback, telegram_user_id=user.telegram_id, chat_id=chat_id),
+        context,
+    )
+    current = await current_session(bot, user, chat_id)
+    assert current is not None and current.phase is ReminderFlowPhase.PREVIEW
+    assert current.schedule_kind is ReminderScheduleKind.DAILY
+    assert current.local_time == time(19)
     async with db.sessions() as session:
         assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
         assert await session.scalar(select(func.count(InboxItem.id))) == 0
         assert await session.scalar(select(func.count(TaskReminder.id))) == 0
         assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+
+
+@pytest.mark.parametrize(
+    ("phase", "reply"),
+    [
+        (ReminderFlowPhase.RECURRENCE_FREQUENCY, "раз в час"),
+        (ReminderFlowPhase.RECURRENCE_PERIOD, "раз десять"),
+        (ReminderFlowPhase.RECURRENCE_PERIOD, "в течение дня каждый час"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_guided_recurrence_wrong_slot_keeps_exact_generation(
+    db,
+    fake_ai,
+    phase,
+    reply,
+):
+    user = await subscriber(db, 6_195 + list(ReminderFlowPhase).index(phase))
+    bot = deterministic_bot(db, fake_ai)
+    session = await bot.reminder_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=9_195,
+        access_version=user.access_version,
+        title="возвращаться к дыханию",
+        schedule_kind=None,
+        local_date=None,
+        local_time=None,
+        timezone="Europe/Moscow",
+        timezone_source=ReminderTimezoneSource.PROFILE,
+        phase=phase,
+        guided_recurrence=True,
+        recurrence_frequency_per_day=(10 if phase is ReminderFlowPhase.RECURRENCE_PERIOD else None),
+    )
+
+    turn = await bot._reminder_guided_recurrence_turn(session, reply)
+
+    assert turn.session is session
+    assert turn.error is not None
+    live = await bot.reminder_sessions.get_exact(session)
+    assert live is session
+    assert live.version == session.version
+    assert live.recurrence_frequency_per_day == session.recurrence_frequency_per_day
+
+
+@pytest.mark.asyncio
+async def test_guided_recurrence_unsupported_range_and_multi_time_require_one_fresh_time(
+    db,
+    fake_ai,
+):
+    user = await subscriber(db, 6_199)
+    bot = deterministic_bot(db, fake_ai)
+    session = await bot.reminder_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=9_199,
+        access_version=user.access_version,
+        title="возвращаться к дыханию",
+        schedule_kind=None,
+        local_date=None,
+        local_time=None,
+        timezone="Europe/Moscow",
+        timezone_source=ReminderTimezoneSource.PROFILE,
+        phase=ReminderFlowPhase.RECURRENCE_DAYS,
+        guided_recurrence=True,
+        recurrence_frequency_per_day=10,
+        recurrence_active_period="day",
+    )
+
+    ranged = await bot._reminder_guided_recurrence_turn(
+        session,
+        "каждый день с 1.09 по 5.09 в 19:00",
+    )
+    assert ranged.session is not None
+    assert ranged.session.phase is ReminderFlowPhase.RECURRENCE_SINGLE_TIME
+    assert ranged.session.local_time is None
+    assert ranged.session.recurrence_frequency_per_day == 1
+    assert ranged.session.recurrence_days == "daily"
+
+    version = ranged.session.version
+    multiple = await bot._reminder_guided_recurrence_turn(
+        ranged.session,
+        "10:00 12:00 14:00 16:00",
+    )
+    assert multiple.session is ranged.session
+    assert multiple.session.version == version
+    assert multiple.error is not None
+
+    accepted = await bot._reminder_guided_recurrence_turn(ranged.session, "19:00")
+    assert accepted.session is not None
+    assert accepted.session.phase is ReminderFlowPhase.PREVIEW
+    assert accepted.session.local_time == time(19)
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import func, select
 
+from future_self.actions import ActionCommandRouter
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.models import (
@@ -15,6 +16,20 @@ from future_self.models import (
     TaskState,
 )
 from future_self.schemas import ParsedThought, TemporalResolution
+
+
+def test_draft_router_never_treats_conversational_maybe_as_control() -> None:
+    router = ActionCommandRouter()
+
+    assert (
+        router.route(
+            "Почему это может быть важно для меня?",
+            has_pending_action=True,
+        ).kind
+        == "none"
+    )
+    assert router.route("может быть", has_pending_action=True).kind == "control"
+    assert router.route("не сохраняй пока", has_pending_action=True).kind == "control"
 
 
 class FakeMessage:

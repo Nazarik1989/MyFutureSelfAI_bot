@@ -186,6 +186,11 @@ _EDGE_FILLER_PATTERN = re.compile(
 _RECALL_VOCATIVE = re.compile(r"^(?:nova|нова)\b[\s,;:—-]*", re.IGNORECASE)
 _CONVERSATION_RECALL_PATTERNS = (
     re.compile(
+        r"^(?:а\s+)?(?:о\s+ч[её]м\s+мы\s+(?:сейчас\s+)?говорили|"
+        r"что\s+мы\s+(?:сейчас\s+)?обсуждали)[?!.…]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
         r"^(?:пожалуйста[\s,]+)?напомни(?:\s+мне)?[\s,]+(?:про\s+)?"
         r"(?:наш(?:\s+с\s+тобой)?\s+)?разговор\b[\s\S]*$",
         re.IGNORECASE,

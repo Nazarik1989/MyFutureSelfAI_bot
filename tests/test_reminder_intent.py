@@ -27,6 +27,8 @@ NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)  # 15:00 in Moscow
     ("phrase", "expected"),
     [
         ("напомни плиз", ConversationRecallIntent.AMBIGUOUS),
+        ("О чём мы сейчас говорили?", ConversationRecallIntent.RECALL),
+        ("Что мы сейчас обсуждали?", ConversationRecallIntent.RECALL),
         (
             "напомни про наш с тобой разговор о ментальных тренировках, что именно мы обсуждали?",
             ConversationRecallIntent.RECALL,

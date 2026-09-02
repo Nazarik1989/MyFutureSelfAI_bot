@@ -300,3 +300,163 @@ async def test_preview_message_cas_is_exactly_owner_chat_version_and_preview_sta
         expected_message_id=201,
         restored_message_id=202,
     )
+
+
+async def test_editing_and_revision_are_fenced_to_exact_owner_chat_and_access_generation(db):
+    owner = await _owner(
+        db,
+        telegram_id=7701,
+        access_tier="guest",
+        access_version=3,
+    )
+    other = await _owner(db, telegram_id=7702, access_version=7)
+    service = DraftInboxService(db, 60)
+    creation = await service.create_or_get(
+        user_id=owner.id,
+        telegram_user_id=owner.telegram_id,
+        chat_id=8701,
+        source="text",
+        raw_text="Send the agreement to Marina",
+        parsed=_thought(),
+    )
+    draft = creation.draft
+    assert (await service.begin_edit(draft.id, draft.version, owner.telegram_id, 8701)).ok
+
+    assert (
+        await service.editing(
+            owner.telegram_id,
+            8701,
+            expected_owner_id=owner.id,
+            expected_access_tier="guest",
+            expected_access_version=3,
+        )
+    ).id == draft.id
+    assert (
+        await service.editing(
+            owner.telegram_id,
+            8702,
+            expected_owner_id=owner.id,
+            expected_access_tier="guest",
+            expected_access_version=3,
+        )
+        is None
+    )
+    assert (
+        await service.editing(
+            owner.telegram_id,
+            8701,
+            expected_owner_id=other.id,
+            expected_access_tier="guest",
+            expected_access_version=3,
+        )
+        is None
+    )
+    assert (
+        await service.editing(
+            owner.telegram_id,
+            8701,
+            expected_owner_id=owner.id,
+            expected_access_tier="subscriber",
+            expected_access_version=3,
+        )
+        is None
+    )
+
+    async with db.session() as session:
+        await session.execute(
+            update(User)
+            .where(User.id == owner.id)
+            .values(access_tier="subscriber", access_version=4)
+        )
+    stale = await service.revise(
+        draft.id,
+        owner.telegram_id,
+        8701,
+        "Send the revised agreement",
+        "text",
+        _thought(next_step="Send the revised agreement"),
+        expected_version=draft.version,
+        expected_owner_id=owner.id,
+        expected_access_tier="guest",
+        expected_access_version=3,
+    )
+    assert not stale.ok
+    unchanged = await service.get(draft.id)
+    assert unchanged is not None
+    assert unchanged.version == draft.version
+    assert unchanged.raw_text == "Send the agreement to Marina"
+
+    current = await service.revise(
+        draft.id,
+        owner.telegram_id,
+        8701,
+        "Send the revised agreement",
+        "text",
+        _thought(next_step="Send the revised agreement"),
+        expected_version=draft.version,
+        expected_owner_id=owner.id,
+        expected_access_tier="subscriber",
+        expected_access_version=4,
+    )
+    assert current.ok and current.draft is not None
+    assert current.draft.id == draft.id
+    assert current.draft.version == draft.version + 1
+
+
+async def test_concurrent_edit_replacements_use_one_exact_version_cas(db):
+    owner = await _owner(
+        db,
+        telegram_id=7801,
+        access_tier="subscriber",
+        access_version=6,
+    )
+    service = DraftInboxService(db, 60)
+    creation = await service.create_or_get(
+        user_id=owner.id,
+        telegram_user_id=owner.telegram_id,
+        chat_id=8801,
+        source="text",
+        raw_text="Исходная редакция",
+        parsed=ParsedThought(kind="note", title="Исходная редакция"),
+    )
+    draft = creation.draft
+    assert draft is not None
+    assert (
+        await service.begin_edit(
+            draft.id,
+            draft.version,
+            owner.telegram_id,
+            8801,
+            expected_access_version=owner.access_version,
+        )
+    ).ok
+
+    async def revise(value: str):
+        return await service.revise(
+            draft.id,
+            owner.telegram_id,
+            8801,
+            value,
+            "text",
+            ParsedThought(kind="note", title=value),
+            expected_version=draft.version,
+            expected_owner_id=owner.id,
+            expected_access_tier=owner.access_tier,
+            expected_access_version=owner.access_version,
+        )
+
+    first, second = await asyncio.gather(
+        revise("Почему я откладываю важные дела?"),
+        revise("Я начинаю с одного маленького шага"),
+    )
+
+    assert sorted((first.ok, second.ok)) == [False, True]
+    current = await service.get(draft.id)
+    assert current is not None
+    assert current.version == draft.version + 1
+    assert current.status == "preview"
+    assert current.raw_text in {
+        "Почему я откладываю важные дела?",
+        "Я начинаю с одного маленького шага",
+    }
+    assert await _counts(db) == (1, 0)

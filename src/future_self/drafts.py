@@ -500,11 +500,27 @@ class DraftInboxService:
         log_transition(draft_id, telegram_user_id, "preview", "editing", "edit")
         return DraftResult(True, draft=draft)
 
-    async def editing(self, telegram_user_id: int, chat_id: int) -> DraftInboxItem | None:
+    async def editing(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_owner_id: int | None = None,
+        expected_access_tier: str | None = None,
+        expected_access_version: int | None = None,
+    ) -> DraftInboxItem | None:
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_owner_id is not None:
+            owner_filter = owner_filter.where(User.id == expected_owner_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(User.access_version == expected_access_version)
+        if expected_access_tier is not None:
+            owner_filter = owner_filter.where(User.access_tier == expected_access_tier)
         async with self.db.sessions() as session:
             draft = await session.scalar(
                 select(DraftInboxItem)
                 .where(
+                    DraftInboxItem.user_id.in_(owner_filter),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
                     DraftInboxItem.status == "editing",
@@ -684,16 +700,29 @@ class DraftInboxService:
         raw_text: str,
         source: str,
         parsed: ParsedThought,
+        *,
+        expected_version: int,
+        expected_owner_id: int,
+        expected_access_tier: str,
+        expected_access_version: int,
     ) -> DraftResult:
         now = datetime.now(UTC)
+        owner_filter = select(User.id).where(
+            User.id == expected_owner_id,
+            User.telegram_id == telegram_user_id,
+            User.access_tier == expected_access_tier,
+            User.access_version == expected_access_version,
+        )
         async with self.db.session() as session:
             changed = await session.execute(
                 update(DraftInboxItem)
                 .where(
                     DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(owner_filter),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
                     DraftInboxItem.status == "editing",
+                    DraftInboxItem.version == expected_version,
                     DraftInboxItem.expires_at > now,
                 )
                 .values(

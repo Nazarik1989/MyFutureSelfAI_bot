@@ -70,18 +70,18 @@ class DraftCommandInterpreter:
         "удали черновик",
     }
     CANCEL = {"отмена", "отмени", "отменить"}
-    DEFER = (
+    DEFER = {
         "не сохраняй пока",
         "пока не сохраняй",
         "возможно",
         "может быть",
         "добавим позже",
-    )
-    NON_ACTION = ("ты это сохранишь", "можно будет сохранить", "как думаешь")
+    }
+    NON_ACTION = {"ты это сохранишь", "можно будет сохранить", "как думаешь"}
 
     def parse(self, text: str) -> CommandMatch:
         normalized = self._normalize(text)
-        if any(marker in normalized for marker in self.DEFER):
+        if normalized in self.DEFER:
             return CommandMatch(handled_without_action=True)
         if normalized in self.SAVE or is_save_inbox_command(text):
             return CommandMatch(action="save", confidence=1.0)
@@ -93,7 +93,7 @@ class DraftCommandInterpreter:
             return CommandMatch(action="discard", confidence=1.0)
         if normalized in self.CANCEL:
             return CommandMatch(action="cancel", confidence=1.0)
-        if any(marker in normalized for marker in self.NON_ACTION):
+        if normalized in self.NON_ACTION:
             return CommandMatch(handled_without_action=True)
         if "сохрани" in normalized and any(
             marker in normalized for marker in ("наверное", "пожалуй", "может")
@@ -154,13 +154,9 @@ class ActionCommandRouter:
                 action=command.action,
                 needs_confirmation=command.needs_confirmation,
             )
-        if command.handled_without_action or any(
-            marker in normalized for marker in self.CONTROL_ONLY
-        ):
+        if command.handled_without_action or normalized in self.CONTROL_ONLY:
             return ActionRoute(kind="control")
-        if any(
-            marker in normalized for marker in ("да ее", "все правильно", "подтверждаю", "запишешь")
-        ):
+        if normalized in {"да ее", "все правильно", "подтверждаю", "запишешь"}:
             return ActionRoute(kind="control")
         return ActionRoute(kind="none")
 

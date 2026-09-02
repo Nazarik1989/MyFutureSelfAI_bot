@@ -149,6 +149,23 @@ _COMMUNICATION_SETTINGS_QUESTION = re.compile(
     r"^(?:нова[,!]?\s*)?какие\s+настройки\s+общения\s+ты\s+обо\s+мне\s+помнишь[?!.…]*$",
     re.IGNORECASE,
 )
+_LOCAL_WEAK_CONTINUATION = re.compile(
+    r"^(?:а\s+ещ[её]|что\s+ещ[её]|и\s+ещ[её])[?!.…]*$",
+    re.IGNORECASE,
+)
+_REPORTED_SPEECH_PREFIX = (
+    r"(?:\bмне\s+(?:(?:тут|как-то)\s+)?(?:сказал\w*|говор(?:ят|ит|ил\w*))|"
+    r"\b[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z-]{1,49}\s+"
+    r"(?:сказал\w*|говор(?:ят|ит|ил\w*)))"
+)
+_REPORTED_EXPLICIT_NAME = re.compile(
+    _REPORTED_SPEECH_PREFIX + r"[\s\S]{0,180}\bменя\s+зовут\s+(?P<name>[А-ЯЁа-яёA-Za-z-]{2,50})\b",
+    re.IGNORECASE,
+)
+_REPORTED_COPULAR_NAME = re.compile(
+    _REPORTED_SPEECH_PREFIX + r"[\s\S]{0,180}\b(?:что\s+)?я\s+(?P<name>[А-ЯЁа-яёA-Za-z-]{2,50})\b",
+    re.IGNORECASE,
+)
 _GRAMMATICAL_ADDRESS_QUESTION = re.compile(
     r"^(?:нова[,!]?\s*)?в\s+каком\s+роде\s+ты\s+должна\s+ко\s+мне\s+обращаться[?!.…]*$",
     re.IGNORECASE,
@@ -426,6 +443,9 @@ _DISCOURSE_NONCONTINUATION = re.compile(
 )
 
 _STATUS_RECEIPT_UNSET = object()
+_COMPLETED_FLOW_TIME_ONLY = re.compile(
+    r"^\s*(?:в\s+)?(?:[01]?\d|2[0-3])\s*[:.]\s*[0-5]\d\s*[.!…]*$"
+)
 
 type _CompanionCheck = Literal["ready", "access_changed", "context_changed", "unavailable"]
 
@@ -546,9 +566,30 @@ def _grounded_setting_acknowledgement(user_text: str) -> str | None:
     if grounded is None:
         return None
     key, value = grounded
+    fields = effective_structured_settings((value,))
+    if key == "response_length":
+        wording = {
+            "short": "коротко",
+            "normal": "обычной длиной",
+            "detailed": "подробно",
+        }.get(fields.get("response_length", ""))
+        return f"Хорошо, буду отвечать {wording}." if wording is not None else None
+    if key == "tone":
+        wording = {
+            "calm": "спокойно",
+            "direct": "прямо",
+            "supportive": "поддерживающе",
+        }.get(fields.get("tone", ""))
+        return f"Хорошо, буду говорить {wording}." if wording is not None else None
+    if key == "reminder_style":
+        wording = {
+            "gentle": "мягко",
+            "direct": "прямо",
+            "brief": "кратко",
+        }.get(fields.get("reminder_style", ""))
+        return f"Хорошо, буду напоминать {wording}." if wording is not None else None
     if key != "identity":
         return None
-    fields = effective_structured_settings((value,))
     grammatical = fields.get("grammatical_address")
     if grammatical is not None:
         label = {
@@ -561,6 +602,39 @@ def _grounded_setting_acknowledgement(user_text: str) -> str | None:
     if display_name:
         return f"Хорошо, буду обращаться к тебе как {display_name[:1].upper() + display_name[1:]}."
     return None
+
+
+def _server_grounded_memory_candidate(user_text: str) -> NovaCompanionMemoryCandidate | None:
+    grounded = grounded_structured_memory(user_text)
+    if grounded is None:
+        return None
+    key, value = grounded
+    return NovaCompanionMemoryCandidate(
+        category="identity" if key == "identity" else "preference",
+        key=key,
+        value=value,
+        evidence=user_text,
+        salience=5 if key == "identity" else 4,
+    )
+
+
+def _looks_like_reported_name(value: str) -> bool:
+    parts = value.split("-")
+    return all(
+        len(part) >= 2
+        and part[0].isalpha()
+        and part[0].isupper()
+        and part[1:].isalpha()
+        and part[1:].islower()
+        for part in parts
+    )
+
+
+def _is_reported_identity_claim(text: str) -> bool:
+    if _REPORTED_EXPLICIT_NAME.search(text) is not None:
+        return True
+    matched = _REPORTED_COPULAR_NAME.search(text)
+    return matched is not None and _looks_like_reported_name(matched.group("name"))
 
 
 def _has_mismatched_direct_address(answer: str, grammatical: str) -> bool:
@@ -758,6 +832,16 @@ class _CompanionStatusReceipt:
     local_time: time | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class _CompanionLocalContinuation:
+    owner_id: int = field(repr=False)
+    telegram_user_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    access_version: int = field(repr=False)
+    response: str = field(repr=False)
+    expires_at: datetime = field(repr=False)
+
+
 class NovaCompanionHandlers:
     """Conversation-first Nova routing and optional capture delivery."""
 
@@ -788,6 +872,9 @@ class NovaCompanionHandlers:
         ] = {}
         self._nova_companion_status_receipts: dict[
             tuple[int, int, int], _CompanionStatusReceipt
+        ] = {}
+        self._nova_companion_local_continuations: dict[
+            tuple[int, int, int], _CompanionLocalContinuation
         ] = {}
 
     def nova_companion_policy(self) -> NovaCompanionPolicy:
@@ -833,6 +920,25 @@ class NovaCompanionHandlers:
             )
         )
         address = NovaAddressClassifier.classify(text)
+        semantic_text = (
+            address.content
+            if address.kind is NovaAddressKind.VOCATIVE and address.content is not None
+            else text.strip()
+        )
+        continuation_response = self._nova_companion_local_continuation_answer(
+            semantic_text,
+            user=user,
+            chat_id=update.effective_chat.id,
+        )
+        if continuation_response is not None:
+            await self._nova_companion_local_response(
+                update,
+                context,
+                delivery_message,
+                continuation_response,
+                user=user,
+            )
+            return True
         if address.is_local_response:
             await self._nova_companion_local_response(
                 update,
@@ -842,11 +948,6 @@ class NovaCompanionHandlers:
                 user=user,
             )
             return True
-        semantic_text = (
-            address.content
-            if address.kind is NovaAddressKind.VOCATIVE and address.content is not None
-            else text.strip()
-        )
         identity_response = await self._nova_companion_identity_answer(semantic_text, user)
         if identity_response is not None:
             await self._nova_companion_local_response(
@@ -855,6 +956,7 @@ class NovaCompanionHandlers:
                 delivery_message,
                 identity_response,
                 user=user,
+                continuation_response="Других подтверждённых вариантов имени у меня нет.",
             )
             return True
         grounded_response = await self._nova_companion_grounded_projection_answer(
@@ -868,6 +970,7 @@ class NovaCompanionHandlers:
                 delivery_message,
                 grounded_response,
                 user=user,
+                continuation_response="Это все активные настройки общения, которые у меня сейчас сохранены.",
             )
             return True
         status_response = await self._nova_companion_status_answer(
@@ -929,6 +1032,17 @@ class NovaCompanionHandlers:
                 temporal_resolution=temporal_resolution,
             )
             return True
+        if _grounded_setting_acknowledgement(semantic_text) is not None:
+            await self._nova_companion_prepare_and_deliver(
+                update,
+                context,
+                delivery_message,
+                user=user,
+                snapshot=conversation_snapshot,
+                text=semantic_text,
+                source=source,
+            )
+            return True
         continuation = self._nova_companion_reminder_continuation_action(semantic_text)
         recall_intent = classify_conversation_recall(semantic_text)
         if continuation is not None:
@@ -961,6 +1075,7 @@ class NovaCompanionHandlers:
                 delivery_message,
                 self._nova_companion_recall_unavailable_answer(semantic_text),
                 user=user,
+                continuation_response="Других доступных деталей того разговора сейчас нет.",
             )
             return True
         if recall_intent is not ConversationRecallIntent.NONE:
@@ -1138,8 +1253,9 @@ class NovaCompanionHandlers:
         return answer
 
     async def _nova_companion_identity_answer(self, text: str, user: User) -> str | None:
+        authoritative_name = " ".join((user.display_name or "").split())
         if _IDENTITY_NAME_QUESTION.search(text.strip()):
-            name = " ".join((user.display_name or "").split())
+            name = authoritative_name
             if name:
                 return f"Да, тебя зовут {name}."
             policy = self.nova_brain_policy()
@@ -1171,6 +1287,11 @@ class NovaCompanionHandlers:
                         declared = declared[:1].upper() + declared[1:]
                         return f"Из твоих слов: тебя зовут {declared}."
             return "Пока не знаю, как тебя зовут."
+        if authoritative_name and _is_reported_identity_claim(text.strip()):
+            return (
+                f"Подтверждённое имя в профиле — {authoritative_name}. "
+                "Пересказ чужих слов я не принимаю за смену имени."
+            )
         if _IDENTITY_CITY_QUESTION.fullmatch(text.strip()):
             city = " ".join((user.location_city or "").split())
             return (
@@ -1260,13 +1381,21 @@ class NovaCompanionHandlers:
             "feminine": "обращаться к тебе в женском роде",
             "neutral": "обращаться к тебе нейтрально",
         }.get(grammatical or "")
-        clauses.extend(item for item in (response_length, tone, address) if item is not None)
+        reminder_style = {
+            "gentle": "напоминать мягко",
+            "direct": "напоминать прямо",
+            "brief": "напоминать кратко",
+        }.get(effective.get("reminder_style", ""))
+        clauses.extend(
+            item for item in (response_length, tone, reminder_style, address) if item is not None
+        )
         if not clauses:
             return "У меня нет активных сохранённых настроек общения."
         prefix = {
             "masculine": "Ты попросил",
             "feminine": "Ты попросила",
-        }.get(grammatical or "", "Ты попросил(а)")
+            "neutral": "В активных настройках указано",
+        }.get(grammatical or "", "В активных настройках указано")
         if len(clauses) == 1:
             return f"{prefix} {clauses[0]}"
         return f"{prefix} {', '.join(clauses[:-1])} и {clauses[-1]}"
@@ -1590,6 +1719,13 @@ class NovaCompanionHandlers:
         )
         if exact_status:
             return True
+        if (
+            _COMPLETED_FLOW_TIME_ONLY.fullmatch(semantic_text)
+            and isinstance(telegram_user_id, int)
+            and isinstance(chat_id, int)
+            and self.nova_companion_status_receipt_anchor(telegram_user_id, chat_id) is not None
+        ):
+            return True
         return bool(
             _CONTEXTUAL_STATUS_QUESTION.fullmatch(semantic_text)
             and isinstance(telegram_user_id, int)
@@ -1689,6 +1825,52 @@ class NovaCompanionHandlers:
     def _nova_companion_trim_private_map(values: dict[Any, Any], *, limit: int = 512) -> None:
         while len(values) > limit:
             values.pop(next(iter(values)), None)
+
+    def _nova_companion_local_continuation_answer(
+        self,
+        text: str,
+        *,
+        user: User,
+        chat_id: int,
+    ) -> str | None:
+        key = self._nova_companion_status_key(user.id, user.telegram_id, chat_id)
+        anchor = self._nova_companion_local_continuations.get(key)
+        if _LOCAL_WEAK_CONTINUATION.fullmatch(text.strip()) is None:
+            if self._nova_companion_local_continuations.get(key) is anchor:
+                self._nova_companion_local_continuations.pop(key, None)
+            return None
+        if (
+            anchor is None
+            or anchor.owner_id != user.id
+            or anchor.telegram_user_id != user.telegram_id
+            or anchor.chat_id != chat_id
+            or anchor.access_version != user.access_version
+            or anchor.expires_at <= datetime.now(UTC)
+        ):
+            if self._nova_companion_local_continuations.get(key) is anchor:
+                self._nova_companion_local_continuations.pop(key, None)
+            return None
+        if self._nova_companion_local_continuations.get(key) is not anchor:
+            return None
+        self._nova_companion_local_continuations.pop(key, None)
+        return anchor.response
+
+    def _nova_companion_publish_local_continuation(
+        self,
+        user: User,
+        chat_id: int,
+        response: str,
+    ) -> None:
+        key = self._nova_companion_status_key(user.id, user.telegram_id, chat_id)
+        self._nova_companion_local_continuations[key] = _CompanionLocalContinuation(
+            owner_id=user.id,
+            telegram_user_id=user.telegram_id,
+            chat_id=chat_id,
+            access_version=user.access_version,
+            response=response,
+            expires_at=datetime.now(UTC) + timedelta(minutes=20),
+        )
+        self._nova_companion_trim_private_map(self._nova_companion_local_continuations)
 
     def _nova_companion_bind_pending_capture_status(
         self,
@@ -2499,7 +2681,9 @@ class NovaCompanionHandlers:
         response: str,
         *,
         user: User,
+        continuation_response: str | None = None,
     ) -> None:
+        delivered = False
         if delivery_message is not None:
             coroutine = self._nova_companion_local_voice_lifecycle(
                 context,
@@ -2518,26 +2702,32 @@ class NovaCompanionHandlers:
                 raise
             self._track_nova_companion_task(task)
             try:
-                await asyncio.shield(task)
+                delivered = await asyncio.shield(task)
             except asyncio.CancelledError:
                 raise
-            return
-        coroutine = self._nova_companion_local_text_lifecycle(
-            update,
-            context,
-            response,
-            user=user,
-        )
-        try:
-            task = asyncio.create_task(
-                coroutine,
-                name="nova-companion-local-text-lifecycle",
+        else:
+            coroutine = self._nova_companion_local_text_lifecycle(
+                update,
+                context,
+                response,
+                user=user,
             )
-        except BaseException:
-            coroutine.close()
-            raise
-        self._track_nova_companion_task(task)
-        await asyncio.shield(task)
+            try:
+                task = asyncio.create_task(
+                    coroutine,
+                    name="nova-companion-local-text-lifecycle",
+                )
+            except BaseException:
+                coroutine.close()
+                raise
+            self._track_nova_companion_task(task)
+            delivered = await asyncio.shield(task)
+        if delivered and continuation_response is not None:
+            self._nova_companion_publish_local_continuation(
+                user,
+                update.effective_chat.id,
+                continuation_response,
+            )
 
     async def _nova_companion_local_text_lifecycle(
         self,
@@ -3284,6 +3474,15 @@ class NovaCompanionHandlers:
             memory_revision=memory_revision,
             brain_fence=brain_fence,
         )
+        server_memory_candidate = (
+            _server_grounded_memory_candidate(text) if brain_fence is not None else None
+        )
+        server_setting_acknowledgement = (
+            _grounded_setting_acknowledgement(text) if server_memory_candidate is not None else None
+        )
+        server_setting_authoritative = (
+            server_memory_candidate is not None and server_setting_acknowledgement is not None
+        )
         generation_timezone = materialized.fence.timezone_name
         try:
             pre_provider_check = await self._nova_companion_current_check(generation)
@@ -3389,13 +3588,16 @@ class NovaCompanionHandlers:
                 answer=(
                     NOVA_COMPANION_GUIDED_REMINDER_FALLBACK_TEXT
                     if reminder_candidate is not None
-                    else NOVA_COMPANION_UNAVAILABLE_TEXT
+                    else server_setting_acknowledgement or NOVA_COMPANION_UNAVAILABLE_TEXT
                 ),
                 user_text=text,
                 source=source,
                 generation=generation,
                 reminder_candidate=reminder_candidate,
-                persist_exchange=reminder_candidate is not None,
+                memory_candidate=server_memory_candidate,
+                persist_exchange=(
+                    reminder_candidate is not None or server_memory_candidate is not None
+                ),
             )
         else:
             diagnostic_codes: list[NovaCompanionDiagnosticCode] = list(result.diagnostic_codes)
@@ -3418,6 +3620,7 @@ class NovaCompanionHandlers:
                 result.capture is not None
                 and not suppress_proposals
                 and not guided_server_authoritative
+                and not server_setting_authoritative
             ):
                 suggestion = validate_capture_suggestion(
                     kind=result.capture.kind,
@@ -3429,7 +3632,11 @@ class NovaCompanionHandlers:
                     suggestion = None
                 if suggestion is None:
                     reject_proposal("invalid_capture")
-            reminder_offer_attempted = result.reminder_offer is not None and not suppress_proposals
+            reminder_offer_attempted = bool(
+                result.reminder_offer is not None
+                and not suppress_proposals
+                and not server_setting_authoritative
+            )
             if reminder_offer_attempted and not guided_server_authoritative:
                 try:
                     reminder_title, guided_recurrence = _guided_recurrence_title(
@@ -3475,6 +3682,7 @@ class NovaCompanionHandlers:
                     reject_proposal("invalid_reminder_offer")
             conflicting_action_proposals = (
                 not suppress_proposals
+                and not server_setting_authoritative
                 and result.capture is not None
                 and result.reminder_offer is not None
             )
@@ -3484,6 +3692,9 @@ class NovaCompanionHandlers:
                 reject_proposal("conflicting_actions")
             if guided_server_authoritative:
                 suggestion = None
+            if server_setting_authoritative:
+                suggestion = None
+                reminder_candidate = None
             guided_valid_provider_action = bool(
                 guided_server_authoritative
                 and (result.capture is not None or result.reminder_offer is not None)
@@ -3538,12 +3749,13 @@ class NovaCompanionHandlers:
                 )
             )
             active_settings = _active_structured_settings(brain_projection)
-            grounded_acknowledgement = (
-                _grounded_setting_acknowledgement(text) if brain_fence is not None else None
-            )
+            grounded_acknowledgement = server_setting_acknowledgement
             grammatical_address_replaced = False
+            grounded_acknowledgement_replaced = grounded_acknowledgement is not None
             if grounded_acknowledgement is not None:
                 answer = grounded_acknowledgement
+                capability_denial_replaced = False
+                discourse_recovered = False
             else:
                 addressed_answer = _apply_grammatical_address(
                     answer,
@@ -3552,31 +3764,32 @@ class NovaCompanionHandlers:
                 )
                 grammatical_address_replaced = addressed_answer != answer
                 answer = addressed_answer
-            capability_denial_replaced = bool(
-                _UNTRUSTED_CAPABILITY_DENIAL.search(answer) and reminder_candidate is not None
-            )
-            if capability_denial_replaced:
-                answer = (
-                    "Похоже, тебе важно регулярно возвращаться к этому. "
-                    "Можно настроить настоящее напоминание."
+                capability_denial_replaced = bool(
+                    _UNTRUSTED_CAPABILITY_DENIAL.search(answer) and reminder_candidate is not None
                 )
-            answer, discourse_recovered = _companion_discourse_answer(
-                answer,
-                discourse_anchor,
-            )
+                if capability_denial_replaced:
+                    answer = (
+                        "Похоже, тебе важно регулярно возвращаться к этому. "
+                        "Можно настроить настоящее напоминание."
+                    )
+                answer, discourse_recovered = _companion_discourse_answer(
+                    answer,
+                    discourse_anchor,
+                )
             raw_answer_replaced = (
                 suppressed_action_dependency
                 or guided_server_fallback
                 or rejected_reminder_offer
                 or capability_denial_replaced
                 or grammatical_address_replaced
+                or grounded_acknowledgement_replaced
                 or discourse_recovered
             )
             if discourse_recovered and discourse_anchor is not None:
                 suggestion = None
                 if discourse_anchor.status == "ambiguous":
                     reminder_candidate = None
-            if _has_untrusted_operational_claim(
+            if not server_setting_authoritative and _has_untrusted_operational_claim(
                 answer,
                 user_text=text,
                 action_context=(
@@ -3603,18 +3816,24 @@ class NovaCompanionHandlers:
                 else None
             )
             dialogue_state_update = None
-            memory_candidate = None
-            if brain_fence is not None and not raw_answer_replaced and not suppress_proposals:
+            memory_candidate = server_memory_candidate
+            if (
+                brain_fence is not None
+                and not raw_answer_replaced
+                and not suppress_proposals
+                and not server_setting_authoritative
+            ):
                 dialogue_state_update = validate_dialogue_state_update(
                     result.dialogue_state_update,
                     user_text=text,
                     assistant_answer=answer,
                     visible_action=visible_action,
                 )
-                memory_candidate = validate_memory_candidate(
-                    result.memory_candidate,
-                    user_text=text,
-                )
+                if memory_candidate is None:
+                    memory_candidate = validate_memory_candidate(
+                        result.memory_candidate,
+                        user_text=text,
+                    )
             if diagnostic_codes:
                 logger.warning(
                     "Nova companion provider proposal rejected diagnostic_codes=%s",

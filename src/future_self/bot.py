@@ -3158,8 +3158,70 @@ class FutureSelfBot(
         if action_route.kind != "none":
             await self._handle_action_route(update, context, user, snapshot, action_route, source)
             return
-        editing = await self.draft_service.editing(update.effective_user.id, chat_id)
-        if editing is None and await self.nova_companion_route(
+        editing = await self.draft_service.editing(
+            update.effective_user.id,
+            chat_id,
+            expected_owner_id=user.id,
+            expected_access_tier=user.access_tier,
+            expected_access_version=user.access_version,
+        )
+        if editing is not None:
+            date_resolution = self.date_resolver.resolve(text, user.timezone)
+            temporal_resolution = (
+                self.date_resolver.temporal_resolution(
+                    date_resolution.target_date,
+                    user.timezone,
+                    text,
+                    self.date_resolver.extract_local_time(text),
+                )
+                if date_resolution.status == "resolved" and date_resolution.target_date
+                else None
+            )
+            parsed = ParsedThought(
+                kind=editing.kind,
+                title=text.strip()[:200],
+                resolved_date=date_resolution.target_date,
+                temporal_resolution=temporal_resolution,
+            )
+            revised = await self.draft_service.revise(
+                editing.id,
+                update.effective_user.id,
+                chat_id,
+                text.strip(),
+                source,
+                parsed,
+                expected_version=editing.version,
+                expected_owner_id=user.id,
+                expected_access_tier=user.access_tier,
+                expected_access_version=user.access_version,
+            )
+            if not revised.ok or revised.draft is None:
+                await update.effective_message.reply_text(
+                    "Эта карточка уже неактуальна. Создай новую."
+                )
+                return
+            await self.conversation.append(
+                telegram_user_id,
+                chat_id,
+                role="user",
+                content=text.strip(),
+                source=source,
+                intent="draft_edit",
+                topic=revised.draft.title,
+            )
+            await self._send_draft_preview(
+                update.effective_message,
+                revised.draft,
+                include_original=source != "voice",
+            )
+            await self.conversation.set_active_draft(
+                telegram_user_id,
+                chat_id,
+                revised.draft.id,
+            )
+            await self._remember_preview(telegram_user_id, chat_id, revised.draft)
+            return
+        if await self.nova_companion_route(
             update,
             context,
             text,
@@ -3285,35 +3347,6 @@ class FutureSelfBot(
                 intent="date_interpretation",
                 topic=result.topic,
             )
-        if editing:
-            parsed = self._parsed_from_intent(
-                result,
-                text,
-                fallback_kind=editing.kind,
-                resolved_date=date_resolution.target_date,
-                temporal_resolution=temporal_resolution,
-            )
-            revised = await self.draft_service.revise(
-                editing.id,
-                update.effective_user.id,
-                chat_id,
-                text.strip(),
-                source,
-                parsed,
-            )
-            if not revised.ok:
-                await update.effective_message.reply_text(
-                    "Эта карточка уже неактуальна. Создай новую."
-                )
-                return
-            await self._send_draft_preview(
-                update.effective_message,
-                revised.draft,
-                include_original=source != "voice",
-            )
-            await self.conversation.set_active_draft(telegram_user_id, chat_id, revised.draft.id)
-            await self._remember_preview(telegram_user_id, chat_id, revised.draft)
-            return
         if result.intent in {"conversation", "question"}:
             if not application_enabled:
                 answer = result.answer or "Я тебя услышал. Можешь уточнить, чем помочь?"
