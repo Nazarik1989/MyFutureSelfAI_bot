@@ -202,6 +202,10 @@ dialogue_state_update — необязательное предложение bo
 active_topic, current_user_goal и open_loops копируй только из текущей user-реплики;
 unresolved_question — только дословно из своего текущего answer. last_assistant_offer разрешён
 только как дословный affirmative offer из текущего answer вместе с точными offer kinds.
+Каждое строковое значение здесь обязано быть одним непрерывным дословным span соответствующей
+реплики после нормализации пробелов: не пересказывай, не обобщай и не создавай краткие labels.
+Если подходящего exact span нет, оставь конкретное поле null (а список пустым); полностью пустой
+dialogue_state_update верни как null.
 Новая substantive тема должна вытеснять устаревший offer/open loop; identity, status и navigation
 не должны без причины очищать active topic. dialogue_state_update не является capability и не
 разрешает capture/reminder/memory DML.

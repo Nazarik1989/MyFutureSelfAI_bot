@@ -1071,34 +1071,68 @@ def validate_dialogue_state_update(
         return None
     user_fold = clean_user.casefold()
     answer_fold = clean_answer.casefold()
-    for name in ("active_topic", "current_user_goal"):
-        value = getattr(proposal, name)
-        if value is not None and value.casefold() not in user_fold:
-            return None
-    for loop in proposal.open_loops:
-        if loop.casefold() not in user_fold:
-            return None
-    if (
-        proposal.unresolved_question is not None
-        and proposal.unresolved_question.casefold() not in answer_fold
-    ):
-        return None
-    if proposal.last_assistant_offer is not None:
-        if proposal.last_assistant_offer.casefold() not in answer_fold:
-            return None
-        anchor = NovaCompanionDiscourseReducer.reduce(
-            "давай",
-            [{"role": "assistant", "content": proposal.last_assistant_offer}],
-        )
-        if anchor is None or tuple(proposal.last_assistant_offer_kinds) != anchor.offer_kinds:
-            return None
-    if proposal.requested_action is not None:
+    active_topic = (
+        proposal.active_topic
+        if proposal.active_topic is not None and proposal.active_topic.casefold() in user_fold
+        else None
+    )
+    current_user_goal = (
+        proposal.current_user_goal
+        if proposal.current_user_goal is not None
+        and proposal.current_user_goal.casefold() in user_fold
+        else None
+    )
+    open_loops = [loop for loop in proposal.open_loops if loop.casefold() in user_fold]
+    unresolved_question = (
+        proposal.unresolved_question
+        if proposal.unresolved_question is not None
+        and proposal.unresolved_question.casefold() in answer_fold
+        else None
+    )
+    last_assistant_offer = proposal.last_assistant_offer
+    last_assistant_offer_kinds = list(proposal.last_assistant_offer_kinds)
+    if last_assistant_offer is not None:
+        if last_assistant_offer.casefold() not in answer_fold:
+            last_assistant_offer = None
+            last_assistant_offer_kinds = []
+        else:
+            anchor = NovaCompanionDiscourseReducer.reduce(
+                "давай",
+                [{"role": "assistant", "content": last_assistant_offer}],
+            )
+            if anchor is None or tuple(last_assistant_offer_kinds) != anchor.offer_kinds:
+                last_assistant_offer = None
+                last_assistant_offer_kinds = []
+    requested_action = proposal.requested_action
+    if requested_action is not None:
         allowed = {"plan", "clarify"}
         if visible_action is not None:
             allowed.add(visible_action)
-        if proposal.requested_action not in allowed:
-            return None
-    validated = proposal.model_copy(deep=True)
+        if requested_action not in allowed:
+            requested_action = None
+    if not any(
+        (
+            active_topic,
+            current_user_goal,
+            last_assistant_offer,
+            unresolved_question,
+            requested_action,
+            open_loops,
+        )
+    ):
+        return None
+    validated = proposal.model_copy(
+        deep=True,
+        update={
+            "active_topic": active_topic,
+            "current_user_goal": current_user_goal,
+            "last_assistant_offer": last_assistant_offer,
+            "last_assistant_offer_kinds": last_assistant_offer_kinds,
+            "unresolved_question": unresolved_question,
+            "requested_action": requested_action,
+            "open_loops": open_loops,
+        },
+    )
     # The model may propose additions grounded in this exact turn, but it never
     # receives authority to erase durable server state.  Topic replacement is
     # handled deterministically by `_apply_state_update` below.

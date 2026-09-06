@@ -51,6 +51,24 @@ MONTHS = {
     "декабря": 12,
 }
 
+_FULL_NUMERIC_DATE_PATTERNS = (
+    re.compile(r"(?<!\d)\d{4}\s*-\s*\d{1,2}\s*-\s*\d{1,2}(?!\d)"),
+    re.compile(r"(?<!\d)\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{4}(?!\d)"),
+)
+
+
+def full_numeric_date_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return complete numeric/ISO date spans before any clock extraction."""
+
+    if not isinstance(text, str):
+        return ()
+    spans: list[tuple[int, int]] = []
+    for pattern in _FULL_NUMERIC_DATE_PATTERNS:
+        for match in pattern.finditer(text):
+            if not any(match.start() < stop and start < match.end() for start, stop in spans):
+                spans.append(match.span())
+    return tuple(sorted(spans))
+
 
 class DateOption(BaseModel):
     value: date
@@ -248,15 +266,60 @@ class DateResolver:
 
     @staticmethod
     def extract_local_time(text: str) -> time | None:
-        colon = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
-        if colon:
+        blocked = full_numeric_date_spans(text)
+
+        def available(pattern: re.Pattern[str], value: str) -> re.Match[str] | None:
+            return next(
+                (
+                    match
+                    for match in pattern.finditer(value)
+                    if not any(
+                        match.start() < stop and start < match.end() for start, stop in blocked
+                    )
+                ),
+                None,
+            )
+
+        colon = available(
+            re.compile(r"\b([01]?\d|2[0-3])\s*[:.]\s*([0-5]\d)\b"),
+            text,
+        )
+        if colon is not None:
             return time(int(colon.group(1)), int(colon.group(2)))
-        hour = re.search(
-            r"\bв\s+([01]?\d|2[0-3])(?:\s*(?:час(?:а|ов)?))?\b",
+        hour = available(
+            re.compile(r"\bв\s+([01]?\d|2[0-3])(?:\s*(?:ч\.?|час(?:а|ов)?))?\b"),
             text.lower(),
         )
-        if hour:
+        if hour is not None:
             return time(int(hour.group(1)), 0)
+        natural = available(
+            re.compile(
+                r"\bв\s+(один|два|три|четыре|пять|шесть|семь|восемь|девять|"
+                r"десять|одиннадцать|двенадцать)\s+(утра|дня|вечера|ночи)\b"
+            ),
+            text.casefold().replace("ё", "е"),
+        )
+        if natural is not None:
+            words = {
+                "один": 1,
+                "два": 2,
+                "три": 3,
+                "четыре": 4,
+                "пять": 5,
+                "шесть": 6,
+                "семь": 7,
+                "восемь": 8,
+                "девять": 9,
+                "десять": 10,
+                "одиннадцать": 11,
+                "двенадцать": 12,
+            }
+            value = words[natural.group(1)]
+            if natural.group(2) in {"дня", "вечера"} and value < 12:
+                value += 12
+            elif natural.group(2) == "ночи" and value == 12:
+                value = 0
+            return time(value)
         return None
 
     @staticmethod

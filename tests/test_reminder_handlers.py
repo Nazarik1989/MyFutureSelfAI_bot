@@ -24,7 +24,11 @@ from future_self.models import (
 from future_self.nova_companion_flow import NovaCompanionReminderCandidate
 from future_self.nova_memory_flow import NovaMemoryFlowPhase
 from future_self.reminder_flow import ReminderFlowPhase, ReminderFlowStore
-from future_self.reminder_handlers import REMINDER_STALE_TEXT
+from future_self.reminder_handlers import (
+    REMINDER_STALE_TEXT,
+    _reminder_turn_understanding,
+    _semantic_fallback_reminder_text,
+)
 from future_self.reminder_intent import (
     ReminderIntentParser,
     ReminderScheduleKind,
@@ -174,6 +178,121 @@ async def save_direct_reminder(
     assert result.ok is True
     assert result.inbox_item is not None
     return flow_session, result, recurring
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Можешь напомнить мне лечь спать сегодня в 22?",
+        "Можешь, пожалуйста, напомнить мне сегодня в 22 часа лечь спать?",
+        "Сможешь напомнить мне сегодня в 22:00 лечь спать?",
+    ],
+)
+def test_operational_turn_understanding_grounds_slots_independent_of_word_order(phrase):
+    parser = ReminderIntentParser(now_provider=lambda: NOW)
+    base = parser.parse(phrase, "Europe/Moscow")
+
+    understood = _reminder_turn_understanding(
+        phrase,
+        base,
+        parser=parser,
+        timezone="Europe/Moscow",
+        now=NOW,
+    )
+
+    assert understood.requested_action == "collect"
+    assert understood.elastic_routing is True
+    assert understood.exact_action_anchor.casefold() in {"напомнить"}
+    assert understood.title == "лечь спать"
+    assert understood.local_date == date(2026, 8, 10)
+    assert understood.local_time == time(22)
+    assert understood.known_slots == ("title", "date", "time", "timezone")
+    assert understood.missing_slot is None
+    assert understood.confidence == "high"
+    assert understood.ambiguous is False
+    assert understood.allowed_transition is ReminderFlowPhase.PREVIEW
+
+
+def test_semantic_fallback_canonicalization_removes_subordinate_frame() -> None:
+    phrase = "Мне хотелось бы, чтобы ты напомнила сегодня в 22:00 позвонить врачу."
+    canonical = _semantic_fallback_reminder_text(phrase)
+
+    assert canonical is not None
+    parsed = ReminderIntentParser(now_provider=lambda: NOW).parse(
+        canonical,
+        "Europe/Moscow",
+    )
+    assert parsed.title == "позвонить врачу"
+    assert parsed.local_date == date(2026, 8, 10)
+    assert parsed.local_time == time(22)
+    assert parsed.status.value == "complete"
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_time", "expected_status"),
+    [
+        ("Создай напоминание на 05.09.2026 в 22:00 позвонить врачу.", time(22), "complete"),
+        ("Создай напоминание на 5.9.2026 в 22.00 позвонить врачу.", time(22), "complete"),
+        ("Создай напоминание на 2026-09-05 в 22:00 позвонить врачу.", time(22), "complete"),
+        ("Создай напоминание в 22:00 на 05.09.2026 позвонить врачу.", time(22), "complete"),
+        ("Создай напоминание на 05.09.2026 позвонить врачу.", None, "needs_time"),
+    ],
+)
+def test_operational_turn_understanding_protects_full_date_spans_and_base_slots(
+    phrase,
+    expected_time,
+    expected_status,
+):
+    parser = ReminderIntentParser(now_provider=lambda: NOW)
+    base = parser.parse(phrase, "Europe/Moscow")
+
+    understood = _reminder_turn_understanding(
+        phrase,
+        base,
+        parser=parser,
+        timezone="Europe/Moscow",
+        now=NOW,
+    )
+
+    assert understood.parser_result.status.value == expected_status
+    assert understood.title == "позвонить врачу"
+    assert understood.local_date == date(2026, 9, 5)
+    assert understood.local_time == expected_time
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_status", "error_code"),
+    [
+        (
+            "Создай напоминание на 05.09.2026 или 06.09.2026 в 22:00 позвонить врачу.",
+            "invalid",
+            "ambiguous_date",
+        ),
+        (
+            "Создай напоминание на 05.09.2026 в 21:00 или 22:00 позвонить врачу.",
+            "needs_time",
+            "missing_time",
+        ),
+    ],
+)
+def test_operational_turn_understanding_does_not_resolve_conflicting_temporal_spans(
+    phrase,
+    expected_status,
+    error_code,
+):
+    parser = ReminderIntentParser(now_provider=lambda: NOW)
+    base = parser.parse(phrase, "Europe/Moscow")
+
+    understood = _reminder_turn_understanding(
+        phrase,
+        base,
+        parser=parser,
+        timezone="Europe/Moscow",
+        now=NOW,
+    )
+
+    assert understood.parser_result.status.value == expected_status
+    assert understood.parser_result.error_code.value == error_code
 
 
 async def seed_memory_root(
@@ -1188,17 +1307,6 @@ async def test_guided_recurrence_collects_slots_and_fails_closed_to_supported_da
     assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_PERIOD
     assert current.recurrence_frequency_per_day == 10
 
-    rejected_version = current.version
-    wrong_period = ReminderMessage("раз в час")
-    assert await bot.reminder_text_gate(
-        reminder_update(wrong_period, telegram_user_id=user.telegram_id, chat_id=chat_id),
-        context,
-    )
-    current = await current_session(bot, user, chat_id)
-    assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_PERIOD
-    assert current.version == rejected_version
-    assert "часть дня" in wrong_period.replies[-1]["text"]
-
     period = ReminderMessage("в течение дня")
     assert await bot.reminder_text_gate(
         reminder_update(period, telegram_user_id=user.telegram_id, chat_id=chat_id),
@@ -1255,9 +1363,7 @@ async def test_guided_recurrence_collects_slots_and_fails_closed_to_supported_da
 @pytest.mark.parametrize(
     ("phase", "reply"),
     [
-        (ReminderFlowPhase.RECURRENCE_FREQUENCY, "раз в час"),
         (ReminderFlowPhase.RECURRENCE_PERIOD, "раз десять"),
-        (ReminderFlowPhase.RECURRENCE_PERIOD, "в течение дня каждый час"),
     ],
 )
 @pytest.mark.asyncio
@@ -1293,6 +1399,49 @@ async def test_guided_recurrence_wrong_slot_keeps_exact_generation(
     assert live is session
     assert live.version == session.version
     assert live.recurrence_frequency_per_day == session.recurrence_frequency_per_day
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected_phase", "frequency", "period"),
+    [
+        ("раз десять", ReminderFlowPhase.RECURRENCE_PERIOD, 10, None),
+        ("десять раз в день", ReminderFlowPhase.RECURRENCE_DAYS, 10, "day"),
+        ("каждый час в течение дня", ReminderFlowPhase.RECURRENCE_SINGLE_TIME, 1, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_guided_recurrence_understands_natural_frequency_turns_without_guessing(
+    db,
+    fake_ai,
+    reply,
+    expected_phase,
+    frequency,
+    period,
+):
+    user = await subscriber(db, 6_198 + frequency)
+    bot = deterministic_bot(db, fake_ai)
+    session = await bot.reminder_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=user.telegram_id,
+        chat_id=9_198,
+        access_version=user.access_version,
+        title="возвращаться к главному",
+        schedule_kind=None,
+        local_date=None,
+        local_time=None,
+        timezone="Europe/Moscow",
+        timezone_source=ReminderTimezoneSource.PROFILE,
+        phase=ReminderFlowPhase.RECURRENCE_FREQUENCY,
+        guided_recurrence=True,
+    )
+
+    turn = await bot._reminder_guided_recurrence_turn(session, reply)
+
+    assert turn.error is None
+    assert turn.session is not None and turn.session.phase is expected_phase
+    assert turn.session.title == "возвращаться к главному"
+    assert turn.session.recurrence_frequency_per_day == frequency
+    assert turn.session.recurrence_active_period == period
 
 
 @pytest.mark.asyncio
@@ -1387,9 +1536,13 @@ async def test_one_shot_that_becomes_past_before_confirm_has_no_dml(db, fake_ai)
     labels = {
         button.text for row in query.edits[0]["reply_markup"].inline_keyboard for button in row
     }
-    assert {"Сегодня", "Завтра", "Выбрать дату", "🔁 Каждый день"} <= labels
+    assert labels == {"Отмена"}
     live = await current_session(bot, user, 9220)
-    assert live is not None and live.phase is ReminderFlowPhase.PAST
+    assert live is not None and live.phase is ReminderFlowPhase.TIME
+    assert live.title == "проверить почту"
+    assert live.local_date == date(2026, 8, 10)
+    assert live.local_time is None
+    assert live.rejected_local_time == time(15, 1)
     assert not any(
         statement.lstrip().split(maxsplit=1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}
         for statement in statements
@@ -1444,7 +1597,11 @@ async def test_one_shot_crossing_time_during_save_is_rolled_back_and_shows_past(
     assert len(query.edits) == 1
     assert "уже прошло" in query.edits[0]["text"]
     live = await current_session(bot, user, 9224)
-    assert live is not None and live.phase is ReminderFlowPhase.PAST
+    assert live is not None and live.phase is ReminderFlowPhase.TIME
+    assert live.title == "проверить почту"
+    assert live.local_date == date(2026, 8, 10)
+    assert live.local_time is None
+    assert live.rejected_local_time == time(15, 1)
     async with db.sessions() as session:
         assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
         assert await session.scalar(select(func.count(InboxItem.id))) == 0
@@ -1750,7 +1907,7 @@ async def test_when_button_preserves_title_and_advances_to_missing_time(
         ("Напомни 31 февраля в 19:00 позвонить", ReminderFlowPhase.INVALID),
         ("Напомни завтра в 25:70 позвонить", ReminderFlowPhase.INVALID),
         ("Напомни сегодня завтра в 19:00 позвонить", ReminderFlowPhase.INVALID),
-        ("Напомни завтра в 18:00 или 19:00 позвонить", ReminderFlowPhase.INVALID),
+        ("Напомни завтра в 18:00 или 19:00 позвонить", ReminderFlowPhase.TIME),
         (
             "Каждый день завтра в 19:00 напоминай позвонить",
             ReminderFlowPhase.INVALID,

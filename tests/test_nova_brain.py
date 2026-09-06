@@ -476,22 +476,23 @@ def test_nova_brain_state_validation_requires_exact_user_and_assistant_grounding
         )
         is not None
     )
-    assert (
-        validate_dialogue_state_update(
-            proposal,
-            user_text="Другая тема",
-            assistant_answer=("Могу предложить короткое упражнение. Какой вариант тебе ближе?"),
-            visible_action=None,
-        )
-        is None
+    partial = validate_dialogue_state_update(
+        proposal,
+        user_text="Другая тема",
+        assistant_answer=("Могу предложить короткое упражнение. Какой вариант тебе ближе?"),
+        visible_action=None,
     )
+    assert partial is not None
+    assert partial.active_topic is None
+    assert partial.last_assistant_offer == "Могу предложить короткое упражнение."
+    assert partial.unresolved_question == "Какой вариант тебе ближе?"
     clear_attempt = validate_dialogue_state_update(
         NovaCompanionDialogueStateUpdate(clear_fields=["active_topic", "open_loops"]),
         user_text="Продолжим",
         assistant_answer="Продолжим",
         visible_action=None,
     )
-    assert clear_attempt is not None and clear_attempt.clear_fields == []
+    assert clear_attempt is None
 
 
 async def test_nova_brain_apply_persists_state_and_observed_memory_across_service_restart(db):

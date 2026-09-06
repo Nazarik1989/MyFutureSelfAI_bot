@@ -1271,6 +1271,37 @@ def test_nova_companion_invalid_dialogue_does_not_cancel_valid_reminder_offer():
     assert result.diagnostic_codes == ("invalid_dialogue_state",)
 
 
+def test_nova_companion_dialogue_state_is_sanitized_per_field_without_rejecting_turn():
+    text = "Хочу позвонить врачу завтра"
+    result = ai_module.validate_nova_companion_response(
+        text,
+        NovaCompanionProviderResponse(
+            answer="Могу предложить настоящее напоминание.",
+            reminder_offer=NovaCompanionProviderReminderOffer(
+                title="позвонить врачу",
+                schedule_wording="завтра",
+                evidence=text,
+            ),
+            dialogue_state_update=NovaCompanionDialogueStateUpdate(
+                active_topic="медицинские дела",
+                current_user_goal="позвонить врачу",
+                open_loops=["завтра", "несуществующий summary"],
+                requested_action="reminder",
+            ),
+        ),
+        companion_projection(),
+        brain_enabled=True,
+    )
+
+    assert result.reminder_offer is not None
+    assert result.dialogue_state_update is not None
+    assert result.dialogue_state_update.active_topic is None
+    assert result.dialogue_state_update.current_user_goal == "позвонить врачу"
+    assert result.dialogue_state_update.open_loops == ["завтра"]
+    assert result.dialogue_state_update.requested_action == "reminder"
+    assert "invalid_dialogue_state" not in result.diagnostic_codes
+
+
 def test_nova_companion_conflicting_actions_fail_closed_without_losing_answer():
     text = "Хочу записать идею и завтра позвонить врачу"
     result = ai_module.validate_nova_companion_response(

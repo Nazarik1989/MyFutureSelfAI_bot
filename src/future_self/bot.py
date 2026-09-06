@@ -2488,7 +2488,6 @@ class FutureSelfBot(
             context,
             text,
             "text",
-            companion_status_preinvalidated=True,
         )
 
     async def system_action_text_gate(

@@ -9,10 +9,12 @@ from future_self.reminder_intent import (
     ReminderIntentParser,
     ReminderIntentStatus,
     ReminderScheduleKind,
+    ReminderSpeechAct,
     ReminderTimezoneHint,
     ReminderTimezoneSource,
     calculate_daily_occurrence,
     classify_conversation_recall,
+    classify_reminder_speech_act,
     first_daily_occurrence_utc,
     format_schedule_time,
     next_daily_occurrence_utc,
@@ -21,6 +23,145 @@ from future_self.reminder_intent import (
 )
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)  # 15:00 in Moscow
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected"),
+    [
+        ("Можешь напомнить мне сегодня в 22:00 позвонить врачу?", ReminderSpeechAct.DIRECT_REQUEST),
+        (
+            "Можешь ли ты напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.DIRECT_REQUEST,
+        ),
+        (
+            "Не могли бы вы напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.DIRECT_REQUEST,
+        ),
+        (
+            "Когда будешь дома, можешь напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.DIRECT_REQUEST,
+        ),
+        (
+            "Подскажи, можешь напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.DIRECT_REQUEST,
+        ),
+        (
+            "Подскажи, можешь ли ты напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.DIRECT_REQUEST,
+        ),
+        (
+            "Ты вообще можешь напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.DIRECT_REQUEST,
+        ),
+        (
+            "Не забудешь сегодня вечером напомнить позвонить врачу?",
+            ReminderSpeechAct.DIRECT_REQUEST,
+        ),
+        (
+            "Почему ты не можешь напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        ("Что ты можешь напомнить мне сегодня в 22:00?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Когда ты сможешь напомнить мне о встрече?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Ты вообще умеешь ставить напоминания?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Ты точно можешь напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Можешь напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Ты можешь напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("А ты можешь напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Ну, можешь напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Скажи, можешь напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Эй, можешь напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Про врача можешь напомнить?", ReminderSpeechAct.DIRECT_REQUEST),
+        ("Как ты можешь мне напомнить?", ReminderSpeechAct.NON_EXECUTABLE),
+        (
+            "Ты можешь напомнить мне сегодня в 22:00? Как работает эта функция?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Ты можешь напомнить мне сегодня в 22:00? А как работает эта функция?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Ты можешь напомнить мне сегодня в 22:00? И как это работает?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Ты можешь напомнить мне сегодня в 22:00. Ну как работает эта функция?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Когда, по твоему мнению, ты сможешь напомнить мне сегодня в 22:00?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Ты можешь рассказать, как напомнить мне сегодня в 22:00 позвонить врачу?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Ты можешь рассказать про способ напомнить мне сегодня в 22:00?",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        ("Расскажи о функции напоминаний", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Марина сказала: «Напомни ей завтра в 19:00 позвонить»", ReminderSpeechAct.NON_EXECUTABLE),
+        (
+            "Он написал: 'Напомни завтра в 19:00 позвонить врачу'",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "В примере было `Напомни завтра в 19:00 позвонить врачу`",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "В примере было ‘Напомни завтра в 19:00 позвонить врачу’",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "В примере было ‹Напомни завтра в 19:00 позвонить врачу›",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Пример команды: напомни сегодня в 22:00 позвонить врачу",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "Он написал: напомни завтра в 19:00 позвонить врачу",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        (
+            "В документации написано: напомни завтра в 19:00 позвонить врачу",
+            ReminderSpeechAct.NON_EXECUTABLE,
+        ),
+        ("Ты можешь создавать напоминания?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Как создавать напоминания?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Ты можешь устанавливать напоминания?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Какие напоминания ты можешь создавать?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Ты поддерживаешь напоминания?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Можно делать напоминания?", ReminderSpeechAct.NON_EXECUTABLE),
+        ("Какие напоминания ты поддерживаешь?", ReminderSpeechAct.NON_EXECUTABLE),
+        (
+            "Я хочу, чтобы ты напомнила мне сегодня в 22:00 позвонить врачу",
+            ReminderSpeechAct.SEMANTIC_FALLBACK,
+        ),
+        (
+            "Было бы здорово, если бы ты напомнил мне завтра в 09:00 позвонить",
+            ReminderSpeechAct.SEMANTIC_FALLBACK,
+        ),
+        (
+            "Можно попросить тебя напомнить завтра в 09:00 позвонить",
+            ReminderSpeechAct.SEMANTIC_FALLBACK,
+        ),
+        (
+            "Мне хотелось бы, чтобы ты напомнила сегодня в 22:00 позвонить врачу",
+            ReminderSpeechAct.SEMANTIC_FALLBACK,
+        ),
+        ("Эта песня напомнила мне Москву", ReminderSpeechAct.NON_EXECUTABLE),
+    ],
+)
+def test_reminder_speech_act_uses_governing_tokens_and_action_position(
+    phrase,
+    expected,
+) -> None:
+    assert classify_reminder_speech_act(phrase) is expected
 
 
 @pytest.mark.parametrize(
@@ -189,6 +330,38 @@ def test_supported_clock_forms_are_deterministic(phrase):
 
     assert result.status == ReminderIntentStatus.NEEDS_WHEN
     assert result.local_time == expected
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_time", "expected_title"),
+    [
+        ("Ты можешь мне напомнить в 22ч, что пора спать?", time(22), "пора спать"),
+        ("Ты можешь мне напомнить в 22 ч, что пора спать?", time(22), "пора спать"),
+        ("Ты можешь мне напомнить в 22:00, что пора спать?", time(22), "пора спать"),
+        ("Ты можешь мне напомнить в 22.00, что пора спать?", time(22), "пора спать"),
+        ("Ты можешь мне напомнить в десять вечера, что пора спать?", time(22), "пора спать"),
+    ],
+)
+def test_conversational_reminder_clock_and_subject_are_grounded(
+    phrase,
+    expected_time,
+    expected_title,
+):
+    result = parse_reminder_intent(phrase, "Europe/Moscow", now=NOW)
+
+    assert result.status is ReminderIntentStatus.NEEDS_WHEN
+    assert result.local_time == expected_time
+    assert result.title == expected_title
+
+
+def test_conversational_remind_wording_without_schedule_is_not_execution_authority():
+    result = parse_reminder_intent(
+        "Ты можешь мне напомнить, о чём мы говорили?",
+        "Europe/Moscow",
+        now=NOW,
+    )
+
+    assert result.status is ReminderIntentStatus.NOT_REMINDER
 
 
 def test_unspaced_moscow_timezone_is_explicit_and_wins_over_profile():

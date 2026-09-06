@@ -73,8 +73,11 @@ from .nova_memory_application import (
 from .reminder_flow import ReminderFlowSession
 from .reminder_intent import (
     ConversationRecallIntent,
+    ReminderIntentCode,
     ReminderIntentStatus,
+    ReminderSpeechAct,
     classify_conversation_recall,
+    classify_reminder_speech_act,
 )
 from .schemas import (
     NovaCompanionDiagnosticCode,
@@ -201,6 +204,11 @@ _REMINDER_WEAK_CONTINUATION = re.compile(
 )
 _CONTEXTUAL_STATUS_QUESTION = re.compile(
     r"^(?:ну\s+что[,:]?\s*)?(?:вс[её]\s+)?готово\?+[!.…]*$",
+    re.IGNORECASE,
+)
+_COMPLETED_REMINDER_DETAIL_QUESTION = re.compile(
+    r"^(?P<field>какое|когда|во\s+сколько|о\s+ч[её]м|"
+    r"(?:а\s+)?на\s+какую\s+дату)\?+[!.…]*$",
     re.IGNORECASE,
 )
 _VAGUE_RECURRENCE = re.compile(
@@ -503,6 +511,97 @@ def _guided_recurrence_title(
         return title, False
     cleaned = _GUIDED_TITLE_PREFIX.sub("", title.strip(), count=1).strip(" ,:;—-")
     return (cleaned or title), True
+
+
+def _semantic_reminder_provider_handoff(
+    *,
+    current_text: str,
+    local_fallback: str,
+    offer: Any | None,
+    parser: Any,
+    timezone: str,
+) -> str:
+    """Use only current-turn-grounded provider slots to complete a local parse.
+
+    The returned text still goes through the authoritative reminder parser and
+    flow.  Invalid, absent, or unnecessary provider output cannot replace slots
+    already established by the local pre-pass.
+    """
+
+    if offer is None:
+        return local_fallback
+
+    def normalize(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).split())
+
+    evidence = normalize(offer.evidence)
+    source = normalize(current_text)
+    title = normalize(offer.title).strip(" ,:;—-.!?…")
+    schedule = (
+        normalize(offer.schedule_wording).strip(" ,:;—-.!?…")
+        if offer.schedule_wording is not None
+        else None
+    )
+    if (
+        not title
+        or evidence != source
+        or title not in evidence
+        or (schedule is not None and schedule not in evidence)
+    ):
+        return local_fallback
+    local = parser.parse(local_fallback, timezone)
+    if local.status is ReminderIntentStatus.INVALID or local.error_code in {
+        ReminderIntentCode.AMBIGUOUS_DATE,
+        ReminderIntentCode.AMBIGUOUS_TIME,
+        ReminderIntentCode.CONFLICTING_SCHEDULE,
+        ReminderIntentCode.INVALID_DATE,
+        ReminderIntentCode.INVALID_TIME,
+    }:
+        return local_fallback
+    handoff = (
+        f"{local_fallback.rstrip(' ,:;—-.!?…')} {title}" if local.title is None else local_fallback
+    )
+    grounded = parser.parse(handoff, timezone)
+    if grounded.status in {
+        ReminderIntentStatus.INVALID,
+        ReminderIntentStatus.NOT_REMINDER,
+    }:
+        return local_fallback
+    for name in ("schedule_kind", "title", "local_date", "local_time", "timezone"):
+        known = getattr(local, name)
+        supplied = getattr(grounded, name)
+        if known is not None and supplied != known:
+            return local_fallback
+    local_slot_count = sum(
+        getattr(local, name) is not None
+        for name in ("schedule_kind", "title", "local_date", "local_time", "timezone")
+    )
+    grounded_slot_count = sum(
+        getattr(grounded, name) is not None
+        for name in ("schedule_kind", "title", "local_date", "local_time", "timezone")
+    )
+    if grounded_slot_count <= local_slot_count:
+        return local_fallback
+    if grounded.status is ReminderIntentStatus.COMPLETE or schedule is None:
+        return handoff
+
+    supplemented = f"{handoff.rstrip(' ,:;—-.!?…')} {schedule}"
+    candidate = parser.parse(supplemented, timezone)
+    if candidate.status in {
+        ReminderIntentStatus.INVALID,
+        ReminderIntentStatus.NOT_REMINDER,
+    }:
+        return handoff
+    for name in ("schedule_kind", "title", "local_date", "local_time", "timezone"):
+        known = getattr(grounded, name)
+        supplied = getattr(candidate, name)
+        if known is not None and supplied != known:
+            return handoff
+    candidate_slot_count = sum(
+        getattr(candidate, name) is not None
+        for name in ("schedule_kind", "title", "local_date", "local_time", "timezone")
+    )
+    return supplemented if candidate_slot_count > grounded_slot_count else handoff
 
 
 def _guided_context_subject(snapshot: object) -> str | None:
@@ -925,6 +1024,7 @@ class NovaCompanionHandlers:
             if address.kind is NovaAddressKind.VOCATIVE and address.content is not None
             else text.strip()
         )
+        reminder_speech_act = classify_reminder_speech_act(semantic_text)
         continuation_response = self._nova_companion_local_continuation_answer(
             semantic_text,
             user=user,
@@ -996,6 +1096,33 @@ class NovaCompanionHandlers:
             conversation_snapshot=conversation_snapshot,
         ):
             return True
+        if reminder_speech_act is ReminderSpeechAct.NON_EXECUTABLE:
+            await self._nova_companion_prepare_and_deliver(
+                update,
+                context,
+                delivery_message,
+                user=user,
+                snapshot=conversation_snapshot,
+                text=semantic_text,
+                source=source,
+                suppress_proposals=True,
+            )
+            return True
+        if reminder_speech_act is ReminderSpeechAct.SEMANTIC_FALLBACK:
+            semantic_fallback = self.reminder_semantic_fallback_text(semantic_text)
+            if semantic_fallback is not None:
+                await self._nova_companion_prepare_and_deliver(
+                    update,
+                    context,
+                    delivery_message,
+                    user=user,
+                    snapshot=conversation_snapshot,
+                    text=semantic_text,
+                    source=source,
+                    suppress_proposals=True,
+                    semantic_reminder_fallback=semantic_fallback,
+                )
+                return True
         if not status_receipt_preinvalidated:
             self.nova_companion_invalidate_status_for_input(
                 user.telegram_id,
@@ -1719,6 +1846,15 @@ class NovaCompanionHandlers:
         )
         if exact_status:
             return True
+        detail_question = _COMPLETED_REMINDER_DETAIL_QUESTION.fullmatch(semantic_text)
+        if (
+            detail_question is not None
+            and isinstance(telegram_user_id, int)
+            and isinstance(chat_id, int)
+        ):
+            receipt = self.nova_companion_status_receipt_anchor(telegram_user_id, chat_id)
+            if isinstance(receipt, _CompanionStatusReceipt) and receipt.kind == "reminder":
+                return True
         if (
             _COMPLETED_FLOW_TIME_ONLY.fullmatch(semantic_text)
             and isinstance(telegram_user_id, int)
@@ -2223,6 +2359,7 @@ class NovaCompanionHandlers:
         key = self._nova_companion_status_key(user.id, user.telegram_id, chat_id)
         receipt = self._nova_companion_status_receipts.get(key)
         contextual = bool(_CONTEXTUAL_STATUS_QUESTION.fullmatch(cleaned))
+        detail_question = bool(_COMPLETED_REMINDER_DETAIL_QUESTION.fullmatch(cleaned))
         capture_kind: Literal["task", "note", "idea"] | None = None
         reminder_question = bool(_REMINDER_STATUS_QUESTION.fullmatch(cleaned))
         if _CAPTURE_STATUS_QUESTION.fullmatch(cleaned):
@@ -2261,6 +2398,13 @@ class NovaCompanionHandlers:
                 access_version=user.access_version,
             )
             if current_reminder is None and pending_reminder is None:
+                return None
+            reminder_question = True
+        elif detail_question:
+            if receipt is None or receipt.kind != "reminder":
+                return None
+            if receipt.access_version != user.access_version:
+                self._nova_companion_status_receipts.pop(key, None)
                 return None
             reminder_question = True
         if capture_kind is not None:
@@ -2390,10 +2534,25 @@ class NovaCompanionHandlers:
                 type(exc).__name__,
             )
             return "Не могу сейчас надёжно проверить статус напоминания."
+        detail_actor_is_current = (
+            await self._nova_companion_actor_is_current(user) if detail_question else True
+        )
+        if detail_question and (
+            not detail_actor_is_current
+            or self._nova_companion_status_receipts.get(key) is not receipt
+        ):
+            if self._nova_companion_status_receipts.get(key) is receipt:
+                self._nova_companion_status_receipts.pop(key, None)
+            return "Не могу сейчас надёжно проверить детали напоминания."
         if reminder is None and recurring_schedule is None:
             self._nova_companion_status_receipts.pop(key, None)
             return "Пока нет — напоминание ещё не создано."
         if recurring_schedule is not None:
+            if detail_question:
+                return (
+                    f"{receipt.title} — каждый день в "
+                    f"{recurring_schedule.local_time.strftime('%H:%M')}."
+                )
             return (
                 "Да, ежедневное напоминание создано на "
                 f"{recurring_schedule.local_time.strftime('%H:%M')}."
@@ -2410,7 +2569,17 @@ class NovaCompanionHandlers:
             self._nova_companion_status_receipts.pop(key, None)
             return "Пока нет — напоминание ещё не создано."
         today = self._reminder_now().astimezone(ZoneInfo(reminder.timezone)).date()
-        day = "завтра" if local.date() == today + timedelta(days=1) else local.strftime("%d.%m.%Y")
+        day = (
+            "сегодня"
+            if local.date() == today
+            else (
+                "завтра"
+                if local.date() == today + timedelta(days=1)
+                else local.strftime("%d.%m.%Y")
+            )
+        )
+        if detail_question:
+            return f"{receipt.title} — {day} в {local.strftime('%H:%M')}."
         return f"Да, напоминание создано на {day}, {local.strftime('%H:%M')}."
 
     @staticmethod
@@ -3356,6 +3525,7 @@ class NovaCompanionHandlers:
         source: str,
         suppress_proposals: bool = False,
         guided_recurrence_fallback_title: str | None = None,
+        semantic_reminder_fallback: str | None = None,
     ) -> None:
         try:
             (
@@ -3574,6 +3744,37 @@ class NovaCompanionHandlers:
                 chat_id=generation.chat_id,
                 neutral_text=self._nova_companion_neutral_text(post_provider_check),
             )
+            return
+        if semantic_reminder_fallback is not None:
+            handoff_text = _semantic_reminder_provider_handoff(
+                current_text=text,
+                local_fallback=semantic_reminder_fallback,
+                offer=(
+                    result.reminder_offer if not provider_failed and result is not None else None
+                ),
+                parser=self.reminder_intent_parser,
+                timezone=generation_timezone,
+            )
+            handled = await self._reminder_question_gate(
+                update,
+                context,
+                handoff_text,
+                candidate_message=delivery_message,
+                expected_access_version=generation.access_version,
+                expected_session=None,
+                voice_fenced=delivery_message is not None,
+                voice_state=None,
+                weekly_candidate_handoff=False,
+                require_empty_generation=True,
+                allow_timezone_provider=False,
+            )
+            if not handled:
+                await self._nova_companion_retire_pre_delivery(
+                    context,
+                    delivery_message,
+                    chat_id=generation.chat_id,
+                    neutral_text=NOVA_COMPANION_UNAVAILABLE_TEXT,
+                )
             return
         if provider_failed or result is None:
             reminder_candidate = (

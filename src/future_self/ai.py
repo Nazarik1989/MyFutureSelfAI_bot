@@ -461,8 +461,9 @@ def validate_nova_companion_response(
         if dialogue is not None
         else None
     )
-    if dialogue is not None and validated_dialogue is None:
-        reject("invalid_dialogue_state")
+    # A structurally valid optional dialogue proposal is sanitized field by
+    # field. Ungrounded summaries are simply discarded; they must not turn an
+    # otherwise normal turn into a provider-boundary rejection diagnostic.
     validated_memory = (
         validate_memory_candidate(memory, user_text=text) if memory is not None else None
     )

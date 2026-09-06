@@ -53,6 +53,15 @@ class ConversationRecallIntent(StrEnum):
     AMBIGUOUS = "ambiguous"
 
 
+class ReminderSpeechAct(StrEnum):
+    """Execution-neutral semantic shape of a reminder mention."""
+
+    NONE = "none"
+    DIRECT_REQUEST = "direct_request"
+    SEMANTIC_FALLBACK = "semantic_fallback"
+    NON_EXECUTABLE = "non_executable"
+
+
 @dataclass(frozen=True, slots=True)
 class ReminderIntentResult:
     """A privacy-safe, serializable description of a reminder command.
@@ -125,6 +134,10 @@ DAILY_AMBIGUOUS_FOLD = 0
 _MAX_NONEXISTENT_DAYS_TO_SKIP = 370
 
 _COMMAND_START = r"^\s*(?:пожалуйста\b[\s,;:—-]*)?"
+_CONVERSATIONAL_COMMAND_PATTERN = re.compile(
+    r"^\s*(?:ты\s+)?можешь(?:\s+ли)?(?:\s+мне)?\s+напомнить\b",
+    re.IGNORECASE,
+)
 _COMMAND_PATTERNS = (
     re.compile(_COMMAND_START + r"напомни(?:те)?(?:\s+мне)?\b", re.IGNORECASE),
     re.compile(_COMMAND_START + r"поставь(?:те)?\s+напоминание\b", re.IGNORECASE),
@@ -168,9 +181,28 @@ _ALTERNATIVE_CLOCK_TIME_PATTERN = re.compile(
 )
 _INVALID_ALTERNATIVE_CLOCK_PATTERN = re.compile(r"\b(?:или|либо)\s+\d+\s*[:.]\s*\d+(?!\d)")
 _HOUR_WORD_TIME_PATTERN = re.compile(
-    r"\bв\s+(?P<hour>[01]?\d|2[0-3])\s+час(?:а|ов)?"
+    r"\bв\s+(?P<hour>[01]?\d|2[0-3])\s*(?:ч\.?|час(?:а|ов)?)"
     r"(?:\s+(?P<minute>[0-5]?\d)\s+минут(?:у|ы)?)?"
     r"(?!\s+\d+\s+минут(?:у|ы)?)\b"
+)
+_NATURAL_HOUR_WORDS = {
+    "один": 1,
+    "два": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "одиннадцать": 11,
+    "двенадцать": 12,
+}
+_NATURAL_HOUR_TIME_PATTERN = re.compile(
+    r"\bв\s+(?P<hour_word>"
+    + "|".join(_NATURAL_HOUR_WORDS)
+    + r")\s+(?P<day_part>утра|дня|вечера|ночи)\b"
 )
 _SPACED_TIME_PATTERN = re.compile(
     r"\bв\s+(?P<hour>[01]?\d|2[0-3])\s+(?P<minute>[0-5]\d)(?!\s+\d)\b"
@@ -184,6 +216,12 @@ _EDGE_FILLER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _RECALL_VOCATIVE = re.compile(r"^(?:nova|нова)\b[\s,;:—-]*", re.IGNORECASE)
+_RECALL_CONVERSATIONAL_REQUEST_PREFIX = re.compile(
+    r"^\s*(?:ты\s+)?(?:можешь|сможешь)(?:\s+ли)?"
+    r"(?:[\s,;:—-]+пожалуйста)?(?:\s+мне)?\s+напомнить"
+    r"(?:\s+мне)?\b",
+    re.IGNORECASE,
+)
 _CONVERSATION_RECALL_PATTERNS = (
     re.compile(
         r"^(?:а\s+)?(?:о\s+ч[её]м\s+мы\s+(?:сейчас\s+)?говорили|"
@@ -219,6 +257,67 @@ _AMBIGUOUS_RECALL_OR_REMINDER = re.compile(
     r"^напомни(?:\s+мне)?[\s,]+(?:плиз|пожалуйста)[?!.…]*$",
     re.IGNORECASE,
 )
+_SPEECH_ACTION_PATTERN = re.compile(
+    r"\b(?:напомни(?:те|ть)?|напомнил(?:а|и)?|"
+    r"поставь(?:те)?|поставить|ставить|"
+    r"создай(?:те)?|создать|создавать|установи(?:те|ть)|устанавливать)\b",
+    re.IGNORECASE,
+)
+_SPEECH_WORD_PATTERN = re.compile(r"[^\W_]+(?:-[^\W_]+)*", re.UNICODE)
+_SPEECH_LEADING_QUESTION = re.compile(
+    r"^(?:(?:nova|нова|скажи|подскажи|пожалуйста)\b[\s,;:—-]*)*"
+    r"(?:почему|что|когда|как)\b[^,;:.!?]{0,100}\b"
+    r"(?:не\s+)?(?:можешь|сможешь)\b",
+    re.IGNORECASE,
+)
+_SPEECH_INTERROGATIVE_WORDS = frozenset(
+    {"почему", "что", "когда", "как", "какой", "какая", "какое", "какие"}
+)
+_SPEECH_TEMPORAL_CLAUSE_VERB = re.compile(
+    r"\b[а-яё-]+(?:ешь|ишь|етесь|итесь|ешься|ишься)\b",
+    re.IGNORECASE,
+)
+_SPEECH_DIRECT_MODALS = frozenset({"можешь", "сможешь", "мог", "могла", "могли", "забудешь"})
+_SPEECH_REPORT_WORDS = frozenset(
+    {
+        "говорил",
+        "говорила",
+        "говорит",
+        "сказал",
+        "сказала",
+        "сказали",
+        "спросил",
+        "спросила",
+        "попросил",
+        "попросила",
+        "просил",
+        "просила",
+        "цитировал",
+        "цитировала",
+        "написал",
+        "написала",
+        "написали",
+        "написано",
+    }
+)
+_SPEECH_DISCUSSION_MARKERS = re.compile(
+    r"\b(?:расскажи|рассказ\w*|объясн\w*|покаж\w*|подскаж\w*|обсуд\w*|цитат\w*|функци\w*|"
+    r"умеешь|способна|возможност\w*)\b",
+    re.IGNORECASE,
+)
+_SPEECH_REMINDER_MENTION = re.compile(r"\b(?:напомн\w*|напоминан\w*)\b", re.IGNORECASE)
+_SPEECH_TRAILING_QUESTION = re.compile(
+    r"[.!?…]\s*(?:(?:а|и|ну)\s+)?(?:почему|что|когда|как)\b",
+    re.IGNORECASE,
+)
+_SPEECH_EXAMPLE_CONTEXT = re.compile(
+    r"\b(?:пример\w*|например|команд\w*|документаци\w*)\b",
+    re.IGNORECASE,
+)
+_SPEECH_CAPABILITY_PREDICATE = re.compile(
+    r"\b(?:поддержив\w*|дела(?:ть|ешь|ете)|можно|способн\w*|доступн\w*|работа\w*)\b",
+    re.IGNORECASE,
+)
 
 
 def _has_explicit_reminder_schedule(text: str) -> bool:
@@ -239,6 +338,7 @@ def _has_explicit_reminder_schedule(text: str) -> bool:
             _ISO_DATE_PATTERN,
             _CLOCK_TIME_PATTERN,
             _HOUR_WORD_TIME_PATTERN,
+            _NATURAL_HOUR_TIME_PATTERN,
             _SPACED_TIME_PATTERN,
             _INVALID_CLOCK_PATTERN,
             _INVALID_SPACED_TIME_PATTERN,
@@ -256,6 +356,10 @@ def classify_conversation_recall(text: object) -> ConversationRecallIntent:
     cleaned = _RECALL_VOCATIVE.sub("", cleaned, count=1).strip()
     if not cleaned:
         return ConversationRecallIntent.NONE
+    # Recall remains conversational when the same request is wrapped in a
+    # polite/modal form.  Canonicalizing only the speech-act prefix lets the
+    # existing exact recall grammar keep authority over the subject.
+    cleaned = _RECALL_CONVERSATIONAL_REQUEST_PREFIX.sub("напомни", cleaned, count=1)
     if _has_explicit_reminder_schedule(cleaned):
         return ConversationRecallIntent.NONE
     if any(pattern.fullmatch(cleaned) for pattern in _CONVERSATION_RECALL_PATTERNS):
@@ -406,9 +510,240 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text).strip())
 
 
+def reminder_action_is_quoted(text: str, start: int) -> bool:
+    for pattern in (
+        r"«[^»]*»",
+        r"“[^”]*”",
+        r"„[^“]*“",
+        r'"[^"]*"',
+        r"'[^']*'",
+        r"`[^`]*`",
+        r"‘[^’]*’",
+        r"‹[^›]*›",
+    ):
+        if any(match.start() <= start < match.end() for match in re.finditer(pattern, text)):
+            return True
+    prefix = text[:start]
+    return bool(
+        prefix.count('"') % 2
+        or prefix.rfind("«") > prefix.rfind("»")
+        or prefix.rfind("“") > prefix.rfind("”")
+        or prefix.rfind("„") > prefix.rfind("“")
+        or prefix.count("'") % 2
+        or prefix.count("`") % 2
+        or prefix.rfind("‘") > prefix.rfind("’")
+        or prefix.rfind("‹") > prefix.rfind("›")
+    )
+
+
+def _speech_has_temporal_when_clause(text: str, action_start: int) -> bool:
+    """Recognize a completed ``когда ... ,`` condition before the request.
+
+    A leading ``когда`` normally asks about capability.  A finite predicate
+    before the first comma instead makes it an adverbial condition, as in
+    ``Когда будешь дома, можешь напомнить ...``.
+    """
+
+    prefix = text[:action_start]
+    when = re.search(r"\bкогда\b", prefix, re.IGNORECASE)
+    if when is None:
+        return False
+    comma = prefix.find(",", when.end())
+    if comma < 0:
+        return False
+    clause = prefix[when.end() : comma]
+    return _SPEECH_TEMPORAL_CLAUSE_VERB.search(clause) is not None
+
+
+def classify_reminder_speech_act(text: object) -> ReminderSpeechAct:
+    """Classify reminder wording before any state-machine transition.
+
+    The decision is based on the action span and the words that govern it. It
+    deliberately does not infer title/date/time values and grants no execution
+    authority by itself.
+    """
+
+    if not isinstance(text, str):
+        return ReminderSpeechAct.NONE
+    normalized = _normalize(text)
+    if not normalized or len(normalized) > 4_096:
+        return ReminderSpeechAct.NONE
+    folded = normalized.casefold().replace("ё", "е")
+    actions = tuple(_SPEECH_ACTION_PATTERN.finditer(folded))
+    if len(actions) != 1:
+        if _SPEECH_REMINDER_MENTION.search(folded):
+            words = frozenset(match.group(0) for match in _SPEECH_WORD_PATTERN.finditer(folded))
+            capability_question = bool(
+                "?" in normalized
+                and _SPEECH_CAPABILITY_PREDICATE.search(folded)
+                and (
+                    bool(words & _SPEECH_INTERROGATIVE_WORDS) or bool(words & {"ты", "вы", "можно"})
+                )
+            )
+            if _SPEECH_DISCUSSION_MARKERS.search(folded) or capability_question:
+                return ReminderSpeechAct.NON_EXECUTABLE
+        return ReminderSpeechAct.NONE
+
+    action = actions[0]
+    words = tuple(_SPEECH_WORD_PATTERN.finditer(folded))
+    action_index = next(
+        (index for index, word in enumerate(words) if word.start() == action.start()),
+        None,
+    )
+    if action_index is None or action_index > 32:
+        return ReminderSpeechAct.NONE
+    before = tuple(word.group(0) for word in words[:action_index])
+    after = tuple(word.group(0) for word in words[action_index + 1 :])
+    action_word = action.group(0)
+
+    if reminder_action_is_quoted(normalized, action.start()) or any(
+        word in _SPEECH_REPORT_WORDS for word in before
+    ):
+        return ReminderSpeechAct.NON_EXECUTABLE
+    prefix = folded[: action.start()]
+    suffix = folded[action.end() :]
+    if _SPEECH_TRAILING_QUESTION.search(suffix):
+        return ReminderSpeechAct.NON_EXECUTABLE
+    if _SPEECH_EXAMPLE_CONTEXT.search(prefix) and ":" in prefix:
+        return ReminderSpeechAct.NON_EXECUTABLE
+    interrogatives = tuple(word for word in before if word in _SPEECH_INTERROGATIVE_WORDS)
+    if interrogatives and not (
+        interrogatives[0] == "когда" and _speech_has_temporal_when_clause(folded, action.start())
+    ):
+        return ReminderSpeechAct.NON_EXECUTABLE
+    if _SPEECH_LEADING_QUESTION.search(folded[: action.start()]):
+        return ReminderSpeechAct.NON_EXECUTABLE
+    discussion = _SPEECH_DISCUSSION_MARKERS.search(folded[: action.start()])
+    direct_prompt_filler = bool(
+        discussion is not None
+        and discussion.group(0).startswith("подскаж")
+        and any(word in _SPEECH_DIRECT_MODALS for word in before)
+        and all(
+            word in {"ли", "ты", "мне", "нам", "пожалуйста", "не"}
+            for word in before[
+                max(index for index, word in enumerate(before) if word in _SPEECH_DIRECT_MODALS)
+                + 1 :
+            ]
+        )
+    )
+    if discussion is not None and not direct_prompt_filler:
+        return ReminderSpeechAct.NON_EXECUTABLE
+    if "умеешь" in before:
+        return ReminderSpeechAct.NON_EXECUTABLE
+
+    finite_subordinate = action_word.startswith("напомнил") and bool(
+        "ты" in before
+        and (
+            "чтобы" in before
+            or "если" in before
+            or ("бы" in before and any(word in {"здорово", "хорошо", "удобно"} for word in before))
+        )
+    )
+    requested_infinitive = action_word.endswith("ть") and bool(
+        "попросить" in before
+        and any(word in {"тебя", "вас"} for word in before)
+        and any(word in {"можно", "хочу", "хотел", "хотела", "хотелось"} for word in before)
+    )
+    if finite_subordinate or requested_infinitive:
+        return ReminderSpeechAct.SEMANTIC_FALLBACK
+    if action_word.startswith("напомнил"):
+        return ReminderSpeechAct.NON_EXECUTABLE
+
+    imperative = bool(
+        re.fullmatch(
+            r"(?:напомни(?:те)?|поставь(?:те)?|создай(?:те)?|установи(?:те)?)",
+            action_word,
+        )
+    )
+    if imperative:
+        return ReminderSpeechAct.DIRECT_REQUEST
+
+    modal_positions = [index for index, word in enumerate(before) if word in _SPEECH_DIRECT_MODALS]
+    if not modal_positions:
+        return ReminderSpeechAct.NON_EXECUTABLE
+    modal_index = modal_positions[-1]
+    if (
+        modal_index > 0
+        and before[modal_index - 1] == "не"
+        and "ты" in before[: modal_index - 1]
+        and "бы" not in before
+    ):
+        return ReminderSpeechAct.NON_EXECUTABLE
+    if before[modal_index] in {"можешь", "сможешь"} and "не" in before[modal_index + 1 :]:
+        return ReminderSpeechAct.NON_EXECUTABLE
+    if before[modal_index] == "забудешь" and "не" not in before[: modal_index + 1]:
+        return ReminderSpeechAct.NON_EXECUTABLE
+
+    meaningful_after = tuple(
+        word
+        for word in after
+        if word not in {"мне", "нам", "пожалуйста", "напоминание", "напоминания"}
+    )
+    meaningful_before = tuple(
+        word
+        for word in before
+        if word not in _SPEECH_DIRECT_MODALS
+        and word
+        not in {
+            "nova",
+            "нова",
+            "ты",
+            "вы",
+            "мне",
+            "нам",
+            "ли",
+            "бы",
+            "не",
+            "пожалуйста",
+            "подскажи",
+            "слушай",
+            "точно",
+            "вообще",
+            "а",
+            "ну",
+            "скажи",
+            "эй",
+        }
+    )
+    if not meaningful_after and not meaningful_before:
+        return ReminderSpeechAct.NON_EXECUTABLE
+    if (
+        any(word in {"точно", "вообще"} for word in before)
+        and not meaningful_after
+        and not any(
+            pattern.search(folded)
+            for pattern in (
+                _RELATIVE_DATE_PATTERN,
+                _DAILY_PATTERN,
+                _NAMED_DATE_PATTERN,
+                _NUMERIC_DATE_PATTERN,
+                _ISO_DATE_PATTERN,
+                _CLOCK_TIME_PATTERN,
+                _HOUR_WORD_TIME_PATTERN,
+                _NATURAL_HOUR_TIME_PATTERN,
+                _SPACED_TIME_PATTERN,
+            )
+        )
+    ):
+        return ReminderSpeechAct.NON_EXECUTABLE
+    return ReminderSpeechAct.DIRECT_REQUEST
+
+
 def _has_explicit_intent(lowered: str) -> bool:
     if any(pattern.match(lowered) for pattern in _COMMAND_PATTERNS):
         return True
+    if _CONVERSATIONAL_COMMAND_PATTERN.match(lowered) is not None:
+        return any(
+            pattern.search(lowered)
+            for pattern in (
+                _RELATIVE_DATE_PATTERN,
+                _DAILY_PATTERN,
+                _CLOCK_TIME_PATTERN,
+                _HOUR_WORD_TIME_PATTERN,
+                _NATURAL_HOUR_TIME_PATTERN,
+                _SPACED_TIME_PATTERN,
+            )
+        )
     daily = _DAILY_PATTERN.match(lowered)
     if daily is None:
         return False
@@ -421,6 +756,7 @@ def _has_explicit_intent(lowered: str) -> bool:
             for pattern in (
                 _CLOCK_TIME_PATTERN,
                 _HOUR_WORD_TIME_PATTERN,
+                _NATURAL_HOUR_TIME_PATTERN,
                 _SPACED_TIME_PATTERN,
             )
             if (match := pattern.match(remainder)) is not None
@@ -439,6 +775,8 @@ def _has_explicit_intent(lowered: str) -> bool:
 
 def _intent_spans(lowered: str) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
+    if match := _CONVERSATIONAL_COMMAND_PATTERN.match(lowered):
+        spans.append(match.span())
     for pattern in _COMMAND_PATTERNS:
         if match := pattern.match(lowered):
             spans.append(match.span())
@@ -538,6 +876,7 @@ def _extract_time(text: str, blocked: tuple[tuple[int, int], ...]) -> _TimeExtra
     occupied = list(blocked)
     for pattern in (
         _HOUR_WORD_TIME_PATTERN,
+        _NATURAL_HOUR_TIME_PATTERN,
         _SPACED_TIME_PATTERN,
         _CLOCK_TIME_PATTERN,
     ):
@@ -545,11 +884,22 @@ def _extract_time(text: str, blocked: tuple[tuple[int, int], ...]) -> _TimeExtra
             span = match.span()
             if _overlaps(span, occupied):
                 continue
-            minute = match.groupdict().get("minute")
+            groups = match.groupdict()
+            minute = groups.get("minute")
+            hour_word = groups.get("hour_word")
+            if hour_word is not None:
+                hour = _NATURAL_HOUR_WORDS[hour_word]
+                day_part = groups["day_part"]
+                if day_part in {"дня", "вечера"} and hour < 12:
+                    hour += 12
+                elif day_part == "ночи" and hour == 12:
+                    hour = 0
+            else:
+                hour = int(match.group("hour"))
             found.append(
                 (
                     span,
-                    time(int(match.group("hour")), int(minute) if minute is not None else 0),
+                    time(hour, int(minute) if minute is not None else 0),
                 )
             )
             occupied.append(span)
@@ -607,6 +957,7 @@ def _masked_title(text: str, spans: Iterable[tuple[int, int]]) -> str | None:
     while title and title != previous:
         previous = title
         title = _EDGE_FILLER_PATTERN.sub("", title).strip(" \t.,!?;:()[]{}\"'«»—-")
+    title = re.sub(r"^(?:что\s+|событие\s*[:,—-]?\s*)", "", title, flags=re.I)
     return title or None
 
 
@@ -857,15 +1208,18 @@ __all__ = [
     "ReminderIntentResult",
     "ReminderIntentStatus",
     "ReminderScheduleKind",
+    "ReminderSpeechAct",
     "ReminderTimezoneSource",
     "ReminderTimezoneHint",
     "calculate_daily_occurrence",
+    "classify_reminder_speech_act",
     "classify_conversation_recall",
     "first_daily_occurrence_utc",
     "format_schedule_time",
     "next_daily_occurrence_utc",
     "parse_reminder_intent",
     "present_schedule_time",
+    "reminder_action_is_quoted",
     "reminder_explicit_timezone_spans",
     "reminder_relative_day_offset",
 ]

@@ -73,6 +73,7 @@ class ReminderFlowSession:
     calendar_anchor_utc: datetime | None = None
     weekly_candidate_handoff: bool = False
     past_time_rejected: bool = False
+    rejected_local_time: time | None = None
     guided_recurrence: bool = False
     recurrence_frequency_per_day: int | None = None
     recurrence_active_period: Literal["day", "morning", "afternoon", "evening"] | None = None
@@ -154,6 +155,7 @@ class ReminderFlowStore:
         calendar_anchor_utc: datetime | None = None,
         weekly_candidate_handoff: bool = False,
         past_time_rejected: bool = False,
+        rejected_local_time: time | None = None,
         guided_recurrence: bool = False,
         recurrence_frequency_per_day: int | None = None,
         recurrence_active_period: Literal["day", "morning", "afternoon", "evening"] | None = None,
@@ -195,6 +197,7 @@ class ReminderFlowStore:
                 else None,
                 weekly_candidate_handoff=bool(weekly_candidate_handoff),
                 past_time_rejected=bool(past_time_rejected),
+                rejected_local_time=self._time(rejected_local_time),
                 guided_recurrence=bool(guided_recurrence),
                 recurrence_frequency_per_day=self._frequency(recurrence_frequency_per_day),
                 recurrence_active_period=self._active_period(recurrence_active_period),
@@ -246,6 +249,7 @@ class ReminderFlowStore:
         relative_day_offset: int | None | object = ...,
         calendar_anchor_utc: datetime | None | object = ...,
         past_time_rejected: bool | object = ...,
+        rejected_local_time: time | None | object = ...,
         guided_recurrence: bool | object = ...,
         recurrence_frequency_per_day: int | None | object = ...,
         recurrence_active_period: (
@@ -297,6 +301,10 @@ class ReminderFlowStore:
                 )
             if past_time_rejected is not ...:
                 values["past_time_rejected"] = bool(past_time_rejected)
+            if rejected_local_time is not ...:
+                values["rejected_local_time"] = self._time(
+                    rejected_local_time if isinstance(rejected_local_time, time) else None
+                )
             if guided_recurrence is not ...:
                 values["guided_recurrence"] = bool(guided_recurrence)
             if recurrence_frequency_per_day is not ...:

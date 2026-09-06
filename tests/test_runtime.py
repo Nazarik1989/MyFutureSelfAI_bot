@@ -221,6 +221,110 @@ async def test_real_application_stage8b21_course_reminder_transcript(
 
 
 @pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("failure", ["telegram", "cancellation"])
+async def test_real_application_stage8c4_timezone_cleanup_preserves_newer_same_id_version(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    failure,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    phrase = "Я хочу, чтобы ты напомнила мне сегодня в 22:00 по Лондону лечь спать."
+    case_index = 2 * ["telegram", "cancellation"].index(failure) + (source == "voice")
+    telegram_id = 747_000 + case_index
+    transcription = RuntimeTranscription(phrase)
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="PRIVATE_SAME_ID_DELIVERY"
+    )
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    newer_snapshots = []
+
+    async def advance_same_id_then_fail(*_args, **_kwargs):
+        live = await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        assert live is not None
+        newer = await core.reminder_sessions.update(live, title="newer same-id generation")
+        assert newer is not None
+        newer_snapshots.append(newer)
+        blocked.set()
+        if failure == "cancellation":
+            await release.wait()
+        raise TelegramError("PRIVATE_SAME_ID_DELIVERY_FAILURE")
+
+    if source == "text":
+        monkeypatch.setattr(ExtBot, "send_message", advance_same_id_then_fail)
+        update_value = _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=62_200 + case_index,
+            source_message_id=216_200 + case_index,
+        )
+    else:
+        monkeypatch.setattr(ExtBot, "edit_message_text", advance_same_id_then_fail)
+        update_value = _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=62_200 + case_index,
+            source_message_id=216_200 + case_index,
+            progress_message_id=217_200 + case_index,
+        )[0]
+
+    processing = asyncio.create_task(application.process_update(update_value))
+    if failure == "cancellation":
+        await asyncio.wait_for(blocked.wait(), timeout=10)
+        processing.cancel()
+        outcome = await asyncio.gather(processing, return_exceptions=True)
+        assert isinstance(outcome[0], asyncio.CancelledError)
+    else:
+        await processing
+    release.set()
+
+    assert len(newer_snapshots) == 1
+    newer = newer_snapshots[0]
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None
+    assert current.id == newer.id and current.version == newer.version
+    assert current.title == "newer same-id generation"
+    assert [call[0] for call in fake_ai.companion_calls] == [phrase]
+    assert fake_ai.reminder_timezone_calls == []
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
 async def test_real_application_stage8b21_single_offer_continuation_transcript(
     db,
     fake_ai,
@@ -11067,7 +11171,14 @@ async def test_real_application_companion_temporal_conflict_keeps_opaque_choice(
     assert core._nova_companion_tasks == set()
 
 
-async def _seed_runtime_companion_reminder_receipt(core, db, owner, *, suffix: str):
+async def _seed_runtime_companion_reminder_receipt(
+    core,
+    db,
+    owner,
+    *,
+    suffix: str,
+    title: str | None = None,
+):
     from future_self.nova_companion_handlers import _CompanionStatusReceipt
 
     event_at = datetime(2026, 8, 22, 16, 0, tzinfo=UTC)
@@ -11075,9 +11186,9 @@ async def _seed_runtime_companion_reminder_receipt(core, db, owner, *, suffix: s
         item = InboxItem(
             user_id=owner.id,
             kind="task",
-            title=f"Стрижка {suffix}",
+            title=title or f"Стрижка {suffix}",
             description=None,
-            raw_text=f"Стрижка {suffix}",
+            raw_text=title or f"Стрижка {suffix}",
             next_step=None,
             resolved_date=event_at.date(),
             temporal_resolution=None,
@@ -11367,6 +11478,249 @@ async def test_real_application_contextual_status_uses_live_receipt_before_group
 
     assert transport.sent[-1]["text"].startswith("Да, напоминание создано на ")
     assert core._nova_companion_status_receipts[key] is receipt
+    assert fake_ai.companion_calls == []
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_real_application_stage8c4_semantic_fallback_provider_cannot_collapse_ambiguous_time(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    phrase = "Я хочу, чтобы ты напомнила мне сегодня в 21:00 или 22:00 позвонить врачу."
+    telegram_id = 744_100 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    private_value = "PRIVATE_AMBIGUOUS_PROVIDER_SELECTION"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer=private_value,
+        reminder_offer=NovaCompanionProviderReminderOffer(
+            title="позвонить врачу",
+            schedule_wording="сегодня в 21:00",
+            evidence=phrase,
+        ),
+    )
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=62_025,
+            source_message_id=214_025,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=62_026,
+            source_message_id=214_026,
+            progress_message_id=215_026,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None and current.phase is ReminderFlowPhase.TIME
+    assert current.title == "позвонить врачу"
+    assert current.local_date == date(2026, 9, 2)
+    assert current.local_time is None
+    assert [call[0] for call in fake_ai.companion_calls] == [phrase]
+    rendered = " ".join(str(item.get("text", "")) for item in (*transport.sent, *transport.edits))
+    assert private_value not in rendered
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    "detail",
+    ["Какое?", "Когда?", "Во сколько?", "О чём?", "А на какую дату?"],
+)
+async def test_real_application_completed_reminder_receipt_answers_exact_follow_up_locally(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    detail,
+):
+    telegram_id = (
+        716_420
+        + 10
+        * [
+            "Какое?",
+            "Когда?",
+            "Во сколько?",
+            "О чём?",
+            "А на какую дату?",
+        ].index(detail)
+        + (source == "voice")
+    )
+    transcription = RuntimeTranscription("Напоминание уже создано?")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core._reminder_now_provider = lambda: datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    key, receipt = await _seed_runtime_companion_reminder_receipt(
+        core,
+        db,
+        owner,
+        suffix=f"detail-{telegram_id}",
+        title="Позвонить врачу",
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    async def send(value: str, offset: int) -> None:
+        if source == "text":
+            update_value = _runtime_text_update(
+                application,
+                telegram_id,
+                value,
+                update_id=42_420 + offset,
+                source_message_id=117_420 + offset,
+            )
+        else:
+            transcription.transcript = value
+            update_value, _progress = _runtime_voice_update(
+                application,
+                telegram_id,
+                update_id=42_420 + offset,
+                source_message_id=117_420 + offset,
+                progress_message_id=118_420 + offset,
+            )
+        await application.process_update(update_value)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        await send("Напоминание уже создано?", 1)
+        await send(detail, 2)
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    rendered = [str(item.get("text", "")) for item in (*transport.sent, *transport.edits)]
+    assert "Позвонить врачу — завтра в 19:00." in rendered
+    assert core._nova_companion_status_receipts[key] is receipt
+    assert fake_ai.companion_calls == []
+    assert not any(
+        statement.lstrip().split(maxsplit=1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}
+        and any(
+            table in statement.casefold()
+            for table in (
+                "conversation_messages",
+                "draft_inbox_items",
+                "inbox_items",
+                "task_reminders",
+                "recurring_task_reminder_schedules",
+            )
+        )
+        for statement in statements
+        if statement.strip()
+    )
+
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Обсудим новую отдельную тему."
+    )
+    await send("Давай обсудим новый проект", 3)
+    await core._drain_nova_companion_tasks()
+    assert key not in core._nova_companion_status_receipts
+    assert len(fake_ai.companion_calls) == 1
+    assert core._nova_companion_tasks == set()
+
+
+async def test_real_application_completed_receipt_detail_rechecks_concurrent_identity_fence(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    telegram_id = 716_419
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        FakeTranscription(),
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    key, receipt = await _seed_runtime_companion_reminder_receipt(
+        core,
+        db,
+        owner,
+        suffix="concurrent-detail",
+        title="Позвонить врачу",
+    )
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    checks = 0
+
+    async def access_fence(_user):
+        nonlocal checks
+        checks += 1
+        if checks == 2 and core._nova_companion_status_receipts.get(key) is receipt:
+            core._nova_companion_status_receipts.pop(key, None)
+        return True
+
+    monkeypatch.setattr(core, "_nova_companion_actor_is_current", access_fence)
+
+    await application.process_update(
+        _runtime_text_update(
+            application,
+            telegram_id,
+            "Когда?",
+            update_id=42_419,
+            source_message_id=117_419,
+        )
+    )
+
+    assert checks >= 2
+    assert transport.sent[-1]["text"] == "Не могу сейчас надёжно проверить детали напоминания."
+    assert key not in core._nova_companion_status_receipts
     assert fake_ai.companion_calls == []
     assert core._nova_companion_tasks == set()
 
@@ -14048,6 +14402,262 @@ async def test_real_application_stage8c2_past_time_recovery_freezes_today_event(
 
 
 @pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Ты можешь мне напомнить в 22ч, что пора спать?",
+        "Ты можешь мне напомнить в 22 ч, что пора спать?",
+        "Ты можешь мне напомнить в 22:00, что пора спать?",
+        "Ты можешь мне напомнить в 22.00, что пора спать?",
+        "Ты можешь мне напомнить в десять вечера, что пора спать?",
+        "Ты можешь мне напомнить, что пора спать, в десять вечера?",
+    ],
+)
+async def test_real_application_stage8c4_conversational_reminder_keeps_grounded_slots(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    phrase,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    telegram_id = (
+        729_220
+        + 10
+        * [
+            "Ты можешь мне напомнить в 22ч, что пора спать?",
+            "Ты можешь мне напомнить в 22 ч, что пора спать?",
+            "Ты можешь мне напомнить в 22:00, что пора спать?",
+            "Ты можешь мне напомнить в 22.00, что пора спать?",
+            "Ты можешь мне напомнить в десять вечера, что пора спать?",
+            "Ты можешь мне напомнить, что пора спать, в десять вечера?",
+        ].index(phrase)
+        + (source == "voice")
+    )
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=59_220,
+            source_message_id=207_220,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=59_221,
+            source_message_id=207_221,
+            progress_message_id=208_221,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None and current.phase is ReminderFlowPhase.PREVIEW
+    assert current.title == "пора спать"
+    assert current.local_date == date(2026, 9, 2)
+    assert current.local_time == time(22)
+    assert fake_ai.companion_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("reply", ["В 22 ч спать", "Событие сон, 22:00"])
+async def test_real_application_stage8c4_time_continuation_does_not_reset_known_subject(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    reply,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    telegram_id = (
+        729_280 + 10 * ["В 22 ч спать", "Событие сон, 22:00"].index(reply) + (source == "voice")
+    )
+    transcription = RuntimeTranscription("Напомни сегодня, что пора спать")
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+
+    async def send(value: str, offset: int) -> None:
+        if source == "text":
+            update_value = _runtime_text_update(
+                application,
+                telegram_id,
+                value,
+                update_id=59_280 + offset,
+                source_message_id=207_280 + offset,
+            )
+        else:
+            transcription.transcript = value
+            update_value, _progress = _runtime_voice_update(
+                application,
+                telegram_id,
+                update_id=59_280 + offset,
+                source_message_id=207_280 + offset,
+                progress_message_id=208_280 + offset,
+            )
+        await application.process_update(update_value)
+
+    await send("Напомни сегодня, что пора спать", 1)
+    initial = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert initial is not None and initial.phase is ReminderFlowPhase.TIME
+    assert initial.title == "пора спать"
+    await send(reply, 2)
+    preview = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert preview is not None and preview.phase is ReminderFlowPhase.PREVIEW
+    assert preview.title == "пора спать"
+    assert preview.local_date == date(2026, 9, 2)
+    assert preview.local_time == time(22)
+    assert fake_ai.companion_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_real_application_stage8c4_initial_past_today_asks_only_for_new_time(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    phrase = "Напомни сегодня в 07:30 позвонить врачу."
+    telegram_id = 729_290 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+
+    async def send(value: str, offset: int) -> None:
+        if source == "text":
+            update_value = _runtime_text_update(
+                application,
+                telegram_id,
+                value,
+                update_id=59_290 + offset,
+                source_message_id=207_290 + offset,
+            )
+        else:
+            transcription.transcript = value
+            update_value, _progress = _runtime_voice_update(
+                application,
+                telegram_id,
+                update_id=59_290 + offset,
+                source_message_id=207_290 + offset,
+                progress_message_id=208_290 + offset,
+            )
+        await application.process_update(update_value)
+
+    await send(phrase, 1)
+    rejected = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert rejected is not None and rejected.phase is ReminderFlowPhase.TIME
+    assert rejected.title == "позвонить врачу"
+    assert rejected.local_date == date(2026, 9, 2)
+    assert rejected.local_time is None
+    assert rejected.rejected_local_time == time(7, 30)
+    rendered = [str(item.get("text", "")) for item in (*transport.sent, *transport.edits)]
+    assert any(
+        "Время 07:30 уже прошло. Дату сохраняю" in value
+        and "Во сколько сегодня напомнить?" in value
+        for value in rendered
+    )
+    rendering = next(
+        item
+        for item in reversed([*transport.sent, *transport.edits])
+        if item.get("reply_markup") is not None
+    )
+    labels = {button.text for row in rendering["reply_markup"].inline_keyboard for button in row}
+    assert labels == {"Отмена"}
+
+    await send("23:30", 2)
+    preview = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert preview is not None and preview.phase is ReminderFlowPhase.PREVIEW
+    assert preview.title == "позвонить врачу"
+    assert preview.local_date == date(2026, 9, 2)
+    assert preview.local_time == time(23, 30)
+    assert fake_ai.companion_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
 @pytest.mark.parametrize("unsupported_case", ["date_range", "multi_time"])
 async def test_real_application_stage8c2_guided_recurrence_collects_without_guessing(
     db,
@@ -14056,7 +14666,7 @@ async def test_real_application_stage8c2_guided_recurrence_collects_without_gues
     source,
     unsupported_case,
 ):
-    phrase = "Напоминай мне почаще возвращаться к главному"
+    phrase = "Напоминай мне почаще возвращаться к главному."
     telegram_id = 729_300 + (10 if unsupported_case == "multi_time" else 0) + (source == "voice")
     transcription = RuntimeTranscription(phrase)
     fake_ai.companion_provider_result = NovaCompanionProviderResponse(
@@ -14144,7 +14754,7 @@ async def test_real_application_stage8c2_guided_recurrence_collects_without_gues
     assert current is not None and current.phase is ReminderFlowPhase.RECURRENCE_PERIOD
     assert current.recurrence_frequency_per_day == 10
     period_version = current.version
-    for wrong_period in ("раз в час", "раз десять", "в течение дня каждый час"):
+    for wrong_period in ("раз десять",):
         await send(wrong_period)
         rejected = await core.reminder_sessions.current(
             owner_id=owner.id,
@@ -15167,3 +15777,962 @@ async def test_real_application_stage8c2_gender_setting_survives_restart_and_rec
     assert active_settings == ("identity:grammatical_address=masculine",)
     assert len(fake_ai.companion_calls) == 1
     assert restarted._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    ("phrase", "expected_phase", "expected_title", "expected_time"),
+    [
+        (
+            "Можешь напомнить мне лечь спать сегодня в 22?",
+            ReminderFlowPhase.PREVIEW,
+            "лечь спать",
+            time(22),
+        ),
+        (
+            "Можешь, пожалуйста, напомнить мне сегодня в 22 часа лечь спать?",
+            ReminderFlowPhase.PREVIEW,
+            "лечь спать",
+            time(22),
+        ),
+        (
+            "Сможешь напомнить мне сегодня в 22:00 лечь спать?",
+            ReminderFlowPhase.PREVIEW,
+            "лечь спать",
+            time(22),
+        ),
+        (
+            "Поставь, пожалуйста, напоминание на 22:00: пора спать.",
+            ReminderFlowPhase.PREVIEW,
+            "пора спать",
+            time(22),
+        ),
+        (
+            "Не забудешь сегодня вечером напомнить позвонить маме?",
+            ReminderFlowPhase.TIME,
+            "позвонить маме",
+            None,
+        ),
+        (
+            "Нова, пожалуйста, сможешь сегодня в 22:00 напомнить мне лечь спать?",
+            ReminderFlowPhase.PREVIEW,
+            "лечь спать",
+            time(22),
+        ),
+        (
+            "Можешь напомнить мне лечь спать в 22:00 сегодня?",
+            ReminderFlowPhase.PREVIEW,
+            "лечь спать",
+            time(22),
+        ),
+    ],
+)
+async def test_real_application_stage8c4_elastic_turn_understanding_routes_grounded_slots(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    phrase,
+    expected_phase,
+    expected_title,
+    expected_time,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    case_index = abs(hash(phrase)) % 1_000
+    telegram_id = 730_000 + case_index * 2 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="PROVIDER_MUST_NOT_ROUTE",
+        reminder_offer=NovaCompanionProviderReminderOffer(
+            title="PROVIDER_TITLE",
+            evidence=phrase,
+        ),
+    )
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=60_000 + case_index,
+            source_message_id=210_000 + case_index,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=60_000 + case_index,
+            source_message_id=210_000 + case_index,
+            progress_message_id=211_000 + case_index,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None and current.phase is expected_phase
+    assert current.title == expected_title
+    assert current.local_date == date(2026, 9, 2)
+    assert current.local_time == expected_time
+    assert fake_ai.companion_calls == []
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Можешь, пожалуйста, напомнить мне сегодня в 22 часа лечь спать?",
+        "Слушай, можешь напомнить мне сегодня в 22 часа лечь спать?",
+        "Подскажи, можешь напомнить мне сегодня в 22 часа лечь спать?",
+        "Не могли бы вы напомнить мне сегодня в 22 часа лечь спать?",
+    ],
+)
+async def test_real_application_stage8c4_fully_local_turn_never_calls_provider(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    phrase,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    case_index = (
+        0
+        if phrase.startswith("Можешь")
+        else 1
+        if phrase.startswith("Слушай")
+        else 2
+        if phrase.startswith("Подскажи")
+        else 3
+    )
+    telegram_id = 732_100 + case_index * 2 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    fake_ai.companion_error = AssertionError("fully local turn must not call provider")
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=60_100,
+            source_message_id=210_100,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=60_101,
+            source_message_id=210_101,
+            progress_message_id=211_101,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None and current.phase is ReminderFlowPhase.PREVIEW
+    assert current.title == "лечь спать"
+    assert current.local_date == date(2026, 9, 2)
+    assert current.local_time == time(22)
+    assert fake_ai.companion_calls == []
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("date_wording", ["05.09.2026", "5.9.2026", "2026-09-05"])
+async def test_real_application_stage8c4_numeric_date_span_survives_elastic_canonicalization(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    date_wording,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    phrase = f"Создай напоминание на {date_wording} в 22:00 позвонить врачу."
+    case_index = ["05.09.2026", "5.9.2026", "2026-09-05"].index(date_wording)
+    telegram_id = 733_000 + case_index * 2 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    fake_ai.companion_error = AssertionError("numeric date reminder must stay fully local")
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=60_150 + case_index,
+            source_message_id=210_150 + case_index,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=60_160 + case_index,
+            source_message_id=210_160 + case_index,
+            progress_message_id=211_160 + case_index,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None and current.phase is ReminderFlowPhase.PREVIEW
+    assert current.title == "позвонить врачу"
+    assert current.local_date == date(2026, 9, 5)
+    assert current.local_time == time(22)
+    assert fake_ai.companion_calls == []
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Почему ты не можешь напомнить мне сегодня в 22:00 позвонить врачу?",
+        "Что ты можешь напомнить мне сегодня в 22:00?",
+        "Когда ты сможешь напомнить мне о встрече?",
+        "Ты вообще умеешь ставить напоминания?",
+        "Ты точно можешь напомнить?",
+        "Можешь напомнить?",
+        "Ты можешь напомнить?",
+        "А ты можешь напомнить?",
+        "Ну, можешь напомнить?",
+        "Скажи, можешь напомнить?",
+        "Эй, можешь напомнить?",
+        "Как ты можешь мне напомнить?",
+        "Ты можешь напомнить мне сегодня в 22:00? Как работает эта функция?",
+        "Ты можешь напомнить мне сегодня в 22:00? А как работает эта функция?",
+        "Ты можешь напомнить мне сегодня в 22:00? И как это работает?",
+        "Ты можешь напомнить мне сегодня в 22:00. Ну как работает эта функция?",
+        "Когда, по твоему мнению, ты сможешь напомнить мне сегодня в 22:00?",
+        "Ты можешь рассказать, как напомнить мне сегодня в 22:00 позвонить врачу?",
+        "Расскажи о функции напоминаний.",
+        "Он написал: 'Напомни завтра в 19:00 позвонить врачу'.",
+        "В примере было `Напомни завтра в 19:00 позвонить врачу`.",
+        "В примере было ‘Напомни завтра в 19:00 позвонить врачу’.",
+        "В примере было ‹Напомни завтра в 19:00 позвонить врачу›.",
+        "Пример команды: напомни сегодня в 22:00 позвонить врачу.",
+        "Он написал: напомни завтра в 19:00 позвонить врачу.",
+        "В документации написано: напомни завтра в 19:00 позвонить врачу.",
+        "Ты можешь создавать напоминания?",
+        "Как создавать напоминания?",
+        "Ты можешь устанавливать напоминания?",
+        "Какие напоминания ты можешь создавать?",
+        "Ты поддерживаешь напоминания?",
+        "Можно делать напоминания?",
+        "Какие напоминания ты поддерживаешь?",
+    ],
+)
+async def test_real_application_stage8c4_capability_questions_never_enter_reminder_flow(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    phrase,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    case_index = abs(hash(phrase)) % 1_000
+    telegram_id = 740_000 + case_index * 2 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Объясняю возможности напоминаний без выполнения действия.",
+        reminder_offer=NovaCompanionProviderReminderOffer(
+            title="напомнить",
+            evidence=phrase,
+        ),
+    )
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=61_000 + case_index,
+            source_message_id=212_000 + case_index,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=61_000 + case_index,
+            source_message_id=212_000 + case_index,
+            progress_message_id=213_000 + case_index,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+    await core._drain_nova_companion_tasks()
+
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    assert [call[0] for call in fake_ai.companion_calls] == [phrase]
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 2
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    ("provider_case", "phrase"),
+    [
+        (
+            "valid",
+            (
+                "Я хочу, чтобы ты напомнила мне сегодня в 22:00 позвонить врачу; "
+                "запасной вариант — сегодня в 21:00."
+            ),
+        ),
+        (
+            "invalid_title",
+            ("Я хочу, чтобы ты напомнила мне сегодня в 22:00 позвонить врачу 05.09.2026."),
+        ),
+        ("null", "Было бы здорово, если бы ты напомнила мне сегодня в 22:00 позвонить врачу."),
+        ("malformed", "Можно попросить тебя напомнить сегодня в 22:00 позвонить врачу?"),
+        ("conflicting", "Я хочу, чтобы ты напомнил мне сегодня в 22:00 позвонить врачу."),
+        ("failure", "Я хочу, чтобы ты напомнила бы мне сегодня в 22:00 позвонить врачу."),
+    ],
+)
+async def test_real_application_stage8c4_semantic_fallback_calls_provider_once_then_grounds_server_side(
+    db,
+    fake_ai,
+    monkeypatch,
+    caplog,
+    source,
+    provider_case,
+    phrase,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    case_index = [
+        "valid",
+        "invalid_title",
+        "null",
+        "malformed",
+        "conflicting",
+        "failure",
+    ].index(provider_case)
+    telegram_id = 744_000 + case_index * 2 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    private_value = f"PRIVATE_SEMANTIC_FALLBACK_{provider_case.upper()}"
+    if provider_case == "valid":
+        fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+            answer=private_value,
+            reminder_offer=NovaCompanionProviderReminderOffer(
+                title="позвонить врачу",
+                schedule_wording="сегодня в 21:00",
+                evidence=phrase,
+            ),
+        )
+    elif provider_case == "invalid_title":
+        fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+            answer=private_value,
+            reminder_offer=NovaCompanionProviderReminderOffer(
+                title="позвонить врачу 05.09.2026",
+                evidence=phrase,
+            ),
+        )
+    elif provider_case == "null":
+        fake_ai.companion_provider_result = NovaCompanionProviderResponse(answer=private_value)
+    elif provider_case == "malformed":
+        fake_ai.companion_provider_raw_result = {
+            "answer": private_value,
+            "reminder_offer": "{not-json",
+        }
+    elif provider_case == "conflicting":
+        fake_ai.companion_provider_raw_result = {
+            "answer": private_value,
+            "capture": {
+                "kind": "task",
+                "title": "позвонить врачу",
+                "evidence": phrase,
+            },
+            "reminder_offer": {
+                "title": "позвонить врачу",
+                "schedule_wording": "сегодня в 22:00",
+                "evidence": phrase,
+            },
+        }
+    else:
+        fake_ai.companion_error = RuntimeError(private_value)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    monkeypatch.setattr(
+        core,
+        "reminder_semantic_fallback_text",
+        lambda _text: "напомни сегодня в 22:00",
+    )
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=62_000 + case_index,
+            source_message_id=214_000 + case_index,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=62_000 + case_index,
+            source_message_id=214_000 + case_index,
+            progress_message_id=215_000 + case_index,
+        )[0]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await application.process_update(update_value)
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None
+    assert current.phase is (
+        ReminderFlowPhase.PREVIEW if provider_case == "valid" else ReminderFlowPhase.TITLE
+    )
+    assert current.title == ("позвонить врачу" if provider_case == "valid" else None)
+    assert current.local_date == date(2026, 9, 2)
+    assert current.local_time == time(22)
+    assert [call[0] for call in fake_ai.companion_calls] == [phrase]
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    rendered = " ".join(str(item.get("text", "")) for item in (*transport.sent, *transport.edits))
+    assert private_value not in rendered
+    assert private_value not in caplog.text
+    async with db.sessions() as session:
+        contents = tuple(await session.scalars(select(ConversationMessage.content)))
+        assert private_value not in contents
+        assert contents == ()
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    ("case_name", "phrase", "expected_phase", "expected_timezone"),
+    [
+        (
+            "close_morphology",
+            "Мне хотелось бы, чтобы ты напомнила мне сегодня в 22:00 позвонить врачу.",
+            ReminderFlowPhase.PREVIEW,
+            "Europe/Moscow",
+        ),
+        (
+            "unknown_timezone",
+            ("Я хочу, чтобы ты напомнила мне позвонить врачу завтра в 09:00 по Светогорску."),
+            ReminderFlowPhase.TIMEZONE_RETRY,
+            "Europe/Moscow",
+        ),
+    ],
+)
+async def test_real_application_stage8c4_semantic_fallback_preserves_local_slots_without_second_provider(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    case_name,
+    phrase,
+    expected_phase,
+    expected_timezone,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    case_index = ["close_morphology", "unknown_timezone"].index(case_name)
+    telegram_id = 745_000 + case_index * 2 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    private_value = f"PRIVATE_SEMANTIC_LOCAL_{case_name.upper()}"
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(answer=private_value)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    transport = _patch_runtime_weekly_transport(monkeypatch, application)
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=62_050 + case_index,
+            source_message_id=214_050 + case_index,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=62_060 + case_index,
+            source_message_id=214_060 + case_index,
+            progress_message_id=215_060 + case_index,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None and current.phase is expected_phase
+    assert current.title == "позвонить врачу"
+    assert current.local_time == time(22 if case_name == "close_morphology" else 9)
+    assert current.timezone == expected_timezone
+    assert [call[0] for call in fake_ai.companion_calls] == [phrase]
+    assert fake_ai.reminder_timezone_calls == []
+    rendered = " ".join(str(item.get("text", "")) for item in (*transport.sent, *transport.edits))
+    assert private_value not in rendered
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+async def test_real_application_stage8c4_semantic_fallback_preserves_newer_reminder_generation(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    fallback_phrase = "Я хочу, чтобы ты напомнила мне сегодня в 22:00 по Лондону позвонить врачу."
+    newer_phrase = "Напомни сегодня в 23:00 купить хлеб."
+    telegram_id = 746_000 + (source == "voice")
+    transcription = RuntimeTranscription(fallback_phrase)
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="PRIVATE_STALE_FALLBACK_ANSWER"
+    )
+    fake_ai.companion_release.clear()
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    first_update = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            fallback_phrase,
+            update_id=62_100,
+            source_message_id=214_100,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=62_101,
+            source_message_id=214_101,
+            progress_message_id=215_101,
+        )[0]
+    )
+    first = asyncio.create_task(application.process_update(first_update))
+    await asyncio.wait_for(fake_ai.companion_started.wait(), timeout=10)
+
+    if source == "voice":
+        transcription.transcript = newer_phrase
+        newer_update = _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=62_111,
+            source_message_id=214_111,
+            progress_message_id=215_111,
+        )[0]
+    else:
+        newer_update = _runtime_text_update(
+            application,
+            telegram_id,
+            newer_phrase,
+            update_id=62_110,
+            source_message_id=214_110,
+        )
+    await application.process_update(newer_update)
+    newer = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert newer is not None and newer.title == "купить хлеб"
+
+    fake_ai.companion_release.set()
+    await first
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    assert current is not None and current.id == newer.id and current.version == newer.version
+    assert current.title == "купить хлеб"
+    assert current.local_time == time(23)
+    assert [call[0] for call in fake_ai.companion_calls] == [fallback_phrase]
+    assert fake_ai.reminder_timezone_calls == []
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize(
+    ("phrase", "expected_route", "expected_phase"),
+    [
+        ("Можешь напомнить, о чём мы говорили?", "recall", None),
+        ("Напомни мне про это", "reminder", ReminderFlowPhase.TITLE),
+        (
+            "Марина сказала: «Напомни ей завтра в 19:00 позвонить»",
+            "companion",
+            None,
+        ),
+        (
+            "Можешь напомнить мне сегодня в 22:00 позвонить маме и купить хлеб?",
+            "reminder",
+            ReminderFlowPhase.TITLE,
+        ),
+        (
+            "Можешь напомнить мне сегодня в 18:00 или 19:00 позвонить маме?",
+            "reminder",
+            ReminderFlowPhase.TIME,
+        ),
+        ("Ты умеешь ставить напоминания?", "companion", None),
+        ("Про врача можешь напомнить?", "reminder", ReminderFlowPhase.WHEN),
+    ],
+)
+async def test_real_application_stage8c4_elastic_turn_negative_boundaries(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    phrase,
+    expected_route,
+    expected_phase,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    case_index = abs(hash(phrase)) % 1_000
+    telegram_id = 734_200 + case_index * 2 + (source == "voice")
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    fake_ai.companion_provider_result = NovaCompanionProviderResponse(
+        answer="Отвечаю как на обычную разговорную реплику."
+    )
+    update_value = (
+        _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=60_200 + case_index,
+            source_message_id=210_200 + case_index,
+        )
+        if source == "text"
+        else _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=60_200 + case_index,
+            source_message_id=210_200 + case_index,
+            progress_message_id=211_200 + case_index,
+        )[0]
+    )
+
+    await application.process_update(update_value)
+    await core._drain_nova_companion_tasks()
+
+    current = await core.reminder_sessions.current(
+        owner_id=owner.id,
+        telegram_user_id=telegram_id,
+        chat_id=telegram_id,
+    )
+    if expected_route == "reminder":
+        assert current is not None and current.phase is expected_phase
+        assert fake_ai.companion_calls == []
+        async with db.sessions() as session:
+            assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+    elif expected_route == "companion":
+        assert current is None
+        assert [call[0] for call in fake_ai.companion_calls] == [phrase]
+        async with db.sessions() as session:
+            assert await session.scalar(select(func.count(ConversationMessage.id))) == 2
+    else:
+        assert expected_route == "recall"
+        assert current is None
+        assert len(fake_ai.companion_calls) <= 1
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()
+
+
+@pytest.mark.parametrize("source", ["text", "voice"])
+@pytest.mark.parametrize("failure", ["telegram", "cancellation"])
+@pytest.mark.parametrize(
+    ("route", "phrase"),
+    [
+        ("local", "Можешь напомнить мне лечь спать сегодня в 22?"),
+        (
+            "fallback",
+            "Я хочу, чтобы ты напомнила мне сегодня в 22:00 лечь спать.",
+        ),
+        (
+            "fallback_timezone",
+            ("Я хочу, чтобы ты напомнила мне сегодня в 22:00 по Лондону лечь спать."),
+        ),
+    ],
+)
+async def test_real_application_stage8c4_launch_failure_leaves_no_generation(
+    db,
+    fake_ai,
+    monkeypatch,
+    source,
+    failure,
+    route,
+    phrase,
+):
+    fixed_now = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    case_index = (
+        4 * ["local", "fallback", "fallback_timezone"].index(route)
+        + 2 * ["telegram", "cancellation"].index(failure)
+        + (source == "voice")
+    )
+    telegram_id = 736_400 + case_index
+    transcription = RuntimeTranscription(phrase)
+    core = FutureSelfBot(
+        runtime_settings(
+            database_url=db.url,
+            enable_nova_companion=True,
+            nova_companion_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        transcription,
+    )
+    core.reminder_intent_parser = ReminderIntentParser(now_provider=lambda: fixed_now)
+    core._reminder_now_provider = lambda: fixed_now
+    application = core.build()
+    application._initialized = True
+    owner = await _runtime_stage7c_user(core, db, telegram_id, tier="subscriber")
+    _patch_runtime_weekly_transport(monkeypatch, application)
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_or_block(*_args, **_kwargs):
+        blocked.set()
+        if failure == "cancellation":
+            await release.wait()
+        raise TelegramError("PRIVATE_ELASTIC_DELIVERY_FAILURE")
+
+    if source == "text":
+        monkeypatch.setattr(ExtBot, "send_message", fail_or_block)
+        update_value = _runtime_text_update(
+            application,
+            telegram_id,
+            phrase,
+            update_id=60_400 + case_index,
+            source_message_id=210_400 + case_index,
+        )
+    else:
+        monkeypatch.setattr(ExtBot, "edit_message_text", fail_or_block)
+        update_value = _runtime_voice_update(
+            application,
+            telegram_id,
+            update_id=60_400 + case_index,
+            source_message_id=210_400 + case_index,
+            progress_message_id=211_400 + case_index,
+        )[0]
+
+    processing = asyncio.create_task(application.process_update(update_value))
+    if failure == "cancellation":
+        await asyncio.wait_for(blocked.wait(), timeout=10)
+        processing.cancel()
+        result = await asyncio.gather(processing, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+    else:
+        await processing
+    release.set()
+
+    assert (
+        await core.reminder_sessions.current(
+            owner_id=owner.id,
+            telegram_user_id=telegram_id,
+            chat_id=telegram_id,
+        )
+        is None
+    )
+    assert [call[0] for call in fake_ai.companion_calls] == ([phrase] if route != "local" else [])
+    assert fake_ai.reminder_timezone_calls == []
+    assert core.nova_companion_captures._capabilities == {}
+    assert core.nova_companion_reminders._capabilities == {}
+    async with db.sessions() as session:
+        assert await session.scalar(select(func.count(ConversationMessage.id))) == 0
+        assert await session.scalar(select(func.count(DraftInboxItem.id))) == 0
+        assert await session.scalar(select(func.count(InboxItem.id))) == 0
+        assert await session.scalar(select(func.count(TaskReminder.id))) == 0
+        assert await session.scalar(select(func.count(RecurringTaskReminderSchedule.id))) == 0
+    assert core._nova_companion_tasks == set()

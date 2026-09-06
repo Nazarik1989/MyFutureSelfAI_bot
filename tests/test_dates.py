@@ -1,6 +1,40 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
+
+import pytest
 
 from future_self.dates import DateResolver
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "в 22ч пора спать",
+        "в 22 ч пора спать",
+        "пора спать в 22:00",
+        "пора спать в 22.00",
+        "в десять вечера пора спать",
+        "пора спать в десять вечера",
+    ],
+)
+def test_extract_local_time_accepts_grounded_conversational_clock_forms(text) -> None:
+    assert DateResolver.extract_local_time(text) == time(22)
+
+
+@pytest.mark.parametrize("text", ["05.09.2026", "5.9.2026", "2026-09-05"])
+def test_extract_local_time_never_treats_a_full_date_span_as_a_clock(text) -> None:
+    assert DateResolver.extract_local_time(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "05.09.2026 в 22:00",
+        "в 22.00 на 5.9.2026",
+        "2026-09-05, затем в 22:00",
+    ],
+)
+def test_extract_local_time_uses_the_clock_outside_a_full_date_span(text) -> None:
+    assert DateResolver.extract_local_time(text) == time(22)
 
 
 def test_resolve_uses_injected_clock_when_now_is_omitted() -> None:
