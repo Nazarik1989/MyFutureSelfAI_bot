@@ -2,16 +2,20 @@ import asyncio
 import logging
 import re
 import warnings
+import weakref
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from hashlib import blake2s
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
+from sqlalchemy import update as sql_update
 from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
@@ -23,7 +27,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -46,7 +50,7 @@ from .actions import (
     DraftAction,
     DraftActionService,
 )
-from .ai import AIService
+from .ai import WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS, AIService
 from .callback_ui import edit_callback_screen
 from .collection_commands import CollectionCommandRouter
 from .collection_handlers import CollectionHandlers
@@ -63,6 +67,7 @@ from .domain import (
     IntentRouter,
     OnboardingFlow,
     PendingIntent,
+    TodayApplicationSnapshot,
     normalize_display_name,
 )
 from .drafts import DraftInboxService
@@ -94,6 +99,34 @@ from .models import (
 from .natural_commands import NaturalAction, NaturalCommandRouter
 from .navigation import NavigationFlowStore
 from .navigation_handlers import NavigationHandlers
+from .nova import NovaSessionStore, is_explicit_nova_invocation
+from .nova_companion_flow import ExplicitCaptureClassifier
+from .nova_companion_handlers import NovaCompanionHandlers
+from .nova_handlers import NovaHandlers
+from .nova_memory import (
+    NovaMemoryApplicationSnapshot,
+    NovaMemoryService,
+    NovaMemoryValidationError,
+)
+from .nova_memory_application import (
+    NovaMemoryProjection,
+    NovaMemoryProjectionError,
+    build_nova_memory_projection,
+)
+from .nova_memory_flow import (
+    NovaMemoryFlowStore,
+    NovaMemoryIntentKind,
+    classify_nova_memory_intent,
+)
+from .nova_memory_handlers import NOVA_MEMORY_ACCESS_CHANGED_TEXT, NovaMemoryHandlers
+from .recurring_reminders import (
+    RecurringReminderDelivery,
+    RecurringTaskReminderEngine,
+    RecurringTaskReminderService,
+)
+from .reminder_flow import ReminderFlowStore
+from .reminder_handlers import ReminderHandlers, ReminderVoiceGateState
+from .reminder_intent import ReminderIntentParser
 from .reminders import TaskReminderEngine
 from .repositories import (
     CheckInRepository,
@@ -119,6 +152,9 @@ from .vision_renderer import (
     VisionRenderLimiter,
     VisionRenderSessionStore,
 )
+from .weekly_review import WeeklyReviewService
+from .weekly_review_flow import WeeklyReviewCapabilityStore, WeeklyReviewPolicy
+from .weekly_review_handlers import WEEKLY_REVIEW_RETRY_TEXT, WeeklyReviewHandlers
 from .workspace_access import WorkspaceAccessService
 from .workspace_handlers import WorkspaceHandlers
 
@@ -129,6 +165,14 @@ _ONBOARDING_META_KEY = "__onboarding_flow__"
 _PENDING_ONBOARDING_TIMEZONE = "pending_timezone"
 _PENDING_TIMEZONE_UPDATE = "pending_timezone_update"
 _ACTIVE_ONBOARDING_STATUSES = frozenset({"in_progress", "awaiting_confirmation"})
+_NOVA_MEMORY_APPLICATION_ACCESS_ATTR = "_nova_memory_application_access_generation"
+_NOVA_MEMORY_APPLICATION_DRAIN_TIMEOUT_SECONDS = 30.0
+_NOVA_MEMORY_APPLICATION_CANCEL_TIMEOUT_SECONDS = 5.0
+_NOVA_MEMORY_APPLICATION_CANCEL_RETRY_SECONDS = 0.1
+_WEEKLY_REVIEW_DRAIN_TIMEOUT_SECONDS = 31.0
+_WEEKLY_REVIEW_CANCEL_TIMEOUT_SECONDS = 5.0
+_WEEKLY_REVIEW_CANCEL_RETRY_SECONDS = 0.1
+_WEEKLY_REVIEW_PROCESSING_RECOVERY_MARGIN_SECONDS = 5.0
 EVENING_WORKED, EVENING_FAILED, EVENING_ENERGY, EVENING_OBSTACLE, EVENING_TOMORROW = range(10, 15)
 (
     HEALTH_ENERGY,
@@ -153,6 +197,60 @@ ACTION_LABELS = {
     "note": "заметку",
 }
 NAVIGATION = ReplyKeyboardMarkup([["Назад", "Пропустить"], ["Отменить"]], resize_keyboard=True)
+
+NOVA_MEMORY_APPLICATION_CHANGED_TEXT = (
+    "🧬 Память Nova изменилась, пока я готовила ответ.\nПовтори вопрос — я учту актуальную версию."
+)
+NOVA_MEMORY_APPLICATION_UNAVAILABLE_TEXT = (
+    "Не удалось безопасно применить память Nova.\nПовтори вопрос чуть позже."
+)
+
+
+class _NovaMemoryApplicationDrainError(RuntimeError):
+    """Raised when tracked delivery tasks ignore the bounded shutdown cancellation."""
+
+
+class _WeeklyReviewDrainError(RuntimeError):
+    """Raised when a tracked weekly lifecycle ignores bounded shutdown cancellation."""
+
+
+@dataclass(frozen=True, slots=True)
+class _NovaMemoryApplicationFence:
+    telegram_actor_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    tier: str
+    access_version: int = field(repr=False)
+    collection_revision: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _NovaMemoryAccessGeneration:
+    telegram_actor_id: int = field(repr=False)
+    chat_id: int = field(repr=False)
+    tier: str
+    access_version: int = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _NovaMemoryCallbackBinding:
+    chat_id: int = field(repr=False)
+    message_id: int = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _NovaMemoryPreparedAnswer:
+    text: str = field(repr=False)
+    fence: _NovaMemoryApplicationFence
+    projection: NovaMemoryProjection | None = field(default=None, repr=False)
+
+
+type _NovaMemoryApplicationResult = Literal[
+    "ready",
+    "access_changed",
+    "memory_changed",
+    "unavailable",
+    "provider_failed",
+]
 
 
 def _truncate_utf16(value: str, max_units: int) -> str:
@@ -190,6 +288,11 @@ class FutureSelfBot(
     CollectionHandlers,
     WorkspaceHandlers,
     KnowledgeHandlers,
+    WeeklyReviewHandlers,
+    NovaCompanionHandlers,
+    NovaMemoryHandlers,
+    ReminderHandlers,
+    NovaHandlers,
     NavigationHandlers,
 ):
     def __init__(
@@ -224,6 +327,39 @@ class FutureSelfBot(
             enable_workspace_access=getattr(settings, "enable_workspace_access", False)
         )
         self.navigation_flow_sessions = NavigationFlowStore()
+        self.nova_sessions = NovaSessionStore()
+        self._nova_ui_lock = asyncio.Lock()
+        self._nova_launch_lock = asyncio.Lock()
+        self.nova_memory_service = NovaMemoryService(
+            db,
+            max_items=settings.nova_memory_max_items,
+        )
+        self.nova_memory_sessions = NovaMemoryFlowStore()
+        self._nova_memory_ui_lock = asyncio.Lock()
+        self._nova_memory_launch_lock = asyncio.Lock()
+        self._nova_memory_application_tasks: set[asyncio.Task[bool]] = set()
+        self._nova_memory_application_ui_locks: weakref.WeakValueDictionary[
+            tuple[int, int], asyncio.Lock
+        ] = weakref.WeakValueDictionary()
+        self.weekly_review_service = WeeklyReviewService(
+            db,
+            review_weekday=settings.weekly_review_weekday,
+        )
+        self.weekly_review_policy = WeeklyReviewPolicy(
+            enabled=bool(getattr(settings, "enable_weekly_review", False)),
+            admin_only=bool(getattr(settings, "weekly_review_admin_only", True)),
+        )
+        self.weekly_review_capabilities = WeeklyReviewCapabilityStore()
+        self._weekly_review_launch_lock = asyncio.Lock()
+        self._reply_keyboard_owner_lock = asyncio.Lock()
+        self._weekly_review_tasks: set[asyncio.Task[Any]] = set()
+        self._weekly_review_ui_locks: weakref.WeakValueDictionary[tuple[int, int], asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        self.reminder_sessions = ReminderFlowStore()
+        self._reminder_ui_lock = asyncio.Lock()
+        self._reminder_launch_lock = asyncio.Lock()
+        self._reminder_now_provider = lambda: datetime.now(UTC)
         self.conversation = ConversationContextService(
             db,
             settings.conversation_context_messages,
@@ -231,7 +367,14 @@ class FutureSelfBot(
             settings.draft_focus_ttl_minutes,
             settings.system_action_ttl_minutes,
         )
+        self._init_nova_companion()
         self.date_resolver = DateResolver()
+        self.reminder_intent_parser = ReminderIntentParser()
+        self.recurring_reminder_service = RecurringTaskReminderService(
+            db,
+            grace_minutes=settings.recurring_task_reminder_grace_minutes,
+            lease_seconds=settings.task_reminder_lease_seconds,
+        )
         self.task_service = TaskService(
             db,
             date_event_hour=settings.task_date_event_hour,
@@ -300,6 +443,7 @@ class FutureSelfBot(
         )
         self.scheduler: JobQueueScheduler | None = None
         self.reminder_engine: TaskReminderEngine | None = None
+        self.recurring_reminder_engine: RecurringTaskReminderEngine | None = None
         self._guest_maintenance_task: asyncio.Task[None] | None = None
 
     @property
@@ -331,16 +475,20 @@ class FutureSelfBot(
         gated_public_commands = [
             "menu",
             "today",
+            "week",
             "inbox",
             "tasks",
             "collections",
             "vision",
             "health",
             "checkin",
+            "health_edit",
             "doctor",
             "doctor_find",
             "doctor_prepare",
+            "doctor_prepare_edit",
             "doctor_preparations",
+            "cleanup_drafts",
             "location",
             "timezone",
             "profile",
@@ -348,6 +496,7 @@ class FutureSelfBot(
             "last_saved",
             "evening",
             "labs",
+            "mynova",
         ]
         if getattr(self.settings, "enable_workspace_access", False):
             gated_public_commands.extend(("spaces", "workspaces"))
@@ -355,6 +504,8 @@ class FutureSelfBot(
             gated_public_commands.append("knowledge")
         if getattr(self.settings, "enable_knowledge_capture", False):
             gated_public_commands.append("capture")
+        gated_public_commands.append("help")
+        app.add_handler(CommandHandler("cancel", self.nova_cancel_gate), group=-3)
         app.add_handler(
             CommandHandler(
                 gated_public_commands,
@@ -370,6 +521,13 @@ class FutureSelfBot(
         )
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.navigation_text_gate),
+            group=-2,
+        )
+        app.add_handler(
+            MessageHandler(
+                filters.PHOTO | filters.Document.ALL | filters.VOICE | filters.AUDIO,
+                self.nova_non_text_gate,
+            ),
             group=-2,
         )
         app.add_handler(
@@ -415,6 +573,10 @@ class FutureSelfBot(
                     CommandHandler("start", self.start),
                     CommandHandler("onboarding", self.start),
                     CallbackQueryHandler(
+                        self.nova_onboarding_entry,
+                        pattern=r"^nova:action:onboarding:",
+                    ),
+                    CallbackQueryHandler(
                         self.navigation_onboarding_entry,
                         pattern=r"^nav:action:onboarding$",
                     ),
@@ -447,6 +609,10 @@ class FutureSelfBot(
             entry_points=[
                 CommandHandler("evening", self.evening_start),
                 CallbackQueryHandler(
+                    self.nova_evening_entry,
+                    pattern=r"^nova:action:evening:",
+                ),
+                CallbackQueryHandler(
                     self.navigation_evening_entry,
                     pattern=r"^nav:action:evening$",
                 ),
@@ -475,6 +641,10 @@ class FutureSelfBot(
             entry_points=[
                 CommandHandler("checkin", self.health_checkin_start),
                 CommandHandler("health_edit", self.health_checkin_start),
+                CallbackQueryHandler(
+                    self.nova_health_entry,
+                    pattern=r"^nova:action:checkin:",
+                ),
                 CallbackQueryHandler(
                     self.navigation_health_entry,
                     pattern=r"^nav:action:checkin$",
@@ -515,6 +685,10 @@ class FutureSelfBot(
                 CommandHandler("doctor_prepare", self.doctor_prepare_start),
                 CommandHandler("doctor_prepare_edit", self.doctor_prepare_start),
                 CallbackQueryHandler(
+                    self.nova_doctor_entry,
+                    pattern=r"^nova:action:doctor_prepare:",
+                ),
+                CallbackQueryHandler(
                     self.navigation_doctor_entry,
                     pattern=r"^nav:action:doctor_prepare$",
                 ),
@@ -547,6 +721,7 @@ class FutureSelfBot(
         app.add_handler(health_checkin)
         app.add_handler(doctor_prepare)
         app.add_handler(CommandHandler("menu", self.menu_command))
+        app.add_handler(CommandHandler("mynova", self.mynova_command))
         app.add_handler(CommandHandler("tasks", self.tasks_command))
         app.add_handler(CommandHandler("collections", self.collections_command))
         if getattr(self.settings, "enable_workspace_access", False):
@@ -566,6 +741,7 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("last_saved", self.last_saved_command))
         app.add_handler(CommandHandler("cleanup_drafts", self.cleanup_drafts_command))
         app.add_handler(CommandHandler("today", self.today))
+        app.add_handler(CommandHandler("week", self.week_command))
         app.add_handler(CommandHandler("health", self.health_command))
         app.add_handler(CommandHandler("health_delete", self.health_delete_command))
         app.add_handler(CommandHandler("health_reminder_on", self.health_reminder_on))
@@ -577,6 +753,42 @@ class FutureSelfBot(
         app.add_handler(CommandHandler("doctor_find", self.doctor_find))
         app.add_handler(CommandHandler("doctor_find_task", self.doctor_find_task))
         app.add_handler(CommandHandler("cancel", self.cancel_draft_edit))
+        app.add_handler(
+            CallbackQueryHandler(
+                self.weekly_review_callback,
+                pattern=r"^wrev:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self.nova_companion_callback,
+                pattern=r"^ncap:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self.nova_companion_reminder_callback,
+                pattern=r"^nrem:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self.nova_brain_callback,
+                pattern=r"^nbrain:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self.nova_memory_callback,
+                pattern=r"^nmem:[A-Za-z0-9_-]+$",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self.reminder_callback,
+                pattern=r"^rmd:[A-Za-z0-9_-]+$",
+            )
+        )
         app.add_handler(CallbackQueryHandler(self.task_callback, pattern=r"^task:"))
         app.add_handler(CallbackQueryHandler(self.collection_callback, pattern=r"^collection:"))
         if getattr(self.settings, "enable_workspace_access", False):
@@ -593,6 +805,7 @@ class FutureSelfBot(
             )
         )
         app.add_handler(CallbackQueryHandler(self.timezone_action, pattern=r"^timezone:update:"))
+        app.add_handler(CallbackQueryHandler(self.nova_callback, pattern=r"^nova:"))
         app.add_handler(CallbackQueryHandler(self.navigation_action, pattern=r"^nav:"))
         app.add_handler(CallbackQueryHandler(self.intent_action, pattern=r"^intent:"))
         app.add_handler(CallbackQueryHandler(self.context_action, pattern=r"^context:"))
@@ -618,6 +831,34 @@ class FutureSelfBot(
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text))
         app.add_error_handler(self.error_handler)
         return app
+
+    async def _sync_access_commands(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        telegram_id: int,
+        tier: Any,
+        access_version: int,
+    ) -> None:
+        """Freeze the access generation admitted by the perimeter for this update."""
+
+        setattr(
+            context,
+            _NOVA_MEMORY_APPLICATION_ACCESS_ATTR,
+            _NovaMemoryAccessGeneration(
+                telegram_actor_id=telegram_id,
+                chat_id=chat_id,
+                tier=str(tier),
+                access_version=access_version,
+            ),
+        )
+        await super()._sync_access_commands(
+            context,
+            chat_id,
+            telegram_id,
+            tier,
+            access_version,
+        )
 
     @staticmethod
     async def private_chat_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -654,6 +895,8 @@ class FutureSelfBot(
             self.knowledge_storage.cleanup_staging(
                 older_than_seconds=self.settings.knowledge_staging_ttl_minutes * 60
             )
+        if self.weekly_review_policy.enabled:
+            await self._maintain_weekly_review_state(app.bot, startup_recovery=True)
         try:
             await app.bot.set_my_commands(
                 [BotCommand(item.command, item.description) for item in GUEST_COMMANDS],
@@ -673,15 +916,41 @@ class FutureSelfBot(
         async def delete_stale_reminder(telegram_id: int, message_id: int) -> None:
             await app.bot.delete_message(chat_id=telegram_id, message_id=message_id)
 
+        async def send_recurring(delivery: RecurringReminderDelivery) -> int | None:
+            message = await app.bot.send_message(
+                chat_id=delivery.destination_id,
+                text=f"🔔 Ежедневное напоминание\n\n{delivery.title}",
+            )
+            return getattr(message, "message_id", None)
+
         async def send_vision_companion(preference_id: int, moment: str) -> None:
             await self._vision_companion_notification(app.bot, preference_id, moment)
+
+        async def send_weekly_review(telegram_id: int, timezone: str) -> None:
+            await self.weekly_review_scheduled_notification(
+                app.bot,
+                telegram_id,
+                timezone,
+            )
 
         async def can_send(telegram_id: int) -> bool:
             try:
                 return await self.access_service.has_full_access_by_telegram_id(telegram_id)
             except Exception as exc:
-                log_safe_failure("Background access check failed", exc, user_id=telegram_id)
+                log_safe_failure("Background access check failed", exc)
                 return False
+
+        async def can_send_weekly(telegram_id: int) -> bool:
+            if not self.weekly_review_policy.enabled:
+                return False
+            try:
+                status = await self.access_service.status(telegram_id)
+            except Exception as exc:
+                log_safe_failure("Weekly background access check failed", exc)
+                return False
+            return bool(
+                status is not None and self.weekly_review_policy.allows_tier(status.access_tier)
+            )
 
         if isinstance(app, Application) or getattr(app, "post_stop", None) is not None:
             self._start_guest_maintenance(app.bot)
@@ -704,6 +973,8 @@ class FutureSelfBot(
             self.settings.enable_weekly_review,
             send_vision_companion,
             can_send=can_send,
+            weekly_review_send=send_weekly_review,
+            weekly_can_send=can_send_weekly,
         )
         if self.settings.enable_task_reminders:
             self.reminder_engine = TaskReminderEngine(
@@ -718,6 +989,18 @@ class FutureSelfBot(
             await self.reminder_engine.deliver_due()
             self.scheduler.start_task_reminders(
                 self.reminder_engine,
+                interval_seconds=self.settings.task_reminder_poll_seconds,
+            )
+            self.recurring_reminder_engine = RecurringTaskReminderEngine(
+                self.db,
+                send_recurring,
+                delete_sent=delete_stale_reminder,
+                grace_minutes=self.settings.recurring_task_reminder_grace_minutes,
+                lease_seconds=self.settings.task_reminder_lease_seconds,
+            )
+            await self.recurring_reminder_engine.deliver_due()
+            self.scheduler.start_recurring_task_reminders(
+                self.recurring_reminder_engine,
                 interval_seconds=self.settings.task_reminder_poll_seconds,
             )
         async with self.db.sessions() as session:
@@ -756,10 +1039,14 @@ class FutureSelfBot(
 
     async def _guest_maintenance_loop(self, telegram_bot: object) -> None:
         await self._cleanup_guest_results_safely()
+        await self._cleanup_nova_companion_capabilities_safely()
+        await self._maintain_weekly_review_state(telegram_bot, startup_recovery=False)
         await self._recover_guest_demo_results(telegram_bot)
         while True:
             await self._guest_maintenance_wait()
             await self._cleanup_guest_results_safely()
+            await self._cleanup_nova_companion_capabilities_safely()
+            await self._maintain_weekly_review_state(telegram_bot, startup_recovery=False)
 
     async def _guest_maintenance_wait(self) -> None:
         await asyncio.sleep(60)
@@ -771,6 +1058,69 @@ class FutureSelfBot(
             raise
         except Exception as exc:
             log_safe_failure("Guest result cleanup failed", exc)
+
+    async def _cleanup_nova_companion_capabilities_safely(self) -> None:
+        try:
+            await self.nova_companion_captures.cleanup()
+            await self.nova_companion_reminders.cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova companion failed operation=capability_cleanup error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _maintain_weekly_review_state(
+        self,
+        telegram_bot: object,
+        *,
+        startup_recovery: bool,
+    ) -> None:
+        """Run one bounded retention/recovery batch without provider work."""
+
+        if not self.weekly_review_policy.enabled:
+            return
+        allowed_tiers = (
+            frozenset({"admin"}) if self.weekly_review_policy.admin_only else FULL_ACCESS_TIERS
+        )
+        try:
+            await self.weekly_review_service.cleanup_expired(allowed_tiers=allowed_tiers)
+            if startup_recovery:
+                recovered = await self.weekly_review_service.recover_processing_session_snapshots(
+                    allowed_tiers=allowed_tiers,
+                )
+            else:
+                current = datetime.now(UTC)
+                processing_cutoff = current - timedelta(
+                    seconds=(
+                        WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS
+                        + _WEEKLY_REVIEW_PROCESSING_RECOVERY_MARGIN_SECONDS
+                    )
+                )
+                recovered = await self.weekly_review_service.recover_processing_session_snapshots(
+                    updated_before=processing_cutoff,
+                    allowed_tiers=allowed_tiers,
+                )
+            await self.weekly_review_capabilities.cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Weekly review maintenance failed operation=maintenance error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        context = type("WeeklyRecoveryContext", (), {"bot": telegram_bot})()
+        for session in recovered:
+            if session.canonical_message_id is None:
+                continue
+            await self._weekly_review_render(
+                context,
+                session,
+                f"{self._weekly_review_week_heading(session)}\n\n{WEEKLY_REVIEW_RETRY_TEXT}",
+                await self._weekly_review_cancel_markup(session),
+            )
 
     async def _stop_guest_maintenance(self) -> None:
         task = self._guest_maintenance_task
@@ -788,18 +1138,113 @@ class FutureSelfBot(
 
     async def _post_stop(self, app: Application) -> None:
         del app
-        await self._stop_guest_maintenance()
+        await self._quiesce_private_delivery_tasks()
 
     async def _post_shutdown(self, app: Application) -> None:
         del app
-        await self._stop_guest_maintenance()
-        await self.image_generation.close()
+        try:
+            await self._quiesce_private_delivery_tasks()
+        finally:
+            await self.image_generation.close()
+
+    async def _quiesce_private_delivery_tasks(self) -> None:
+        try:
+            await self._drain_private_delivery_tasks()
+        finally:
+            try:
+                await self._stop_guest_maintenance()
+            finally:
+                await self._drain_private_delivery_tasks()
+
+    async def _drain_private_delivery_tasks(self) -> None:
+        results = await asyncio.gather(
+            self._drain_weekly_review_tasks(),
+            self._drain_nova_memory_application_tasks(),
+            self._drain_nova_companion_tasks(),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _drain_weekly_review_tasks(self) -> None:
+        current = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _WEEKLY_REVIEW_DRAIN_TIMEOUT_SECONDS
+        while True:
+            pending = self._pending_weekly_review_tasks(current)
+            if not pending:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            _done, still_pending = await asyncio.wait(pending, timeout=remaining)
+            if still_pending:
+                break
+
+        pending = self._pending_weekly_review_tasks(current)
+        if not pending:
+            return
+        logger.warning(
+            "Weekly review shutdown operation=drain error_type=TimeoutError pending_count=%s",
+            len(pending),
+        )
+        cancel_deadline = loop.time() + _WEEKLY_REVIEW_CANCEL_TIMEOUT_SECONDS
+        while True:
+            pending = self._pending_weekly_review_tasks(current)
+            if not pending:
+                return
+            for task in pending:
+                task.cancel()
+            remaining = cancel_deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.wait(
+                pending,
+                timeout=min(_WEEKLY_REVIEW_CANCEL_RETRY_SECONDS, remaining),
+            )
+
+        pending = self._pending_weekly_review_tasks(current)
+        if pending:
+            logger.error(
+                "Weekly review shutdown operation=terminal_drain error_type=TimeoutError "
+                "pending_count=%s",
+                len(pending),
+            )
+            raise _WeeklyReviewDrainError("Weekly review terminal drain timed out")
+
+    def _pending_weekly_review_tasks(
+        self,
+        current: asyncio.Task[object] | None,
+    ) -> set[asyncio.Task[Any]]:
+        tasks = self._weekly_review_tasks
+        for task in tuple(tasks):
+            if task is current or not task.done():
+                continue
+            try:
+                task.result()
+            except BaseException:
+                pass
+            tasks.discard(task)
+        return {task for task in tuple(tasks) if task is not current and not task.done()}
 
     async def _user(self, telegram_id: int) -> User:
         async with self.db.session() as session:
             return await UserRepository(session).get_or_create(
                 telegram_id, self.settings.default_timezone
             )
+
+    async def _weekly_review_has_reply_keyboard_owner(self, user: User) -> bool:
+        if not user.onboarding_completed:
+            async with self.db.sessions() as session:
+                onboarding = await OnboardingRepository(session).get(user.id)
+            if onboarding is not None and onboarding.status in _ACTIVE_ONBOARDING_STATUSES:
+                return True
+        if getattr(self.settings, "enable_workspace_access", False):
+            pending = await self.workspace_service.pending_input(user.id, user.telegram_id)
+            if pending is not None:
+                return True
+        return False
 
     @staticmethod
     def _onboarding_public_answers(answers: dict[str, object]) -> dict[str, str]:
@@ -877,21 +1322,14 @@ class FutureSelfBot(
             return None
         _user_id, step, _status, _answers = restored
         navigation = self.natural_command_router.route(text)
-        explicit_unknown = (
-            navigation is None and self.natural_command_router.is_explicit_navigation_request(text)
-        )
-        if navigation is not None or explicit_unknown:
+        if navigation is not None and navigation.action != "help":
             screen_update = navigation_update or update
-            if navigation is None or navigation.action == "help":
-                await self.help_command(screen_update, context)
-                action = "help"
-            else:
-                await self._prompt_navigation_flow(
-                    screen_update.effective_message,
-                    update,
-                    "onboarding",
-                )
-                action = "flow"
+            await self._prompt_navigation_flow(
+                screen_update.effective_message,
+                update,
+                "onboarding",
+            )
+            action = "flow"
             state = PROFILE_CONFIRM if step >= len(ONBOARDING_QUESTIONS) else ONBOARDING_INPUT
             return state, action
         if attached and not detached and step < len(ONBOARDING_QUESTIONS) and not force:
@@ -927,12 +1365,31 @@ class FutureSelfBot(
         detached = bool(context.user_data.get("onboarding_detached"))
         restored = await self._restore_onboarding_context(update, context)
         if restored is None:
+            flow = await self._active_navigation_flow(update, context)
+            if command == "/cancel":
+                if flow is not None:
+                    await self.nova_memory_clear_current(update)
+                elif await self.nova_memory_public_command_gate(update, context):
+                    raise ApplicationHandlerStop
+                return
+            if flow is not None:
+                await self.reminder_clear_current(update)
+                await self.nova_memory_clear_current(update)
+                await self._prompt_navigation_flow(update.effective_message, update, flow)
+                raise ApplicationHandlerStop
+            if await self.nova_memory_public_command_gate(update, context):
+                raise ApplicationHandlerStop
             return
         if command == "/help":
             await self.help_command(update, context)
             raise ApplicationHandlerStop
         if command == "/menu":
-            await self._send_navigation_root(update.effective_message)
+            user = await self._user(update.effective_user.id)
+            await self._send_after_reply_keyboard_cleanup(
+                update.effective_message,
+                "Главное меню\n\nЧто хочешь сделать?",
+                self._root_keyboard(user.access_tier),
+            )
             raise ApplicationHandlerStop
         if attached and not detached and restored[1] >= len(ONBOARDING_QUESTIONS):
             context.user_data["onboarding_detached"] = True
@@ -959,6 +1416,10 @@ class FutureSelfBot(
         raise ApplicationHandlerStop
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.weekly_review_clear_current(update)
+        await self.nova_memory_clear_current(update)
+        await self.reminder_clear_current(update)
+        await self.nova_clear_current(update)
         user = await self._user(update.effective_user.id)
         if user.access_tier == GUEST:
             await self.show_guest_root(update)
@@ -977,34 +1438,39 @@ class FutureSelfBot(
                 if user.display_name
                 else "друг"
             )
-            await update.effective_message.reply_text(
+            await self._send_after_reply_keyboard_cleanup(
+                update.effective_message,
                 f"С возвращением, {display_name}!",
-                reply_markup=InlineKeyboardMarkup(
+                InlineKeyboardMarkup(
                     [[InlineKeyboardButton("Открыть главное меню", callback_data="nav:root")]]
                 ),
             )
             return ConversationHandler.END
-        async with self.db.session() as session:
-            state = await OnboardingRepository(session).get_or_create(user.id)
-            if state.status == "cancelled":
-                state.status = "in_progress"
-            step = max(0, min(state.current_step, len(ONBOARDING_QUESTIONS)))
-            state.current_step = step
-        context.user_data["onboarding_user_id"] = user.id
-        context.user_data.pop("onboarding_detached", None)
-        intro = (
-            "Все ответы сохранены. Восстанавливаю итоговый профиль."
-            if step >= len(ONBOARDING_QUESTIONS)
-            else (
-                f"Я — «{self.settings.bot_persona_name}». Продолжим с шага {step + 1} из "
-                f"{len(ONBOARDING_QUESTIONS)}. Можно вернуться, пропустить необязательное или отменить."
+        async with self._reply_keyboard_owner_lock:
+            # This lock is shared with weekly proactive delivery. The durable
+            # owner is published before the reply keyboard and neither can be
+            # interleaved with a weekly ReplyKeyboardRemove.
+            async with self.db.session() as session:
+                state = await OnboardingRepository(session).get_or_create(user.id)
+                if state.status == "cancelled":
+                    state.status = "in_progress"
+                step = max(0, min(state.current_step, len(ONBOARDING_QUESTIONS)))
+                state.current_step = step
+            context.user_data["onboarding_user_id"] = user.id
+            context.user_data.pop("onboarding_detached", None)
+            intro = (
+                "Все ответы сохранены. Восстанавливаю итоговый профиль."
+                if step >= len(ONBOARDING_QUESTIONS)
+                else (
+                    f"Я — «{self.settings.bot_persona_name}». Продолжим с шага {step + 1} из "
+                    f"{len(ONBOARDING_QUESTIONS)}. Можно вернуться, пропустить необязательное или отменить."
+                )
             )
-        )
-        await update.effective_message.reply_text(intro)
-        if step >= len(ONBOARDING_QUESTIONS):
-            return await self._present_onboarding_summary(update, context)
-        await self._ask_question(update, step)
-        return ONBOARDING_INPUT
+            await update.effective_message.reply_text(intro)
+            if step >= len(ONBOARDING_QUESTIONS):
+                return await self._present_onboarding_summary(update, context)
+            await self._ask_question(update, step)
+            return ONBOARDING_INPUT
 
     async def _ask_question(self, update: Update, step: int) -> None:
         _, question, required = ONBOARDING_QUESTIONS[step]
@@ -1457,7 +1923,7 @@ class FutureSelfBot(
         user = await self._user(update.effective_user.id)
         if user.onboarding_completed:
             await query.answer("Регистрация уже завершена", show_alert=True)
-            await self._send_navigation_root(query.message)
+            await self._send_navigation_root(query.message, tier=user.access_tier)
             return ConversationHandler.END
         async with self.db.sessions() as session:
             state = await OnboardingRepository(session).get(user.id)
@@ -1513,7 +1979,15 @@ class FutureSelfBot(
             return PROFILE_CONFIRM
         try:
             async with self.db.session() as session:
-                stored_user = await session.get(User, user.id)
+                locked_owner_id = await session.scalar(
+                    sql_update(User)
+                    .where(User.id == user.id)
+                    .values(updated_at=User.updated_at)
+                    .returning(User.id)
+                )
+                if locked_owner_id is None:
+                    raise RuntimeError("Onboarding owner disappeared")
+                stored_user = await session.get(User, locked_owner_id)
                 if stored_user is None:
                     raise RuntimeError("Onboarding owner disappeared")
                 from .repositories import ProfileRepository
@@ -1527,7 +2001,11 @@ class FutureSelfBot(
                 if timezone_value := answers.get("timezone"):
                     from .domain import canonical_timezone
 
-                    stored_user.timezone = canonical_timezone(timezone_value)
+                    await self.recurring_reminder_service.refresh_profile_timezone_in_session(
+                        session,
+                        stored_user.id,
+                        canonical_timezone(timezone_value),
+                    )
                 if location_value := answers.get("location"):
                     location = parse_location(location_value)
                     stored_user.location_city = location.city
@@ -1559,7 +2037,7 @@ class FutureSelfBot(
             "Кнопки регистрации убраны — дальше можно пользоваться обычным меню.",
             reply_markup=ReplyKeyboardRemove(),
         )
-        await self._send_navigation_root(query.message)
+        await self._send_navigation_root(query.message, tier=user.access_tier)
         await self._propose_goals(query, user.id, summary)
         return ConversationHandler.END
 
@@ -1890,11 +2368,19 @@ class FutureSelfBot(
 
         health_schedule: tuple[int, time] | None = None
         companion_schedule: SimpleNamespace | None = None
+        stale_selection = False
         async with self.db.session() as session:
-            stored_user = await session.scalar(
-                select(User)
-                .where(User.id == user.id, User.telegram_id == update.effective_user.id)
-                .with_for_update()
+            locked_owner_id = await session.scalar(
+                sql_update(User)
+                .where(
+                    User.id == user.id,
+                    User.telegram_id == update.effective_user.id,
+                )
+                .values(updated_at=User.updated_at)
+                .returning(User.id)
+            )
+            stored_user = (
+                await session.get(User, locked_owner_id) if locked_owner_id is not None else None
             )
             state = await OnboardingRepository(session).get_or_create(user.id)
             latest = dict(state.answers)
@@ -1905,44 +2391,52 @@ class FutureSelfBot(
                 or not isinstance(current, dict)
                 or current.get("token") != token
             ):
-                await query.answer("Этот выбор уже обработан.", show_alert=True)
-                return
-            stored_user.timezone = timezone
-            latest["timezone"] = timezone
-            if location is not None:
-                stored_user.location_city = location.city
-                stored_user.location_fallback_city = None
-                latest["location"] = location.label
-            metadata.pop(_PENDING_TIMEZONE_UPDATE, None)
-            latest[_ONBOARDING_META_KEY] = metadata
-            state.answers = latest
+                stale_selection = True
+            else:
+                await self.recurring_reminder_service.refresh_profile_timezone_in_session(
+                    session,
+                    stored_user.id,
+                    timezone,
+                )
+                latest["timezone"] = timezone
+                if location is not None:
+                    stored_user.location_city = location.city
+                    stored_user.location_fallback_city = None
+                    latest["location"] = location.label
+                metadata.pop(_PENDING_TIMEZONE_UPDATE, None)
+                latest[_ONBOARDING_META_KEY] = metadata
+                state.answers = latest
 
-            health = await session.scalar(
-                select(HealthReminderPreference).where(
-                    HealthReminderPreference.user_id == stored_user.id
-                )
-            )
-            if health is not None:
-                health.timezone = timezone
-                if health.enabled:
-                    health_schedule = (health.user_id, health.local_time)
-            companion = await session.scalar(
-                select(VisionCompanionPreference).where(
-                    VisionCompanionPreference.owner_id == stored_user.id
-                )
-            )
-            if companion is not None:
-                companion.timezone = timezone
-                if companion.enabled:
-                    companion_schedule = SimpleNamespace(
-                        id=companion.id,
-                        owner_id=companion.owner_id,
-                        telegram_user_id=stored_user.telegram_id,
-                        timezone=timezone,
-                        morning_time=companion.morning_time,
-                        evening_time=companion.evening_time,
-                        extra_times=tuple(companion.extra_times),
+                health = await session.scalar(
+                    select(HealthReminderPreference).where(
+                        HealthReminderPreference.user_id == stored_user.id
                     )
+                )
+                if health is not None:
+                    health.timezone = timezone
+                    if health.enabled:
+                        health_schedule = (health.user_id, health.local_time)
+                companion = await session.scalar(
+                    select(VisionCompanionPreference).where(
+                        VisionCompanionPreference.owner_id == stored_user.id
+                    )
+                )
+                if companion is not None:
+                    companion.timezone = timezone
+                    if companion.enabled:
+                        companion_schedule = SimpleNamespace(
+                            id=companion.id,
+                            owner_id=companion.owner_id,
+                            telegram_user_id=stored_user.telegram_id,
+                            timezone=timezone,
+                            morning_time=companion.morning_time,
+                            evening_time=companion.evening_time,
+                            extra_times=tuple(companion.extra_times),
+                        )
+
+        if stale_selection:
+            await query.answer("Этот выбор уже обработан.", show_alert=True)
+            return
 
         if self.scheduler is not None:
             self.scheduler.schedule_user(user.telegram_id, timezone)
@@ -1989,7 +2483,12 @@ class FutureSelfBot(
             return
         if await self.knowledge_pending_text(update, text, "text"):
             return
-        await self._route_message(update, context, text, "text")
+        await self._route_message(
+            update,
+            context,
+            text,
+            "text",
+        )
 
     async def system_action_text_gate(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1997,7 +2496,16 @@ class FutureSelfBot(
         """Route safe destructive controls before any stateful text handler."""
 
         text = update.effective_message.text or ""
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         if await self._try_system_action(update, context, text):
+            self.nova_companion_invalidate_status_receipt_exact(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_receipt=status_receipt,
+            )
             raise ApplicationHandlerStop
 
     async def voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
@@ -2040,6 +2548,26 @@ class FutureSelfBot(
                         "Аудио не отправлено на распознавание; используй preview или /cancel."
                     )
                     return
+        voice_user = None
+        voice_memory_fence = None
+        voice_weekly_session = None
+        telegram_user = getattr(update, "effective_user", None)
+        effective_chat = getattr(update, "effective_chat", None)
+        if (
+            getattr(telegram_user, "id", None) is not None
+            and getattr(effective_chat, "id", None) is not None
+        ):
+            voice_user = await self._user(telegram_user.id)
+            voice_memory_fence = await self.nova_memory_voice_fence(
+                update,
+                user=voice_user,
+            )
+            voice_weekly_session = await self.weekly_review_voice_fence(
+                update,
+                user=voice_user,
+            )
+            if self.weekly_review_voice_lookup_failed(voice_weekly_session):
+                raise ApplicationHandlerStop
         media = update.effective_message.voice or update.effective_message.audio
         if not self.voice_enabled:
             message = (
@@ -2047,20 +2575,119 @@ class FutureSelfBot(
                 if not self.settings.enable_voice
                 else "Распознавание голосовых временно не настроено. Пришли мысль текстом."
             )
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
             await update.effective_message.reply_text(message)
             return
         if media.duration and media.duration > self.settings.max_audio_seconds:
-            await update.effective_message.reply_text(
-                "Аудио слишком длинное. Пришли запись короче трёх минут."
-            )
+            message = "Аудио слишком длинное. Пришли запись короче трёх минут."
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
+            await update.effective_message.reply_text(message)
             return
         if media.file_size and media.file_size > self.settings.max_audio_bytes:
-            await update.effective_message.reply_text("Аудиофайл слишком большой.")
+            message = "Аудиофайл слишком большой."
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
+            await update.effective_message.reply_text(message)
             return
         mime = getattr(media, "mime_type", None)
         if mime and not (mime.startswith("audio/") or mime == "application/ogg"):
-            await update.effective_message.reply_text("Этот формат аудио не поддерживается.")
+            message = "Этот формат аудио не поддерживается."
+            if voice_user is not None and await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=None,
+                notice=message,
+            ):
+                return
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=None,
+                notice=message,
+            ):
+                return
+            await update.effective_message.reply_text(message)
             return
+        # Freeze the access generation before STT. A downgrade or version bounce
+        # while the transcript is being produced must not be hidden by a later
+        # repository read.
+        if voice_user is None:
+            voice_user = await self._user(update.effective_user.id)
+            voice_memory_fence = await self.nova_memory_voice_fence(
+                update,
+                user=voice_user,
+            )
+            voice_weekly_session = await self.weekly_review_voice_fence(
+                update,
+                user=voice_user,
+            )
+            if self.weekly_review_voice_lookup_failed(voice_weekly_session):
+                raise ApplicationHandlerStop
+        voice_status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        voice_nova_session = await self.nova_sessions.current(
+            owner_id=voice_user.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+        )
+        voice_reminder_session = await self.reminder_sessions.current(
+            owner_id=voice_user.id,
+            telegram_user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+        )
+        voice_access_version = voice_user.access_version
         progress = await update.effective_message.reply_text("Расшифровываю голосовую мысль…")
         try:
             telegram_file = await media.get_file()
@@ -2069,67 +2696,340 @@ class FutureSelfBot(
                 raise ValueError("Audio exceeds limit")
             filename = getattr(media, "file_name", None) or "voice.ogg"
             text = await self.transcription.transcribe(audio, filename)
+        except asyncio.CancelledError:
+            self.weekly_review_schedule_voice_cancel_cleanup(
+                update,
+                context,
+                progress,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+            )
+            raise
         except (TranscriptionError, TelegramError, ValueError) as exc:
             log_safe_failure("Voice processing failed", exc)
-            await progress.edit_text(
-                "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
-            )
+            message = "Не удалось распознать голосовое. Попробуй ещё раз или пришли текст."
+            if await self.weekly_review_voice_failure(
+                update,
+                context,
+                expected_user=voice_user,
+                expected_session=voice_weekly_session,
+                progress=progress,
+                notice=message,
+            ):
+                return
+            if await self.nova_memory_voice_failure(
+                update,
+                context,
+                fence=voice_memory_fence,
+                progress=progress,
+                notice=message,
+            ):
+                return
+            await progress.edit_text(message)
             return
-        if await self._try_system_action(update, context, text):
-            await progress.edit_text(f"Я услышал: «{_truncate_utf16(text, 4_000)}»")
-            return
-        screen_update = self._edited_screen_update(update, progress)
-        onboarding_result = await self.onboarding_persistent_input(
+        self.nova_companion_invalidate_status_for_input(
+            update.effective_user.id,
+            update.effective_chat.id,
+            text,
+            expected_receipt=voice_status_receipt,
+        )
+        if await self.nova_memory_voice_pre_route(
             update,
+            context,
+            progress,
+            fence=voice_memory_fence,
+        ):
+            raise ApplicationHandlerStop
+        if await self.weekly_review_voice_pre_route(
+            update,
+            context,
+            progress,
+            expected_user=voice_user,
+            expected_session=voice_weekly_session,
+        ):
+            raise ApplicationHandlerStop
+        screen_update = self._edited_screen_update(update, progress)
+        memory_voice_active = (
+            voice_memory_fence is not None and voice_memory_fence.session is not None
+        )
+        weekly_voice_active = voice_weekly_session is not None
+        stateful_voice_active = memory_voice_active or weekly_voice_active
+        ownership_update = screen_update if stateful_voice_active else update
+        if await self._try_system_action(
+            ownership_update,
+            context,
+            text,
+            clear_current_memory=False,
+            clear_current_weekly=False,
+        ):
+            await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
+            if not stateful_voice_active:
+                await progress.edit_text(f"Я услышал: «{_truncate_utf16(text, 4_000)}»")
+            return
+        voice_flow = await self._active_navigation_flow(update, context)
+        if await self.nova_memory_voice_pre_route(
+            update,
+            context,
+            progress,
+            fence=voice_memory_fence,
+        ):
+            raise ApplicationHandlerStop
+        if await self.weekly_review_voice_pre_route(
+            update,
+            context,
+            progress,
+            expected_user=voice_user,
+            expected_session=voice_weekly_session,
+        ):
+            raise ApplicationHandlerStop
+        try:
+            memory_intent = classify_nova_memory_intent(text).kind
+        except NovaMemoryValidationError:
+            memory_intent = NovaMemoryIntentKind.AWAIT_CONTENT
+        if voice_flow == "onboarding" and memory_intent is not NovaMemoryIntentKind.NONE:
+            await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
+            await self.reminder_clear_current(update)
+            await self.nova_clear_current(update)
+            await self._prompt_navigation_flow(
+                screen_update.effective_message,
+                update,
+                voice_flow,
+            )
+            raise ApplicationHandlerStop
+        onboarding_result = await self.onboarding_persistent_input(
+            ownership_update,
             context,
             text,
             force=True,
             navigation_update=screen_update,
         )
         if onboarding_result is not None:
+            await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
             onboarding_state, navigation_action = onboarding_result
-            if navigation_action is None:
+            if not stateful_voice_active and navigation_action is None:
                 await progress.edit_text("Голос распознан и обработан в регистрации.")
             return onboarding_state
-        natural_command = self.natural_command_router.route(text)
-        explicit_unknown = (
-            natural_command is None
-            and self.natural_command_router.is_explicit_navigation_request(text)
-            and self.collection_command_router.route(text) is None
+        reminder_voice_state = ReminderVoiceGateState(
+            access_expected=is_full_access_tier(voice_user.access_tier)
         )
-        if natural_command is not None or explicit_unknown:
-            action = natural_command.action if natural_command is not None else "help"
-            flow = await self._active_navigation_flow(update, context)
-            if flow is not None and action != "help":
+        if voice_flow is not None:
+            await self._clear_frozen_voice_memory(voice_memory_fence)
+            await self._clear_frozen_voice_weekly(voice_weekly_session)
+            if memory_intent is not NovaMemoryIntentKind.NONE:
+                await self.reminder_clear_current(update)
+                await self.nova_clear_current(update)
                 await self._prompt_navigation_flow(
                     screen_update.effective_message,
                     update,
-                    flow,
+                    voice_flow,
                 )
-            else:
-                await self._handle_natural_command(screen_update, context, action)
+                raise ApplicationHandlerStop
+            await self.reminder_clear_current(update)
+            if await self._route_voice_durable_flow(
+                ownership_update,
+                context,
+                voice_flow,
+                text,
+            ):
+                return
+            await self._prompt_navigation_flow(
+                screen_update.effective_message,
+                update,
+                voice_flow,
+            )
+            raise ApplicationHandlerStop
+        if await self.weekly_review_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            expected_user=voice_user,
+            expected_session=voice_weekly_session,
+        ):
+            raise ApplicationHandlerStop
+        if await self.nova_memory_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            user=voice_user,
+            fence=voice_memory_fence,
+        ):
+            raise ApplicationHandlerStop
+        if await self.reminder_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            expected_access_version=voice_access_version,
+            expected_session=voice_reminder_session,
+            voice_state=reminder_voice_state,
+        ):
             return
-        if await self.workspace_pending_text(update, text, "voice"):
-            await progress.edit_text("Голос распознан и обработан в пространстве.")
+        if await self.weekly_review_launch_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            expected_user=voice_user,
+        ):
             return
-        if await self.collection_pending_text(update, text, "voice"):
-            await progress.edit_text("Голос распознан и обработан в разделе.")
+        if not reminder_voice_state.access_failed:
+            natural_command = self.natural_command_router.route(text)
+            explicit_unknown = (
+                natural_command is None
+                and self.natural_command_router.is_explicit_navigation_request(text)
+                and self.collection_command_router.route(text) is None
+            )
+            if natural_command is not None or explicit_unknown:
+                action = natural_command.action if natural_command is not None else "help"
+                flow = await self._active_navigation_flow(update, context)
+                if flow is not None and action == "help":
+                    # Natural help words can be legitimate answers to a durable
+                    # business flow. Let its existing consumer keep ownership.
+                    await self.nova_clear_current(update)
+                else:
+                    await self.nova_clear_current(update)
+                    if flow is not None:
+                        await self._prompt_navigation_flow(
+                            screen_update.effective_message,
+                            update,
+                            flow,
+                        )
+                    else:
+                        await self.nova_memory_clear_current(update)
+                        await self._handle_natural_command(screen_update, context, action)
+                    return
+            if await self.workspace_pending_text(ownership_update, text, "voice"):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и обработан в пространстве.")
+                return
+            if await self.collection_pending_text(ownership_update, text, "voice"):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и обработан в разделе.")
+                return
+            if await self.task_pending_text(ownership_update, text):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и применён к задаче.")
+                return
+            if await self._handle_vision_input(ownership_update, text):
+                if not memory_voice_active:
+                    await progress.edit_text("Голос распознан и добавлен в карточку.")
+                return
+        if await self.nova_voice_gate(
+            update,
+            context,
+            text,
+            progress,
+            user=voice_user,
+            expected_session=voice_nova_session,
+        ):
             return
-        if await self.task_pending_text(update, text):
-            await progress.edit_text("Голос распознан и применён к задаче.")
+        if reminder_voice_state.access_failed:
+            await self._reminder_edit_access_candidate(progress)
             return
-        if await self._handle_vision_input(update, text):
-            await progress.edit_text("Голос распознан и добавлен в карточку.")
-            return
+        if self.nova_companion_available_for_actor(voice_user):
+            snapshot = await self.conversation.get(
+                update.effective_user.id,
+                update.effective_chat.id,
+            )
+            handled = await self.nova_companion_route(
+                update,
+                context,
+                text,
+                "voice",
+                user=voice_user,
+                conversation_snapshot=snapshot,
+                delivery_message=progress,
+                status_receipt_preinvalidated=True,
+            )
+            if handled:
+                return
         heard_text = _truncate_utf16(text, 4_000)
         await progress.edit_text(f"Я услышал: «{heard_text}»")
-        await self._route_message(update, context, text, "voice")
+        await self._route_message(
+            update,
+            context,
+            text,
+            "voice",
+            frozen_user=voice_user,
+            companion_status_preinvalidated=True,
+        )
+
+    async def _route_voice_durable_flow(
+        self,
+        update: Any,
+        context: ContextTypes.DEFAULT_TYPE,
+        flow: str,
+        text: str,
+    ) -> bool:
+        """Give an already-persisted flow the STT result on the progress screen."""
+
+        if flow == "workspace":
+            return await self.workspace_pending_text(update, text, "voice")
+        if flow == "collection_input":
+            return await self.collection_pending_text(update, text, "voice")
+        if flow == "task_edit":
+            return await self.task_pending_text(update, text)
+        if flow == "vision":
+            return await self._handle_vision_input(update, text)
+        if flow == "date_choice":
+            user = await self._user(update.effective_user.id)
+            snapshot = await self.conversation.get(
+                update.effective_user.id,
+                update.effective_chat.id,
+            )
+            selected = self.date_resolver.choose_option(text, snapshot.pending_date_options)
+            if selected is None:
+                return False
+            await self._confirm_pending_date(
+                update,
+                context,
+                user,
+                snapshot,
+                selected.value,
+                "voice",
+                input_text=text,
+            )
+            return True
+        if flow in {"draft_action", "draft_edit"}:
+            await self._route_message(
+                update,
+                context,
+                text,
+                "voice",
+                companion_status_preinvalidated=True,
+            )
+            return True
+        return False
+
+    async def _clear_frozen_voice_memory(self, fence: Any | None) -> bool:
+        session = getattr(fence, "session", None)
+        if session is None:
+            return False
+        return await self.nova_memory_clear_bound(
+            fence.owner_id,
+            fence.telegram_user_id,
+            fence.chat_id,
+            session_id=session.id,
+        )
+
+    async def _clear_frozen_voice_weekly(self, session: Any | None) -> bool:
+        if session is None or self.weekly_review_voice_lookup_failed(session):
+            return False
+        return await self._weekly_review_clear_exact(session)
 
     async def _try_system_action(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         text: str,
+        *,
+        clear_current_memory: bool = True,
+        clear_current_weekly: bool = True,
     ) -> bool:
         """Consume destructive control language before any content flow or LLM."""
 
@@ -2138,6 +3038,16 @@ class FutureSelfBot(
             update.effective_user.id,
             update.effective_chat.id,
         )
+        if not snapshot.system_pending_action:
+            if await self.nova_memory_owns_text(update, text, user=user):
+                return False
+            nova_session = await self.nova_sessions.current(
+                owner_id=user.id,
+                telegram_user_id=update.effective_user.id,
+                chat_id=update.effective_chat.id,
+            )
+            if nova_session is not None or is_explicit_nova_invocation(text):
+                return False
         if snapshot.system_pending_action and self.natural_command_router.route(text) is not None:
             # An explicit navigation/read action means the user moved on. Drop
             # only the still-current preview and let normal natural routing run.
@@ -2172,22 +3082,59 @@ class FutureSelfBot(
             return False
         if route.kind == "none":
             return False
+        if clear_current_memory:
+            await self.nova_memory_clear_current(update)
+        if clear_current_weekly:
+            await self.weekly_review_clear_current(update)
+        await self.reminder_clear_current(update)
         await self._handle_system_action_route(update, context, user, snapshot, route)
         return True
 
     async def _route_message(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, source: str
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        source: str,
+        *,
+        frozen_user: User | None = None,
+        companion_delivery_message: object | None = None,
+        companion_status_preinvalidated: bool = False,
     ) -> None:
         natural_command = self.natural_command_router.route(text)
         if natural_command is not None:
+            await self.nova_memory_clear_current(update)
             await self._handle_natural_command(update, context, natural_command.action)
             return
-        if await self.handle_collection_natural(update, context, text, source):
-            return
+        user = frozen_user
+        reserved_capture = ExplicitCaptureClassifier.classify(text)
+        if reserved_capture is not None and user is None:
+            user = await self._user(update.effective_user.id)
+        companion_owns_capture = (
+            reserved_capture is not None and self.nova_companion_available_for_actor(user)
+        )
+        if not companion_owns_capture:
+            if await self.handle_collection_natural(update, context, text, source):
+                return
         if self.natural_command_router.is_explicit_navigation_request(text):
+            await self.nova_memory_clear_current(update)
             await self.help_command(update, context)
             return
-        user = await self._user(update.effective_user.id)
+        user = user or await self._user(update.effective_user.id)
+        access_generation = self._nova_memory_access_generation(
+            context,
+            telegram_actor_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            fallback=user,
+        )
+        application_enabled = self.nova_memory_application_available_for_tier(
+            access_generation.tier
+        )
+        if application_enabled and not self._nova_memory_user_matches_generation(
+            user, access_generation
+        ):
+            await update.effective_message.reply_text(NOVA_MEMORY_ACCESS_CHANGED_TEXT)
+            return
         chat_id = update.effective_chat.id
         telegram_user_id = update.effective_user.id
         snapshot = await self.conversation.get(telegram_user_id, chat_id)
@@ -2209,6 +3156,80 @@ class FutureSelfBot(
         )
         if action_route.kind != "none":
             await self._handle_action_route(update, context, user, snapshot, action_route, source)
+            return
+        editing = await self.draft_service.editing(
+            update.effective_user.id,
+            chat_id,
+            expected_owner_id=user.id,
+            expected_access_tier=user.access_tier,
+            expected_access_version=user.access_version,
+        )
+        if editing is not None:
+            date_resolution = self.date_resolver.resolve(text, user.timezone)
+            temporal_resolution = (
+                self.date_resolver.temporal_resolution(
+                    date_resolution.target_date,
+                    user.timezone,
+                    text,
+                    self.date_resolver.extract_local_time(text),
+                )
+                if date_resolution.status == "resolved" and date_resolution.target_date
+                else None
+            )
+            parsed = ParsedThought(
+                kind=editing.kind,
+                title=text.strip()[:200],
+                resolved_date=date_resolution.target_date,
+                temporal_resolution=temporal_resolution,
+            )
+            revised = await self.draft_service.revise(
+                editing.id,
+                update.effective_user.id,
+                chat_id,
+                text.strip(),
+                source,
+                parsed,
+                expected_version=editing.version,
+                expected_owner_id=user.id,
+                expected_access_tier=user.access_tier,
+                expected_access_version=user.access_version,
+            )
+            if not revised.ok or revised.draft is None:
+                await update.effective_message.reply_text(
+                    "Эта карточка уже неактуальна. Создай новую."
+                )
+                return
+            await self.conversation.append(
+                telegram_user_id,
+                chat_id,
+                role="user",
+                content=text.strip(),
+                source=source,
+                intent="draft_edit",
+                topic=revised.draft.title,
+            )
+            await self._send_draft_preview(
+                update.effective_message,
+                revised.draft,
+                include_original=source != "voice",
+            )
+            await self.conversation.set_active_draft(
+                telegram_user_id,
+                chat_id,
+                revised.draft.id,
+            )
+            await self._remember_preview(telegram_user_id, chat_id, revised.draft)
+            return
+        if await self.nova_companion_route(
+            update,
+            context,
+            text,
+            source,
+            user=user,
+            conversation_snapshot=snapshot,
+            delivery_message=companion_delivery_message,
+            status_receipt_preinvalidated=companion_status_preinvalidated,
+        ):
             return
         relative_reminder = self.date_resolver.resolve_relative_reminder(text, user.timezone)
         if relative_reminder is not None:
@@ -2264,7 +3285,6 @@ class FutureSelfBot(
             )
             await update.effective_message.reply_text(response)
             return
-        editing = await self.draft_service.editing(update.effective_user.id, chat_id)
         prompt_context = snapshot.for_prompt()
         prompt_context["date_resolution"] = date_resolution.model_dump(mode="json")
         temporal_resolution = (
@@ -2277,12 +3297,31 @@ class FutureSelfBot(
             if date_resolution.status == "resolved" and date_resolution.target_date
             else None
         )
+        if application_enabled and not await self._nova_memory_application_user_is_current(user):
+            await update.effective_message.reply_text(NOVA_MEMORY_ACCESS_CHANGED_TEXT)
+            return
         try:
-            result = await self.intent_router.route(
-                text, user.timezone, conversation_context=prompt_context
-            )
+            if application_enabled:
+                result = await self.intent_router.route(
+                    text,
+                    user.timezone,
+                    conversation_context=prompt_context,
+                    defer_answer=True,
+                )
+            else:
+                result = await self.intent_router.route(
+                    text,
+                    user.timezone,
+                    conversation_context=prompt_context,
+                )
         except Exception as exc:
-            log_safe_failure("Intent routing failed", exc, user_id=user.id)
+            if application_enabled:
+                logger.warning(
+                    "Nova memory application failed stage=route error_type=%s",
+                    type(exc).__name__,
+                )
+            else:
+                log_safe_failure("Intent routing failed", exc, user_id=user.id)
             await update.effective_message.reply_text(
                 "Не удалось понять сообщение. Ничего не сохранено — попробуй ещё раз."
             )
@@ -2307,48 +3346,42 @@ class FutureSelfBot(
                 intent="date_interpretation",
                 topic=result.topic,
             )
-        if editing:
-            parsed = self._parsed_from_intent(
-                result,
-                text,
-                fallback_kind=editing.kind,
-                resolved_date=date_resolution.target_date,
-                temporal_resolution=temporal_resolution,
-            )
-            revised = await self.draft_service.revise(
-                editing.id,
-                update.effective_user.id,
-                chat_id,
-                text.strip(),
-                source,
-                parsed,
-            )
-            if not revised.ok:
-                await update.effective_message.reply_text(
-                    "Эта карточка уже неактуальна. Создай новую."
+        if result.intent in {"conversation", "question"}:
+            if not application_enabled:
+                answer = result.answer or "Я тебя услышал. Можешь уточнить, чем помочь?"
+                if self._is_task_question(text):
+                    await self._show_task_choices(update.effective_message, session_id, answer)
+                else:
+                    await update.effective_message.reply_text(answer)
+                await self._append_delivered_answer(
+                    telegram_user_id,
+                    chat_id,
+                    answer,
+                    result.topic or snapshot.current_topic,
                 )
                 return
-            await self._send_draft_preview(
-                update.effective_message,
-                revised.draft,
-                include_original=source != "voice",
+            prepared = await self._prepare_nova_memory_answer(
+                user=user,
+                chat_id=chat_id,
+                question=text,
+                route_answer=result.answer,
+                timezone_name=user.timezone,
+                conversation_context=prompt_context,
+                legacy_default_answer=False,
             )
-            await self.conversation.set_active_draft(telegram_user_id, chat_id, revised.draft.id)
-            await self._remember_preview(telegram_user_id, chat_id, revised.draft)
-            return
-        if result.intent in {"conversation", "question"}:
-            answer = result.answer or "Я тебя услышал. Можешь уточнить, чем помочь?"
-            if self._is_task_question(text):
-                await self._show_task_choices(update.effective_message, session_id, answer)
-            else:
-                await update.effective_message.reply_text(answer)
-            await self.conversation.append(
-                telegram_user_id,
-                chat_id,
-                role="assistant",
-                content=answer,
-                source="text",
-                intent="answer",
+            if isinstance(prepared, str):
+                await update.effective_message.reply_text(
+                    self._nova_memory_application_neutral_text(prepared)
+                )
+                return
+            await self._deliver_nova_memory_application_answer(
+                context,
+                update.effective_message,
+                session_id=session_id,
+                question=text,
+                prepared=prepared,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
                 topic=result.topic or snapshot.current_topic,
             )
             return
@@ -2451,6 +3484,8 @@ class FutureSelfBot(
         snapshot: ConversationSnapshot,
         selected_date: date,
         source: str,
+        *,
+        input_text: str | None = None,
     ) -> None:
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
@@ -2462,11 +3497,12 @@ class FutureSelfBot(
             )
             return
         await self.conversation.set_resolved_date(telegram_user_id, chat_id, selected_date)
+        selected_expression = input_text or update.effective_message.text or "Выбрана дата"
         await self.conversation.append(
             telegram_user_id,
             chat_id,
             role="user",
-            content=update.effective_message.text or "Выбрана дата",
+            content=selected_expression,
             source=source,
             intent="confirm_date",
             topic=snapshot.current_topic,
@@ -2477,7 +3513,7 @@ class FutureSelfBot(
                 for message in reversed(snapshot.messages)
                 if message["role"] == "user" and message["intent"] == "date_conflict"
             ),
-            update.effective_message.text or "Выбрана дата",
+            selected_expression,
         )
         local_time = self.date_resolver.extract_local_time(original_expression)
         if local_time is None and candidates:
@@ -2555,6 +3591,9 @@ class FutureSelfBot(
     ) -> None:
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+        if route.kind == "negative":
+            await update.effective_message.reply_text("Ничего не удаляю и не изменяю.")
+            return
         if route.kind == "clarify":
             if snapshot.system_pending_action:
                 await self.conversation.clear_system_action(
@@ -3176,6 +4215,24 @@ class FutureSelfBot(
                 )
                 return
             raw_text = task.description
+        if target is None and action in {"save", "discard", "cancel"}:
+            candidates = await self.draft_service.active_previews(telegram_user_id, chat_id)
+            if len(candidates) == 1:
+                target = candidates[0]
+        target_message_id = getattr(target, "preview_message_id", None)
+        if type(target_message_id) is not int or target_message_id <= 0:
+            target_message_id = None
+        pending_capture = (
+            self.nova_companion_pending_capture_anchor(
+                telegram_user_id,
+                chat_id,
+                target.id,
+                target.version,
+                target_message_id,
+            )
+            if target is not None and target_message_id is not None
+            else None
+        )
         outcome = await self.action_service.execute(
             action,
             telegram_user_id=telegram_user_id,
@@ -3186,6 +4243,10 @@ class FutureSelfBot(
             raw_text=raw_text,
             draft_id=target.id if target else None,
             version=target.version if target else None,
+            expected_preview_message_id=target_message_id,
+            expected_access_version=(
+                pending_capture.access_version if pending_capture is not None else None
+            ),
         )
         if outcome.status == "ambiguous":
             candidates = await self.draft_service.active_previews(telegram_user_id, chat_id)
@@ -3200,12 +4261,24 @@ class FutureSelfBot(
             )
             return
         draft = outcome.result.draft
+        if action in {"discard", "cancel"}:
+            self.nova_companion_record_terminal_capture(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=pending_capture,
+            )
         await self._deactivate_preview_keyboard(context, chat_id, outcome.previous_message_id)
         if action == "save":
             await self.conversation.clear_focus(telegram_user_id, chat_id)
             await self.conversation.set_active_draft(telegram_user_id, chat_id, None)
             channel = "голосовой" if source == "voice" else "текстовой"
-            receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
+            receipt = await self._record_saved_receipt(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_companion_pending=pending_capture,
+            )
             await update.effective_message.reply_text(
                 f"Сохранено в inbox по {channel} команде.\n{receipt}",
                 reply_markup=self._saved_receipt_markup(outcome),
@@ -3409,7 +4482,7 @@ class FutureSelfBot(
         return "занес" in lowered and "задач" in lowered
 
     @staticmethod
-    async def _show_task_choices(message: object, session_id: int, answer: str) -> None:
+    async def _show_task_choices(message: object, session_id: int, answer: str) -> object:
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -3428,7 +4501,799 @@ class FutureSelfBot(
                 ],
             ]
         )
-        await message.reply_text(answer, reply_markup=keyboard)
+        return await message.reply_text(answer, reply_markup=keyboard)
+
+    async def _deliver_routed_answer(
+        self,
+        message: object,
+        session_id: int,
+        question: str,
+        answer: str,
+    ) -> object | None:
+        if self._is_task_question(question):
+            return await self._show_task_choices(message, session_id, answer)
+        return await message.reply_text(answer)
+
+    async def _append_delivered_answer(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        answer: str,
+        topic: str | None,
+        *,
+        intent: str = "answer",
+    ) -> None:
+        await self.conversation.append(
+            telegram_user_id,
+            chat_id,
+            role="assistant",
+            content=answer,
+            source="text",
+            intent=intent,
+            topic=topic,
+        )
+
+    async def _prepare_nova_memory_answer(
+        self,
+        *,
+        user: User,
+        chat_id: int,
+        question: str,
+        route_answer: str | None,
+        timezone_name: str,
+        conversation_context: dict[str, object],
+        legacy_default_answer: bool = False,
+    ) -> _NovaMemoryPreparedAnswer | _NovaMemoryApplicationResult:
+        policy = self.nova_memory_application_policy()
+        try:
+            snapshot = await self.nova_memory_service.application_snapshot(
+                telegram_actor_id=user.telegram_id,
+                expected_tier=user.access_tier,
+                expected_access_version=user.access_version,
+                policy=policy,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application failed stage=snapshot error_type=%s",
+                type(exc).__name__,
+            )
+            return "unavailable"
+        mapped = self._nova_memory_snapshot_result(snapshot)
+        if mapped != "ready":
+            return mapped
+        assert snapshot.collection_revision is not None
+        fence = _NovaMemoryApplicationFence(
+            telegram_actor_id=user.telegram_id,
+            chat_id=chat_id,
+            tier=user.access_tier,
+            access_version=user.access_version,
+            collection_revision=snapshot.collection_revision,
+        )
+        projection: NovaMemoryProjection | None = None
+        if snapshot.status == "ready":
+            try:
+                projection = build_nova_memory_projection(
+                    snapshot.items,
+                    collection_revision=snapshot.collection_revision,
+                )
+            except NovaMemoryProjectionError as exc:
+                logger.warning(
+                    "Nova memory application failed stage=projection error_type=%s",
+                    type(exc).__name__,
+                )
+                return "unavailable"
+
+        answer = route_answer
+        if answer is None and projection is None and legacy_default_answer:
+            answer = "Я тебя услышал. Можешь уточнить, чем помочь?"
+        if projection is not None or answer is None:
+            before_provider = await self._nova_memory_application_check(fence)
+            if before_provider != "ready":
+                return before_provider
+            try:
+                generated = await self.intent_router.answer(
+                    question,
+                    timezone_name,
+                    conversation_context=conversation_context,
+                    confirmed_memory=projection,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Nova memory application failed stage=provider error_type=%s",
+                    type(exc).__name__,
+                )
+                return "provider_failed"
+            after_provider = await self._nova_memory_application_check(fence)
+            if after_provider != "ready":
+                return after_provider
+            answer = generated.answer
+        assert answer is not None
+        return _NovaMemoryPreparedAnswer(answer, fence, projection)
+
+    async def _nova_memory_application_check(
+        self,
+        fence: _NovaMemoryApplicationFence,
+    ) -> _NovaMemoryApplicationResult:
+        try:
+            current = await self.nova_memory_service.application_current_check(
+                telegram_actor_id=fence.telegram_actor_id,
+                expected_tier=fence.tier,
+                expected_access_version=fence.access_version,
+                expected_collection_revision=fence.collection_revision,
+                policy=self.nova_memory_application_policy(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application failed stage=current_check error_type=%s",
+                type(exc).__name__,
+            )
+            return "unavailable"
+        if current.status in {"ready", "empty"}:
+            return "ready"
+        if current.status in {"disabled", "access_changed"}:
+            return "access_changed"
+        if current.status == "memory_changed":
+            return "memory_changed"
+        return "unavailable"
+
+    async def _nova_memory_application_user_is_current(self, user: User) -> bool:
+        """Bind routing to the full-access generation admitted for this update."""
+        try:
+            async with self.db.sessions() as session:
+                current = await session.scalar(
+                    select(User.id).where(
+                        User.id == user.id,
+                        User.telegram_id == user.telegram_id,
+                        User.access_tier == user.access_tier,
+                        User.access_tier.in_(FULL_ACCESS_TIERS),
+                        User.access_version == user.access_version,
+                    )
+                )
+            return current == user.id
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application failed stage=access_generation error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    @staticmethod
+    def _nova_memory_user_matches_generation(
+        user: User,
+        generation: _NovaMemoryAccessGeneration,
+    ) -> bool:
+        return (
+            user.telegram_id == generation.telegram_actor_id
+            and user.access_tier == generation.tier
+            and user.access_version == generation.access_version
+        )
+
+    @staticmethod
+    def _nova_memory_access_generation(
+        context: Any,
+        *,
+        telegram_actor_id: int,
+        chat_id: int,
+        fallback: User,
+    ) -> _NovaMemoryAccessGeneration:
+        generation = getattr(context, _NOVA_MEMORY_APPLICATION_ACCESS_ATTR, None)
+        if (
+            isinstance(generation, _NovaMemoryAccessGeneration)
+            and generation.telegram_actor_id == telegram_actor_id
+            and generation.chat_id == chat_id
+        ):
+            return generation
+        return _NovaMemoryAccessGeneration(
+            telegram_actor_id=telegram_actor_id,
+            chat_id=chat_id,
+            tier=fallback.access_tier,
+            access_version=fallback.access_version,
+        )
+
+    @staticmethod
+    def _nova_memory_snapshot_result(
+        snapshot: NovaMemoryApplicationSnapshot,
+    ) -> _NovaMemoryApplicationResult:
+        if snapshot.status in {"ready", "empty"} and snapshot.collection_revision:
+            return "ready"
+        if snapshot.status in {"disabled", "access_changed"}:
+            return "access_changed"
+        if snapshot.status == "memory_changed":
+            return "memory_changed"
+        return "unavailable"
+
+    @staticmethod
+    def _nova_memory_application_neutral_text(
+        outcome: _NovaMemoryApplicationResult,
+    ) -> str:
+        if outcome == "access_changed":
+            return NOVA_MEMORY_ACCESS_CHANGED_TEXT
+        if outcome == "memory_changed":
+            return NOVA_MEMORY_APPLICATION_CHANGED_TEXT
+        return NOVA_MEMORY_APPLICATION_UNAVAILABLE_TEXT
+
+    @staticmethod
+    def _log_nova_memory_application_outcome(
+        projection: NovaMemoryProjection | None,
+    ) -> None:
+        if projection is None:
+            logger.info(
+                "Nova memory application outcome=empty selected_count=0 omitted_count=0 "
+                "important_count=0 payload_bytes=0"
+            )
+            return
+        logger.info(
+            "Nova memory application outcome=applied selected_count=%s omitted_count=%s "
+            "important_count=%s payload_bytes=%s",
+            projection.selected_count,
+            projection.omitted_count,
+            projection.important_count,
+            projection.payload_bytes,
+        )
+
+    async def _deliver_nova_memory_application_answer(
+        self,
+        context: Any,
+        message: object,
+        *,
+        session_id: int,
+        question: str,
+        prepared: _NovaMemoryPreparedAnswer,
+        telegram_user_id: int,
+        chat_id: int,
+        topic: str | None,
+    ) -> bool:
+        task = asyncio.create_task(
+            self._nova_memory_application_send_lifecycle(
+                context,
+                message,
+                session_id=session_id,
+                question=question,
+                prepared=prepared,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                topic=topic,
+            ),
+            name="nova-memory-application-send-lifecycle",
+        )
+        self._track_nova_memory_application_task(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+
+    async def _nova_memory_application_send_lifecycle(
+        self,
+        context: Any,
+        message: object,
+        *,
+        session_id: int,
+        question: str,
+        prepared: _NovaMemoryPreparedAnswer,
+        telegram_user_id: int,
+        chat_id: int,
+        topic: str | None,
+    ) -> bool:
+        try:
+            return await self._run_nova_memory_application_send_lifecycle(
+                context,
+                message,
+                session_id=session_id,
+                question=question,
+                prepared=prepared,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                topic=topic,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application task failed operation=send_lifecycle error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    async def _run_nova_memory_application_send_lifecycle(
+        self,
+        context: Any,
+        message: object,
+        *,
+        session_id: int,
+        question: str,
+        prepared: _NovaMemoryPreparedAnswer,
+        telegram_user_id: int,
+        chat_id: int,
+        topic: str | None,
+    ) -> bool:
+        pre_delivery = await self._nova_memory_application_check(prepared.fence)
+        if pre_delivery != "ready":
+            await message.reply_text(self._nova_memory_application_neutral_text(pre_delivery))
+            return False
+        try:
+            sent = await self._deliver_routed_answer(
+                message,
+                session_id,
+                question,
+                prepared.text,
+            )
+        except asyncio.CancelledError:
+            raise
+        except TelegramError as exc:
+            logger.warning(
+                "Nova memory application delivery failed stage=telegram_send error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        if sent is None:
+            return False
+        message_id = self._positive_message_id(getattr(sent, "message_id", None))
+        if message_id is None:
+            logger.warning(
+                "Nova memory application failed stage=delivery_binding error_type=MissingMessageId"
+            )
+            return False
+        outcome = await self._nova_memory_application_check(prepared.fence)
+        if outcome == "ready":
+            self._log_nova_memory_application_outcome(prepared.projection)
+            await self._append_delivered_answer(
+                telegram_user_id,
+                chat_id,
+                prepared.text,
+                topic,
+                intent="memory_answer" if prepared.projection else "answer",
+            )
+            return True
+        await self._compensate_nova_memory_application_message(
+            context,
+            sent,
+            chat_id=prepared.fence.chat_id,
+            message_id=message_id,
+            neutral_text=self._nova_memory_application_neutral_text(outcome),
+        )
+        return False
+
+    def _track_nova_memory_application_task(self, task: asyncio.Task[bool]) -> None:
+        tasks = getattr(self, "_nova_memory_application_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._nova_memory_application_tasks = tasks
+        tasks.add(task)
+
+        def finish(completed: asyncio.Task[bool]) -> None:
+            tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError as exc:
+                logger.warning(
+                    "Nova memory application task finished operation=delivery_lifecycle "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
+            except BaseException as exc:
+                logger.warning(
+                    "Nova memory application task failed operation=delivery_lifecycle "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
+                return
+
+        task.add_done_callback(finish)
+
+    async def _drain_nova_memory_application_tasks(self) -> None:
+        current = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _NOVA_MEMORY_APPLICATION_DRAIN_TIMEOUT_SECONDS
+        while True:
+            pending = self._pending_nova_memory_application_tasks(current)
+            if not pending:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            _done, still_pending = await asyncio.wait(pending, timeout=remaining)
+            if still_pending:
+                break
+
+        pending = self._pending_nova_memory_application_tasks(current)
+        if not pending:
+            return
+        logger.warning(
+            "Nova memory application shutdown operation=drain error_type=TimeoutError "
+            "pending_count=%s",
+            len(pending),
+        )
+        cancel_deadline = loop.time() + _NOVA_MEMORY_APPLICATION_CANCEL_TIMEOUT_SECONDS
+        while True:
+            pending = self._pending_nova_memory_application_tasks(current)
+            if not pending:
+                return
+            for task in pending:
+                task.cancel()
+            remaining = cancel_deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.wait(
+                pending,
+                timeout=min(_NOVA_MEMORY_APPLICATION_CANCEL_RETRY_SECONDS, remaining),
+            )
+
+        pending = self._pending_nova_memory_application_tasks(current)
+        if not pending:
+            return
+        logger.error(
+            "Nova memory application shutdown operation=terminal_drain "
+            "error_type=TimeoutError pending_count=%s",
+            len(pending),
+        )
+        raise _NovaMemoryApplicationDrainError("Nova memory application terminal drain timed out")
+
+    def _pending_nova_memory_application_tasks(
+        self,
+        current: asyncio.Task[object] | None,
+    ) -> set[asyncio.Task[bool]]:
+        tasks = getattr(self, "_nova_memory_application_tasks", set())
+        for task in tuple(tasks):
+            if task is current or not task.done():
+                continue
+            try:
+                task.result()
+            except BaseException:
+                pass
+            tasks.discard(task)
+        return {task for task in tuple(tasks) if task is not current and not task.done()}
+
+    async def _compensate_nova_memory_application_message(
+        self,
+        context: Any,
+        message: object,
+        *,
+        chat_id: int,
+        message_id: int,
+        neutral_text: str,
+    ) -> None:
+        bot = getattr(context, "bot", None)
+        delete = getattr(bot, "delete_message", None)
+        delete_succeeded = False
+        try:
+            if callable(delete):
+                deleted = await delete(chat_id=chat_id, message_id=message_id)
+                delete_succeeded = deleted is not False
+            else:
+                message_delete = getattr(message, "delete", None)
+                if callable(message_delete):
+                    deleted = await message_delete()
+                    delete_succeeded = deleted is not False
+        except asyncio.CancelledError as exc:
+            logger.warning(
+                "Nova memory application cleanup failed operation=delete error_type=%s",
+                type(exc).__name__,
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application cleanup failed operation=delete error_type=%s",
+                type(exc).__name__,
+            )
+        if delete_succeeded:
+            return
+        try:
+            edit = getattr(bot, "edit_message_text", None)
+            if callable(edit):
+                await edit(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=neutral_text,
+                    reply_markup=None,
+                    parse_mode=None,
+                )
+                return
+            message_edit = getattr(message, "edit_text", None)
+            if callable(message_edit):
+                await message_edit(
+                    neutral_text,
+                    reply_markup=None,
+                    parse_mode=None,
+                )
+        except asyncio.CancelledError as exc:
+            logger.warning(
+                "Nova memory application cleanup failed operation=edit error_type=%s",
+                type(exc).__name__,
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application cleanup failed operation=edit error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _edit_nova_memory_application_answer(
+        self,
+        context: Any,
+        query: Any,
+        prepared: _NovaMemoryPreparedAnswer,
+        *,
+        pending_key: str,
+        pending: PendingIntent,
+        binding: _NovaMemoryCallbackBinding,
+        telegram_user_id: int,
+        chat_id: int,
+        topic: str | None,
+    ) -> bool:
+        task = asyncio.create_task(
+            self._nova_memory_application_edit_lifecycle(
+                context,
+                query,
+                prepared,
+                pending_key=pending_key,
+                pending=pending,
+                binding=binding,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                topic=topic,
+            ),
+            name="nova-memory-application-edit-lifecycle",
+        )
+        self._track_nova_memory_application_task(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+
+    async def _nova_memory_application_edit_lifecycle(
+        self,
+        context: Any,
+        query: Any,
+        prepared: _NovaMemoryPreparedAnswer,
+        *,
+        pending_key: str,
+        pending: PendingIntent,
+        binding: _NovaMemoryCallbackBinding,
+        telegram_user_id: int,
+        chat_id: int,
+        topic: str | None,
+    ) -> bool:
+        try:
+            return await self._run_nova_memory_application_edit_lifecycle(
+                context,
+                query,
+                prepared,
+                pending_key=pending_key,
+                pending=pending,
+                binding=binding,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                topic=topic,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application task failed operation=edit_lifecycle error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    async def _run_nova_memory_application_edit_lifecycle(
+        self,
+        context: Any,
+        query: Any,
+        prepared: _NovaMemoryPreparedAnswer,
+        *,
+        pending_key: str,
+        pending: PendingIntent,
+        binding: _NovaMemoryCallbackBinding,
+        telegram_user_id: int,
+        chat_id: int,
+        topic: str | None,
+    ) -> bool:
+        ui_lock = self._nova_memory_application_ui_lock(binding)
+        async with ui_lock:
+            if context.user_data.get(pending_key) is not pending:
+                return False
+            if not self._nova_memory_callback_binding_matches(query, binding):
+                return False
+            pre_edit = await self._nova_memory_application_check(prepared.fence)
+            if context.user_data.get(
+                pending_key
+            ) is not pending or not self._nova_memory_callback_binding_matches(query, binding):
+                return False
+            if pre_edit != "ready":
+                await self._edit_nova_memory_application_neutral(
+                    query,
+                    self._nova_memory_application_neutral_text(pre_edit),
+                    operation="intent_answer_pre_edit",
+                )
+                return False
+            try:
+                await query.edit_message_text(prepared.text)
+            except asyncio.CancelledError:
+                raise
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).casefold():
+                    pass
+                else:
+                    logger.warning(
+                        "Nova memory application delivery failed stage=telegram_edit error_type=%s",
+                        type(exc).__name__,
+                    )
+                    return False
+            except TelegramError as exc:
+                logger.warning(
+                    "Nova memory application delivery failed stage=telegram_edit error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+            delivered = await self._nova_memory_application_post_edit_fence(
+                context,
+                query,
+                prepared.fence,
+                pending_key=pending_key,
+                pending=pending,
+                binding=binding,
+            )
+            if delivered:
+                self._log_nova_memory_application_outcome(prepared.projection)
+                await self._append_delivered_answer(
+                    telegram_user_id,
+                    chat_id,
+                    prepared.text,
+                    topic,
+                    intent="memory_answer" if prepared.projection else "answer",
+                )
+            return delivered
+
+    async def _nova_memory_application_post_edit_fence(
+        self,
+        context: Any,
+        query: Any,
+        fence: _NovaMemoryApplicationFence,
+        *,
+        pending_key: str,
+        pending: PendingIntent,
+        binding: _NovaMemoryCallbackBinding,
+    ) -> bool:
+        if context.user_data.get(
+            pending_key
+        ) is not pending or not self._nova_memory_callback_binding_matches(query, binding):
+            await self._edit_nova_memory_application_neutral(
+                query,
+                NOVA_MEMORY_APPLICATION_UNAVAILABLE_TEXT,
+                operation="intent_answer_replaced_post_edit",
+                observe_cancellation=True,
+            )
+            return False
+        outcome = await self._nova_memory_application_check(fence)
+        if context.user_data.get(
+            pending_key
+        ) is not pending or not self._nova_memory_callback_binding_matches(query, binding):
+            await self._edit_nova_memory_application_neutral(
+                query,
+                NOVA_MEMORY_APPLICATION_UNAVAILABLE_TEXT,
+                operation="intent_answer_replaced_post_edit",
+                observe_cancellation=True,
+            )
+            return False
+        if outcome == "ready":
+            return True
+        await self._edit_nova_memory_application_neutral(
+            query,
+            self._nova_memory_application_neutral_text(outcome),
+            operation="intent_answer_post_edit",
+            observe_cancellation=True,
+        )
+        return False
+
+    @classmethod
+    def _nova_memory_callback_binding(
+        cls,
+        update: Any,
+        query: Any,
+        pending: PendingIntent,
+    ) -> _NovaMemoryCallbackBinding | None:
+        expected_chat_id = cls._positive_message_id(pending.canonical_chat_id)
+        expected_message_id = cls._positive_message_id(pending.canonical_message_id)
+        message = getattr(query, "message", None)
+        actual_chat_id = cls._positive_message_id(
+            getattr(getattr(message, "chat", None), "id", None)
+        )
+        actual_message_id = cls._positive_message_id(getattr(message, "message_id", None))
+        update_chat_id = cls._positive_message_id(
+            getattr(getattr(update, "effective_chat", None), "id", None)
+        )
+        if (
+            expected_chat_id is None
+            or expected_message_id is None
+            or actual_chat_id != expected_chat_id
+            or update_chat_id != expected_chat_id
+            or actual_message_id != expected_message_id
+        ):
+            return None
+        return _NovaMemoryCallbackBinding(expected_chat_id, expected_message_id)
+
+    def _nova_memory_application_ui_lock(
+        self,
+        binding: _NovaMemoryCallbackBinding,
+    ) -> asyncio.Lock:
+        key = (binding.chat_id, binding.message_id)
+        lock = self._nova_memory_application_ui_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._nova_memory_application_ui_locks[key] = lock
+        return lock
+
+    @classmethod
+    def _nova_memory_callback_binding_matches(
+        cls,
+        query: Any,
+        binding: _NovaMemoryCallbackBinding,
+    ) -> bool:
+        message = getattr(query, "message", None)
+        message_id = cls._positive_message_id(getattr(message, "message_id", None))
+        chat_id = cls._positive_message_id(getattr(getattr(message, "chat", None), "id", None))
+        return message_id == binding.message_id and chat_id == binding.chat_id
+
+    @staticmethod
+    async def _edit_nova_memory_application_neutral(
+        query: Any,
+        text: str,
+        *,
+        operation: str,
+        observe_cancellation: bool = False,
+    ) -> None:
+        try:
+            await query.edit_message_text(
+                text,
+                reply_markup=None,
+                parse_mode=None,
+            )
+        except asyncio.CancelledError as exc:
+            logger.warning(
+                "Nova memory application cleanup failed operation=%s error_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            task = asyncio.current_task()
+            if not observe_cancellation or task is None or task.cancelling():
+                raise
+        except Exception as exc:
+            logger.warning(
+                "Nova memory application cleanup failed operation=%s error_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+
+    async def _edit_nova_memory_application_neutral_if_current(
+        self,
+        context: Any,
+        query: Any,
+        text: str,
+        *,
+        pending_key: str,
+        pending: PendingIntent,
+        binding: _NovaMemoryCallbackBinding,
+        operation: str,
+    ) -> bool:
+        ui_lock = self._nova_memory_application_ui_lock(binding)
+        async with ui_lock:
+            if context.user_data.get(pending_key) is not pending:
+                return False
+            if not self._nova_memory_callback_binding_matches(query, binding):
+                return False
+            await self._edit_nova_memory_application_neutral(
+                query,
+                text,
+                operation=operation,
+            )
+            return True
 
     async def _send_draft_preview(
         self,
@@ -3436,7 +5301,9 @@ class FutureSelfBot(
         draft: DraftInboxItem,
         *,
         include_original: bool = True,
-    ) -> None:
+        on_sent: Callable[[object], None] | None = None,
+        bind_preview: bool = True,
+    ) -> object:
         step = f"\nСледующий шаг: {escape(draft.next_step)}" if draft.next_step else ""
         description = f"\nОписание: {escape(draft.description)}" if draft.description else ""
         if draft.temporal_resolution:
@@ -3476,8 +5343,11 @@ class FutureSelfBot(
             parse_mode="HTML",
             reply_markup=keyboard,
         )
-        if message_id := getattr(preview_message, "message_id", None):
+        if on_sent is not None:
+            on_sent(preview_message)
+        if bind_preview and (message_id := getattr(preview_message, "message_id", None)):
             await self.draft_service.set_preview_message(draft.id, message_id)
+        return preview_message
 
     async def _show_unknown(
         self,
@@ -3488,7 +5358,7 @@ class FutureSelfBot(
         result: IntentResult,
     ) -> None:
         token = uuid4().hex[:12]
-        context.user_data[f"intent:{token}"] = PendingIntent(token, text, source, result)
+        pending = PendingIntent(token, text, source, result)
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Ответить", callback_data=f"intent:answer:{token}")],
@@ -3508,9 +5378,21 @@ class FutureSelfBot(
                 ],
             ]
         )
-        await update.effective_message.reply_text(
+        sent = await update.effective_message.reply_text(
             "Что сделать с этим сообщением?", reply_markup=keyboard
         )
+        pending.canonical_chat_id = self._positive_message_id(
+            getattr(getattr(sent, "chat", None), "id", None)
+            or getattr(update.effective_chat, "id", None)
+        )
+        pending.canonical_message_id = self._positive_message_id(getattr(sent, "message_id", None))
+        if pending.canonical_chat_id is not None and pending.canonical_message_id is not None:
+            context.user_data[f"intent:{token}"] = pending
+        else:
+            logger.warning(
+                "Unknown intent callback binding failed stage=delivery_binding "
+                "error_type=MissingMessageId"
+            )
 
     async def intent_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -3519,27 +5401,115 @@ class FutureSelfBot(
         if not isinstance(pending, PendingIntent) or pending.handled:
             await query.answer("Это действие уже обработано", show_alert=True)
             return
+        binding = (
+            self._nova_memory_callback_binding(update, query, pending)
+            if action == "answer"
+            else None
+        )
+        if action == "answer" and binding is None:
+            await query.answer("Это действие устарело", show_alert=True)
+            return
         pending.handled = True
         await query.answer()
         if action == "drop":
             await query.edit_message_text("Хорошо, ничего не делаю.")
             return
         if action == "answer":
-            user = await self._user(update.effective_user.id)
-            snapshot = await self.conversation.get(
-                update.effective_user.id, update.effective_chat.id
-            )
+            pending_key = f"intent:{token}"
+            assert binding is not None
             try:
-                answer = await self.intent_router.answer(
-                    pending.raw_text,
-                    user.timezone,
-                    conversation_context=snapshot.for_prompt(),
+                user = await self._user(update.effective_user.id)
+                access_generation = self._nova_memory_access_generation(
+                    context,
+                    telegram_actor_id=update.effective_user.id,
+                    chat_id=update.effective_chat.id,
+                    fallback=user,
                 )
+                snapshot = await self.conversation.get(
+                    update.effective_user.id, update.effective_chat.id
+                )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                log_safe_failure("Unknown intent answer failed", exc, user_id=user.id)
-                await query.edit_message_text("Не удалось ответить сейчас. Ничего не сохранено.")
+                logger.warning(
+                    "Nova memory application failed stage=callback_context error_type=%s",
+                    type(exc).__name__,
+                )
+                await self._edit_nova_memory_application_neutral_if_current(
+                    context,
+                    query,
+                    NOVA_MEMORY_APPLICATION_UNAVAILABLE_TEXT,
+                    pending_key=pending_key,
+                    pending=pending,
+                    binding=binding,
+                    operation="intent_answer_context",
+                )
                 return
-            await query.edit_message_text(answer.answer)
+            application_enabled = self.nova_memory_application_available_for_tier(
+                access_generation.tier
+            )
+            if not application_enabled:
+                try:
+                    answer = await self.intent_router.answer(
+                        pending.raw_text,
+                        user.timezone,
+                        conversation_context=snapshot.for_prompt(),
+                    )
+                except Exception as exc:
+                    log_safe_failure("Unknown intent answer failed", exc, user_id=user.id)
+                    await query.edit_message_text(
+                        "Не удалось ответить сейчас. Ничего не сохранено."
+                    )
+                    return
+                await query.edit_message_text(answer.answer)
+                return
+            if not self._nova_memory_user_matches_generation(user, access_generation):
+                await self._edit_nova_memory_application_neutral_if_current(
+                    context,
+                    query,
+                    NOVA_MEMORY_ACCESS_CHANGED_TEXT,
+                    pending_key=pending_key,
+                    pending=pending,
+                    binding=binding,
+                    operation="intent_answer_access_generation",
+                )
+                return
+            prepared = await self._prepare_nova_memory_answer(
+                user=user,
+                chat_id=update.effective_chat.id,
+                question=pending.raw_text,
+                route_answer=None,
+                timezone_name=user.timezone,
+                conversation_context=snapshot.for_prompt(),
+                legacy_default_answer=False,
+            )
+            if context.user_data.get(pending_key) is not pending:
+                return
+            if isinstance(prepared, str):
+                await self._edit_nova_memory_application_neutral_if_current(
+                    context,
+                    query,
+                    self._nova_memory_application_neutral_text(prepared),
+                    pending_key=pending_key,
+                    pending=pending,
+                    binding=binding,
+                    operation="intent_answer_preparation",
+                )
+                return
+            try:
+                await self._edit_nova_memory_application_answer(
+                    context,
+                    query,
+                    prepared,
+                    pending_key=pending_key,
+                    pending=pending,
+                    binding=binding,
+                    telegram_user_id=update.effective_user.id,
+                    chat_id=update.effective_chat.id,
+                    topic=pending.result.topic or snapshot.current_topic,
+                )
+            except asyncio.CancelledError:
+                raise
             return
         parsed = ParsedThought(
             kind=action,
@@ -3642,6 +5612,21 @@ class FutureSelfBot(
         if action != "save":
             await query.answer("Подтверди это действие текстом или голосом", show_alert=True)
             return
+        draft = await self.draft_service.get(draft_id)
+        draft_message_id = getattr(draft, "preview_message_id", None)
+        if type(draft_message_id) is not int or draft_message_id <= 0:
+            draft_message_id = None
+        pending_capture = (
+            self.nova_companion_pending_capture_anchor(
+                update.effective_user.id,
+                update.effective_chat.id,
+                draft_id,
+                version,
+                draft_message_id,
+            )
+            if draft_message_id is not None
+            else None
+        )
         outcome = await self.action_service.execute(
             "save",
             telegram_user_id=update.effective_user.id,
@@ -3649,13 +5634,20 @@ class FutureSelfBot(
             source="callback",
             draft_id=draft_id,
             version=version,
+            expected_preview_message_id=draft_message_id,
+            expected_access_version=(
+                pending_capture.access_version if pending_capture is not None else None
+            ),
         )
         if outcome.status != "ok":
             await self._stale_callback(query)
             return
         await query.answer()
         receipt = await self._record_saved_receipt(
-            update.effective_user.id, update.effective_chat.id, outcome
+            update.effective_user.id,
+            update.effective_chat.id,
+            outcome,
+            expected_companion_pending=pending_capture,
         )
         await query.edit_message_text(
             receipt,
@@ -3776,6 +5768,20 @@ class FutureSelfBot(
         if draft.status != "preview":
             await query.answer("Эта карточка сейчас редактируется", show_alert=True)
             return
+        draft_message_id = getattr(draft, "preview_message_id", None)
+        if type(draft_message_id) is not int or draft_message_id <= 0:
+            draft_message_id = None
+        pending_capture = (
+            self.nova_companion_pending_capture_anchor(
+                telegram_user_id,
+                chat_id,
+                draft.id,
+                draft.version,
+                draft_message_id,
+            )
+            if draft_message_id is not None
+            else None
+        )
         outcome = await self.action_service.execute(
             "save" if action == "save" else "discard",
             telegram_user_id=telegram_user_id,
@@ -3783,18 +5789,33 @@ class FutureSelfBot(
             source="callback",
             draft_id=draft.id,
             version=draft.version,
+            expected_preview_message_id=draft_message_id,
+            expected_access_version=(
+                pending_capture.access_version if pending_capture is not None else None
+            ),
         )
         if outcome.status != "ok":
             await self._stale_callback(query)
             return
         await query.answer()
         if action == "save":
-            receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
+            receipt = await self._record_saved_receipt(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_companion_pending=pending_capture,
+            )
             await query.edit_message_text(
                 receipt,
                 reply_markup=self._saved_receipt_markup(outcome),
             )
         else:
+            self.nova_companion_record_terminal_capture(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=pending_capture,
+            )
             await query.edit_message_text("Черновик удалён.")
         await self.conversation.clear_focus(telegram_user_id, chat_id)
 
@@ -3812,6 +5833,20 @@ class FutureSelfBot(
             return
         telegram_user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+        canonical_message_id = getattr(query.message, "message_id", None)
+        if type(canonical_message_id) is not int or canonical_message_id <= 0:
+            await self._stale_callback(query)
+            return
+        pending_capture = self.nova_companion_pending_capture_anchor(
+            telegram_user_id,
+            chat_id,
+            draft_id,
+            version,
+            canonical_message_id,
+        )
+        expected_access_version = (
+            pending_capture.access_version if pending_capture is not None else None
+        )
         if action == "edit":
             outcome = await self.action_service.execute(
                 "edit",
@@ -3820,6 +5855,8 @@ class FutureSelfBot(
                 source="callback",
                 draft_id=draft_id,
                 version=version,
+                expected_preview_message_id=canonical_message_id,
+                expected_access_version=expected_access_version,
             )
             if outcome.status != "ok":
                 await self._stale_callback(query)
@@ -3835,10 +5872,18 @@ class FutureSelfBot(
                 source="callback",
                 draft_id=draft_id,
                 version=version,
+                expected_preview_message_id=canonical_message_id,
+                expected_access_version=expected_access_version,
             )
             if outcome.status != "ok":
                 await self._stale_callback(query)
                 return
+            self.nova_companion_record_terminal_capture(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=pending_capture,
+            )
             await query.answer()
             await query.edit_message_text("Не сохраняю.")
             await self.conversation.set_active_draft(telegram_user_id, chat_id, None)
@@ -3850,12 +5895,19 @@ class FutureSelfBot(
                 source="callback",
                 draft_id=draft_id,
                 version=version,
+                expected_preview_message_id=canonical_message_id,
+                expected_access_version=expected_access_version,
             )
             if outcome.status != "ok":
                 await self._stale_callback(query)
                 return
             await query.answer()
-            receipt = await self._record_saved_receipt(telegram_user_id, chat_id, outcome)
+            receipt = await self._record_saved_receipt(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_companion_pending=pending_capture,
+            )
             await query.edit_message_text(
                 receipt,
                 reply_markup=self._saved_receipt_markup(outcome),
@@ -3895,10 +5947,34 @@ class FutureSelfBot(
         await self.conversation.clear_system_action(
             update.effective_user.id, update.effective_chat.id
         )
+        editing = await self.draft_service.editing(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        editing_message_id = getattr(editing, "preview_message_id", None)
+        editing_pending = (
+            self.nova_companion_pending_capture_anchor(
+                update.effective_user.id,
+                update.effective_chat.id,
+                editing.id,
+                editing.version,
+                editing_message_id,
+            )
+            if editing is not None and type(editing_message_id) is int and editing_message_id > 0
+            else None
+        )
         discarded = await self.draft_service.cancel_editing(
             update.effective_user.id, update.effective_chat.id
         )
         if discarded:
+            if editing is not None:
+                self.nova_companion_clear_pending_capture_exact(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    editing.id,
+                    editing.version,
+                    expected_pending=editing_pending,
+                )
             await self.conversation.set_active_draft(
                 update.effective_user.id, update.effective_chat.id, None
             )
@@ -3998,10 +6074,24 @@ class FutureSelfBot(
         telegram_user_id: int,
         chat_id: int,
         outcome: ActionOutcome,
+        *,
+        expected_companion_pending: object | None = None,
     ) -> str:
         item = outcome.result.inbox_item if outcome.result else None
         if item is None:
             return "Сохранено в inbox."
+        record_companion_status = getattr(
+            self,
+            "nova_companion_record_confirmed_capture",
+            None,
+        )
+        if callable(record_companion_status):
+            record_companion_status(
+                telegram_user_id,
+                chat_id,
+                outcome,
+                expected_pending=expected_companion_pending,
+            )
         if outcome.result and outcome.result.duplicate:
             return (
                 "Такая запись уже есть в Inbox — повторную копию не создаю:\n"
@@ -4437,27 +6527,171 @@ class FutureSelfBot(
         )
 
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        task = asyncio.create_task(
+            self._today_lifecycle(update, context),
+            name="weekly-review-today-lifecycle",
+        )
+        self._weekly_review_track_task(task)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today delivery failed operation=weekly_today error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _today_lifecycle(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
         user = await self._user(update.effective_user.id)
         if not user.onboarding_completed:
             await update.effective_message.reply_text(
                 "Сначала заверши Vision Profile через /start."
             )
             return
+        include_weekly_focus = self.weekly_review_policy.allows_actor(user)
         try:
-            plan = await self.focus_service.generate(user.id)
+            snapshot = await self.focus_service.materialize_today_application(
+                user.id,
+                include_weekly_focus=include_weekly_focus,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            log_safe_failure("Today plan failed", exc, user_id=user.id)
+            logger.warning(
+                "Today plan failed operation=materialize error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        try:
+            provider_allowed = await self._today_application_is_current(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today plan failed operation=pre_provider_fence error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        if not provider_allowed:
+            return
+        try:
+            plan = await self.focus_service.generate_today_plan(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today plan failed operation=provider error_type=%s",
+                type(exc).__name__,
+            )
+            try:
+                fallback_allowed = await self._today_application_is_current(snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception as fence_exc:
+                logger.warning(
+                    "Today plan failed operation=provider_failure_fence error_type=%s",
+                    type(fence_exc).__name__,
+                )
+                return
+            if not fallback_allowed:
+                return
             await update.effective_message.reply_text(
                 "Не удалось собрать фокус дня. Попробуй немного позже."
             )
             return
+        try:
+            delivery_allowed = await self._today_application_is_current(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today plan failed operation=pre_send_fence error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        if not delivery_allowed:
+            return
         actions = "\n".join(f"{i}. {action}" for i, action in enumerate(plan.actions, 1))
-        await update.effective_message.reply_text(
-            f"{plan.vision_reminder}\n\nФокус: {plan.main_focus}\n{actions}\n\n"
+        weekly_line = (
+            f"🎯 Фокус недели: {snapshot.weekly_focus}\n\n"
+            if snapshot.includes_weekly_focus and snapshot.weekly_focus
+            else ""
+        )
+        sent = await update.effective_message.reply_text(
+            f"{weekly_line}{plan.vision_reminder}\n\nФокус: {plan.main_focus}\n{actions}\n\n"
             f"На сложный день: {plan.hard_day_minimum}"
+        )
+        try:
+            delivered_current = await self._today_application_is_current(snapshot)
+        except asyncio.CancelledError:
+            await self._today_neutralize_delivery(
+                context,
+                update,
+                sent,
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today delivery failed operation=post_send_fence error_type=%s",
+                type(exc).__name__,
+            )
+            delivered_current = False
+        if delivered_current:
+            return
+        await self._today_neutralize_delivery(context, update, sent)
+
+    async def _today_neutralize_delivery(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        update: Update,
+        sent: Any,
+    ) -> None:
+        message_id = getattr(sent, "message_id", None)
+        if isinstance(message_id, int) and message_id > 0:
+            await self._weekly_review_neutralize_sent(
+                context.bot,
+                update.effective_chat.id,
+                message_id,
+            )
+            return
+        delete = getattr(sent, "delete", None)
+        if not callable(delete):
+            logger.error(
+                "Today delivery cleanup failed operation=missing_message_id "
+                "error_type=MissingMessageId"
+            )
+            return
+        try:
+            await delete()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Today delivery cleanup failed operation=delete error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _today_application_is_current(
+        self,
+        snapshot: TodayApplicationSnapshot,
+    ) -> bool:
+        check = await self.focus_service.check_today_application(snapshot)
+        if not check.is_current:
+            return False
+        if not snapshot.includes_weekly_focus:
+            return True
+        return self.weekly_review_policy.allows_actor(
+            snapshot,
+            expected_access_version=snapshot.access_version,
         )
 
     async def evening_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.reminder_clear_current(update)
         context.user_data["evening"] = {}
         await update.effective_message.reply_text(
             "Что сегодня получилось? Даже небольшой шаг считается."
@@ -4506,6 +6740,7 @@ class FutureSelfBot(
         return ConversationHandler.END
 
     async def health_checkin_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.reminder_clear_current(update)
         user = await self._user(update.effective_user.id)
         record_id = None
         command_text = update.effective_message.text or ""
@@ -4701,6 +6936,7 @@ class FutureSelfBot(
         )
 
     async def doctor_prepare_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self.reminder_clear_current(update)
         user = await self._user(update.effective_user.id)
         command = (update.effective_message.text or "").split(maxsplit=1)[0]
         command = command.split("@", maxsplit=1)[0]

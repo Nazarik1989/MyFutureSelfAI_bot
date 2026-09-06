@@ -14,6 +14,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from .access import FULL_ACCESS_TIERS, is_full_access_tier
 from .db import Database
 from .models import DraftInboxItem, InboxItem, TaskReminder, TaskState, User
+from .recurring_reminders import RecurringTaskReminderService
 from .schemas import TemporalResolution
 
 logger = logging.getLogger(__name__)
@@ -238,18 +239,53 @@ class TaskReminderEngine:
         current = as_utc(now or datetime.now(UTC))
         event_cutoff = current - self.STALE_AFTER
         stale_claim = current - self.lease
+        stale_reminder = and_(
+            TaskReminder.remind_at < event_cutoff,
+            or_(
+                TaskReminder.status == "pending",
+                and_(
+                    TaskReminder.status == "processing",
+                    TaskReminder.claimed_at <= stale_claim,
+                ),
+            ),
+        )
         async with self.db.session() as session:
+            reminder_candidates = (
+                await session.execute(
+                    select(TaskReminder.id, InboxItem.user_id)
+                    .join(InboxItem, InboxItem.id == TaskReminder.inbox_item_id)
+                    .where(stale_reminder)
+                )
+            ).all()
+            task_candidates = (
+                await session.execute(
+                    select(InboxItem.id, InboxItem.user_id)
+                    .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
+                    .where(
+                        InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
+                        TaskState.owner_id == InboxItem.user_id,
+                        TaskState.status == "active",
+                        TaskState.event_at.is_not(None),
+                        TaskState.event_at < event_cutoff,
+                    )
+                )
+            ).all()
+            owner_ids = sorted(
+                {owner_id for _entity_id, owner_id in reminder_candidates}
+                | {owner_id for _item_id, owner_id in task_candidates}
+            )
+            for owner_id in owner_ids:
+                await session.execute(
+                    update(User).where(User.id == owner_id).values(updated_at=User.updated_at)
+                )
+
+            reminder_ids = {reminder_id for reminder_id, _owner_id in reminder_candidates}
             changed = await session.execute(
                 update(TaskReminder)
                 .where(
-                    TaskReminder.remind_at < event_cutoff,
-                    or_(
-                        TaskReminder.status == "pending",
-                        and_(
-                            TaskReminder.status == "processing",
-                            TaskReminder.claimed_at <= stale_claim,
-                        ),
-                    ),
+                    TaskReminder.id.in_(reminder_ids),
+                    stale_reminder,
                 )
                 .values(
                     status="expired",
@@ -260,27 +296,28 @@ class TaskReminderEngine:
                 .returning(TaskReminder.inbox_item_id)
             )
             transitioned = set(changed.scalars().all())
-            archive_ids = set(
-                (
-                    await session.scalars(
-                        select(InboxItem.id)
-                        .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
-                        .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
-                        .where(
-                            InboxItem.kind == "task",
-                            InboxItem.status == "confirmed",
-                            TaskState.owner_id == InboxItem.user_id,
-                            TaskState.status == "active",
-                            TaskState.event_at.is_not(None),
-                            TaskState.event_at < event_cutoff,
-                            or_(
-                                TaskReminder.id.is_(None),
-                                TaskReminder.status.in_({"cancelled", "sent", "expired"}),
-                            ),
-                        )
+            candidate_item_ids = {item_id for item_id, _owner_id in task_candidates}
+            archive_rows = (
+                await session.execute(
+                    select(InboxItem.id, InboxItem.user_id)
+                    .join(TaskState, TaskState.inbox_item_id == InboxItem.id)
+                    .outerjoin(TaskReminder, TaskReminder.inbox_item_id == InboxItem.id)
+                    .where(
+                        InboxItem.id.in_(candidate_item_ids),
+                        InboxItem.kind == "task",
+                        InboxItem.status == "confirmed",
+                        TaskState.owner_id == InboxItem.user_id,
+                        TaskState.status == "active",
+                        TaskState.event_at.is_not(None),
+                        TaskState.event_at < event_cutoff,
+                        or_(
+                            TaskReminder.id.is_(None),
+                            TaskReminder.status.in_({"cancelled", "sent", "expired"}),
+                        ),
                     )
-                ).all()
-            )
+                )
+            ).all()
+            archive_ids = {item_id for item_id, _owner_id in archive_rows}
             if archive_ids:
                 await session.execute(
                     update(InboxItem)
@@ -291,6 +328,12 @@ class TaskReminderEngine:
                     )
                     .values(status="archived")
                 )
+                for item_id, owner_id in sorted(archive_rows, key=lambda row: (row[1], row[0])):
+                    await RecurringTaskReminderService.complete_for_terminal_task_in_session(
+                        session,
+                        owner_id,
+                        item_id,
+                    )
             return len(transitioned | archive_ids)
 
     async def _claim_due(self, now: datetime) -> list[ClaimedReminder]:

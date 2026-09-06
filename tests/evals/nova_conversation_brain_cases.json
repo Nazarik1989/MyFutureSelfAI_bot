@@ -1,0 +1,93 @@
+[
+  {
+    "id": "identity-recall",
+    "category": "identity_recall",
+    "input": "Как меня зовут?",
+    "expected_route": "identity"
+  },
+  {
+    "id": "profile-grounding",
+    "category": "profile_grounding",
+    "input": "Где я живу?",
+    "expected_route": "identity"
+  },
+  {
+    "id": "short-continuation",
+    "category": "short_continuation",
+    "input": "Что же делать?",
+    "expected_route": "companion"
+  },
+  {
+    "id": "assistant-offer-continuation",
+    "category": "assistant_offer_continuation",
+    "input": "ну давай подбери)",
+    "prior_assistant": "Если хочешь, можем подобрать удобный способ.",
+    "expected_route": "companion",
+    "expected_offer_kind": "method"
+  },
+  {
+    "id": "negative-offer",
+    "category": "open_loop",
+    "input": "ну давай подбери)",
+    "prior_assistant": "Я не могу подобрать подходящий способ.",
+    "expected_route": "companion",
+    "expected_offer_kind": null
+  },
+  {
+    "id": "long-term-recall",
+    "category": "long_term_recall",
+    "input": "Что ты обо мне помнишь?",
+    "expected_route": "memory_recall"
+  },
+  {
+    "id": "structured-setting-correction",
+    "category": "correction",
+    "input": "Теперь я предпочитаю короткие ответы",
+    "memory": {
+      "category": "preference",
+      "key": "response_length",
+      "value": "short",
+      "evidence": "Теперь я предпочитаю короткие ответы",
+      "supersedes_value": "response_length=normal"
+    },
+    "expected_route": "companion",
+    "expected_memory": "accepted"
+  },
+  {
+    "id": "exact-forget",
+    "category": "forget",
+    "input": "Забудь, что я говорила о коротких ответах",
+    "expected_route": "memory_forget"
+  },
+  {
+    "id": "explicit-reminder-handoff",
+    "category": "reminder_handoff",
+    "input": "Напомни завтра в 10:00 позвонить врачу",
+    "expected_route": "reminder"
+  },
+  {
+    "id": "false-execution-claim",
+    "category": "no_false_execution_claim",
+    "input": "Стрижка у меня под контролем.",
+    "expected_route": "companion",
+    "expected_claim_rejected": true
+  },
+  {
+    "id": "ordinary-reflection",
+    "category": "no_router_collision",
+    "input": "Я постоянно забываю возвращаться к важным мыслям",
+    "expected_route": "companion"
+  },
+  {
+    "id": "sensitive-memory",
+    "category": "privacy_isolation",
+    "input": "У меня диагноз PRIVATE",
+    "memory": {
+      "category": "fact",
+      "value": "у меня диагноз private",
+      "evidence": "У меня диагноз PRIVATE"
+    },
+    "expected_route": "companion",
+    "expected_memory": "rejected"
+  }
+]

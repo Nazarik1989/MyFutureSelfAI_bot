@@ -1,10 +1,19 @@
 import asyncio
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 from sqlalchemy import func, select
 
 from future_self.access import SUBSCRIBER
-from future_self.models import InboxItem, TaskActionToken, TaskReminder, TaskState, VisionItem
+from future_self.models import (
+    InboxItem,
+    RecurringTaskReminderOccurrence,
+    RecurringTaskReminderSchedule,
+    TaskActionToken,
+    TaskReminder,
+    TaskState,
+    VisionItem,
+)
+from future_self.recurring_reminders import RecurringTaskReminderService
 from future_self.reminders import TaskReminderEngine, as_utc
 from future_self.repositories import UserRepository
 from future_self.tasks import TaskService, add_task_state
@@ -79,6 +88,19 @@ async def token(service, owner_id, item_id, action, *, chat_id=100):
     return (await service.issue_actions(owner_id, chat_id, item_id, 1, (action,)))[action]
 
 
+async def create_pending_daily_schedule(db, owner_id: int, item_id: int):
+    service = RecurringTaskReminderService(db)
+    created = await service.create_daily(
+        owner_id,
+        item_id,
+        time(18, 1),
+        now=datetime(2026, 8, 10, 15, tzinfo=UTC),
+    )
+    assert created.schedule is not None
+    await service.materialize_due(now=created.schedule.next_occurrence_at)
+    return service, created.schedule
+
+
 async def test_bulk_overdue_cleanup_is_optimistic_atomic_and_owner_scoped(db):
     now = datetime(2026, 7, 25, 12, tzinfo=UTC)
     owner_id, first_id, _ = await create_task(
@@ -109,6 +131,10 @@ async def test_bulk_overdue_cleanup_is_optimistic_atomic_and_owner_scoped(db):
         event_at=now - timedelta(days=4),
         remind_at=now - timedelta(days=4, minutes=30),
     )
+    _daily_service, first_daily = await create_pending_daily_schedule(db, owner_id, first_id)
+    await create_pending_daily_schedule(db, owner_id, second_id)
+    await create_pending_daily_schedule(db, owner_id, future_id)
+    await create_pending_daily_schedule(db, foreign_owner, foreign_id)
     service = TaskService(db)
     snapshot = await service.overdue_snapshot(owner_id, now=now)
     assert [row["id"] for row in snapshot] == [first_id, second_id]
@@ -142,6 +168,15 @@ async def test_bulk_overdue_cleanup_is_optimistic_atomic_and_owner_scoped(db):
                 .where(TaskState.inbox_item_id.in_({first_id, second_id, future_id, foreign_id}))
             )
         ).all()
+        schedules = {
+            schedule.inbox_item_id: schedule.status
+            for schedule in (await session.scalars(select(RecurringTaskReminderSchedule))).all()
+        }
+        first_occurrence = await session.scalar(
+            select(RecurringTaskReminderOccurrence).where(
+                RecurringTaskReminderOccurrence.schedule_id == first_daily.id
+            )
+        )
     values = {
         item.id: (state.status, item.status, reminder.status) for state, item, reminder in rows
     }
@@ -149,6 +184,13 @@ async def test_bulk_overdue_cleanup_is_optimistic_atomic_and_owner_scoped(db):
     assert values[second_id] == ("cancelled", "archived", "expired")
     assert values[future_id] == ("active", "confirmed", "pending")
     assert values[foreign_id] == ("active", "confirmed", "pending")
+    assert schedules == {
+        first_id: "completed",
+        second_id: "completed",
+        future_id: "active",
+        foreign_id: "active",
+    }
+    assert first_occurrence.status == "cancelled"
     assert foreign_owner != owner_id
 
 
@@ -265,6 +307,7 @@ async def test_complete_is_idempotent_cancels_claim_and_reopen_keeps_reminder_of
         event_at=event,
         remind_at=event - timedelta(minutes=30),
     )
+    recurring_service, recurring = await create_pending_daily_schedule(db, owner_id, item_id)
     service = TaskService(db)
     complete_token = await token(service, owner_id, item_id, "complete")
     first = await service.complete(complete_token, owner_id, 100)
@@ -276,14 +319,33 @@ async def test_complete_is_idempotent_cancels_claim_and_reopen_keeps_reminder_of
             select(TaskReminder).where(TaskReminder.inbox_item_id == item_id)
         )
         state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item_id))
+        stored_schedule = await session.get(RecurringTaskReminderSchedule, recurring.id)
+        occurrence = await session.scalar(
+            select(RecurringTaskReminderOccurrence).where(
+                RecurringTaskReminderOccurrence.schedule_id == recurring.id
+            )
+        )
     assert reminder.status == "cancelled"
     assert reminder.claim_token is None
     assert state.version == 2
+    assert (stored_schedule.status, stored_schedule.version) == ("completed", 2)
+    assert occurrence.status == "cancelled"
     reopen_token = (await service.issue_actions(owner_id, 100, item_id, 2, ("reopen",)))["reopen"]
     reopened = await service.reopen(reopen_token, owner_id, 100)
     assert reopened.status == "reopened"
     assert reopened.record.reminder.status == "cancelled"
     assert reopened.record.state.version == 3
+    still_completed = await recurring_service.get(owner_id, item_id)
+    assert still_completed is not None
+    assert (still_completed.status, still_completed.version) == ("completed", 2)
+
+    reenabled = await recurring_service.reenable(
+        owner_id,
+        item_id,
+        now=recurring.next_occurrence_at,
+    )
+    assert reenabled.schedule is not None
+    assert (reenabled.schedule.status, reenabled.schedule.version) == ("active", 3)
 
 
 async def test_reschedule_preserves_interval_and_invalidates_competing_callback(db):
@@ -319,6 +381,7 @@ async def test_auto_archived_overdue_task_stays_manageable_but_cannot_remind(db)
         event_at=event,
         remind_at=event - timedelta(minutes=30),
     )
+    recurring_service, recurring = await create_pending_daily_schedule(db, owner_id, item_id)
 
     async def send(chat_id: int, text: str) -> int:
         raise AssertionError("stale reminder must not be delivered")
@@ -328,13 +391,37 @@ async def test_auto_archived_overdue_task_stays_manageable_but_cannot_remind(db)
     assert (await service.record(owner_id, item_id)).item.id == item_id
     actions = await service.issue_actions(owner_id, 100, item_id, 1, ("reschedule_menu",))
     assert set(actions) == {"reschedule_menu"}
+    menu = await service.reschedule_menu(actions["reschedule_menu"], owner_id, 100)
+    proposed = await service.choose_reschedule_preset(
+        menu.tokens["1h"],
+        owner_id,
+        100,
+        now=now,
+    )
+    assert proposed.status == "choose_reminder"
+    assert (
+        await service.apply_reschedule_choice(
+            proposed.tokens["reschedule_preserve"],
+            owner_id,
+            100,
+        )
+    ).status == "rescheduled"
     async with db.sessions() as session:
         item = await session.get(InboxItem, item_id)
         state = await session.scalar(select(TaskState).where(TaskState.inbox_item_id == item_id))
         reminder = await session.scalar(
             select(TaskReminder).where(TaskReminder.inbox_item_id == item_id)
         )
-    assert (item.status, state.status, reminder.status) == ("archived", "active", "expired")
+        stored_schedule = await session.get(RecurringTaskReminderSchedule, recurring.id)
+        occurrence = await session.scalar(
+            select(RecurringTaskReminderOccurrence).where(
+                RecurringTaskReminderOccurrence.schedule_id == recurring.id
+            )
+        )
+    assert (item.status, state.status, reminder.status) == ("confirmed", "active", "pending")
+    assert (stored_schedule.status, stored_schedule.version) == ("completed", 2)
+    assert occurrence.status == "cancelled"
+    assert (await recurring_service.get(owner_id, item_id)).status == "completed"  # type: ignore[union-attr]
 
 
 async def test_custom_event_and_reminder_inputs_are_persistent_and_deterministic(db):
@@ -413,6 +500,7 @@ async def test_delete_confirmation_is_owner_chat_version_bound_and_moves_to_tras
         session.add(vision)
         await session.flush()
         vision_id = vision.id
+    _recurring_service, recurring = await create_pending_daily_schedule(db, owner_id, item_id)
     service = TaskService(db)
     ask = await token(service, owner_id, item_id, "delete_ask")
     confirm = await service.prepare_delete(ask, owner_id, 100)
@@ -447,6 +535,12 @@ async def test_delete_confirmation_is_owner_chat_version_bound_and_moves_to_tras
             select(TaskReminder).where(TaskReminder.inbox_item_id == item_id)
         )
         linked_vision = await session.get(VisionItem, vision_id)
+        stored_schedule = await session.get(RecurringTaskReminderSchedule, recurring.id)
+        occurrence = await session.scalar(
+            select(RecurringTaskReminderOccurrence).where(
+                RecurringTaskReminderOccurrence.schedule_id == recurring.id
+            )
+        )
     assert item.status == "trashed"
     assert item.pre_trash_status == "confirmed"
     assert item.trashed_at is not None
@@ -456,6 +550,8 @@ async def test_delete_confirmation_is_owner_chat_version_bound_and_moves_to_tras
     assert state.cancelled_at is None
     assert reminder.status == "cancelled"
     assert linked_vision.linked_task_id == item_id
+    assert (stored_schedule.status, stored_schedule.version) == ("completed", 2)
+    assert occurrence.status == "cancelled"
 
 
 async def test_tokens_are_owner_isolated_forged_stale_and_single_use(db):

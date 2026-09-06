@@ -8,10 +8,15 @@ from future_self.config import Settings
 from future_self.domain import ONBOARDING_QUESTIONS, canonical_timezone
 from future_self.models import User
 from future_self.repositories import OnboardingRepository
-from future_self.schemas import TimezoneResolution
+from future_self.schemas import ReminderTimezoneResolution, TimezoneResolution
 from future_self.timezones import (
+    MAX_REMINDER_TIMEZONE_CANDIDATE_WORDS,
+    MAX_REMINDER_TIMEZONE_FRAGMENT_CHARS,
+    ReminderTimezoneFragment,
+    ReminderTimezoneStatus,
     TimezoneCandidate,
     TimezoneResolver,
+    extract_reminder_timezone_fragment,
     resolve_timezone_locally,
     timezone_candidate_text,
 )
@@ -98,6 +103,259 @@ def test_common_city_is_resolved_locally_inside_a_phrase():
     candidate = resolve_timezone_locally("я сейчас живу в Казани")
 
     assert candidate == TimezoneCandidate("Europe/Moscow", "Казань", "local")
+
+
+@pytest.mark.parametrize(
+    ("phrase", "window_prefix"),
+    [
+        (
+            "Напомни завтра в 10:00 по светогорску созвониться с клиентом",
+            "по светогорску",
+        ),
+        (
+            "Каждый день в 20:30 по времени Нижнего Новгорода заполнить дневник",
+            "по времени Нижнего Новгорода",
+        ),
+        (
+            "Напомни в 18:00 в часовом поясе Сан-Хосе, Коста-Рика проверить почту",
+            "в часовом поясе Сан-Хосе, Коста-Рика",
+        ),
+    ],
+)
+def test_reminder_timezone_marker_extraction_produces_a_bounded_candidate_window(
+    phrase,
+    window_prefix,
+):
+    fragment = extract_reminder_timezone_fragment(phrase)
+
+    assert fragment is not None
+    assert fragment.text.startswith(window_prefix)
+    assert fragment.location_text
+    assert len(fragment.text) <= MAX_REMINDER_TIMEZONE_FRAGMENT_CHARS
+    assert len(fragment.text.split()) <= MAX_REMINDER_TIMEZONE_CANDIDATE_WORDS
+    assert phrase[fragment.span[0] : fragment.span[1]] == fragment.text
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Напомни в 10:00 по Нижнему Новгороду позвонить",
+        "Напомни в 10:00 по Светогорску, Ленинградская область позвонить",
+        "Напомни в 10:00 по Сан-Хосе, США позвонить",
+        "Напомни в 10:00 по Сан-Хосе, Коста-Рика позвонить",
+        "Напомни в 10:00 по Лос-Анджелесу позвонить",
+        "Напомни в 10:00 по Los Angeles позвонить",
+        "Напомни в 10:00 по Нью-Йорку позвонить",
+        "Напомни в 10:00 по New York позвонить",
+        "Напомни в 10:00 по Санкт-Петербургу позвонить",
+        "Напомни в 10:00 по Санкт Петербургу позвонить",
+    ],
+)
+def test_multiword_hyphenated_and_qualified_places_remain_in_candidate_window(phrase):
+    fragment = extract_reminder_timezone_fragment(phrase)
+
+    assert fragment is not None
+    assert fragment.text.startswith(("по ", "в часовом поясе "))
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Напомни завтра в 19:30 по работе позвонить",
+        "Напомни завтра в 19:30 по проекту отправить отчёт",
+        "Напомни завтра в 19:30 по плану провести встречу",
+        "Эта история напомнила мне о работе",
+    ],
+)
+def test_semantic_po_phrases_are_not_timezone_markers(phrase):
+    assert extract_reminder_timezone_fragment(phrase) is None
+
+
+@pytest.mark.parametrize(
+    ("phrase", "timezone"),
+    [
+        ("Напомни завтра в 10:00 по МСК позвонить", "Europe/Moscow"),
+        ("Напомни завтра в 10:00 по Лондону позвонить", "Europe/London"),
+        ("Каждый день в 20:30 по времени Тбилиси писать", "Asia/Tbilisi"),
+        ("Напомни в 10:00 по Санкт-Петербургу позвонить", "Europe/Moscow"),
+        ("Напомни в 10:00 по Санкт Петербургу позвонить", "Europe/Moscow"),
+        ("Напомни в 10:00 по Лос-Анджелесу позвонить", "America/Los_Angeles"),
+        ("Напомни в 10:00 по Los Angeles позвонить", "America/Los_Angeles"),
+        ("Напомни в 10:00 по Нью-Йорку позвонить", "America/New_York"),
+        ("Напомни в 10:00 по New York позвонить", "America/New_York"),
+    ],
+)
+async def test_known_reminder_timezones_are_local_and_never_call_model(fake_ai, phrase, timezone):
+    fragment = extract_reminder_timezone_fragment(phrase)
+
+    assert fragment is not None
+    resolver = TimezoneResolver(fake_ai)
+    local = resolver.resolve_reminder_locally(fragment)
+    outcome = await resolver.resolve_reminder(fragment)
+
+    assert local == outcome
+    assert outcome.status is ReminderTimezoneStatus.RESOLVED
+    assert outcome.candidate is not None
+    assert outcome.candidate.timezone == timezone
+    assert outcome.evidence_text is not None
+    assert outcome.evidence_span is not None
+    assert phrase[outcome.evidence_span[0] : outcome.evidence_span[1]] == outcome.evidence_text
+    assert fake_ai.reminder_timezone_calls == []
+    assert fake_ai.timezone_calls == []
+
+
+async def test_exact_iana_reminder_timezone_is_local_and_never_calls_model(fake_ai):
+    fragment = ReminderTimezoneFragment(
+        "по Europe/London",
+        "Europe/London",
+        (0, len("по Europe/London")),
+    )
+
+    outcome = await TimezoneResolver(fake_ai).resolve_reminder(fragment)
+
+    assert outcome.status is ReminderTimezoneStatus.RESOLVED
+    assert outcome.candidate is not None
+    assert outcome.candidate.timezone == "Europe/London"
+    assert outcome.evidence_text == "по Europe/London"
+    assert outcome.evidence_span == (0, len("по Europe/London"))
+    assert fake_ai.reminder_timezone_calls == []
+    assert fake_ai.timezone_calls == []
+
+
+async def test_unknown_explicit_city_uses_only_timezone_fragment_and_validates_evidence(fake_ai):
+    phrase = "Напомни в 9:00 по Светогорску позвонить врачу"
+    fragment = extract_reminder_timezone_fragment(phrase)
+    assert fragment is not None
+    fake_ai.reminder_timezone_results[fragment.text] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Moscow",
+        matched_text="по светогорску",
+        city="Светогорск",
+        country="Россия",
+    )
+
+    outcome = await TimezoneResolver(fake_ai).resolve_reminder(fragment)
+
+    assert outcome.status is ReminderTimezoneStatus.RESOLVED
+    assert outcome.candidate == TimezoneCandidate("Europe/Moscow", "Светогорск", "model")
+    assert outcome.evidence_text == "по Светогорску"
+    assert outcome.evidence_span is not None
+    assert phrase[outcome.evidence_span[0] : outcome.evidence_span[1]] == outcome.evidence_text
+    assert fake_ai.reminder_timezone_calls == [fragment.text]
+    assert phrase not in fake_ai.reminder_timezone_calls
+    assert fake_ai.timezone_calls == []
+
+
+@pytest.mark.parametrize("status", ["not_mentioned", "insufficient"])
+async def test_model_reminder_timezone_status_is_preserved_without_candidate(fake_ai, status):
+    fragment = ReminderTimezoneFragment("по Сан-Хосе", "Сан-Хосе", (0, 11))
+    fake_ai.reminder_timezone_results[fragment.text] = ReminderTimezoneResolution(status=status)
+
+    outcome = await TimezoneResolver(fake_ai).resolve_reminder(fragment)
+
+    assert outcome.status == status
+    assert outcome.candidate is None
+    assert fake_ai.reminder_timezone_calls == [fragment.text]
+
+
+async def test_ambiguous_model_result_returns_exact_timezone_evidence(fake_ai):
+    text = "по Сан-Хосе созвониться"
+    fragment = ReminderTimezoneFragment(
+        text,
+        "Сан-Хосе созвониться",
+        (25, 25 + len(text)),
+    )
+    fake_ai.reminder_timezone_results[fragment.text] = ReminderTimezoneResolution(
+        status="ambiguous",
+        matched_text="по Сан-Хосе",
+    )
+
+    outcome = await TimezoneResolver(fake_ai).resolve_reminder(fragment)
+
+    assert outcome.status is ReminderTimezoneStatus.AMBIGUOUS
+    assert outcome.candidate is None
+    assert outcome.evidence_text == "по Сан-Хосе"
+    assert outcome.evidence_span == (25, 36)
+
+
+async def test_qualified_known_alias_is_never_resolved_by_local_substring_match(fake_ai):
+    phrase = "Напомни в 9:00 по Лондону, Канада позвонить"
+    fragment = extract_reminder_timezone_fragment(phrase)
+    assert fragment is not None
+    resolver = TimezoneResolver(fake_ai)
+    assert resolver.resolve_reminder_locally(fragment) is None
+    fake_ai.reminder_timezone_results[fragment.text] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="America/Toronto",
+        matched_text="по Лондону, Канада",
+        city="London",
+        country="Canada",
+    )
+
+    outcome = await resolver.resolve_reminder(fragment)
+
+    assert outcome.candidate is not None
+    assert outcome.candidate.timezone == "America/Toronto"
+    assert outcome.candidate.source == "model"
+    assert outcome.evidence_text == "по Лондону, Канада"
+    assert fake_ai.reminder_timezone_calls == [fragment.text]
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Напомни в 9:00 по Лондону Канада позвонить",
+        "напомни в 9:00 по лондону канада позвонить",
+        "Напомни в 9:00 по London Ontario позвонить",
+        "Напомни в 9:00 по Москве Московская область позвонить",
+        "Напомни в 9:00 по лондону япония позвонить",
+        "Напомни в 9:00 по лондону гаити позвонить",
+        "Напомни в 9:00 по лондону тольятти позвонить",
+    ],
+)
+def test_unpunctuated_country_or_region_qualifier_also_forces_model(fake_ai, phrase):
+    fragment = extract_reminder_timezone_fragment(phrase)
+
+    assert fragment is not None
+    assert TimezoneResolver(fake_ai).resolve_reminder_locally(fragment) is None
+
+
+async def test_reminder_model_cannot_return_invalid_iana_timezone(fake_ai):
+    fragment = ReminderTimezoneFragment("по Светогорску", "Светогорску", (0, 15))
+    fake_ai.reminder_timezone_results[fragment.text] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Ocean/Atlantis",
+        matched_text="по Светогорску",
+    )
+
+    with pytest.raises(ValueError, match="invalid IANA"):
+        await TimezoneResolver(fake_ai).resolve_reminder(fragment)
+
+
+@pytest.mark.parametrize(
+    ("window", "matched", "error"),
+    [
+        ("по Светогорску позвонить", "по Берлину", "start at"),
+        ("по Светогорску позвонить", "Светогорску", "start at"),
+        ("по Светогорску и по Светогорску", "по Светогорску", "unique"),
+        ("по Светогорску позвонить", "по", "contain a place"),
+    ],
+)
+async def test_reminder_model_evidence_is_exact_prefix_unique_and_contains_place(
+    fake_ai,
+    window,
+    matched,
+    error,
+):
+    fragment = ReminderTimezoneFragment(window, window, (0, len(window)))
+    fake_ai.reminder_timezone_results[fragment.text] = ReminderTimezoneResolution(
+        status="resolved",
+        timezone="Europe/Berlin",
+        matched_text=matched,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        await TimezoneResolver(fake_ai).resolve_reminder(fragment)
 
 
 async def test_unknown_city_uses_model_and_validates_iana_timezone(fake_ai):

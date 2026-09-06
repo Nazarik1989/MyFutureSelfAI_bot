@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -16,6 +17,9 @@ from .navigation import (
     navigation_actions,
     navigation_sections,
 )
+from .nova_memory import NovaMemoryValidationError
+from .nova_memory_flow import NovaMemoryIntentKind, classify_nova_memory_intent
+from .weekly_review_handlers import classify_weekly_review_intent
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +104,12 @@ FLOW_LABELS = {
     "labs": "загрузка результатов анализов",
     "workspace": "операция с совместным пространством",
     "knowledge_capture": "добавление материала в базу знаний",
+    "task_edit": "изменение задачи",
+    "collection_input": "операция с разделом",
+    "draft_edit": "редактирование черновика",
+    "date_choice": "выбор даты",
+    "draft_action": "подтверждение действия с черновиком",
+    "system_action": "подтверждение системного действия",
     "rename_goal": "переименование цели",
 }
 
@@ -114,8 +124,31 @@ class NavigationHandlers:
     async def navigation_public_command_gate(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        command = (update.effective_message.text or "").split(maxsplit=1)[0]
+        command = command.split("@", maxsplit=1)[0].casefold()
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         flow = await self._active_navigation_flow(update, context)
         if flow is None:
+            if command != "/mynova" and await self.nova_memory_public_command_gate(update, context):
+                raise ApplicationHandlerStop
+            if command == "/week" and await self.reminder_public_command_gate(update, context):
+                raise ApplicationHandlerStop
+            if command != "/week":
+                await self.weekly_review_clear_current(update)
+            await self.reminder_clear_current(update)
+            if command == "/week":
+                await self.nova_memory_clear_current(update)
+            if command != "/help":
+                await self.nova_clear_current(update)
+            if command not in {"/help", "/mynova"}:
+                self.nova_companion_invalidate_status_receipt_exact(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    expected_receipt=status_receipt,
+                )
             if hasattr(self, "collection_service"):
                 user = await self._user(update.effective_user.id)
                 await self.collection_service.clear_context(user.id, update.effective_chat.id)
@@ -123,51 +156,104 @@ class NavigationHandlers:
                 if self._workspace_enabled():
                     await self.workspace_service.cancel_input(user.id, update.effective_chat.id)
             return
+        await self.reminder_clear_current(update)
+        await self.nova_memory_clear_current(update)
+        if command == "/help":
+            await self._nova_flow_help(update.effective_message, update, flow)
+            raise ApplicationHandlerStop
         await self._prompt_navigation_flow(update.effective_message, update, flow)
         raise ApplicationHandlerStop
 
     async def navigation_text_gate(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        onboarding_result = await self.onboarding_persistent_input(
-            update, context, update.effective_message.text or ""
-        )
-        if onboarding_result is not None:
-            raise ApplicationHandlerStop
         text = update.effective_message.text or ""
+        self.nova_companion_invalidate_status_for_input(
+            update.effective_user.id,
+            update.effective_chat.id,
+            text,
+        )
+        onboarding_result = await self.onboarding_persistent_input(update, context, text)
+        if onboarding_result is not None:
+            await self.weekly_review_clear_current(update)
+            raise ApplicationHandlerStop
+        flow = await self._active_navigation_flow(update, context)
+        if flow is None:
+            if await self.weekly_review_active_text_gate(update, context):
+                raise ApplicationHandlerStop
+            if await self.nova_memory_text_gate(update, context):
+                raise ApplicationHandlerStop
+            if await self.reminder_text_gate(update, context):
+                raise ApplicationHandlerStop
+            if await self.weekly_review_launch_text_gate(update, context):
+                raise ApplicationHandlerStop
+            if await self.weekly_review_stale_control_gate(update, context):
+                raise ApplicationHandlerStop
+        else:
+            await self.weekly_review_clear_current(update)
+            await self.reminder_clear_current(update)
+            await self.nova_memory_clear_current(update)
+            try:
+                memory_owned = (
+                    classify_nova_memory_intent(text).kind is not NovaMemoryIntentKind.NONE
+                )
+            except NovaMemoryValidationError:
+                memory_owned = True
+            weekly_owned = classify_weekly_review_intent(text) != "none"
+            if memory_owned or weekly_owned:
+                await self._prompt_navigation_flow(update.effective_message, update, flow)
+                raise ApplicationHandlerStop
         command = self.natural_command_router.route(text)
         explicit_unknown = (
             command is None and self.natural_command_router.is_explicit_navigation_request(text)
         )
         if explicit_unknown and self.collection_command_router.route(text) is not None:
             return
-        if command is None and not explicit_unknown:
-            return
-        action = command.action if command is not None else "help"
-        flow = await self._active_navigation_flow(update, context)
-        if flow is not None and action != "help":
-            await self._prompt_navigation_flow(update.effective_message, update, flow)
-        else:
-            await self._handle_natural_command(update, context, action)
-        raise ApplicationHandlerStop
+        if command is not None or explicit_unknown:
+            action = command.action if command is not None else "help"
+            flow = await self._active_navigation_flow(update, context)
+            if flow is not None:
+                if action == "help":
+                    return
+                await self._prompt_navigation_flow(update.effective_message, update, flow)
+            else:
+                await self.nova_memory_clear_current(update)
+                await self._handle_natural_command(update, context, action)
+            raise ApplicationHandlerStop
+        if await self.nova_text_gate(update, context):
+            raise ApplicationHandlerStop
 
     async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
+            await self.nova_memory_clear_current(update)
             await self._prompt_navigation_flow(update.effective_message, update, flow)
             return
+        if await self.nova_memory_public_command_gate(update, context):
+            return
+        await self.weekly_review_clear_current(update)
+        await self.nova_clear_current(update)
+        user = await self._user(update.effective_user.id)
         if hasattr(self, "collection_service"):
-            user = await self._user(update.effective_user.id)
             await self.collection_service.clear_context(user.id, update.effective_chat.id)
             await self.collection_service.cancel_input(user.id, update.effective_chat.id)
-        await self._send_navigation_root(update.effective_message)
+        await self._send_after_reply_keyboard_cleanup(
+            update.effective_message,
+            "Главное меню\n\nЧто хочешь сделать?",
+            self._root_keyboard(user.access_tier),
+        )
 
     async def doctor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await self._prompt_navigation_flow(update.effective_message, update, flow)
             return
-        await self._send_navigation_section(update.effective_message, "health")
+        user = await self._user(update.effective_user.id)
+        await self._send_navigation_section(
+            update.effective_message,
+            "health",
+            tier=user.access_tier,
+        )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -181,46 +267,84 @@ class NavigationHandlers:
     ) -> int | None:
         query = update.callback_query
         data = query.data or ""
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        if data == "nav:action:weekly_review":
+            if await self.reminder_blocks_navigation(update):
+                await query.answer()
+                await self.reminder_public_command_gate(update, context)
+                return None
+        else:
+            await self.reminder_clear_current(update)
         if data.startswith("nav:flow:"):
             return await self._navigation_flow_action(update, context)
 
         flow = await self._active_navigation_flow(update, context)
         help_navigation = data == "nav:help" or data.startswith("nav:help:")
         if flow is not None and not help_navigation:
+            await self.nova_memory_clear_current(update)
             await query.answer()
             await self._prompt_navigation_flow(query.message, update, flow, query=query)
             return None
+        if flow is not None and help_navigation:
+            await self.nova_memory_clear_current(update)
+            await self.nova_navigation_help_callback(update, context)
+            return None
+
+        if data != "nav:action:weekly_review":
+            await self.weekly_review_clear_current(update)
+
+        if data != "nav:nova-memory" and await self.nova_memory_blocks_navigation(update):
+            await query.answer()
+            await self.nova_memory_public_command_gate(update, context)
+            return None
+        if data != "nav:nova-memory":
+            await self.nova_memory_clear_current(update)
 
         user = await self._user(update.effective_user.id)
         if hasattr(self, "collection_service"):
             await self.collection_service.clear_context(user.id, update.effective_chat.id)
             await self.collection_service.cancel_input(user.id, update.effective_chat.id)
 
+        if data == "nav:nova-memory":
+            self.nova_companion_invalidate_status_receipt_exact(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_receipt=status_receipt,
+            )
+            await self.nova_memory_open_from_navigation(update, context)
+            return None
+
         if data == "nav:root":
+            self.nova_companion_invalidate_status_receipt_exact(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_receipt=status_receipt,
+            )
             await query.answer()
+            await self.nova_clear_current(update)
             await self._edit_or_send(
                 query,
                 "Главное меню\n\nЧто хочешь сделать?",
-                self._root_keyboard(),
+                self._root_keyboard(user.access_tier),
             )
             return None
         if data == "nav:help":
-            await query.answer()
-            await self._edit_or_send(
-                query,
-                "❓ Помощь\n\nВыбери направление или задай короткий вопрос о навигации.",
-                self._help_keyboard(),
-            )
+            await self.nova_navigation_help_callback(update, context)
             return None
         sections = navigation_sections(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            self.weekly_review_available_for_tier(user.access_tier),
         )
         actions = navigation_actions(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            self.weekly_review_available_for_tier(user.access_tier),
         )
         topics = help_topics(
             self._workspace_enabled(),
@@ -232,6 +356,11 @@ class NavigationHandlers:
         if data.startswith("nav:section:"):
             section_key = data.removeprefix("nav:section:")
             if section_key == "vision":
+                self.nova_companion_invalidate_status_receipt_exact(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    expected_receipt=status_receipt,
+                )
                 await query.answer()
                 await self._vision_menu(query.message, user=user, query=query)
                 return None
@@ -239,26 +368,27 @@ class NavigationHandlers:
             if section_key not in sections:
                 await self._navigation_stale(query)
                 return None
+            self.nova_companion_invalidate_status_receipt_exact(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_receipt=status_receipt,
+            )
             await query.answer()
+            await self.nova_clear_current(update)
             section = sections[section_key]
             await self._edit_or_send(
                 query,
                 f"{section.emoji} {section.label}\n\n{section.description}",
-                self._section_keyboard(section_key),
+                self._section_keyboard(section_key, user.access_tier),
             )
             return None
         if data.startswith("nav:help:"):
             topic_key = data.removeprefix("nav:help:")
             topic_key = _LEGACY_HELP_ALIASES.get(topic_key, topic_key)
-            topic = topics.get(topic_key)
-            if topic is None:
-                await self._navigation_stale(query)
-                return None
-            await query.answer()
-            await self._edit_or_send(
-                query,
-                f"{topic[0]}\n\n{topic[1]}",
-                self._back_keyboard(self._help_back_target(topic_key)),
+            await self.nova_navigation_help_callback(
+                update,
+                context,
+                topic_key=topic_key,
             )
             return None
         if data.startswith("nav:action:"):
@@ -272,11 +402,22 @@ class NavigationHandlers:
             }:
                 await self._navigation_stale(query)
                 return None
+            await self.nova_clear_current(update)
             if action_key == "vision":
+                self.nova_companion_invalidate_status_receipt_exact(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    expected_receipt=status_receipt,
+                )
                 await query.answer()
                 await self._vision_menu(query.message, user=user, query=query)
                 return None
             if action_key == "task_reminder_guide":
+                self.nova_companion_invalidate_status_receipt_exact(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    expected_receipt=status_receipt,
+                )
                 await query.answer()
                 topic = topics["tasks_section"]
                 await self._edit_or_send(
@@ -286,6 +427,11 @@ class NavigationHandlers:
                 )
                 return None
             if action_key == "doctor_task_guide":
+                self.nova_companion_invalidate_status_receipt_exact(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    expected_receipt=status_receipt,
+                )
                 await query.answer()
                 topic = topics["health_section"]
                 await self._edit_or_send(
@@ -294,6 +440,38 @@ class NavigationHandlers:
                     self._back_keyboard("nav:section:health"),
                 )
                 return None
+            if action_key == "weekly_review":
+                async with self._reminder_launch_lock:
+                    if await self.reminder_blocks_navigation(update):
+                        reminder_owns = True
+                    else:
+                        reminder_owns = False
+                        self.nova_companion_invalidate_status_receipt_exact(
+                            update.effective_user.id,
+                            update.effective_chat.id,
+                            expected_receipt=status_receipt,
+                        )
+                        await query.answer()
+                        screen = _CallbackScreenMessage(
+                            self,
+                            query,
+                            self._back_keyboard(self._section_for_action(action_key)),
+                        )
+                        original_args = getattr(context, "args", None)
+                        context.args = []
+                        try:
+                            await self.week_command(_ScreenUpdate(update, screen), context)
+                        finally:
+                            context.args = original_args or []
+                if reminder_owns:
+                    await query.answer()
+                    await self.reminder_public_command_gate(update, context)
+                return None
+            self.nova_companion_invalidate_status_receipt_exact(
+                update.effective_user.id,
+                update.effective_chat.id,
+                expected_receipt=status_receipt,
+            )
             await query.answer()
             screen = _CallbackScreenMessage(
                 self,
@@ -319,6 +497,10 @@ class NavigationHandlers:
     async def navigation_health_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int | None:
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
@@ -326,7 +508,18 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        if await self.nova_memory_blocks_navigation(update):
+            await update.callback_query.answer()
+            await self.nova_memory_public_command_gate(update, context)
+            return None
+        await self.nova_memory_clear_current(update)
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:health")
         )
@@ -335,6 +528,10 @@ class NavigationHandlers:
     async def navigation_evening_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int | None:
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
@@ -342,7 +539,18 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        if await self.nova_memory_blocks_navigation(update):
+            await update.callback_query.answer()
+            await self.nova_memory_public_command_gate(update, context)
+            return None
+        await self.nova_memory_clear_current(update)
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:today")
         )
@@ -351,6 +559,10 @@ class NavigationHandlers:
     async def navigation_doctor_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int | None:
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
@@ -358,7 +570,18 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        if await self.nova_memory_blocks_navigation(update):
+            await update.callback_query.answer()
+            await self.nova_memory_public_command_gate(update, context)
+            return None
+        await self.nova_memory_clear_current(update)
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:health")
         )
@@ -367,6 +590,10 @@ class NavigationHandlers:
     async def navigation_onboarding_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int | None:
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         flow = await self._active_navigation_flow(update, context)
         if flow is not None:
             await update.callback_query.answer()
@@ -374,7 +601,18 @@ class NavigationHandlers:
                 update.callback_query.message, update, flow, query=update.callback_query
             )
             return None
+        if await self.nova_memory_blocks_navigation(update):
+            await update.callback_query.answer()
+            await self.nova_memory_public_command_gate(update, context)
+            return None
+        await self.nova_memory_clear_current(update)
+        await self.nova_clear_current(update)
         await update.callback_query.answer()
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
         screen = _CallbackScreenMessage(
             self, update.callback_query, self._back_keyboard("nav:section:settings")
         )
@@ -384,6 +622,10 @@ class NavigationHandlers:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int | None:
         query = update.callback_query
+        status_receipt = self.nova_companion_status_receipt_anchor(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
         parts = (query.data or "").split(":")
         if len(parts) != 4 or parts[2] not in {"continue", "exit"}:
             await self._navigation_stale(query)
@@ -398,7 +640,13 @@ class NavigationHandlers:
         if current != capability.flow:
             await self._navigation_stale(query)
             return None
+        await self.nova_memory_clear_current(update)
         await query.answer()
+        self.nova_companion_invalidate_status_receipt_exact(
+            update.effective_user.id,
+            update.effective_chat.id,
+            expected_receipt=status_receipt,
+        )
         if parts[2] == "continue":
             instruction = (
                 "Отправь выбранное фото или нажми «Отмена» в сообщении загрузки."
@@ -430,10 +678,11 @@ class NavigationHandlers:
             return None
 
         await self._clear_navigation_flow(update, context, current)
+        user = await self._user(update.effective_user.id)
         await self._edit_or_send(
             query,
             "Главное меню\n\nЧто хочешь сделать?",
-            self._root_keyboard(),
+            self._root_keyboard(user.access_tier),
         )
         return ConversationHandler.END
 
@@ -462,6 +711,16 @@ class NavigationHandlers:
         ):
             if key in context.user_data:
                 return name
+        conversation = await self.conversation.get(
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        if conversation.system_pending_action:
+            return "system_action"
+        if conversation.pending_date_options:
+            return "date_choice"
+        if conversation.pending_action or conversation.focused_draft_id:
+            return "draft_action"
         if (
             self._workspace_enabled()
             and await self.workspace_service.pending_input(user.id, update.effective_chat.id)
@@ -485,6 +744,21 @@ class NavigationHandlers:
             return "vision_image"
         if await self.vision_service.draft(user.id, update.effective_chat.id) is not None:
             return "vision"
+        if (
+            await self.draft_service.editing(
+                update.effective_user.id,
+                update.effective_chat.id,
+            )
+            is not None
+        ):
+            return "draft_edit"
+        if await self.task_service.pending_input(user.id, update.effective_chat.id) is not None:
+            return "task_edit"
+        if (
+            await self.collection_service.pending_input(user.id, update.effective_chat.id)
+            is not None
+        ):
+            return "collection_input"
         if self._knowledge_capture_enabled():
             capture = await self.knowledge_service.capture_state(user.id, update.effective_chat.id)
             if capture.preview is not None:
@@ -545,6 +819,55 @@ class NavigationHandlers:
                         state.preview.draft_public_id,
                         state.preview.version,
                     )
+            elif flow == "task_edit":
+                await self.task_service.cancel_pending_input(user.id, update.effective_chat.id)
+            elif flow == "collection_input":
+                await self.collection_service.cancel_input(user.id, update.effective_chat.id)
+            elif flow == "draft_edit":
+                await self.conversation.clear_focus(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                await self.conversation.clear_system_action(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                discarded = await self.draft_service.cancel_editing(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                if discarded:
+                    await self.conversation.set_active_draft(
+                        update.effective_user.id,
+                        update.effective_chat.id,
+                        None,
+                    )
+            elif flow == "date_choice":
+                await self.conversation.set_date_conflict(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                    [],
+                )
+            elif flow == "draft_action":
+                await self.conversation.clear_focus(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+            elif flow == "system_action":
+                snapshot = await self.conversation.get(
+                    update.effective_user.id,
+                    update.effective_chat.id,
+                )
+                if snapshot.system_action_version is not None:
+                    await self.conversation.clear_system_action(
+                        update.effective_user.id,
+                        update.effective_chat.id,
+                        expected_version=snapshot.system_action_version,
+                    )
+
+    @staticmethod
+    def _nova_flow_label(flow: str) -> str:
+        return FLOW_LABELS.get(flow, "текущий шаг")
 
     async def _prompt_navigation_flow(
         self,
@@ -656,24 +979,61 @@ class NavigationHandlers:
             )
         )
 
-    async def _send_navigation_root(self, message: Any) -> None:
+    async def _send_navigation_root(self, message: Any, *, tier: str | None = None) -> None:
         await message.reply_text(
             "Главное меню\n\nЧто хочешь сделать?",
-            reply_markup=self._root_keyboard(),
+            reply_markup=self._root_keyboard(tier),
         )
 
-    async def _send_navigation_section(self, message: Any, section_key: str) -> None:
+    async def _send_after_reply_keyboard_cleanup(
+        self,
+        message: Any,
+        text: str,
+        markup: InlineKeyboardMarkup,
+    ) -> None:
+        sent = await self._weekly_review_send_keyboard_cleanup(message, text, None)
+        if sent is None:
+            return
+        try:
+            await sent.edit_text(text, reply_markup=markup)
+        except asyncio.CancelledError:
+            raise
+        except TelegramError as exc:
+            if not self._message_not_modified(exc):
+                logger.warning(
+                    "Navigation keyboard cleanup failed operation=edit error_type=%s",
+                    type(exc).__name__,
+                )
+        except (TypeError, AttributeError) as exc:
+            logger.warning(
+                "Navigation keyboard cleanup failed operation=edit error_type=%s",
+                type(exc).__name__,
+            )
+
+    async def _send_navigation_section(
+        self,
+        message: Any,
+        section_key: str,
+        *,
+        tier: str | None = None,
+    ) -> None:
+        sender = getattr(message, "from_user", None)
+        telegram_id = getattr(sender, "id", None)
+        if tier is None and isinstance(telegram_id, int) and telegram_id > 0:
+            tier = (await self._user(telegram_id)).access_tier
+        weekly_available = self.weekly_review_available_for_tier(tier)
         section = navigation_sections(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            weekly_available,
         )[section_key]
         await message.reply_text(
             f"{section.emoji} {section.label}\n\n{section.description}",
-            reply_markup=self._section_keyboard(section_key),
+            reply_markup=self._section_keyboard(section_key, tier),
         )
 
-    def _root_keyboard(self) -> InlineKeyboardMarkup:
+    def _root_keyboard(self, tier: str | None = None) -> InlineKeyboardMarkup:
         rows = [
             [
                 InlineKeyboardButton("🌱 Сегодня", callback_data="nav:section:today"),
@@ -689,24 +1049,44 @@ class NavigationHandlers:
                     callback_data="nav:section:vision",
                 )
             ],
-            [
-                InlineKeyboardButton("🗂 Мои разделы", callback_data="nav:section:sections"),
-                InlineKeyboardButton("⚙️ Настройки", callback_data="nav:section:settings"),
-            ],
-            [InlineKeyboardButton("❓ Помощь", callback_data="nav:help")],
         ]
+        if tier is not None and self.nova_memory_available_for_tier(tier):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🧬 Моя Nova",
+                        callback_data="nav:nova-memory",
+                    )
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton("🗂 Мои разделы", callback_data="nav:section:sections"),
+                    InlineKeyboardButton("⚙️ Настройки", callback_data="nav:section:settings"),
+                ],
+                [InlineKeyboardButton("❓ Помощь", callback_data="nav:help")],
+            ]
+        )
         return InlineKeyboardMarkup(rows)
 
-    def _section_keyboard(self, section_key: str) -> InlineKeyboardMarkup:
+    def _section_keyboard(
+        self,
+        section_key: str,
+        tier: str | None = None,
+    ) -> InlineKeyboardMarkup:
+        weekly_available = self.weekly_review_available_for_tier(tier)
         sections = navigation_sections(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            weekly_available,
         )
         actions = navigation_actions(
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            weekly_available,
         )
         section = sections[section_key]
         label_overrides = {
@@ -771,6 +1151,7 @@ class NavigationHandlers:
             self._workspace_enabled(),
             self._knowledge_hub_enabled(),
             self._knowledge_capture_enabled(),
+            True,
         ).values():
             if action_key in section.actions:
                 return f"nav:section:{section.key}"

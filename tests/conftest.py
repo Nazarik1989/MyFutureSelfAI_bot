@@ -4,7 +4,12 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 
+from future_self.ai import validate_nova_companion_response
 from future_self.db import Database
+from future_self.nova_brain import NovaBrainProjection
+from future_self.nova_companion import NovaCompanionContextProjection
+from future_self.nova_companion_flow import NovaCompanionDiscourseAnchor
+from future_self.nova_memory_application import NovaMemoryProjection
 from future_self.schemas import (
     AssistantAnswer,
     GoalProposal,
@@ -12,12 +17,16 @@ from future_self.schemas import (
     GuestFirstStep,
     GuestThoughtBreakdown,
     IntentResult,
+    NovaCompanionProviderResponse,
+    NovaCompanionResponse,
     ParsedThought,
+    ReminderTimezoneResolution,
     RoutineProposal,
     RoutineProposals,
     TimezoneResolution,
     TodayPlan,
     VisionSummary,
+    WeeklyReviewExtraction,
 )
 
 
@@ -26,8 +35,39 @@ class FakeAI:
         self.last_today_context: dict[str, object] | None = None
         self.route_calls: list[tuple[str, dict[str, str]]] = []
         self.conversation_contexts: list[dict[str, object]] = []
+        self.answer_calls: list[tuple[str, dict[str, str]]] = []
+        self.answer_conversation_contexts: list[dict[str, object]] = []
+        self.answer_confirmed_memory_calls: list[NovaMemoryProjection | None] = []
+        self.answer_error: BaseException | None = None
+        self.answer_started = asyncio.Event()
+        self.answer_release = asyncio.Event()
+        self.answer_release.set()
+        self.companion_calls: list[tuple[str, dict[str, str], NovaCompanionContextProjection]] = []
+        self.companion_discourse_calls: list[NovaCompanionDiscourseAnchor | None] = []
+        self.companion_brain_calls: list[NovaBrainProjection | None] = []
+        self.companion_result = NovaCompanionResponse(
+            answer="Я рядом. Расскажи, что сейчас для тебя важно."
+        )
+        self.companion_provider_result: NovaCompanionProviderResponse | None = None
+        self.companion_provider_raw_result: object | None = None
+        self.companion_error: BaseException | None = None
+        self.companion_started = asyncio.Event()
+        self.companion_release = asyncio.Event()
+        self.companion_release.set()
         self.timezone_calls: list[str] = []
         self.timezone_results: dict[str, TimezoneResolution] = {}
+        self.reminder_timezone_calls: list[str] = []
+        self.reminder_timezone_results: dict[str, ReminderTimezoneResolution] = {}
+        self.reminder_timezone_error: BaseException | None = None
+        self.reminder_timezone_started = asyncio.Event()
+        self.reminder_timezone_release = asyncio.Event()
+        self.reminder_timezone_release.set()
+        self.weekly_review_calls: list[tuple[str, dict[str, str]]] = []
+        self.weekly_review_result = WeeklyReviewExtraction(focus="Спокойный фокус недели")
+        self.weekly_review_error: BaseException | None = None
+        self.weekly_review_started = asyncio.Event()
+        self.weekly_review_release = asyncio.Event()
+        self.weekly_review_release.set()
         self.guest_thought_calls = 0
         self.guest_first_step_calls = 0
         self.guest_thought_result = GuestThoughtBreakdown(
@@ -65,6 +105,32 @@ class FakeAI:
             location_text,
             TimezoneResolution(timezone=None, city=None, country=None, ambiguous=True),
         )
+
+    async def resolve_reminder_timezone(
+        self,
+        timezone_fragment: str,
+    ) -> ReminderTimezoneResolution:
+        self.reminder_timezone_calls.append(timezone_fragment)
+        self.reminder_timezone_started.set()
+        await self.reminder_timezone_release.wait()
+        if self.reminder_timezone_error is not None:
+            raise self.reminder_timezone_error
+        return self.reminder_timezone_results.get(
+            timezone_fragment,
+            ReminderTimezoneResolution(status="insufficient"),
+        )
+
+    async def extract_weekly_review(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+    ) -> WeeklyReviewExtraction:
+        self.weekly_review_calls.append((text, temporal_context))
+        self.weekly_review_started.set()
+        await self.weekly_review_release.wait()
+        if self.weekly_review_error is not None:
+            raise self.weekly_review_error
+        return self.weekly_review_result.model_copy(deep=True)
 
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals:
         return GoalProposals(
@@ -199,8 +265,49 @@ class FakeAI:
         text: str,
         temporal_context: dict[str, str],
         conversation_context: dict[str, object] | None = None,
+        *,
+        confirmed_memory: NovaMemoryProjection | None = None,
     ) -> AssistantAnswer:
+        self.answer_calls.append((text, temporal_context))
+        self.answer_conversation_contexts.append(conversation_context or {})
+        self.answer_confirmed_memory_calls.append(confirmed_memory)
+        self.answer_started.set()
+        await self.answer_release.wait()
+        if self.answer_error is not None:
+            raise self.answer_error
         return AssistantAnswer(answer=f"Ответ на: {text}")
+
+    async def companion_message(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+        companion_context: NovaCompanionContextProjection,
+        *,
+        discourse_anchor: NovaCompanionDiscourseAnchor | None = None,
+        brain_context: NovaBrainProjection | None = None,
+    ) -> NovaCompanionResponse:
+        self.companion_calls.append((text, dict(temporal_context), companion_context))
+        self.companion_discourse_calls.append(discourse_anchor)
+        self.companion_brain_calls.append(brain_context)
+        self.companion_started.set()
+        await self.companion_release.wait()
+        if self.companion_error is not None:
+            raise self.companion_error
+        if self.companion_provider_raw_result is not None:
+            return validate_nova_companion_response(
+                text,
+                self.companion_provider_raw_result,
+                companion_context,
+                brain_enabled=brain_context is not None,
+            )
+        if self.companion_provider_result is not None:
+            return validate_nova_companion_response(
+                text,
+                self.companion_provider_result.model_copy(deep=True),
+                companion_context,
+                brain_enabled=brain_context is not None,
+            )
+        return self.companion_result.model_copy(deep=True)
 
 
 @pytest.fixture

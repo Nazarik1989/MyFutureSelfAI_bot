@@ -60,6 +60,56 @@ def test_future_domains_are_disabled_and_approved_defaults_are_fixed() -> None:
     assert configured.knowledge_runner_concurrency == 1
     assert configured.knowledge_external_processing_requires_consent is True
     assert configured.knowledge_default_apply_mode == "brief_reminder"
+    assert configured.recurring_task_reminder_grace_minutes == 120
+    assert configured.enable_nova_memory is False
+    assert configured.nova_memory_admin_only is True
+    assert configured.enable_nova_memory_application is False
+    assert configured.nova_memory_application_admin_only is True
+    assert configured.nova_memory_max_items == 100
+    assert configured.enable_nova_companion is False
+    assert configured.nova_companion_admin_only is True
+    assert configured.enable_nova_conversation_brain is False
+    assert configured.nova_conversation_brain_admin_only is True
+    assert configured.nova_conversation_brain_max_memories == 100
+    assert configured.nova_conversation_brain_retrieval_items == 6
+    assert configured.nova_conversation_brain_context_bytes == 8192
+    assert configured.enable_weekly_review is True
+    assert configured.weekly_review_admin_only is True
+
+
+def test_nova_memory_gates_are_independent_and_item_limit_is_bounded() -> None:
+    crud_only = settings(enable_nova_memory=True)
+    assert crud_only.enable_nova_memory is True
+    assert crud_only.enable_nova_memory_application is False
+
+    application_only = settings(enable_nova_memory_application=True)
+    assert application_only.enable_nova_memory is False
+    assert application_only.enable_nova_memory_application is True
+
+    for value in (0, 101):
+        with pytest.raises(ValidationError):
+            settings(nova_memory_max_items=value)
+
+
+def test_nova_conversation_brain_gate_is_independent_and_limits_are_bounded() -> None:
+    brain_only = settings(enable_nova_conversation_brain=True)
+    assert brain_only.enable_nova_conversation_brain is True
+    assert brain_only.enable_nova_companion is False
+    assert brain_only.nova_conversation_brain_admin_only is True
+    for field, values in {
+        "nova_conversation_brain_max_memories": (0, 501),
+        "nova_conversation_brain_retrieval_items": (0, 13),
+        "nova_conversation_brain_context_bytes": (1023, 32769),
+    }.items():
+        for value in values:
+            with pytest.raises(ValidationError):
+                settings(**{field: value})
+
+
+@pytest.mark.parametrize("value", [4, 361])
+def test_recurring_reminder_grace_window_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError):
+        settings(recurring_task_reminder_grace_minutes=value)
 
 
 def test_workspace_foundation_flag_is_independent_from_future_knowledge_flags() -> None:
@@ -304,12 +354,53 @@ def test_container_and_build_context_are_hardened() -> None:
         "/data/backups,readonly",
     ):
         assert control in runbook
+    for nova_memory_control in (
+        "--env ENABLE_NOVA_MEMORY=false",
+        "--env NOVA_MEMORY_ADMIN_ONLY=true",
+        "--env ENABLE_NOVA_MEMORY_APPLICATION=false",
+        "--env NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true",
+        "--env NOVA_MEMORY_MAX_ITEMS=100",
+    ):
+        assert nova_memory_control in runbook
+    for nova_companion_control in (
+        "--env ENABLE_NOVA_COMPANION=false",
+        "--env NOVA_COMPANION_ADMIN_ONLY=true",
+        "--env ENABLE_NOVA_CONVERSATION_BRAIN=false",
+        "--env NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true",
+        "--env NOVA_CONVERSATION_BRAIN_MAX_MEMORIES=100",
+        "--env NOVA_CONVERSATION_BRAIN_RETRIEVAL_ITEMS=6",
+        "--env NOVA_CONVERSATION_BRAIN_CONTEXT_BYTES=8192",
+    ):
+        assert nova_companion_control in runbook
+
+
+def test_stage_7c_memory_transparency_docs_are_explicit_and_retention_honest() -> None:
+    root = Path(__file__).resolve().parents[1]
+    guide = (root / "docs/NOVA_MEMORY_GUIDE.md").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    runbook = (root / "docs/operations/production-hardening.md").read_text(encoding="utf-8")
+    combined = "\n".join((guide, readme, runbook))
+    normalized = " ".join(combined.split())
+
+    for expected_text in (
+        "Персонализация AI-ответов: включена",
+        "NOVA_MEMORY_APPLICATION_ADMIN_ONLY",
+        "category",
+        "important",
+        "content",
+        "configured provider and account",
+    ):
+        assert expected_text in normalized
+    assert "Zero Data Retention" in normalized
+    assert "does not claim Zero Data Retention" in normalized
+    assert "Losing access preserves the records but stops their application" in normalized
+    assert "does not require the model to mention them" in normalized
 
 
 def test_pr24_adds_only_knowledge_ingestion_foundation_schema() -> None:
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
-    assert ScriptDirectory.from_config(config).get_current_head() == "20260806_0024"
+    assert ScriptDirectory.from_config(config).get_current_head() == "20260822_0028"
     model_source = (root / "src/future_self/models.py").read_text(encoding="utf-8")
     for access_model in (
         "Workspace",

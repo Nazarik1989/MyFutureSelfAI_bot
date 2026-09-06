@@ -10,7 +10,7 @@ from autotester.fakes import (
     FakeVoice,
     ScriptedTranscription,
 )
-from telegram import BotCommandScopeAllPrivateChats
+from telegram import BotCommandScopeAllPrivateChats, ReplyKeyboardRemove
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     ApplicationHandlerStop,
@@ -19,14 +19,13 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-from future_self.access import AccessService
+from future_self.access import ADMIN, AccessService
 from future_self.bot import EVENING_WORKED, FutureSelfBot
 from future_self.callback_ui import edit_callback_screen
 from future_self.config import Settings
 from future_self.navigation import (
     ACTIONS,
     ADVANCED_COMMANDS,
-    HELP_TOPIC_LABELS,
     HELP_TOPICS,
     LEGACY_ACTIONS,
     PUBLIC_COMMANDS,
@@ -41,14 +40,22 @@ from future_self.navigation import (
     public_commands,
     validate_catalog,
 )
+from future_self.nova_memory_flow import NovaMemoryFlowPhase
+from future_self.reminder_flow import ReminderFlowPhase
+from future_self.reminder_intent import ReminderScheduleKind, ReminderTimezoneSource
+from future_self.schemas import ParsedThought
 
 
-def settings() -> Settings:
+def settings(**overrides) -> Settings:
+    values = {
+        "_env_file": None,
+        "telegram_bot_token": "123456:test-token",
+        "ai_api_key": "test-key",
+        "database_url": "sqlite+aiosqlite:///:memory:",
+    }
+    values.update(overrides)
     return Settings(
-        _env_file=None,
-        telegram_bot_token="123456:test-token",
-        ai_api_key="test-key",
-        database_url="sqlite+aiosqlite:///:memory:",
+        **values,
     )
 
 
@@ -83,7 +90,9 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
     message = FakeMessage("/menu")
     await bot.menu_command(update_for(message), context())
     assert message.replies[-1]["text"] == "Главное меню\n\nЧто хочешь сделать?"
-    markup = message.replies[-1]["reply_markup"]
+    assert isinstance(message.replies[-1]["reply_markup"], ReplyKeyboardRemove)
+    assert message.edits[-1] == "Главное меню\n\nЧто хочешь сделать?"
+    markup = message.edit_kwargs[-1]["reply_markup"]
     assert [
         [(button.text, button.callback_data) for button in row] for row in markup.inline_keyboard
     ] == [
@@ -98,7 +107,12 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
     ]
 
     expected_section_labels = {
-        "today": ["Фокус на сегодня", "Задачи на сегодня", "Вечерний итог"],
+        "today": [
+            "Фокус на сегодня",
+            "🧭 Обзор недели",
+            "Задачи на сегодня",
+            "Вечерний итог",
+        ],
         "tasks": [
             "Создать задачу",
             "Сегодня",
@@ -127,7 +141,7 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
 
     for section_key, section in SECTIONS.items():
         section_message = FakeMessage()
-        await bot._send_navigation_section(section_message, section_key)
+        await bot._send_navigation_section(section_message, section_key, tier=ADMIN)
         section_markup = section_message.replies[-1]["reply_markup"]
         section_callbacks = [
             button.callback_data for row in section_markup.inline_keyboard for button in row
@@ -145,6 +159,7 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
         assert f"nav:help:{SECTION_HELP_TOPICS[section_key]}" in section_callbacks
         assert "nav:root" in section_callbacks
 
+    await AccessService(db).grant_subscriber(101, source="test")
     help_message = FakeMessage("/help")
     await bot.help_command(update_for(help_message), context())
     help_callbacks = [
@@ -153,14 +168,210 @@ async def test_menu_help_sections_and_catalog_are_complete_without_llm(db, fake_
         for button in row
     ]
     assert help_callbacks == [
-        *(f"nav:help:{key}" for key in ROOT_HELP_TOPIC_KEYS),
+        "nova:topic:quick",
+        "nova:topic:requests",
+        "nova:topic:examples",
+        "nova:topic:privacy",
         "nav:root",
     ]
     assert [
         button.text
         for row in help_message.replies[-1]["reply_markup"].inline_keyboard[:-1]
         for button in row
-    ] == [HELP_TOPIC_LABELS[key] for key in ROOT_HELP_TOPIC_KEYS]
+    ] == [
+        "🚀 Быстрый старт",
+        "🧭 Возможности",
+        "💬 Примеры вопросов",
+        "🔒 Данные и безопасность",
+    ]
+    assert fake_ai.route_calls == []
+
+
+async def test_help_fences_active_draft_edit_and_exit_cancels_that_edit(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 101
+    chat_id = 201
+    user = await bot._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    draft = await bot.draft_service.create(
+        user_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        source="text",
+        raw_text="PRIVATE_DRAFT_EDIT_SENTINEL",
+        parsed=ParsedThought(kind="note", title="Черновик"),
+    )
+    assert (await bot.draft_service.begin_edit(draft.id, draft.version, telegram_id, chat_id)).ok
+
+    message = FakeMessage("/help")
+    update = update_for(message, user_id=telegram_id, chat_id=chat_id)
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_public_command_gate(update, context())
+
+    assert message.replies[-1]["text"].startswith("✨ Nova")
+    assert "редактирование черновика" in message.replies[-1]["text"]
+    assert await bot.draft_service.editing(telegram_id, chat_id) is not None
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+
+    exit_callback = callback_from(message, "nav:flow:exit:")
+    query = FakeCallbackQuery(exit_callback, message)
+    await bot.navigation_action(
+        update_for(message, user_id=telegram_id, chat_id=chat_id, query=query),
+        context(),
+    )
+    assert query.answers == [(None, False)]
+    assert await bot.draft_service.editing(telegram_id, chat_id) is None
+
+
+async def _seed_durable_navigation_flow(
+    bot: FutureSelfBot,
+    flow: str,
+    *,
+    telegram_id: int,
+    chat_id: int,
+) -> None:
+    user = await bot._user(telegram_id)
+    await AccessService(bot.db).grant_subscriber(telegram_id, source="test")
+    if flow == "date_choice":
+        await bot.conversation.set_date_conflict(
+            telegram_id,
+            chat_id,
+            [{"label": "завтра", "value": "2026-08-10"}],
+        )
+        return
+    if flow == "draft_action":
+        draft = await bot.draft_service.create(
+            user_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+            source="text",
+            raw_text="SYNTHETIC_DURABLE_FLOW_DRAFT",
+            parsed=ParsedThought(kind="note", title="Тестовый черновик"),
+        )
+        await bot.conversation.set_focus(
+            telegram_id,
+            chat_id,
+            draft.id,
+            draft.version,
+            "save",
+        )
+        return
+    assert flow == "system_action"
+    await bot.conversation.begin_system_action(
+        telegram_id,
+        chat_id,
+        "archive_overdue_tasks",
+        [{"id": 1, "title": "Тестовая задача"}],
+    )
+
+
+def _assert_durable_navigation_flow(snapshot, flow: str, *, active: bool) -> None:
+    if flow == "date_choice":
+        assert bool(snapshot.pending_date_options) is active
+    elif flow == "draft_action":
+        assert bool(snapshot.pending_action or snapshot.focused_draft_id) is active
+    else:
+        assert flow == "system_action"
+        assert bool(snapshot.system_pending_action) is active
+
+
+@pytest.mark.parametrize("flow", ["date_choice", "draft_action", "system_action"])
+@pytest.mark.parametrize("phrase", ["Помощь", "Nova, где календарь?"])
+async def test_durable_flow_input_is_not_stolen_by_natural_or_explicit_nova(
+    db,
+    fake_ai,
+    flow,
+    phrase,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 301
+    chat_id = 401
+    await _seed_durable_navigation_flow(
+        bot,
+        flow,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    message = FakeMessage(phrase)
+    ctx = context()
+
+    assert (
+        await bot.navigation_text_gate(
+            update_for(message, user_id=telegram_id, chat_id=chat_id),
+            ctx,
+        )
+        is None
+    )
+
+    snapshot = await bot.conversation.get(telegram_id, chat_id)
+    _assert_durable_navigation_flow(snapshot, flow, active=True)
+    assert message.reply_text_calls == 0
+    assert fake_ai.route_calls == []
+    user = await bot._user(telegram_id)
+    assert (
+        await bot.nova_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("flow", ["date_choice", "draft_action", "system_action"])
+async def test_help_fences_durable_flow_and_exit_clears_only_that_state(db, fake_ai, flow):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 302
+    chat_id = 402
+    await _seed_durable_navigation_flow(
+        bot,
+        flow,
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    ctx = context()
+    ctx.user_data["unrelated"] = "keep"
+    message = FakeMessage("/help")
+    update = update_for(message, user_id=telegram_id, chat_id=chat_id)
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_public_command_gate(update, ctx)
+
+    assert message.replies[-1]["text"].startswith("✨ Nova")
+    assert "Сейчас не завершён сценарий" in message.replies[-1]["text"]
+    markup = message.replies[-1]["reply_markup"]
+    assert [button.text for row in markup.inline_keyboard for button in row] == [
+        "▶️ Продолжить текущий шаг",
+        "🏠 Выйти в главное меню",
+    ]
+    before_exit = await bot.conversation.get(telegram_id, chat_id)
+    _assert_durable_navigation_flow(before_exit, flow, active=True)
+
+    exit_callback = callback_from(message, "nav:flow:exit:")
+    query = FakeCallbackQuery(exit_callback, message)
+    result = await bot.navigation_action(
+        update_for(
+            message,
+            user_id=telegram_id,
+            chat_id=chat_id,
+            query=query,
+        ),
+        ctx,
+    )
+
+    assert result == ConversationHandler.END
+    assert query.answers == [(None, False)]
+    assert query.edits[-1] == "Главное меню\n\nЧто хочешь сделать?"
+    after_exit = await bot.conversation.get(telegram_id, chat_id)
+    _assert_durable_navigation_flow(after_exit, flow, active=False)
+    assert ctx.user_data == {"unrelated": "keep"}
     assert fake_ai.route_calls == []
 
 
@@ -178,6 +389,9 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
     ]
     assert len(names) == len(set(names))
     assert len(ACTIONS) == len(set(ACTIONS))
+    assert "mynova" in ADVANCED_COMMANDS
+    assert "mynova" not in names
+    assert "week" in ADVANCED_COMMANDS
     used_actions = {action for section in SECTIONS.values() for action in section.actions}
     assert used_actions | LEGACY_ACTIONS == set(ACTIONS)
 
@@ -195,9 +409,227 @@ def test_catalog_has_no_dead_buttons_duplicates_or_sensitive_callback_data(fake_
         *(f"nav:help:{key}" for key in HELP_TOPICS),
         "nav:root",
         "nav:help",
+        "nav:nova-memory",
     ]
     assert all(len(value.encode()) <= 64 for value in callbacks)
     assert all(not any(char.isdigit() for char in value) for value in callbacks)
+
+
+async def test_nova_memory_root_entry_is_full_width_and_tier_feature_gated(db, fake_ai):
+    telegram_id = 410
+    chat_id = 510
+    bot = FutureSelfBot(
+        settings(enable_nova_memory=True, nova_memory_admin_only=True),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )
+    await bot._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+
+    subscriber_message = FakeMessage("/menu")
+    await bot.menu_command(
+        update_for(subscriber_message, user_id=telegram_id, chat_id=chat_id),
+        context(),
+    )
+    subscriber_rows = subscriber_message.edit_kwargs[-1]["reply_markup"].inline_keyboard
+    assert all(
+        button.callback_data != "nav:nova-memory" for row in subscriber_rows for button in row
+    )
+
+    await AccessService(db).grant_admin(telegram_id, source="test")
+    admin_message = FakeMessage("/menu")
+    await bot.menu_command(
+        update_for(admin_message, user_id=telegram_id, chat_id=chat_id),
+        context(),
+    )
+    admin_rows = admin_message.edit_kwargs[-1]["reply_markup"].inline_keyboard
+    assert [(button.text, button.callback_data) for button in admin_rows[3]] == [
+        ("🧬 Моя Nova", "nav:nova-memory")
+    ]
+    assert admin_rows[2][0].callback_data == "nav:section:vision"
+    assert {button.callback_data for button in admin_rows[4]} == {
+        "nav:section:sections",
+        "nav:section:settings",
+    }
+
+    subscriber_enabled = FutureSelfBot(
+        settings(enable_nova_memory=True, nova_memory_admin_only=False),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )._root_keyboard("subscriber")
+    assert [
+        button.callback_data
+        for row in subscriber_enabled.inline_keyboard
+        for button in row
+        if button.callback_data == "nav:nova-memory"
+    ] == ["nav:nova-memory"]
+
+
+async def test_nova_memory_navigation_callback_opens_bound_canonical_root(db, fake_ai):
+    telegram_id = 412
+    chat_id = 512
+    bot = FutureSelfBot(
+        settings(enable_nova_memory=True, nova_memory_admin_only=True),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )
+    user = await bot._user(telegram_id)
+    await AccessService(db).grant_admin(telegram_id, source="test")
+    message = FakeMessage()
+    query = FakeCallbackQuery("nav:nova-memory", message)
+
+    await bot.navigation_action(
+        update_for(message, user_id=telegram_id, chat_id=chat_id, query=query),
+        context(),
+    )
+
+    assert query.answers == [(None, False)]
+    assert query.edits[-1].startswith("🧬 Моя Nova")
+    current = await bot.nova_memory_sessions.current(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+    )
+    assert current is not None
+    assert current.canonical_message_id == message.message_id
+    assert current.phase.value == "root"
+
+
+async def test_nova_memory_text_routing_precedes_reminder_nova_and_natural(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    calls: list[str] = []
+
+    async def memory_gate(*_args, **_kwargs):
+        calls.append("memory")
+        return True
+
+    async def forbidden_gate(*_args, **_kwargs):
+        raise AssertionError("downstream router must not run")
+
+    monkeypatch.setattr(bot, "nova_memory_text_gate", memory_gate)
+    monkeypatch.setattr(bot, "reminder_text_gate", forbidden_gate)
+    monkeypatch.setattr(bot, "nova_text_gate", forbidden_gate)
+    message = FakeMessage("Nova, запомни: synthetic preference")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(update_for(message), context())
+
+    assert calls == ["memory"]
+    assert fake_ai.route_calls == []
+
+
+async def test_mynova_command_bypasses_memory_prompt_for_canonical_recovery(
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+
+    async def forbidden_memory_prompt(*_args, **_kwargs):
+        raise AssertionError("/mynova must reach its recovery command handler")
+
+    monkeypatch.setattr(
+        bot,
+        "nova_memory_public_command_gate",
+        forbidden_memory_prompt,
+    )
+    message = FakeMessage("/mynova")
+
+    assert await bot.navigation_public_command_gate(update_for(message), context()) is None
+
+
+async def test_explicit_nova_memory_input_cannot_steal_active_durable_flow(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 411
+    chat_id = 511
+    await _seed_durable_navigation_flow(
+        bot,
+        "date_choice",
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    user = await bot._user(telegram_id)
+    await bot.nova_memory_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        tier=user.access_tier,
+        access_version=user.access_version,
+        canonical_message_id=612,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+    message = FakeMessage("Nova, запомни: synthetic preference")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.navigation_text_gate(
+            update_for(message, user_id=telegram_id, chat_id=chat_id),
+            context(),
+        )
+
+    assert message.replies[-1]["text"].startswith("Сейчас не завершён сценарий")
+    assert callback_from(message, "nav:flow:continue:").startswith("nav:flow:continue:")
+    snapshot = await bot.conversation.get(telegram_id, chat_id)
+    assert snapshot.pending_date_options
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+    assert fake_ai.route_calls == []
+
+
+async def test_active_durable_flow_clears_memory_before_accepting_ordinary_input(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    telegram_id = 413
+    chat_id = 513
+    await _seed_durable_navigation_flow(
+        bot,
+        "date_choice",
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+    )
+    user = await bot._user(telegram_id)
+    await bot.nova_memory_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        tier=user.access_tier,
+        access_version=user.access_version,
+        canonical_message_id=613,
+        phase=NovaMemoryFlowPhase.AWAITING_CREATE_CONTENT,
+    )
+
+    message = FakeMessage("завтра")
+    assert (
+        await bot.navigation_text_gate(
+            update_for(message, user_id=telegram_id, chat_id=chat_id),
+            context(),
+        )
+        is None
+    )
+
+    assert message.reply_text_calls == 0
+    assert (
+        await bot.nova_memory_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        is None
+    )
+    snapshot = await bot.conversation.get(telegram_id, chat_id)
+    assert snapshot.pending_date_options
+    assert fake_ai.route_calls == []
 
 
 def test_knowledge_catalog_is_flag_aware_and_capture_stays_advanced():
@@ -257,12 +689,18 @@ def test_help_is_detailed_flag_aware_and_telegram_safe():
     assert "Напомни через" not in disabled_text
     assert "голос" not in disabled_text.casefold()
     assert "отключена настройкой" in disabled["tasks_section"][1]
+    assert "разовых и ежедневных" in disabled["tasks_section"][1]
+    assert "каждый день" not in disabled["tasks_section"][1]
 
     enabled = help_topics(True, True, True, True, True)
     assert set(enabled) == set(HELP_TOPICS)
     assert "Совместными становятся" in enabled["privacy"][1]
     assert "База знаний" in enabled["privacy"][1]
     assert "текстом или голосом" in enabled["records_section"][1]
+    assert "каждый день" in enabled["tasks_section"][1]
+    assert "изменить время" in enabled["tasks_section"][1]
+    assert "отключить ежедневное" in enabled["tasks_section"][1]
+    assert "ежедневные напоминания" in ACTIONS["task_reminder_guide"].description
     assert all(len(f"{title}\n\n{text}") < 4096 for title, text in enabled.values())
     assert all(len(f"nav:help:{key}".encode()) <= 64 for key in enabled)
 
@@ -415,7 +853,7 @@ def test_short_explicit_unknown_navigation_is_help_but_long_narrative_is_not(db,
         ("Где мои записи?", "📝 Записи", "nav:action:inbox"),
         ("Как найти врача?", "❤️ Здоровье", "nav:action:doctor_find"),
         ("Как изменить часовой пояс?", "⚙️ Настройки", "nav:action:timezone"),
-        ("Где календарь?", "❓ Помощь", "nav:help:quick"),
+        ("Где календарь?", "✨ Nova", "nova:topic:quick"),
     ],
 )
 async def test_natural_text_gate_renders_screen_and_stops_content_pipeline(
@@ -742,7 +1180,9 @@ async def test_start_after_onboarding_offers_main_menu_without_llm(db, fake_ai):
     message = FakeMessage("/start")
     result = await bot.start(update_for(message, user_id=777), context())
     assert result == ConversationHandler.END
-    assert callback_from(message, "nav:root") == "nav:root"
+    assert isinstance(message.replies[-1]["reply_markup"], ReplyKeyboardRemove)
+    markup = message.edit_kwargs[-1]["reply_markup"]
+    assert markup.inline_keyboard[0][0].callback_data == "nav:root"
     assert fake_ai.route_calls == []
 
 
@@ -772,3 +1212,70 @@ async def test_evening_reflection_starts_from_main_menu_button(db, fake_ai):
     assert blocked_context.user_data["health_checkin"] == {"energy": 4}
     assert "evening" not in blocked_context.user_data
     assert callback_from(blocked_message, "nav:flow:continue:").startswith("nav:flow:continue:")
+
+
+async def test_direct_weekly_navigation_preserves_active_reminder_canonical_and_answers_once(
+    db,
+    fake_ai,
+):
+    telegram_id = 718_001
+    chat_id = 718_101
+    bot = FutureSelfBot(
+        settings(
+            enable_weekly_review=True,
+            weekly_review_admin_only=False,
+        ),
+        db,
+        fake_ai,
+        ScriptedTranscription(),
+    )
+    await bot._user(telegram_id)
+    await AccessService(db).grant_subscriber(telegram_id, source="test")
+    user = await bot._user(telegram_id)
+    canonical = FakeMessage()
+    reminder = await bot.reminder_sessions.create(
+        owner_id=user.id,
+        telegram_user_id=telegram_id,
+        chat_id=chat_id,
+        access_version=user.access_version,
+        title="Позвонить врачу",
+        schedule_kind=ReminderScheduleKind.ONCE,
+        local_date=None,
+        local_time=None,
+        timezone=user.timezone,
+        timezone_source=ReminderTimezoneSource.PROFILE,
+        phase=ReminderFlowPhase.WHEN,
+        canonical_message_id=canonical.message_id,
+    )
+    query = FakeCallbackQuery("nav:action:weekly_review", canonical)
+
+    await bot.navigation_action(
+        update_for(
+            canonical,
+            user_id=telegram_id,
+            chat_id=chat_id,
+            query=query,
+        ),
+        context(),
+    )
+
+    assert query.answers == [(None, False)]
+    assert query.edits == []
+    assert canonical.reply_text_calls == 0
+    assert canonical.edits == ["🔔 Когда напомнить?"]
+    assert (
+        await bot.reminder_sessions.current(
+            owner_id=user.id,
+            telegram_user_id=telegram_id,
+            chat_id=chat_id,
+        )
+        == reminder
+    )
+    assert (
+        await bot.weekly_review_service.current_session(
+            telegram_actor_id=telegram_id,
+            chat_id=chat_id,
+            expected_access_version=user.access_version,
+        )
+    ).session is None
+    assert fake_ai.weekly_review_calls == []

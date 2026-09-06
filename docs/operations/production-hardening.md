@@ -57,7 +57,7 @@ offsite retention and secret rotation remain host-operator responsibilities.
    override it with a local process/SQLite check compatible with the retained revision:
 
    ```bash
-   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\",\"20260805_0023\",\"20260806_0024\"} else 1)'" \
+   --health-cmd "python -c 'import os,sqlite3;os.kill(1,0);c=sqlite3.connect(\"file:/data/future_self.db?mode=ro\",uri=True,timeout=5);ok=c.execute(\"PRAGMA quick_check\").fetchone()[0]==\"ok\";rev=c.execute(\"SELECT version_num FROM alembic_version\").fetchone()[0];c.close();raise SystemExit(0 if ok and rev in {\"20260722_0018\",\"20260722_0019\",\"20260725_0020\",\"20260731_0021\",\"20260731_0022\",\"20260805_0023\",\"20260806_0024\",\"20260810_0025\",\"20260811_0026\",\"20260817_0027\"} else 1)'" \
    --health-interval=60s --health-timeout=20s --health-start-period=30s \
    --health-retries=3
    ```
@@ -100,6 +100,18 @@ docker run -d \
   --env ENABLE_COUNCIL=false \
   --env ENABLE_SCHEDULED_COUNCIL=false \
   --env ENABLE_KNOWLEDGE_EXPORT=false \
+  --env ENABLE_NOVA_COMPANION=false \
+  --env NOVA_COMPANION_ADMIN_ONLY=true \
+  --env ENABLE_NOVA_CONVERSATION_BRAIN=false \
+  --env NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true \
+  --env NOVA_CONVERSATION_BRAIN_MAX_MEMORIES=100 \
+  --env NOVA_CONVERSATION_BRAIN_RETRIEVAL_ITEMS=6 \
+  --env NOVA_CONVERSATION_BRAIN_CONTEXT_BYTES=8192 \
+  --env ENABLE_NOVA_MEMORY=false \
+  --env NOVA_MEMORY_ADMIN_ONLY=true \
+  --env ENABLE_NOVA_MEMORY_APPLICATION=false \
+  --env NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true \
+  --env NOVA_MEMORY_MAX_ITEMS=100 \
   --mount type=bind,src=/opt/myfutureselfai/data,dst=/data \
   --mount type=bind,src=/opt/myfutureselfai/data/backups,dst=/data/backups,readonly \
   myfutureselfai-bot:<FINAL_SHA>
@@ -146,6 +158,74 @@ files stay root-owned `0700/0600`.
   the `trashed` lifecycle. If it is non-empty, keep the lifecycle-aware image or restore the
   rows explicitly before rollback; migration `20260725_0020` intentionally refuses to
   downgrade while recoverable trash exists.
+
+## Stage 8B.1 Nova Companion pilot
+
+Keep `ENABLE_NOVA_COMPANION=false` and `NOVA_COMPANION_ADMIN_ONLY=true` in the
+baseline deployment. The first flag is the independent kill switch; when it is enabled,
+the second limits conversation-first routing to the `admin` tier. Disabled or ineligible
+actors remain on the existing routing path.
+
+Companion answers may use a bounded owner-scoped projection of confirmed profile, Vision,
+goals, current weekly focus, confirmed Nova Memory and recent conversation data. Treat all
+projected values as untrusted user data. Never include Telegram/database identifiers,
+access metadata, drafts, callback tokens or unrelated Knowledge/health/lab content. The
+provider may return at most one grounded capture suggestion and must never mutate data.
+Only an explicit suggestion callback may create the existing draft preview; the existing
+separate save confirmation remains the sole final-write path. Do not log user content or
+callback payloads. Provider retention depends on the selected provider and account.
+
+## Stage 7A–7C Nova memory and conversation retention
+
+Stage 7A is the data/domain foundation. Stage 7B.1 adds the separately reviewed Telegram
+CRUD flow. Stage 7C adds separately gated application to final conversational/question AI
+answers. Keep both `NOVA_MEMORY_ADMIN_ONLY=true` and
+`NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true` for an admin-only pilot. Enable application only
+after `ENABLE_NOVA_MEMORY=true`; `ENABLE_NOVA_MEMORY_APPLICATION=true` alone is not an
+authorization path. Both flags and both applicable tier policies must pass for the current
+actor. `NOVA_MEMORY_MAX_ITEMS=100` is the hard storage ceiling. The UI creates memory only
+after an explicit preview and confirmation; it must not import conversation history,
+onboarding answers or Vision data automatically.
+
+The application kill switch is independent from CRUD so confirmed records can be
+managed without being injected into prompts. Root and help report the effective state as
+`Персонализация AI-ответов: включена` or `выключена`. Telegram tier `admin` never authorizes
+cross-user browsing or mutation. Item deletion removes content from the active database,
+but historical backups remain subject to the separate backup-retention policy and must
+not be described as immediately erased. Access loss preserves records while stopping
+application, and importance changes selection priority rather than retention. The bounded
+expired-conversation purge remains unwired; enabling memory CRUD/application does not
+register a periodic runtime job.
+
+Application is restricted to final `conversation`/`question` answers after the normal,
+memory-blind router. Never inject memory into classification, action selection, system or
+onboarding flows, reminders/timezone, Tasks, workspaces, collections, Knowledge, Vision,
+guest/image/health flows, or guided Nova help. The outbound projection is limited to 12
+whole records and 8 KiB of compact JSON. It contains only `category`, `important`, and
+`content`; no IDs, collection revision, fingerprint, timestamps, versions, or audit data
+may cross the provider boundary. Treat every content value as untrusted user data, never
+as system/developer/tool instructions.
+
+Snapshot, provider call, and Telegram delivery are fenced to the exact actor tier/access
+version and whole-collection revision. A lost fence discards the provider result without a
+retry. If Telegram already accepted it, delete that exact message or neutralize that same
+message if deletion fails. Do not retain DB transactions over provider or Telegram I/O,
+repeat provider calls, or log questions, answers, memory content, IDs, revisions, SQL,
+exception text, or provider bodies.
+
+The selected records are sent to the configured text AI provider. Provider retention and
+training behavior depend on the deployed provider, account, and contractual settings.
+Do not claim Zero Data Retention unless that exact provider/account configuration has been
+independently verified. Users must be directed to `🧬 Моя Nova` to inspect, edit, and
+delete active records; backup copies remain governed by the existing backup-retention
+policy.
+
+Migration downgrade from `20260811_0026` drops both `nova_memory_items` and
+`nova_memory_changes`, destroying Nova memory in the active database. An application or
+image rollback must therefore keep schema revision `20260811_0026`; rolling back an image
+must never run an automatic Alembic downgrade. Downgrade is permitted only while the bot
+is stopped and an explicit incident decision accepts the data loss, or as part of restoring
+a verified pre-`0026` backup.
 
 ## PR #24 Knowledge rollout gate
 
@@ -262,6 +342,22 @@ only then removes the exact marker inode. On an error it retains the marker, so 
 same command after the reported lease/state problem is resolved. Never remove the
 storage root or SQLite database.
 
+### Weekly review pilot and rollback (revision 0027)
+
+- Keep `ENABLE_WEEKLY_REVIEW=true` together with `WEEKLY_REVIEW_ADMIN_ONLY=true` for
+  the administrator-only pilot. `ENABLE_WEEKLY_REVIEW=false` is the full application
+  kill switch: no weekly UI, provider work, weekly-table reads/DML, recovery,
+  maintenance, proactive send, or weekly-focus application in `/today` is performed.
+- A manual review always targets the actor's current local Monday–Sunday cycle. A
+  scheduled review targets the next cycle; `WEEKLY_REVIEW_WEEKDAY` changes scheduling
+  time only and never moves a manual review to the next week.
+- Prefer a safe image/application rollback while preserving the additive schema at
+  Alembic revision `20260817_0027`. This keeps weekly focus, audit, and session data for
+  a later corrected rollout.
+- `alembic downgrade 20260811_0026` is destructive for Stage 8A: it drops the weekly
+  focus, audit, and durable session tables. Use it only on an isolated/restorable copy
+  after an explicit data-loss decision; never stamp the production database backward.
+
 ### Additive rollback after PR #24
 
 Stop the runner first and disable Hub/Capture/Runner. A retained prior image may run
@@ -270,3 +366,41 @@ described above and tested on an isolated snapshot. Keep revision `20260722_0019
 all assets. Do not downgrade or stamp the live database. Restore the coordinated
 pre-cutover DB+asset backup only when an explicit incident decision accepts losing all
 post-cutover Knowledge changes.
+## Stage 8C Nova conversation brain
+
+Stage 8C is controlled independently from the Stage 8B companion. The safe
+defaults are `ENABLE_NOVA_CONVERSATION_BRAIN=false` and
+`NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true`. Do not enable it merely because the
+Stage 8B companion is enabled. A rollout must explicitly verify the configured
+memory/item/byte limits and the database revision before changing either flag.
+
+The runtime uses SQLite as the source of truth for bounded native conversation,
+working state, and observed memory. Provider requests use `store=false`, one
+attempt, and no tools. No production migration or flag change is part of the
+implementation task; schema rollout follows the normal backed-up migration
+runbook only after release approval.
+
+With the brain flag off, or for a tier excluded by the brain pilot, runtime
+behaviour is the exact Stage 8B companion contract: ignore all state/memory
+proposals, preserve the answer and valid capture/reminder proposal, persist the
+normal two-message exchange, and perform zero brain-table DML.
+
+With the flag on, automatic observed memory is limited to server-parsed structured
+fields: an explicitly self-declared display name, grammatical form of address,
+and closed-enum Nova settings for response length (`short/normal/detailed`), tone
+(`calm/direct/supportive`) and reminder style (`gentle/direct/brief`). Arbitrary
+provider evidence is not a semantic source: the server must parse the whole
+current utterance after removing only bounded vocative/polite wrappers and final
+statement punctuation. Quotes, reported speech, questions, negation and mixed
+prefix/suffix text fail closed. Each owner has at most one active response length,
+tone, reminder style and merged identity record, enforced by a partial unique
+semantic-key index; provider supersedes hints have no replacement authority.
+Arbitrary free-text facts, preferences,
+orientations and themes are never eligible for
+automatic persistence; they stay in bounded conversation or go through the
+existing explicit Nova Memory confirmation flow. Observed memory is distinct
+from confirmed Nova Memory and cannot overwrite the profile. Operators can
+verify it through the bounded `Что ты обо мне помнишь?` summary; users remove an
+observation through the revision-fenced `Забудь …`
+confirmation. Confirmed Nova Memory keeps its existing explicit preview and
+confirmation lifecycle.

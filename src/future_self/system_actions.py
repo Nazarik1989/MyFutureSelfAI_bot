@@ -17,7 +17,7 @@ SystemAction = Literal[
 
 @dataclass(slots=True, frozen=True)
 class SystemActionRoute:
-    kind: Literal["none", "action", "confirm", "cancel", "pending", "clarify"]
+    kind: Literal["none", "action", "confirm", "cancel", "pending", "clarify", "negative"]
     action: SystemAction | None = None
 
 
@@ -202,8 +202,12 @@ class SystemActionRouter:
             index for index, token in enumerate(token_list) if token in self.DELETE_FORMS
         ]
         delete_mentioned = bool(delete_positions)
-        keep_requested = "оставь" in tokens and "не остав" not in normalized
-        negated_keep = "не остав" in normalized
+        negated_keep = self._has_adjacent_prefixed_sequence(
+            token_list,
+            "не",
+            ("остав",),
+        )
+        keep_requested = "оставь" in tokens and not negated_keep
         question_or_capture = delete_mentioned and self._is_question_or_capture(normalized)
         negated_delete = delete_mentioned and self._is_negated_delete(
             normalized, token_list, delete_positions
@@ -236,8 +240,16 @@ class SystemActionRouter:
         task_bulk_scope = all_requested or any(token in {"задачи", "задач"} for token in token_list)
         reminder_control_mentioned = (
             bool(tokens & self.REMINDER_DISABLE_FORMS)
-            or "не нуж" in normalized
-            or "не присыл" in normalized
+            or self._has_adjacent_prefixed_sequence(
+                token_list,
+                "не",
+                ("нужн", "присыл"),
+            )
+            or self._has_negated_modal_control(
+                token_list,
+                ("надо", "нужно"),
+                ("присыл",),
+            )
         )
         unsupported_reminder_cleanup = reminder_target and (
             delete_mentioned or reminder_control_mentioned
@@ -304,7 +316,11 @@ class SystemActionRouter:
             elif mentioned_target is not None and mentioned_target != current_target:
                 return SystemActionRoute(kind="cancel", action="cancel_system_action")
 
-            negated_confirmation = "не подтверж" in normalized
+            negated_confirmation = self._has_adjacent_prefixed_sequence(
+                token_list,
+                "не",
+                ("подтвержд",),
+            )
             if (
                 "отмена" in tokens
                 or "нет" in tokens
@@ -320,6 +336,8 @@ class SystemActionRouter:
             return SystemActionRoute(kind="pending")
         if question_or_capture:
             return SystemActionRoute(kind="none")
+        if negated_delete and self._is_direct_negative_noop(normalized):
+            return SystemActionRoute(kind="negative")
         if negated_delete or negated_keep:
             return SystemActionRoute(kind="clarify")
         if (
@@ -470,18 +488,9 @@ class SystemActionRouter:
     def _is_negated_delete(
         cls, normalized: str, tokens: list[str], delete_positions: list[int]
     ) -> bool:
-        negation_phrases = (
-            "не надо удал",
-            "не нужно удал",
-            "не хочу удал",
-            "не просил удал",
-            "не следует удал",
-            "не надо убир",
-            "не нужно убир",
-            "не надо очищ",
-            "не нужно очищ",
-        )
-        if any(phrase in normalized for phrase in negation_phrases):
+        modal_negations = {"надо", "нужно", "хочу", "просил", "следует"}
+        delete_prefixes = ("удал", "убир", "очищ", "стер")
+        if cls._has_negated_modal_control(tokens, tuple(modal_negations), delete_prefixes):
             return True
         if re.search(
             r"\bне\s+(?:планирую|планировал(?:а)?|собираюсь|собирался|собиралась|"
@@ -504,6 +513,17 @@ class SystemActionRouter:
             if (preceding and preceding[-1] == "не") or preceding == ["не", "да"]:
                 return True
         return False
+
+    @staticmethod
+    def _is_direct_negative_noop(normalized: str) -> bool:
+        return bool(
+            re.fullmatch(
+                r"(?:пожалуйста\s+)?не\s+(?:удаляй|удалите|убирай|убирайте|"
+                r"стирай|стирайте|очищай|очищайте)\s+"
+                r"(?:мои\s+)?(?:записи|задачи|заметки|идеи|черновики)[.!?]*",
+                normalized,
+            )
+        )
 
     @staticmethod
     def _has_excluded_stale_selector(normalized: str) -> bool:
@@ -552,6 +572,38 @@ class SystemActionRouter:
     @staticmethod
     def _contains(value: str, patterns: tuple[str, ...]) -> bool:
         return any(pattern in value for pattern in patterns)
+
+    @staticmethod
+    def _has_adjacent_prefixed_sequence(
+        tokens: list[str],
+        first: str,
+        following_prefixes: tuple[str, ...],
+    ) -> bool:
+        """Match grammatical neighbours, never character substrings across words.
+
+        Russian ``мне`` ends with the characters ``не``.  Treating normalized
+        text as an arbitrary substring therefore turns positive phrases such as
+        ``мне нужно`` into destructive negations.  All negative control markers
+        pass through this token boundary helper instead.
+        """
+
+        return any(
+            tokens[index] == first and tokens[index + 1].startswith(following_prefixes)
+            for index in range(max(0, len(tokens) - 1))
+        )
+
+    @staticmethod
+    def _has_negated_modal_control(
+        tokens: list[str],
+        modals: tuple[str, ...],
+        control_prefixes: tuple[str, ...],
+    ) -> bool:
+        return any(
+            tokens[index] == "не"
+            and tokens[index + 1] in modals
+            and any(token.startswith(control_prefixes) for token in tokens[index + 2 : index + 6])
+            for index in range(max(0, len(tokens) - 2))
+        )
 
     @staticmethod
     def _normalize(text: str) -> str:

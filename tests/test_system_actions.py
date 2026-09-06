@@ -82,6 +82,11 @@ def test_command_shaped_negated_cleanup_is_quarantined(phrase):
     assert (route.kind, route.action) == ("clarify", None)
 
 
+def test_direct_negative_delete_command_is_an_explicit_noop():
+    route = SystemActionRouter().route("Не удаляй мои записи", pending_action=None)
+    assert (route.kind, route.action) == ("negative", None)
+
+
 @pytest.mark.parametrize(
     "phrase",
     [
@@ -295,6 +300,57 @@ def test_cancel_words_are_token_matched_not_substrings(phrase):
     assert SystemActionRouter().route(phrase, pending_action="archive_overdue_tasks").kind == (
         "pending"
     )
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "да, но в том числе мне нужно напоминать о самом главном, чтобы в суете я не забывал курс, по которому я могу стать лучше",
+        "мне нужно напоминать о самом главном",
+        "мне присылай напоминания почаще",
+        "мне нужно напоминание",
+        "мне подтверждать удаление?",
+        "мне нужно удалить старый файл, но это не команда боту",
+    ],
+)
+def test_mne_prefix_never_collides_with_destructive_negation_tokens(phrase):
+    route = SystemActionRouter().route(phrase, pending_action=None)
+    assert (route.kind, route.action) == ("none", None)
+
+
+@pytest.mark.parametrize(
+    ("phrase", "pending", "expected"),
+    [
+        ("мне оставь только последнюю", None, ("action", "discard_selected_drafts")),
+        ("не оставь только последнюю", None, ("clarify", None)),
+        ("не нужно присылать старые напоминания", None, ("clarify", None)),
+        ("не надо больше присылать старые напоминания", None, ("clarify", None)),
+        ("мне не нужны старые напоминания", None, ("clarify", None)),
+        ("не присылай старые напоминания", None, ("clarify", None)),
+        ("больше не присылай старые напоминания", None, ("clarify", None)),
+        (
+            "не подтверждаю удаление",
+            "archive_overdue_tasks",
+            ("cancel", "cancel_system_action"),
+        ),
+        ("да, удалить", "archive_overdue_tasks", ("confirm", None)),
+    ],
+)
+def test_destructive_controls_require_real_adjacent_token_sequences(phrase, pending, expected):
+    route = SystemActionRouter().route(phrase, pending_action=pending)
+    assert (route.kind, route.action) == expected
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "не нужно больше удалять просроченные задачи",
+        "не надо сегодня удалять все старые черновики",
+    ],
+)
+def test_token_safe_modal_negation_remains_fail_closed_with_bounded_fillers(phrase):
+    route = SystemActionRouter().route(phrase, pending_action=None)
+    assert (route.kind, route.action) == ("clarify", None)
 
 
 @pytest.mark.parametrize("phrase", ["не подтверждаю удаление", "не да, удалить"])

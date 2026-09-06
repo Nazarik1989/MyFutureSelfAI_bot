@@ -1,9 +1,16 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 from sqlalchemy import select
 
 from future_self.inbox import InboxLifecycleService
-from future_self.models import InboxItem, TaskReminder, TaskState
+from future_self.models import (
+    InboxItem,
+    RecurringTaskReminderOccurrence,
+    RecurringTaskReminderSchedule,
+    TaskReminder,
+    TaskState,
+)
+from future_self.recurring_reminders import RecurringTaskReminderService
 from future_self.repositories import UserRepository
 
 
@@ -73,6 +80,19 @@ async def create_item(
         return item.id
 
 
+async def create_pending_daily_schedule(db, owner_id: int, item_id: int):
+    service = RecurringTaskReminderService(db)
+    created = await service.create_daily(
+        owner_id,
+        item_id,
+        time(18, 1),
+        now=datetime(2026, 8, 10, 15, tzinfo=UTC),
+    )
+    assert created.schedule is not None
+    await service.materialize_due(now=created.schedule.next_occurrence_at)
+    return created.schedule
+
+
 async def test_confirmed_snapshot_is_owner_scoped_and_contains_task_state(db):
     owner_id = await create_owner(db, 81001)
     other_id = await create_owner(db, 81002)
@@ -117,6 +137,7 @@ async def test_trash_and_restore_keep_task_status_and_leave_reminder_off(db):
         task_status="completed",
         reminder_status="sent",
     )
+    recurring = await create_pending_daily_schedule(db, owner_id, active_id)
     service = InboxLifecycleService(db)
 
     snapshot = await service.confirmed_snapshot(owner_id)
@@ -154,6 +175,12 @@ async def test_trash_and_restore_keep_task_status_and_leave_reminder_off(db):
                 )
             ).all()
         }
+        stored_schedule = await session.get(RecurringTaskReminderSchedule, recurring.id)
+        occurrence = await session.scalar(
+            select(RecurringTaskReminderOccurrence).where(
+                RecurringTaskReminderOccurrence.schedule_id == recurring.id
+            )
+        )
     assert all(item.status == "trashed" and item.version == 2 for item in items.values())
     assert all(item.pre_trash_status == "confirmed" for item in items.values())
     assert states[active_id].status == "active"
@@ -164,6 +191,8 @@ async def test_trash_and_restore_keep_task_status_and_leave_reminder_off(db):
     assert reminders[active_id].claimed_at is None
     assert reminders[active_id].next_attempt_at is None
     assert reminders[completed_id].status == "sent"
+    assert (stored_schedule.status, stored_schedule.version) == ("completed", 2)
+    assert occurrence.status == "cancelled"
 
     trashed = await service.trashed_snapshot(owner_id)
     restored = await service.restore_snapshot(owner_id, trashed)
@@ -186,6 +215,7 @@ async def test_trash_and_restore_keep_task_status_and_leave_reminder_off(db):
         reminder = await session.scalar(
             select(TaskReminder).where(TaskReminder.inbox_item_id == active_id)
         )
+        stored_schedule = await session.get(RecurringTaskReminderSchedule, recurring.id)
     assert all(
         item.status == "confirmed"
         and item.version == 3
@@ -196,6 +226,35 @@ async def test_trash_and_restore_keep_task_status_and_leave_reminder_off(db):
     assert {state.status for state in states} == {"active", "completed"}
     assert {state.version for state in states} == {3}
     assert reminder.status == "cancelled"
+    assert (stored_schedule.status, stored_schedule.version) == ("completed", 2)
+
+
+async def test_in_session_trash_terminalizes_daily_schedule_for_collection_callers(db):
+    owner_id = await create_owner(db, 81111)
+    task_id = await create_item(db, owner_id, "Р—Р°РґР°С‡Р° РёР· РєРѕР»Р»РµРєС†РёРё", kind="task")
+    recurring = await create_pending_daily_schedule(db, owner_id, task_id)
+    service = InboxLifecycleService(db)
+
+    async with db.session() as session:
+        result = await service.trash_live_item_in_session(
+            session,
+            owner_id,
+            task_id,
+            now=datetime(2026, 8, 10, 16, tzinfo=UTC),
+        )
+        assert (result.status, result.count) == ("trashed", 1)
+
+    async with db.sessions() as session:
+        item = await session.get(InboxItem, task_id)
+        schedule = await session.get(RecurringTaskReminderSchedule, recurring.id)
+        occurrence = await session.scalar(
+            select(RecurringTaskReminderOccurrence).where(
+                RecurringTaskReminderOccurrence.schedule_id == recurring.id
+            )
+        )
+    assert item.status == "trashed"
+    assert (schedule.status, schedule.version) == ("completed", 2)
+    assert occurrence.status == "cancelled"
 
 
 async def test_stale_foreign_and_replayed_snapshots_fail_atomically(db):

@@ -3,10 +3,13 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from typing import Literal
 from uuid import uuid4
 
 from sqlalchemy import and_, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from .access import FULL_ACCESS_TIERS
 from .db import Database
 from .models import DraftInboxItem, InboxItem, TaskReminder, TaskState, User
 from .reminders import reminder_for_inbox_item
@@ -29,6 +32,23 @@ class DraftResult:
 class DraftCreation:
     draft: DraftInboxItem
     created: bool
+
+
+type FencedDraftCreationStatus = Literal["created", "reused", "access_changed"]
+
+
+@dataclass(frozen=True, slots=True)
+class FencedDraftCreation:
+    status: FencedDraftCreationStatus
+    draft: DraftInboxItem | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {"created", "reused"} and self.draft is not None
+
+    @property
+    def created(self) -> bool:
+        return self.status == "created"
 
 
 @dataclass(slots=True)
@@ -94,13 +114,50 @@ class DraftInboxService:
         raw_text: str,
         parsed: ParsedThought,
     ) -> DraftInboxItem:
-        now = datetime.now(UTC)
+        async with self.db.session() as session:
+            draft = await self.create_in_session(
+                session,
+                user_id=user_id,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                source=source,
+                raw_text=raw_text,
+                parsed=parsed,
+            )
+        log_transition(draft.id, telegram_user_id, "none", "preview", "create")
+        return draft
+
+    async def create_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        source: str,
+        raw_text: str,
+        parsed: ParsedThought,
+        now: datetime | None = None,
+    ) -> DraftInboxItem:
+        """Create a canonical draft without committing the caller transaction."""
+
+        owner_exists = await session.scalar(
+            select(User.id).where(
+                User.id == user_id,
+                User.telegram_id == telegram_user_id,
+            )
+        )
+        if owner_exists is None:
+            raise ValueError("Telegram user does not own this draft")
+        current = now or datetime.now(UTC)
         draft = DraftInboxItem(
             id=str(uuid4()),
             user_id=user_id,
             telegram_user_id=telegram_user_id,
             chat_id=chat_id,
             source=source,
+            # Reminder flow callers pass the normalized bounded title here,
+            # never the raw command or voice transcript.
             raw_text=raw_text,
             kind=parsed.kind,
             title=parsed.title,
@@ -113,21 +170,11 @@ class DraftInboxService:
                 else None
             ),
             status="preview",
-            expires_at=now + self.ttl,
+            expires_at=current + self.ttl,
             version=1,
         )
-        async with self.db.session() as session:
-            owner_exists = await session.scalar(
-                select(User.id).where(
-                    User.id == user_id,
-                    User.telegram_id == telegram_user_id,
-                )
-            )
-            if owner_exists is None:
-                raise ValueError("Telegram user does not own this draft")
-            session.add(draft)
-            await session.flush()
-        log_transition(draft.id, telegram_user_id, "none", "preview", "create")
+        session.add(draft)
+        await session.flush()
         return draft
 
     async def create_or_get(
@@ -169,6 +216,96 @@ class DraftInboxService:
             created=True,
         )
 
+    async def create_or_get_for_suggestion(
+        self,
+        *,
+        user_id: int,
+        telegram_user_id: int,
+        chat_id: int,
+        expected_access_version: int,
+        source: str,
+        raw_text: str,
+        parsed: ParsedThought,
+    ) -> FencedDraftCreation:
+        """Create/reuse a suggestion draft for one exact full-access generation.
+
+        The owner write lock serializes access changes and concurrent suggestion
+        callbacks before any draft read or write.  A mismatched owner or access
+        generation therefore fails without creating or reusing domain state.
+        """
+
+        identifiers = (user_id, telegram_user_id, chat_id, expected_access_version)
+        if any(type(value) is not int or value <= 0 for value in identifiers):
+            return FencedDraftCreation("access_changed")
+
+        current = datetime.now(UTC)
+        transition: tuple[str, str, str] | None = None
+        async with self.db.session() as session:
+            locked_owner = await session.execute(
+                update(User)
+                .where(
+                    User.id == user_id,
+                    User.telegram_id == telegram_user_id,
+                    User.access_tier.in_(FULL_ACCESS_TIERS),
+                    User.access_version == expected_access_version,
+                )
+                .values(updated_at=User.updated_at)
+                .returning(User.id)
+                .execution_options(synchronize_session=False)
+            )
+            if locked_owner.scalar_one_or_none() is None:
+                return FencedDraftCreation("access_changed")
+
+            active = tuple(
+                (
+                    await session.scalars(
+                        select(DraftInboxItem)
+                        .where(
+                            DraftInboxItem.user_id == user_id,
+                            DraftInboxItem.telegram_user_id == telegram_user_id,
+                            DraftInboxItem.chat_id == chat_id,
+                            DraftInboxItem.status == "preview",
+                            DraftInboxItem.expires_at > current,
+                        )
+                        .order_by(DraftInboxItem.created_at.desc(), DraftInboxItem.id.desc())
+                    )
+                ).all()
+            )
+            draft = next(
+                (
+                    candidate
+                    for candidate in active
+                    if self._matches_suggestion_creation(
+                        candidate,
+                        source=source,
+                        raw_text=raw_text,
+                        parsed=parsed,
+                    )
+                ),
+                None,
+            )
+            if draft is not None:
+                transition = (draft.id, "preview", "reuse_duplicate")
+                result = FencedDraftCreation("reused", draft)
+            else:
+                draft = await self.create_in_session(
+                    session,
+                    user_id=user_id,
+                    telegram_user_id=telegram_user_id,
+                    chat_id=chat_id,
+                    source=source,
+                    raw_text=raw_text,
+                    parsed=parsed,
+                    now=current,
+                )
+                transition = (draft.id, "none", "create_suggestion")
+                result = FencedDraftCreation("created", draft)
+
+        if transition is not None:
+            draft_id, old_status, action = transition
+            log_transition(draft_id, telegram_user_id, old_status, "preview", action)
+        return result
+
     async def set_preview_message(self, draft_id: str, message_id: int) -> None:
         async with self.db.session() as session:
             await session.execute(
@@ -176,6 +313,113 @@ class DraftInboxService:
                 .where(DraftInboxItem.id == draft_id, DraftInboxItem.status == "preview")
                 .values(preview_message_id=message_id)
             )
+
+    async def restore_preview_message_if_current(
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_message_id: int | None,
+        restored_message_id: int | None,
+    ) -> bool:
+        """CAS one preview pointer without overwriting a newer canonical message."""
+
+        if (
+            not isinstance(draft_id, str)
+            or not draft_id
+            or type(version) is not int
+            or version <= 0
+            or type(telegram_user_id) is not int
+            or type(chat_id) is not int
+            or (
+                expected_message_id is not None
+                and (type(expected_message_id) is not int or expected_message_id <= 0)
+            )
+            or (
+                restored_message_id is not None
+                and (type(restored_message_id) is not int or restored_message_id <= 0)
+            )
+        ):
+            return False
+        expected_pointer = (
+            DraftInboxItem.preview_message_id.is_(None)
+            if expected_message_id is None
+            else DraftInboxItem.preview_message_id == expected_message_id
+        )
+        async with self.db.session() as session:
+            changed = await session.execute(
+                update(DraftInboxItem)
+                .where(
+                    DraftInboxItem.id == draft_id,
+                    DraftInboxItem.version == version,
+                    DraftInboxItem.telegram_user_id == telegram_user_id,
+                    DraftInboxItem.chat_id == chat_id,
+                    DraftInboxItem.status == "preview",
+                    expected_pointer,
+                )
+                .values(preview_message_id=restored_message_id)
+                .returning(DraftInboxItem.id)
+            )
+            return changed.scalar_one_or_none() is not None
+
+    async def drop_if_preview_message_current(
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_message_id: int | None,
+        expected_access_version: int | None = None,
+    ) -> DraftResult:
+        """Discard only the exact preview canonical owned by a failed delivery."""
+
+        if (
+            not isinstance(draft_id, str)
+            or not draft_id
+            or type(version) is not int
+            or version <= 0
+            or type(telegram_user_id) is not int
+            or type(chat_id) is not int
+            or (
+                expected_message_id is not None
+                and (type(expected_message_id) is not int or expected_message_id <= 0)
+            )
+        ):
+            return DraftResult(False)
+        expected_pointer = (
+            DraftInboxItem.preview_message_id.is_(None)
+            if expected_message_id is None
+            else DraftInboxItem.preview_message_id == expected_message_id
+        )
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(
+                User.access_tier.in_(FULL_ACCESS_TIERS),
+                User.access_version == expected_access_version,
+            )
+        async with self.db.session() as session:
+            changed = await session.execute(
+                update(DraftInboxItem)
+                .where(
+                    DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(owner_filter),
+                    DraftInboxItem.version == version,
+                    DraftInboxItem.telegram_user_id == telegram_user_id,
+                    DraftInboxItem.chat_id == chat_id,
+                    DraftInboxItem.status == "preview",
+                    expected_pointer,
+                )
+                .values(status="discarded")
+                .returning(DraftInboxItem.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                return DraftResult(False)
+        draft = await self.get(draft_id)
+        log_transition(draft_id, telegram_user_id, "preview", "discarded", "drop")
+        return DraftResult(True, draft=draft)
 
     async def _mark_expired(self, draft: DraftInboxItem, now: datetime) -> bool:
         expires_at = draft.expires_at
@@ -200,15 +444,48 @@ class DraftInboxService:
             return await session.get(DraftInboxItem, draft_id)
 
     async def begin_edit(
-        self, draft_id: str, version: int, telegram_user_id: int, chat_id: int
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_preview_message_id: int | None = None,
+        expected_access_version: int | None = None,
     ) -> DraftResult:
         now = datetime.now(UTC)
         draft = await self.get(draft_id)
         if not self._matches(draft, version, telegram_user_id, chat_id, "preview"):
             return DraftResult(False)
-        if await self._mark_expired(draft, now):
-            return DraftResult(False)
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(
+                User.access_tier.in_(FULL_ACCESS_TIERS),
+                User.access_version == expected_access_version,
+            )
+        preview_filter = (
+            DraftInboxItem.id == draft_id
+            if expected_preview_message_id is None
+            else DraftInboxItem.preview_message_id == expected_preview_message_id
+        )
         async with self.db.session() as session:
+            changed = await session.execute(
+                update(DraftInboxItem)
+                .where(
+                    DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(owner_filter),
+                    DraftInboxItem.telegram_user_id == telegram_user_id,
+                    DraftInboxItem.chat_id == chat_id,
+                    DraftInboxItem.status == "preview",
+                    DraftInboxItem.version == version,
+                    DraftInboxItem.expires_at > now,
+                    preview_filter,
+                )
+                .values(status="editing")
+                .returning(DraftInboxItem.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                return DraftResult(False)
             await session.execute(
                 update(DraftInboxItem)
                 .where(
@@ -219,33 +496,31 @@ class DraftInboxService:
                 )
                 .values(status="discarded")
             )
-            changed = await session.execute(
-                update(DraftInboxItem)
-                .where(
-                    DraftInboxItem.id == draft_id,
-                    DraftInboxItem.user_id.in_(
-                        select(User.id).where(User.telegram_id == telegram_user_id)
-                    ),
-                    DraftInboxItem.telegram_user_id == telegram_user_id,
-                    DraftInboxItem.chat_id == chat_id,
-                    DraftInboxItem.status == "preview",
-                    DraftInboxItem.version == version,
-                    DraftInboxItem.expires_at > now,
-                )
-                .values(status="editing")
-                .returning(DraftInboxItem.id)
-            )
-            if changed.scalar_one_or_none() is None:
-                return DraftResult(False)
         draft = await self.get(draft_id)
         log_transition(draft_id, telegram_user_id, "preview", "editing", "edit")
         return DraftResult(True, draft=draft)
 
-    async def editing(self, telegram_user_id: int, chat_id: int) -> DraftInboxItem | None:
+    async def editing(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_owner_id: int | None = None,
+        expected_access_tier: str | None = None,
+        expected_access_version: int | None = None,
+    ) -> DraftInboxItem | None:
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_owner_id is not None:
+            owner_filter = owner_filter.where(User.id == expected_owner_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(User.access_version == expected_access_version)
+        if expected_access_tier is not None:
+            owner_filter = owner_filter.where(User.access_tier == expected_access_tier)
         async with self.db.sessions() as session:
             draft = await session.scalar(
                 select(DraftInboxItem)
                 .where(
+                    DraftInboxItem.user_id.in_(owner_filter),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
                     DraftInboxItem.status == "editing",
@@ -425,16 +700,29 @@ class DraftInboxService:
         raw_text: str,
         source: str,
         parsed: ParsedThought,
+        *,
+        expected_version: int,
+        expected_owner_id: int,
+        expected_access_tier: str,
+        expected_access_version: int,
     ) -> DraftResult:
         now = datetime.now(UTC)
+        owner_filter = select(User.id).where(
+            User.id == expected_owner_id,
+            User.telegram_id == telegram_user_id,
+            User.access_tier == expected_access_tier,
+            User.access_version == expected_access_version,
+        )
         async with self.db.session() as session:
             changed = await session.execute(
                 update(DraftInboxItem)
                 .where(
                     DraftInboxItem.id == draft_id,
+                    DraftInboxItem.user_id.in_(owner_filter),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
                     DraftInboxItem.status == "editing",
+                    DraftInboxItem.version == expected_version,
                     DraftInboxItem.expires_at > now,
                 )
                 .values(
@@ -561,37 +849,131 @@ class DraftInboxService:
         return draft_id is not None
 
     async def confirm(
-        self, draft_id: str, version: int, telegram_user_id: int, chat_id: int
+        self,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        expected_preview_message_id: int | None = None,
+        expected_access_version: int | None = None,
     ) -> DraftResult:
         """The sole atomic path allowed to construct an InboxItem."""
-        now = datetime.now(UTC)
         async with self.db.session() as session:
-            changed = await session.execute(
-                update(DraftInboxItem)
-                .where(
+            result = await self.confirm_in_session(
+                session,
+                draft_id,
+                version,
+                telegram_user_id,
+                chat_id,
+                expected_preview_message_id=expected_preview_message_id,
+                expected_access_version=expected_access_version,
+            )
+        if not result.ok:
+            return result
+        log_transition(
+            draft_id,
+            telegram_user_id,
+            "preview",
+            "confirmed",
+            "reuse_saved_duplicate" if result.duplicate else "save",
+            inbox_created=not result.duplicate,
+        )
+        return result
+
+    async def confirm_in_session(
+        self,
+        session: AsyncSession,
+        draft_id: str,
+        version: int,
+        telegram_user_id: int,
+        chat_id: int,
+        *,
+        owner_locked: bool = False,
+        allow_saved_dedup: bool = True,
+        return_existing: bool = False,
+        expected_access_version: int | None = None,
+        expected_preview_message_id: int | None = None,
+        now: datetime | None = None,
+    ) -> DraftResult:
+        """Confirm through the canonical Inbox/Task path inside a caller transaction.
+
+        ``allow_saved_dedup=False`` is used for recurring creation because a
+        semantically equal one-shot task must never be reused as a daily task.
+        ``return_existing`` makes an exact draft replay idempotent without
+        broadening the normal preview-confirm contract.
+        """
+
+        current = now or datetime.now(UTC)
+        owner_filter = select(User.id).where(User.telegram_id == telegram_user_id)
+        if expected_access_version is not None:
+            owner_filter = owner_filter.where(
+                User.access_tier.in_(FULL_ACCESS_TIERS),
+                User.access_version == expected_access_version,
+            )
+        preview_filter = (
+            DraftInboxItem.id == draft_id
+            if expected_preview_message_id is None
+            else DraftInboxItem.preview_message_id == expected_preview_message_id
+        )
+        changed = await session.execute(
+            update(DraftInboxItem)
+            .where(
+                DraftInboxItem.id == draft_id,
+                DraftInboxItem.user_id.in_(owner_filter),
+                DraftInboxItem.telegram_user_id == telegram_user_id,
+                DraftInboxItem.chat_id == chat_id,
+                DraftInboxItem.status == "preview",
+                DraftInboxItem.version == version,
+                DraftInboxItem.expires_at > current,
+                preview_filter,
+            )
+            .values(status="confirmed")
+            .returning(DraftInboxItem.id)
+        )
+        if changed.scalar_one_or_none() is None:
+            if not return_existing:
+                return DraftResult(False)
+            draft = await session.scalar(
+                select(DraftInboxItem).where(
                     DraftInboxItem.id == draft_id,
-                    DraftInboxItem.user_id.in_(
-                        select(User.id).where(User.telegram_id == telegram_user_id)
-                    ),
                     DraftInboxItem.telegram_user_id == telegram_user_id,
                     DraftInboxItem.chat_id == chat_id,
-                    DraftInboxItem.status == "preview",
+                    DraftInboxItem.status == "confirmed",
                     DraftInboxItem.version == version,
-                    DraftInboxItem.expires_at > now,
                 )
-                .values(status="confirmed")
-                .returning(DraftInboxItem.id)
             )
-            if changed.scalar_one_or_none() is None:
+            if draft is None:
                 return DraftResult(False)
-            draft = await session.get(DraftInboxItem, draft_id)
-            # Serialize confirmed-record deduplication per owner. A repeated
-            # preview is allowed, but confirming identical canonical content
-            # within a short window reuses the live record instead of creating
-            # a second task/reminder.
+            existing = await session.scalar(
+                select(InboxItem).where(
+                    InboxItem.draft_id == draft_id,
+                    InboxItem.user_id == draft.user_id,
+                )
+            )
+            if existing is None:
+                return DraftResult(False)
+            reminder = await session.scalar(
+                select(TaskReminder).where(TaskReminder.inbox_item_id == existing.id)
+            )
+            return DraftResult(
+                True,
+                draft=draft,
+                inbox_item=existing,
+                reminder=reminder,
+                duplicate=True,
+            )
+
+        draft = await session.get(DraftInboxItem, draft_id)
+        if draft is None:
+            return DraftResult(False)
+        if not owner_locked:
+            # Cross-dialect owner lock used by every create/confirm coordinator.
             await session.execute(
                 update(User).where(User.id == draft.user_id).values(updated_at=User.updated_at)
             )
+
+        if allow_saved_dedup:
             recent_items = (
                 await session.execute(
                     select(InboxItem, TaskState)
@@ -611,7 +993,7 @@ class DraftInboxService:
                                 InboxItem.status == "archived",
                             ),
                         ),
-                        InboxItem.created_at >= now - self.SAVED_DEDUP_WINDOW,
+                        InboxItem.created_at >= current - self.SAVED_DEDUP_WINDOW,
                     )
                     .order_by(InboxItem.id.desc())
                 )
@@ -630,14 +1012,6 @@ class DraftInboxService:
                 reminder = await session.scalar(
                     select(TaskReminder).where(TaskReminder.inbox_item_id == duplicate.id)
                 )
-                log_transition(
-                    draft_id,
-                    telegram_user_id,
-                    "preview",
-                    "confirmed",
-                    "reuse_saved_duplicate",
-                    inbox_created=False,
-                )
                 return DraftResult(
                     True,
                     draft=draft,
@@ -645,46 +1019,41 @@ class DraftInboxService:
                     reminder=reminder,
                     duplicate=True,
                 )
-            inbox_item = InboxItem(
-                draft_id=draft.id,
-                user_id=draft.user_id,
-                kind=draft.kind,
-                title=draft.title,
-                description=draft.description,
-                raw_text=draft.raw_text,
-                next_step=draft.next_step,
-                resolved_date=draft.resolved_date,
-                temporal_resolution=draft.temporal_resolution,
-                source=draft.source,
-                status="confirmed",
-            )
-            session.add(inbox_item)
+
+        inbox_item = InboxItem(
+            draft_id=draft.id,
+            user_id=draft.user_id,
+            kind=draft.kind,
+            title=draft.title,
+            description=draft.description,
+            raw_text=draft.raw_text,
+            next_step=draft.next_step,
+            resolved_date=draft.resolved_date,
+            temporal_resolution=draft.temporal_resolution,
+            source=draft.source,
+            status="confirmed",
+        )
+        session.add(inbox_item)
+        await session.flush()
+        reminder = reminder_for_inbox_item(
+            inbox_item,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            date_event_hour=self.task_date_event_hour,
+            lead_minutes=self.task_reminder_lead_minutes,
+        )
+        if reminder is not None:
+            session.add(reminder)
             await session.flush()
-            reminder = reminder_for_inbox_item(
-                inbox_item,
-                telegram_user_id=telegram_user_id,
-                chat_id=chat_id,
-                date_event_hour=self.task_date_event_hour,
-                lead_minutes=self.task_reminder_lead_minutes,
-            )
-            if reminder is not None:
-                session.add(reminder)
-                await session.flush()
-            owner = await session.get(User, draft.user_id)
-            await add_task_state(
-                session,
-                inbox_item,
-                owner_timezone=owner.timezone,
-                reminder=reminder,
-                date_event_hour=self.task_date_event_hour,
-            )
-        log_transition(
-            draft_id,
-            telegram_user_id,
-            "preview",
-            "confirmed",
-            "save",
-            inbox_created=True,
+        owner = await session.get(User, draft.user_id)
+        if owner is None:
+            raise RuntimeError("Draft owner disappeared during confirmation")
+        await add_task_state(
+            session,
+            inbox_item,
+            owner_timezone=owner.timezone,
+            reminder=reminder,
+            date_event_hour=self.task_date_event_hour,
         )
         return DraftResult(True, draft=draft, inbox_item=inbox_item, reminder=reminder)
 
@@ -737,6 +1106,31 @@ class DraftInboxService:
     @staticmethod
     def _normalize(value: str) -> str:
         return re.sub(r"[^a-zа-я0-9]+", " ", value.lower().replace("ё", "е")).strip()
+
+    @classmethod
+    def _matches_suggestion_creation(
+        cls,
+        draft: DraftInboxItem,
+        *,
+        source: str,
+        raw_text: str,
+        parsed: ParsedThought,
+    ) -> bool:
+        temporal_resolution = (
+            parsed.temporal_resolution.model_dump(mode="json")
+            if parsed.temporal_resolution
+            else None
+        )
+        return bool(
+            draft.source == source
+            and draft.kind == parsed.kind
+            and cls._normalize(draft.raw_text) == cls._normalize(raw_text)
+            and cls._normalize(draft.title) == cls._normalize(parsed.title)
+            and cls._normalize(draft.description or "") == cls._normalize(parsed.description or "")
+            and cls._normalize(draft.next_step or "") == cls._normalize(parsed.next_step or "")
+            and draft.resolved_date == parsed.resolved_date
+            and (draft.temporal_resolution or None) == temporal_resolution
+        )
 
     @classmethod
     def semantic_key(cls, draft: DraftInboxItem | InboxItem) -> tuple[str, ...]:

@@ -50,6 +50,8 @@ ADVANCED_COMMANDS = frozenset(
         "skip",
         "cancel",
         "profile",
+        "mynova",
+        "week",
         "timezone",
         "evening",
         "collections",
@@ -90,6 +92,12 @@ ACTIONS = {
             "today",
         ),
         NavigationAction(
+            "weekly_review",
+            "🧭 Обзор недели",
+            "Один подтверждённый ориентир недели и отдельная проверка напоминаний.",
+            "week_command",
+        ),
+        NavigationAction(
             "evening",
             "Вечерний итог",
             "Пять спокойных вопросов о дне без оценок и давления.",
@@ -122,7 +130,7 @@ ACTIONS = {
         NavigationAction(
             "task_reminder_guide",
             "Как работают напоминания",
-            "Срок, напоминание, перенос и безопасная отмена доставки.",
+            "Разовые и ежедневные напоминания: создание, изменение времени и отключение.",
             "task_reminder_guide",
         ),
         NavigationAction(
@@ -219,7 +227,7 @@ SECTIONS = {
             "🌱",
             "Сегодня",
             "Фокус, задачи на сегодня и спокойный вечерний итог.",
-            ("today", "task_today", "evening"),
+            ("today", "weekly_review", "task_today", "evening"),
         ),
         NavigationSection(
             "tasks",
@@ -470,8 +478,10 @@ HELP_TOPICS = {
     ),
     "tasks_section": (
         "✅ Задачи",
-        "Новую задачу можно написать обычной фразой. Срок и время напоминания хранятся "
-        "отдельно; перенос, завершение и отмена безопасно обновляют ожидающую доставку.",
+        "Разовое или ежедневное напоминание можно создать обычной фразой. Для ежедневного "
+        "укажи «каждый день» и время, затем проверь preview и часовой пояс. В карточке задачи "
+        "можно изменить время или отключить ежедневное напоминание; срок задачи хранится "
+        "отдельно.",
     ),
     "records_section": (
         "📝 Записи",
@@ -522,8 +532,11 @@ def navigation_actions(
     enable_workspace_access: bool = False,
     enable_knowledge_hub: bool = False,
     enable_knowledge_capture: bool = False,
+    enable_weekly_review: bool = True,
 ) -> dict[str, NavigationAction]:
     result = dict(ACTIONS)
+    if not enable_weekly_review:
+        result.pop("weekly_review", None)
     if enable_workspace_access:
         result.update(WORKSPACE_ACTIONS)
     if enable_knowledge_hub:
@@ -537,10 +550,20 @@ def navigation_sections(
     enable_workspace_access: bool = False,
     enable_knowledge_hub: bool = False,
     enable_knowledge_capture: bool = False,
+    enable_weekly_review: bool = True,
 ) -> dict[str, NavigationSection]:
-    if not enable_workspace_access and not enable_knowledge_hub:
+    if not enable_workspace_access and not enable_knowledge_hub and enable_weekly_review:
         return SECTIONS
     result = dict(SECTIONS)
+    if not enable_weekly_review:
+        today = result["today"]
+        result["today"] = NavigationSection(
+            key=today.key,
+            emoji=today.emoji,
+            label=today.label,
+            description=today.description,
+            actions=tuple(action for action in today.actions if action != "weekly_review"),
+        )
     section = result["sections"]
     actions = list(section.actions)
     if enable_workspace_access:
@@ -585,8 +608,8 @@ def help_topics(
     if not enable_task_reminders:
         topics["tasks_section"] = (
             "✅ Задачи",
-            "Задачи, сроки, перенос и история доступны. Доставка Telegram-напоминаний "
-            "сейчас отключена настройкой.",
+            "Задачи, сроки, перенос и история доступны. Доставка разовых и ежедневных "
+            "Telegram-напоминаний сейчас отключена настройкой.",
         )
     privacy_parts = [topics["privacy"][1]]
     if enable_workspace_access:
@@ -666,17 +689,20 @@ def validate_catalog(
     enable_workspace_access: bool = False,
     enable_knowledge_hub: bool = False,
     enable_knowledge_capture: bool = False,
+    enable_weekly_review: bool = True,
 ) -> None:
     commands = public_commands(enable_workspace_access, enable_knowledge_hub)
     actions = navigation_actions(
         enable_workspace_access,
         enable_knowledge_hub,
         enable_knowledge_capture,
+        enable_weekly_review,
     )
     sections = navigation_sections(
         enable_workspace_access,
         enable_knowledge_hub,
         enable_knowledge_capture,
+        enable_weekly_review,
     )
     command_names = [item.command for item in commands]
     if len(command_names) != len(set(command_names)):

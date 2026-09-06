@@ -26,6 +26,59 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
+def _json_string_items_check(column: str, *, maximum_items: int) -> str:
+    return " AND ".join(
+        f"(json_array_length({column}) < {index + 1} OR "
+        f"(coalesce(substr(CAST({column} -> {index} AS TEXT), 1, 1) = '\"', false) "
+        f"AND coalesce(length({column} ->> {index}), 0) BETWEEN 1 AND 200))"
+        for index in range(maximum_items)
+    )
+
+
+def _weekly_reminder_candidate_fields_check(column: str) -> str:
+    """SQLite exact-shape check; PostgreSQL gets its own conditional CHECK."""
+
+    checks: list[str] = []
+    for index in range(5):
+        candidate_path = f"'$[{index}]'"
+        title_path = f"'$[{index}].title'"
+        schedule_path = f"'$[{index}].schedule_wording'"
+        checks.append(
+            f"(json_array_length({column}) < {index + 1} OR ("
+            f"coalesce(json_type({column}, {candidate_path}) = 'object', false) "
+            f"AND coalesce(json_type({column}, {title_path}) = 'text', false) "
+            f"AND coalesce(length(json_extract({column}, {title_path})), 0) "
+            f"BETWEEN 1 AND 200 "
+            f"AND coalesce(json_type({column}, {schedule_path}) = 'text', false) "
+            f"AND coalesce(length(json_extract({column}, {schedule_path})), 0) "
+            f"BETWEEN 1 AND 200 "
+            f"AND json_remove(json_extract({column}, {candidate_path}), "
+            f"'$.title', '$.schedule_wording') = '{{}}'))"
+        )
+    return " AND ".join(checks)
+
+
+def _weekly_reminder_candidate_fields_check_postgresql(column: str) -> str:
+    """PostgreSQL exact-shape check using JSONB key subtraction."""
+
+    checks: list[str] = []
+    for index in range(5):
+        candidate = f"({column} -> {index})"
+        candidate_jsonb = f"({candidate})::jsonb"
+        checks.append(
+            f"(json_array_length({column}) < {index + 1} OR ("
+            f"coalesce(jsonb_typeof({candidate_jsonb}) = 'object', false) "
+            f"AND coalesce(jsonb_typeof({candidate_jsonb} -> 'title') = 'string', false) "
+            f"AND coalesce(length({candidate_jsonb} ->> 'title'), 0) BETWEEN 1 AND 200 "
+            f"AND coalesce(jsonb_typeof({candidate_jsonb} -> 'schedule_wording') = "
+            f"'string', false) "
+            f"AND coalesce(length({candidate_jsonb} ->> 'schedule_wording'), 0) "
+            f"BETWEEN 1 AND 200 "
+            f"AND ({candidate_jsonb} - 'title' - 'schedule_wording') = '{{}}'::jsonb))"
+        )
+    return " AND ".join(checks)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -79,6 +132,368 @@ class User(TimestampMixin, Base):
     task_states: Mapped[list[TaskState]] = relationship(
         back_populates="owner", overlaps="inbox_item,task_state"
     )
+    recurring_task_reminder_schedules: Mapped[list[RecurringTaskReminderSchedule]] = relationship(
+        back_populates="owner",
+        overlaps="inbox_item,recurring_reminder_schedule",
+    )
+    nova_memory_items: Mapped[list[NovaMemoryItem]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    nova_memory_changes: Mapped[list[NovaMemoryChange]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    weekly_focuses: Mapped[list[WeeklyFocus]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    weekly_focus_changes: Mapped[list[WeeklyFocusChange]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    weekly_review_sessions: Mapped[list[WeeklyReviewSession]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    nova_dialogue_states: Mapped[list[NovaDialogueState]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    nova_observed_memories: Mapped[list[NovaObservedMemory]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class NovaMemoryItem(TimestampMixin, Base):
+    __tablename__ = "nova_memory_items"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_nova_memory_items_public_id"),
+        UniqueConstraint(
+            "owner_id",
+            "content_fingerprint",
+            name="uq_nova_memory_items_owner_fingerprint",
+        ),
+        CheckConstraint(
+            "category IN ('about_me', 'interaction', 'orientation')",
+            name="ck_nova_memory_items_category",
+        ),
+        CheckConstraint(
+            "length(content) BETWEEN 1 AND 500",
+            name="ck_nova_memory_items_content_length",
+        ),
+        CheckConstraint(
+            "length(content_fingerprint) = 64",
+            name="ck_nova_memory_items_fingerprint_length",
+        ),
+        CheckConstraint("version > 0", name="ck_nova_memory_items_version"),
+        Index(
+            "ix_nova_memory_items_owner_list",
+            "owner_id",
+            "important",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "ix_nova_memory_items_owner_category_list",
+            "owner_id",
+            "category",
+            "important",
+            "updated_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    category: Mapped[str] = mapped_column(String(24))
+    content: Mapped[str] = mapped_column(Text)
+    content_fingerprint: Mapped[str] = mapped_column(String(64))
+    important: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    owner: Mapped[User] = relationship(back_populates="nova_memory_items")
+
+
+class NovaMemoryChange(Base):
+    __tablename__ = "nova_memory_changes"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('created', 'updated', 'importance_changed', 'deleted', 'deleted_all')",
+            name="ck_nova_memory_changes_operation",
+        ),
+        CheckConstraint(
+            "category IS NULL OR category IN ('about_me', 'interaction', 'orientation')",
+            name="ck_nova_memory_changes_category",
+        ),
+        CheckConstraint(
+            "memory_public_id IS NULL OR length(memory_public_id) = 36",
+            name="ck_nova_memory_changes_public_id_length",
+        ),
+        CheckConstraint(
+            "resulting_version IS NULL OR resulting_version > 0",
+            name="ck_nova_memory_changes_resulting_version",
+        ),
+        CheckConstraint("affected_count > 0", name="ck_nova_memory_changes_affected_count"),
+        CheckConstraint(
+            "(operation IN ('created', 'updated', 'importance_changed') "
+            "AND memory_public_id IS NOT NULL AND category IS NOT NULL "
+            "AND resulting_version IS NOT NULL AND affected_count = 1) OR "
+            "(operation = 'deleted' AND memory_public_id IS NOT NULL "
+            "AND category IS NOT NULL AND resulting_version IS NULL "
+            "AND affected_count = 1) OR "
+            "(operation = 'deleted_all' AND memory_public_id IS NULL "
+            "AND category IS NULL AND resulting_version IS NULL)",
+            name="ck_nova_memory_changes_shape",
+        ),
+        Index(
+            "ix_nova_memory_changes_owner_created",
+            "owner_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_nova_memory_changes_item_history",
+            "owner_id",
+            "memory_public_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    memory_public_id: Mapped[str | None] = mapped_column(String(36))
+    operation: Mapped[str] = mapped_column(String(24))
+    category: Mapped[str | None] = mapped_column(String(24))
+    resulting_version: Mapped[int | None] = mapped_column(Integer)
+    affected_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    owner: Mapped[User] = relationship(back_populates="nova_memory_changes")
+
+
+class WeeklyFocus(TimestampMixin, Base):
+    __tablename__ = "weekly_focuses"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_weekly_focuses_public_id"),
+        UniqueConstraint("owner_id", "week_start", name="uq_weekly_focuses_owner_week"),
+        CheckConstraint(
+            "length(public_id) = 36",
+            name="ck_weekly_focuses_public_id_length",
+        ),
+        CheckConstraint(
+            "length(focus) BETWEEN 1 AND 300",
+            name="ck_weekly_focuses_focus_length",
+        ),
+        CheckConstraint(
+            "approach IS NULL OR length(approach) BETWEEN 1 AND 500",
+            name="ck_weekly_focuses_approach_length",
+        ),
+        CheckConstraint(
+            "json_array_length(small_steps) BETWEEN 0 AND 3",
+            name="ck_weekly_focuses_small_steps_count",
+        ),
+        CheckConstraint(
+            "substr(CAST(small_steps AS TEXT), 1, 1) = '[' "
+            "AND length(CAST(small_steps AS TEXT)) BETWEEN 2 AND 4096",
+            name="ck_weekly_focuses_small_steps_json_shape",
+        ),
+        CheckConstraint(
+            _json_string_items_check("small_steps", maximum_items=3),
+            name="ck_weekly_focuses_small_steps_lengths",
+        ),
+        CheckConstraint(
+            "source IN ('text', 'voice')",
+            name="ck_weekly_focuses_source",
+        ),
+        CheckConstraint("version > 0", name="ck_weekly_focuses_version"),
+        Index("ix_weekly_focuses_owner_history", "owner_id", "week_start", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    week_start: Mapped[date] = mapped_column(Date)
+    focus: Mapped[str] = mapped_column(Text)
+    approach: Mapped[str | None] = mapped_column(Text)
+    small_steps: Mapped[list[str]] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    source: Mapped[str] = mapped_column(String(8))
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    owner: Mapped[User] = relationship(back_populates="weekly_focuses")
+
+
+class WeeklyFocusChange(Base):
+    __tablename__ = "weekly_focus_changes"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('created', 'updated', 'deleted')",
+            name="ck_weekly_focus_changes_operation",
+        ),
+        CheckConstraint(
+            "length(focus_public_id) = 36",
+            name="ck_weekly_focus_changes_public_id_length",
+        ),
+        CheckConstraint(
+            "resulting_version > 0",
+            name="ck_weekly_focus_changes_resulting_version",
+        ),
+        Index(
+            "ix_weekly_focus_changes_owner_created",
+            "owner_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_weekly_focus_changes_focus_history",
+            "owner_id",
+            "focus_public_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    focus_public_id: Mapped[str] = mapped_column(String(36))
+    operation: Mapped[str] = mapped_column(String(12))
+    resulting_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    owner: Mapped[User] = relationship(back_populates="weekly_focus_changes")
+
+
+class WeeklyReviewSession(TimestampMixin, Base):
+    __tablename__ = "weekly_review_sessions"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_weekly_review_sessions_public_id"),
+        UniqueConstraint(
+            "owner_id",
+            "chat_id",
+            name="uq_weekly_review_sessions_owner_chat",
+        ),
+        CheckConstraint(
+            "length(public_id) = 36",
+            name="ck_weekly_review_sessions_public_id_length",
+        ),
+        CheckConstraint(
+            "phase IN ('root', 'awaiting_input', 'processing', 'preview', 'saved', "
+            "'candidates', 'reminder_handoff', 'delete_preview', 'completed')",
+            name="ck_weekly_review_sessions_phase",
+        ),
+        CheckConstraint(
+            "access_version > 0",
+            name="ck_weekly_review_sessions_access_version",
+        ),
+        CheckConstraint(
+            "version > 0",
+            name="ck_weekly_review_sessions_version",
+        ),
+        CheckConstraint(
+            "extracted_focus IS NULL OR length(extracted_focus) BETWEEN 1 AND 300",
+            name="ck_weekly_review_sessions_focus_length",
+        ),
+        CheckConstraint(
+            "extracted_approach IS NULL OR length(extracted_approach) BETWEEN 1 AND 500",
+            name="ck_weekly_review_sessions_approach_length",
+        ),
+        CheckConstraint(
+            "json_array_length(small_steps) BETWEEN 0 AND 3",
+            name="ck_weekly_review_sessions_small_steps_count",
+        ),
+        CheckConstraint(
+            "substr(CAST(small_steps AS TEXT), 1, 1) = '[' "
+            "AND length(CAST(small_steps AS TEXT)) BETWEEN 2 AND 4096",
+            name="ck_weekly_review_sessions_small_steps_json_shape",
+        ),
+        CheckConstraint(
+            _json_string_items_check("small_steps", maximum_items=3),
+            name="ck_weekly_review_sessions_small_steps_lengths",
+        ),
+        CheckConstraint(
+            "json_array_length(reminder_candidates) BETWEEN 0 AND 5",
+            name="ck_weekly_review_sessions_candidates_count",
+        ),
+        CheckConstraint(
+            "substr(CAST(reminder_candidates AS TEXT), 1, 1) = '[' "
+            "AND length(CAST(reminder_candidates AS TEXT)) BETWEEN 2 AND 20000",
+            name="ck_weekly_review_sessions_candidates_json_shape",
+        ),
+        CheckConstraint(
+            _weekly_reminder_candidate_fields_check("reminder_candidates"),
+            name="ck_weekly_review_sessions_candidates_fields",
+        ).ddl_if(dialect="sqlite"),
+        CheckConstraint(
+            _weekly_reminder_candidate_fields_check_postgresql("reminder_candidates"),
+            name="ck_weekly_review_sessions_candidates_fields",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "extracted_source IS NULL OR extracted_source IN ('text', 'voice')",
+            name="ck_weekly_review_sessions_source",
+        ),
+        CheckConstraint(
+            "(canonical_chat_id IS NULL AND canonical_message_id IS NULL) OR "
+            "(canonical_chat_id IS NOT NULL AND canonical_message_id IS NOT NULL "
+            "AND canonical_chat_id = chat_id AND canonical_message_id > 0)",
+            name="ck_weekly_review_sessions_canonical_binding",
+        ),
+        CheckConstraint(
+            "(base_focus_public_id IS NULL AND base_focus_version IS NULL) OR "
+            "(base_focus_public_id IS NOT NULL AND base_focus_version IS NOT NULL "
+            "AND length(base_focus_public_id) = 36 AND base_focus_version > 0)",
+            name="ck_weekly_review_sessions_base_focus_generation",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_weekly_review_sessions_expiry_order",
+        ),
+        Index(
+            "ix_weekly_review_sessions_expiry",
+            "expires_at",
+            "id",
+        ),
+        Index(
+            "ix_weekly_review_sessions_owner_week",
+            "owner_id",
+            "week_start",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    access_version: Mapped[int] = mapped_column(Integer)
+    week_start: Mapped[date] = mapped_column(Date)
+    phase: Mapped[str] = mapped_column(String(24))
+    canonical_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    canonical_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    base_focus_public_id: Mapped[str | None] = mapped_column(String(36))
+    base_focus_version: Mapped[int | None] = mapped_column(Integer)
+    extracted_focus: Mapped[str | None] = mapped_column(Text)
+    extracted_approach: Mapped[str | None] = mapped_column(Text)
+    small_steps: Mapped[list[str]] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    reminder_candidates: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'"),
+    )
+    extracted_source: Mapped[str | None] = mapped_column(String(8))
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    owner: Mapped[User] = relationship(back_populates="weekly_review_sessions")
 
 
 class AccessTierChange(Base):
@@ -315,6 +730,171 @@ class ConversationMessage(Base):
     session: Mapped[ConversationSession] = relationship(back_populates="messages")
 
 
+class NovaDialogueState(TimestampMixin, Base):
+    __tablename__ = "nova_dialogue_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_user_id",
+            "chat_id",
+            name="uq_nova_dialogue_states_actor_chat",
+        ),
+        CheckConstraint("access_version > 0", name="ck_nova_dialogue_states_access_version"),
+        CheckConstraint("revision > 0", name="ck_nova_dialogue_states_revision"),
+        CheckConstraint(
+            "active_topic IS NULL OR length(active_topic) BETWEEN 1 AND 200",
+            name="ck_nova_dialogue_states_active_topic_length",
+        ),
+        CheckConstraint(
+            "current_user_goal IS NULL OR length(current_user_goal) BETWEEN 1 AND 300",
+            name="ck_nova_dialogue_states_user_goal_length",
+        ),
+        CheckConstraint(
+            "last_assistant_offer IS NULL OR length(last_assistant_offer) BETWEEN 1 AND 600",
+            name="ck_nova_dialogue_states_offer_length",
+        ),
+        CheckConstraint(
+            "unresolved_question IS NULL OR length(unresolved_question) BETWEEN 1 AND 300",
+            name="ck_nova_dialogue_states_question_length",
+        ),
+        CheckConstraint(
+            "requested_action IS NULL OR requested_action IN "
+            "('capture', 'reminder', 'plan', 'memory', 'clarify')",
+            name="ck_nova_dialogue_states_requested_action",
+        ),
+        CheckConstraint(
+            "json_array_length(last_assistant_offer_kinds) BETWEEN 0 AND 4",
+            name="ck_nova_dialogue_states_offer_kinds_count",
+        ),
+        CheckConstraint(
+            "json_array_length(open_loops) BETWEEN 0 AND 5",
+            name="ck_nova_dialogue_states_open_loops_count",
+        ),
+        CheckConstraint(
+            "length(CAST(last_assistant_offer_kinds AS TEXT)) BETWEEN 2 AND 1024",
+            name="ck_nova_dialogue_states_offer_kinds_bytes",
+        ),
+        CheckConstraint(
+            "length(CAST(open_loops AS TEXT)) BETWEEN 2 AND 4096",
+            name="ck_nova_dialogue_states_open_loops_bytes",
+        ),
+        Index(
+            "ix_nova_dialogue_states_owner_expiry",
+            "owner_id",
+            "expires_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    access_version: Mapped[int] = mapped_column(Integer)
+    active_topic: Mapped[str | None] = mapped_column(String(200))
+    current_user_goal: Mapped[str | None] = mapped_column(String(300))
+    last_assistant_offer: Mapped[str | None] = mapped_column(String(600))
+    last_assistant_offer_kinds: Mapped[list[str]] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'"),
+    )
+    unresolved_question: Mapped[str | None] = mapped_column(String(300))
+    requested_action: Mapped[str | None] = mapped_column(String(16))
+    open_loops: Mapped[list[str]] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    owner: Mapped[User] = relationship(back_populates="nova_dialogue_states")
+
+
+class NovaObservedMemory(TimestampMixin, Base):
+    __tablename__ = "nova_observed_memories"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_nova_observed_memories_public_id"),
+        UniqueConstraint(
+            "owner_id",
+            "content_fingerprint",
+            name="uq_nova_observed_memories_owner_fingerprint",
+        ),
+        CheckConstraint(
+            "category IN ('fact', 'preference', 'orientation', 'theme', 'identity')",
+            name="ck_nova_observed_memories_category",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'forgotten')",
+            name="ck_nova_observed_memories_status",
+        ),
+        CheckConstraint(
+            "source_kind IN ('conversation', 'explicit')",
+            name="ck_nova_observed_memories_source_kind",
+        ),
+        CheckConstraint(
+            "length(normalized_value) BETWEEN 1 AND 500",
+            name="ck_nova_observed_memories_value_length",
+        ),
+        CheckConstraint(
+            "length(content_fingerprint) = 64",
+            name="ck_nova_observed_memories_fingerprint_length",
+        ),
+        CheckConstraint(
+            "length(source_receipt) = 64",
+            name="ck_nova_observed_memories_receipt_length",
+        ),
+        CheckConstraint("salience BETWEEN 1 AND 5", name="ck_nova_observed_memories_salience"),
+        CheckConstraint("revision > 0", name="ck_nova_observed_memories_revision"),
+        CheckConstraint(
+            "superseded_by_public_id IS NULL OR length(superseded_by_public_id) = 36",
+            name="ck_nova_observed_memories_superseded_id_length",
+        ),
+        CheckConstraint(
+            "semantic_key IS NULL OR "
+            "(semantic_key = 'identity' AND category = 'identity') OR "
+            "(semantic_key IN ('response_length', 'tone', 'reminder_style') "
+            "AND category = 'preference')",
+            name="ck_nova_observed_memories_semantic_key",
+        ),
+        Index(
+            "ix_nova_observed_memories_owner_active",
+            "owner_id",
+            "status",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "ix_nova_observed_memories_owner_category",
+            "owner_id",
+            "category",
+            "status",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "uq_nova_observed_memories_owner_active_semantic_key",
+            "owner_id",
+            "semantic_key",
+            unique=True,
+            sqlite_where=text("status = 'active' AND semantic_key IS NOT NULL"),
+            postgresql_where=text("status = 'active' AND semantic_key IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    category: Mapped[str] = mapped_column(String(16))
+    semantic_key: Mapped[str | None] = mapped_column(String(32))
+    normalized_value: Mapped[str] = mapped_column(Text)
+    content_fingerprint: Mapped[str] = mapped_column(String(64))
+    source_kind: Mapped[str] = mapped_column(String(16))
+    source_session_id: Mapped[int] = mapped_column(Integer)
+    source_message_id: Mapped[int] = mapped_column(Integer)
+    source_receipt: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
+    salience: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    superseded_by_public_id: Mapped[str | None] = mapped_column(String(36))
+    owner: Mapped[User] = relationship(back_populates="nova_observed_memories")
+
+
 class VisionProfile(TimestampMixin, Base):
     __tablename__ = "vision_profiles"
 
@@ -399,6 +979,12 @@ class InboxItem(TimestampMixin, Base):
     user: Mapped[User] = relationship(back_populates="inbox_items")
     reminder: Mapped[TaskReminder | None] = relationship(
         back_populates="inbox_item", uselist=False, cascade="all, delete-orphan"
+    )
+    recurring_reminder_schedule: Mapped[RecurringTaskReminderSchedule | None] = relationship(
+        back_populates="inbox_item",
+        uselist=False,
+        cascade="all, delete-orphan",
+        overlaps="owner,recurring_task_reminder_schedules",
     )
     task_state: Mapped[TaskState | None] = relationship(
         back_populates="inbox_item",
@@ -761,6 +1347,177 @@ class TaskReminder(TimestampMixin, Base):
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
     last_error_type: Mapped[str | None] = mapped_column(String(120))
     inbox_item: Mapped[InboxItem] = relationship(back_populates="reminder")
+
+
+class RecurringTaskReminderSchedule(TimestampMixin, Base):
+    __tablename__ = "recurring_task_reminder_schedules"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["inbox_item_id", "owner_id"],
+            ["inbox_items.id", "inbox_items.user_id"],
+            ondelete="CASCADE",
+            name="fk_recurring_schedule_inbox_owner",
+        ),
+        UniqueConstraint(
+            "inbox_item_id",
+            name="uq_recurring_schedule_inbox_item",
+        ),
+        CheckConstraint(
+            "recurrence_kind IN ('daily')",
+            name="ck_recurring_schedule_kind",
+        ),
+        CheckConstraint(
+            "timezone_source IN ('profile', 'explicit')",
+            name="ck_recurring_schedule_timezone_source",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'completed')",
+            name="ck_recurring_schedule_status",
+        ),
+        CheckConstraint("version > 0", name="ck_recurring_schedule_version"),
+        CheckConstraint(
+            "length(timezone) BETWEEN 1 AND 64",
+            name="ck_recurring_schedule_timezone_length",
+        ),
+        Index(
+            "ix_recurring_schedule_due",
+            "status",
+            "next_occurrence_at",
+        ),
+        Index(
+            "ix_recurring_schedule_owner_status",
+            "owner_id",
+            "status",
+            "next_occurrence_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    inbox_item_id: Mapped[int] = mapped_column(Integer)
+    recurrence_kind: Mapped[str] = mapped_column(String(16), default="daily")
+    local_time: Mapped[time] = mapped_column(Time)
+    timezone: Mapped[str] = mapped_column(String(64))
+    timezone_source: Mapped[str] = mapped_column(String(16), default="profile")
+    start_local_date: Mapped[date] = mapped_column(Date)
+    next_occurrence_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    owner: Mapped[User] = relationship(
+        back_populates="recurring_task_reminder_schedules",
+        overlaps="inbox_item,recurring_reminder_schedule",
+    )
+    inbox_item: Mapped[InboxItem] = relationship(
+        back_populates="recurring_reminder_schedule",
+        overlaps="owner,recurring_task_reminder_schedules",
+    )
+    occurrences: Mapped[list[RecurringTaskReminderOccurrence]] = relationship(
+        back_populates="schedule",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="RecurringTaskReminderOccurrence.scheduled_for",
+    )
+
+
+class RecurringTaskReminderOccurrence(TimestampMixin, Base):
+    __tablename__ = "recurring_task_reminder_occurrences"
+    __table_args__ = (
+        UniqueConstraint(
+            "schedule_id",
+            "schedule_version",
+            "scheduled_for",
+            name="uq_recurring_occurrence_generation_time",
+        ),
+        UniqueConstraint(
+            "schedule_id",
+            "schedule_version",
+            "local_date",
+            name="uq_recurring_occurrence_generation_date",
+        ),
+        UniqueConstraint(
+            "delivery_key",
+            name="uq_recurring_occurrence_delivery_key",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'sent', 'skipped_stale', 'cancelled')",
+            name="ck_recurring_occurrence_status",
+        ),
+        CheckConstraint(
+            "schedule_version > 0",
+            name="ck_recurring_occurrence_schedule_version",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_recurring_occurrence_attempt_count",
+        ),
+        CheckConstraint(
+            "(status = 'processing' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL) OR "
+            "(status <> 'processing' AND claim_token IS NULL AND claimed_at IS NULL)",
+            name="ck_recurring_occurrence_claim_state",
+        ),
+        CheckConstraint(
+            "(status = 'sent' AND sent_at IS NOT NULL) OR (status <> 'sent' AND sent_at IS NULL)",
+            name="ck_recurring_occurrence_sent_state",
+        ),
+        CheckConstraint(
+            "(delivery_started_at IS NULL AND status <> 'sent') OR "
+            "(delivery_started_at IS NOT NULL AND status IN ('processing', 'sent'))",
+            name="ck_recurring_occurrence_delivery_started_state",
+        ),
+        CheckConstraint(
+            "length(delivery_key) BETWEEN 1 AND 128",
+            name="ck_recurring_occurrence_delivery_key_length",
+        ),
+        Index(
+            "ix_recurring_occurrence_due",
+            "status",
+            "scheduled_for",
+            "next_attempt_at",
+        ),
+        Index(
+            "ix_recurring_occurrence_claims",
+            "status",
+            "delivery_started_at",
+            "claimed_at",
+        ),
+        Index(
+            "ix_recurring_occurrence_schedule_history",
+            "schedule_id",
+            "created_at",
+        ),
+        Index(
+            "ix_recurring_occurrence_cleanup",
+            "status",
+            "updated_at",
+        ),
+        Index(
+            "uq_recurring_occurrence_sent_date",
+            "schedule_id",
+            "local_date",
+            unique=True,
+            sqlite_where=text("status = 'sent'"),
+            postgresql_where=text("status = 'sent'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    schedule_id: Mapped[int] = mapped_column(
+        ForeignKey("recurring_task_reminder_schedules.id", ondelete="CASCADE")
+    )
+    schedule_version: Mapped[int] = mapped_column(Integer)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    local_date: Mapped[date] = mapped_column(Date)
+    delivery_key: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    last_error_type: Mapped[str | None] = mapped_column(String(120))
+    schedule: Mapped[RecurringTaskReminderSchedule] = relationship(back_populates="occurrences")
 
 
 class LifeCollection(TimestampMixin, Base):

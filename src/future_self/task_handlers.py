@@ -88,6 +88,20 @@ class TaskHandlers:
                 snapshot,
             )
             return
+        if data.startswith("task:recurring:"):
+            parts = data.split(":")
+            if len(parts) != 3 or not parts[2].isdigit():
+                await self._task_stale(query)
+                return
+            await query.answer()
+            await self._send_recurring_page(
+                query,
+                update.effective_user.id,
+                update.effective_chat.id,
+                int(parts[2]),
+                edit=True,
+            )
+            return
         if data.startswith("task:list:"):
             parts = data.split(":")
             if len(parts) != 4 or parts[2] not in BUCKET_LABELS or not parts[3].isdigit():
@@ -254,6 +268,51 @@ class TaskHandlers:
                 self._task_back_keyboard(),
             )
             return
+        if action == "recurring_time_edit":
+            result = await self.task_service.start_recurring_time_input(
+                token, user.id, update.effective_chat.id
+            )
+            if result.status != "await_recurring_time" or result.record is None:
+                await self._task_stale_message(query)
+                return
+            timezone = result.record.recurring.timezone if result.record.recurring else ""
+            await self._task_edit_or_send(
+                query,
+                "🕒 Изменить время ежедневного напоминания\n\n"
+                "Пришли новое время, например: 19:30. "
+                f"Часовой пояс останется прежним: {timezone}.\n\n"
+                "/cancel — отменить ввод.",
+                self._task_back_keyboard(),
+            )
+            return
+        if action == "recurring_disable":
+            result = await self.task_service.disable_recurring(
+                token, user.id, update.effective_chat.id
+            )
+            await self._render_result(
+                query,
+                user.id,
+                update.effective_chat.id,
+                result,
+                "recurring",
+                0,
+                notice="Ежедневное напоминание отключено.",
+            )
+            return
+        if action == "recurring_reenable":
+            result = await self.task_service.reenable_recurring(
+                token, user.id, update.effective_chat.id
+            )
+            await self._render_result(
+                query,
+                user.id,
+                update.effective_chat.id,
+                result,
+                "recurring",
+                0,
+                notice="Ежедневное напоминание снова включено.",
+            )
+            return
         if action == "delete_ask":
             result = await self.task_service.prepare_delete(
                 token, user.id, update.effective_chat.id
@@ -320,8 +379,52 @@ class TaskHandlers:
                 "Это действие устарело: задача уже изменилась. Открой её снова через /tasks."
             )
             return True
+        value = text if text is not None else (update.effective_message.text or "")
+        if pending.action == "recurring_time_input":
+            schedule_version = (pending.payload or {}).get("schedule_version")
+            if (
+                isinstance(schedule_version, bool)
+                or not isinstance(schedule_version, int)
+                or record.recurring is None
+                or record.recurring.status != "active"
+                or record.recurring.version != schedule_version
+            ):
+                await self.task_service.cancel_pending_input(user.id, update.effective_chat.id)
+                await update.effective_message.reply_text(
+                    "Это действие устарело: расписание уже изменилось. Открой его снова через "
+                    "/tasks."
+                )
+                return True
+            local_time = self.task_service.parse_recurring_time(value, record.recurring)
+            if local_time is None:
+                await update.effective_message.reply_text(
+                    "Не удалось определить время. Напиши его, например: 19:30. "
+                    "Часовой пояс менять здесь не нужно."
+                )
+                return True
+            result = await self.task_service.submit_recurring_time(
+                pending.token,
+                user.id,
+                update.effective_chat.id,
+                local_time,
+            )
+            if result.status in {"recurring_time_changed", "recurring_time_unchanged"}:
+                await self._send_record(
+                    update.effective_message,
+                    user.id,
+                    update.effective_chat.id,
+                    result.record,
+                    "recurring",
+                    0,
+                    notice="Время ежедневного напоминания обновлено.",
+                )
+            else:
+                await update.effective_message.reply_text(
+                    "Действие устарело: расписание уже изменилось. Открой его снова через /tasks."
+                )
+            return True
         parsed = self.task_service.parse_datetime(
-            text if text is not None else (update.effective_message.text or ""),
+            value,
             record.state.timezone,
         )
         if parsed.status != "resolved":
@@ -374,9 +477,13 @@ class TaskHandlers:
             user.id,
             update.effective_chat.id,
             record,
-            self._default_bucket(record),
+            "recurring" if record.recurring is not None else self._default_bucket(record),
             0,
-            notice="Ввод отменён. Новое напоминание не создано.",
+            notice=(
+                "Ввод отменён. Время ежедневного напоминания не изменено."
+                if record.recurring is not None
+                else "Ввод отменён. Новое напоминание не создано."
+            ),
         )
         return True
 
@@ -460,6 +567,80 @@ class TaskHandlers:
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
+    async def _send_recurring_page(
+        self,
+        target: Any,
+        telegram_user_id: int,
+        chat_id: int,
+        page: int,
+        *,
+        edit: bool,
+    ) -> None:
+        user = await self._user(telegram_user_id)
+        task_page = await self.task_service.list_recurring(user.id, page)
+        rows: list[list[InlineKeyboardButton]] = []
+        lines: list[str] = []
+        status_labels = {
+            "active": "включено",
+            "disabled": "отключено",
+            "completed": "завершено",
+        }
+        for index, record in enumerate(
+            task_page.records, start=task_page.page * self.task_service.PAGE_SIZE + 1
+        ):
+            recurring = record.recurring
+            if recurring is None:
+                continue
+            tokens = await self.task_service.issue_actions(
+                user.id,
+                chat_id,
+                record.item.id,
+                record.state.version,
+                ("view",),
+                payload={"bucket": "recurring", "page": task_page.page},
+            )
+            if not tokens:
+                continue
+            lines.append(
+                f"{index}. {escape(record.item.title)} — "
+                f"{recurring.local_time.strftime('%H:%M')} · "
+                f"{status_labels.get(recurring.status, 'неизвестно')}"
+            )
+            rows.append(
+                [InlineKeyboardButton(f"Открыть {index}", callback_data=f"task:{tokens['view']}")]
+            )
+        pagination: list[InlineKeyboardButton] = []
+        if task_page.page > 0:
+            pagination.append(
+                InlineKeyboardButton(
+                    "← Назад", callback_data=f"task:recurring:{task_page.page - 1}"
+                )
+            )
+        if task_page.page + 1 < task_page.pages:
+            pagination.append(
+                InlineKeyboardButton(
+                    "Далее →", callback_data=f"task:recurring:{task_page.page + 1}"
+                )
+            )
+        if pagination:
+            rows.append(pagination)
+        rows.extend(
+            [
+                [InlineKeyboardButton("← Назад", callback_data="task:hub")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
+            ]
+        )
+        listing = "\n".join(lines) if lines else "Ежедневных напоминаний пока нет."
+        text = (
+            f"🔁 Ежедневные напоминания — {task_page.total}\n"
+            f"Страница {task_page.page + 1}/{task_page.pages}\n\n{listing}"
+        )
+        markup = InlineKeyboardMarkup(rows)
+        if edit:
+            await self._task_edit_or_send(target, text, markup, parse_mode="HTML")
+        else:
+            await target.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
     async def _render_result(
         self,
         query: Any,
@@ -478,7 +659,11 @@ class TaskHandlers:
             owner_id,
             chat_id,
             result.record,
-            bucket if bucket in BUCKET_LABELS else self._default_bucket(result.record),
+            (
+                bucket
+                if bucket in BUCKET_LABELS or bucket == "recurring"
+                else self._default_bucket(result.record)
+            ),
             page,
             notice=notice,
         )
@@ -512,6 +697,7 @@ class TaskHandlers:
         notice: str | None,
     ) -> tuple[str, InlineKeyboardMarkup]:
         state, item, reminder = record.state, record.item, record.reminder
+        recurring = record.recurring
         status_label = {
             "active": "активна",
             "completed": "выполнена",
@@ -538,6 +724,25 @@ class TaskHandlers:
                 reminder_text = f"истекло {local_reminder.strftime('%d.%m.%Y %H:%M')}"
             else:
                 reminder_text = "отключено"
+        recurring_text = ""
+        if recurring is not None:
+            recurring_status = {
+                "active": "включено",
+                "disabled": "отключено",
+                "completed": "завершено",
+            }.get(recurring.status, "неизвестно")
+            next_occurrence = "—"
+            if recurring.status == "active":
+                next_local = as_utc(recurring.next_occurrence_at).astimezone(
+                    ZoneInfo(recurring.timezone)
+                )
+                next_occurrence = next_local.strftime("%d.%m.%Y %H:%M")
+            recurring_text = (
+                f"\nПовтор: каждый день в {recurring.local_time.strftime('%H:%M')} "
+                f"({escape(recurring.timezone)})"
+                f"\nСтатус повтора: {recurring_status}"
+                f"\nСледующее срабатывание: {next_occurrence}"
+            )
         description = ""
         if item.description and not item.source.startswith("doctor"):
             description = f"\nОписание: {escape(item.description)}"
@@ -553,11 +758,26 @@ class TaskHandlers:
         text = (
             f"{prefix}<b>{escape(item.title)}</b>{description}\n"
             f"Срок: {due}\n"
-            f"Напоминание: {reminder_text}\n"
+            f"Напоминание: {reminder_text}{recurring_text}\n"
             f"Статус: {status_label}{source_text}{vision_text}"
         )
         if state.status == "completed":
             actions = ("reopen", "delete_ask")
+        elif recurring is not None and recurring.status == "active":
+            actions = (
+                "complete",
+                "reschedule_menu",
+                "recurring_time_edit",
+                "recurring_disable",
+                "delete_ask",
+            )
+        elif recurring is not None and recurring.status in {"disabled", "completed"}:
+            actions = (
+                "complete",
+                "reschedule_menu",
+                "recurring_reenable",
+                "delete_ask",
+            )
         else:
             actions = (
                 "complete",
@@ -572,6 +792,7 @@ class TaskHandlers:
             item.id,
             state.version,
             actions,
+            payload=({"schedule_version": recurring.version} if recurring is not None else None),
         )
         rows: list[list[InlineKeyboardButton]] = []
         if state.status == "completed":
@@ -591,25 +812,63 @@ class TaskHandlers:
                             "Перенести", callback_data=f"task:{tokens['reschedule_menu']}"
                         )
                     ],
-                    [
-                        InlineKeyboardButton(
-                            "Изменить напоминание", callback_data=f"task:{tokens['reminder_edit']}"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Отключить напоминание", callback_data=f"task:{tokens['reminder_off']}"
-                        )
-                    ],
                 ]
             )
+            if recurring is not None and recurring.status == "active":
+                rows.extend(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🕒 Изменить время",
+                                callback_data=f"task:{tokens['recurring_time_edit']}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "⏸ Отключить",
+                                callback_data=f"task:{tokens['recurring_disable']}",
+                            )
+                        ],
+                    ]
+                )
+            elif recurring is not None and recurring.status in {"disabled", "completed"}:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            "▶️ Включить снова",
+                            callback_data=f"task:{tokens['recurring_reenable']}",
+                        )
+                    ]
+                )
+            else:
+                rows.extend(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Изменить напоминание",
+                                callback_data=f"task:{tokens['reminder_edit']}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "Отключить напоминание",
+                                callback_data=f"task:{tokens['reminder_off']}",
+                            )
+                        ],
+                    ]
+                )
+        back_callback = (
+            f"task:recurring:{max(page, 0)}"
+            if bucket == "recurring"
+            else f"task:list:{bucket}:{max(page, 0)}"
+        )
         rows.extend(
             [
                 [InlineKeyboardButton("Удалить", callback_data=f"task:{tokens['delete_ask']}")],
                 [
                     InlineKeyboardButton(
                         "← Назад к списку",
-                        callback_data=f"task:list:{bucket}:{max(page, 0)}",
+                        callback_data=back_callback,
                     )
                 ],
                 [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:root")],
@@ -728,8 +987,8 @@ class TaskHandlers:
                 [InlineKeyboardButton("Создать задачу", callback_data="nav:action:task_create")],
                 [
                     InlineKeyboardButton(
-                        "Как работают напоминания",
-                        callback_data="nav:action:task_reminder_guide",
+                        "🔁 Ежедневные напоминания",
+                        callback_data="task:recurring:0",
                     )
                 ],
                 [InlineKeyboardButton("← Назад", callback_data="nav:root")],

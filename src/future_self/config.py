@@ -47,6 +47,24 @@ class Settings(BaseSettings):
     ai_model: str | None = None
     openrouter_site_url: str | None = None
     openrouter_app_name: str = "MyFutureSelfAI"
+    enable_nova_ai: bool = False
+    nova_ai_admin_only: bool = True
+
+    # Nova Companion is an independent, fail-closed conversation pilot.
+    enable_nova_companion: bool = False
+    nova_companion_admin_only: bool = True
+    enable_nova_conversation_brain: bool = False
+    nova_conversation_brain_admin_only: bool = True
+    nova_conversation_brain_max_memories: int = Field(default=100, ge=1, le=500)
+    nova_conversation_brain_retrieval_items: int = Field(default=6, ge=1, le=12)
+    nova_conversation_brain_context_bytes: int = Field(default=8192, ge=1024, le=32768)
+
+    # Nova memory CRUD and answer application use independent fail-closed gates.
+    enable_nova_memory: bool = False
+    nova_memory_admin_only: bool = True
+    enable_nova_memory_application: bool = False
+    nova_memory_application_admin_only: bool = True
+    nova_memory_max_items: int = Field(default=100, ge=1, le=100)
 
     transcription_provider: Literal["openai", "local", "disabled"] = "disabled"
     transcription_api_key: str | None = Field(default=None, repr=False)
@@ -79,12 +97,13 @@ class Settings(BaseSettings):
     inbox_draft_ttl_minutes: int = Field(default=60, ge=5, le=1440)
     draft_focus_ttl_minutes: int = Field(default=15, ge=1, le=1440)
     system_action_ttl_minutes: int = Field(default=10, ge=1, le=60)
-    conversation_context_messages: int = Field(default=12, ge=10, le=20)
+    conversation_context_messages: int = Field(default=20, ge=10, le=20)
     conversation_context_ttl_hours: int = Field(default=24, ge=1, le=168)
     task_date_event_hour: int = Field(default=9, ge=0, le=23)
     task_reminder_lead_minutes: int = Field(default=30, ge=0, le=10080)
     task_reminder_poll_seconds: int = Field(default=15, ge=5, le=300)
     task_reminder_lease_seconds: int = Field(default=120, ge=30, le=3600)
+    recurring_task_reminder_grace_minutes: int = Field(default=120, ge=5, le=360)
     guest_ai_enabled: bool = True
     guest_operation_limit: int = Field(default=2, ge=1, le=10)
     guest_global_daily_limit: int = Field(default=50, ge=1, le=100_000)
@@ -166,7 +185,10 @@ class Settings(BaseSettings):
 
     enable_task_reminders: bool = True
     enable_voice: bool = True
+    # Weekly review is an additive pilot. The feature switch controls every
+    # surface and the tier switch defaults to administrators only.
     enable_weekly_review: bool = True
+    weekly_review_admin_only: bool = True
     log_level: str = "INFO"
 
     model_config = SettingsConfigDict(

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from autotester.fakes import FakeCallbackQuery, FakeMessage, FakeVoice, ScriptedTranscription
 from sqlalchemy import func, select, update
+from telegram.ext import ApplicationHandlerStop
 
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
@@ -287,7 +288,8 @@ async def test_nonmedical_specialized_flow_keeps_existing_voice_behavior(db, fak
     voice = CountingVoice()
     message = FakeMessage(voice=voice)
 
-    await bot.voice(update_for(message), flow_context)
+    with pytest.raises(ApplicationHandlerStop):
+        await bot.voice(update_for(message), flow_context)
 
     assert voice.download_calls == 1
     assert len(transcription.calls) == 1

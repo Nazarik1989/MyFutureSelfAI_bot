@@ -1,26 +1,127 @@
+from __future__ import annotations
+
+import asyncio
 import json
-from typing import Literal, Protocol, TypeVar
+import re
+import unicodedata
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeVar
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, StringConstraints, TypeAdapter, ValidationError
 
 from . import prompts
 from .config import Settings
+from .nova_brain import (
+    NovaBrainProjection,
+    validate_dialogue_state_update,
+    validate_memory_candidate,
+)
+from .nova_companion import NovaCompanionContextProjection
+from .nova_companion_flow import NovaCompanionDiscourseAnchor, validate_capture_suggestion
+from .nova_memory_application import NovaMemoryProjection
 from .schemas import (
     AssistantAnswer,
     GoalProposals,
     GuestFirstStep,
     GuestThoughtBreakdown,
     IntentResult,
+    NovaCompanionCapture,
+    NovaCompanionDiagnosticCode,
+    NovaCompanionDialogueStateUpdate,
+    NovaCompanionMemoryCandidate,
+    NovaCompanionProviderCapture,
+    NovaCompanionProviderReminderOffer,
+    NovaCompanionProviderResponse,
+    NovaCompanionProviderTransport,
+    NovaCompanionReminderOffer,
+    NovaCompanionResponse,
+    NovaHelpPlan,
     ParsedThought,
+    ReminderTimezoneResolution,
     RoutineProposals,
     TimezoneResolution,
     TodayPlan,
     VisionSummary,
+    WeeklyReviewExtraction,
 )
+from .weekly_review_extraction import validate_weekly_review_extraction, weekly_review_input
+
+if TYPE_CHECKING:
+    from .nova import NovaCatalog
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 GUEST_DEMO_MAX_INPUT_CHARS = 1200
+NOVA_HELP_MAX_INPUT_CHARS = 600
+NOVA_HELP_TIMEOUT_SECONDS = 30.0
+REMINDER_TIMEZONE_MAX_INPUT_CHARS = 120
+REMINDER_TIMEZONE_TIMEOUT_SECONDS = 20.0
+NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS = 30.0
+NOVA_COMPANION_MAX_INPUT_CHARS = 4000
+NOVA_COMPANION_TIMEOUT_SECONDS = 30.0
+WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS = 30.0
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_ITEMS = 12
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_KEY_CHARS = 64
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_VALUE_CHARS = 128
+WEEKLY_REVIEW_TEMPORAL_CONTEXT_FIELDS = frozenset(
+    {
+        "timezone",
+        "local_datetime",
+        "today_date",
+        "today_weekday",
+        "tomorrow_date",
+        "tomorrow_weekday",
+        "week_start",
+        "week_end",
+        "target_week_start",
+        "target_week_end",
+    }
+)
+NOVA_COMPANION_TEMPORAL_CONTEXT_FIELDS = frozenset(
+    {
+        "timezone",
+        "local_datetime",
+        "today_date",
+        "today_weekday",
+        "tomorrow_date",
+        "tomorrow_weekday",
+    }
+)
+NOVA_COMPANION_PROPOSAL_MAX_BYTES = 4096
+NOVA_COMPANION_PROPOSAL_MAX_DEPTH = 4
+NOVA_COMPANION_PROPOSAL_MAX_ITEMS = 32
+NOVA_COMPANION_REJECTED_REMINDER_OFFER_TEXT = (
+    "Пока ничего не создано. Уточни одно событие и время, если хочешь поставить "
+    "настоящее напоминание."
+)
+_NOVA_COMPANION_ANSWER_ADAPTER = TypeAdapter(
+    Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+)
+_NOVA_COMPANION_PROPOSAL_KEYS = {
+    "capture": frozenset({"kind", "title", "next_step", "evidence"}),
+    "reminder_offer": frozenset({"title", "schedule_wording", "evidence"}),
+    "dialogue_state_update": frozenset(
+        {
+            "active_topic",
+            "current_user_goal",
+            "last_assistant_offer",
+            "last_assistant_offer_kinds",
+            "unresolved_question",
+            "requested_action",
+            "open_loops",
+            "clear_fields",
+        }
+    ),
+    "memory_candidate": frozenset(
+        {"category", "key", "value", "evidence", "salience", "supersedes_value"}
+    ),
+}
+_NOVA_COMPANION_DIAGNOSTIC_BY_PROPOSAL: dict[str, NovaCompanionDiagnosticCode] = {
+    "capture": "invalid_capture",
+    "reminder_offer": "invalid_reminder_offer",
+    "dialogue_state_update": "invalid_dialogue_state",
+    "memory_candidate": "invalid_memory_candidate",
+}
 
 
 def _guest_demo_input(text: str) -> str:
@@ -36,6 +137,427 @@ def _guest_demo_input(text: str) -> str:
     return cleaned
 
 
+def _nova_help_input(question: str) -> str:
+    if not isinstance(question, str):
+        raise ValueError("Nova help input must be a string")
+    cleaned = question.strip()
+    if not cleaned:
+        raise ValueError("Nova help input must not be empty")
+    if len(cleaned) > NOVA_HELP_MAX_INPUT_CHARS:
+        raise ValueError(f"Nova help input must not exceed {NOVA_HELP_MAX_INPUT_CHARS} characters")
+    return cleaned
+
+
+def _nova_companion_input(text: str) -> str:
+    if not isinstance(text, str):
+        raise ValueError("Nova companion input must be a string")
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("Nova companion input must not be empty")
+    if len(cleaned) > NOVA_COMPANION_MAX_INPUT_CHARS:
+        raise ValueError(
+            f"Nova companion input must not exceed {NOVA_COMPANION_MAX_INPUT_CHARS} characters"
+        )
+    return cleaned
+
+
+def _nova_companion_temporal_context(context: dict[str, str]) -> dict[str, str]:
+    if not isinstance(context, dict):
+        raise ValueError("Nova companion temporal context must be a mapping")
+    if len(context) > len(NOVA_COMPANION_TEMPORAL_CONTEXT_FIELDS):
+        raise ValueError("Nova companion temporal context has too many fields")
+    bounded: dict[str, str] = {}
+    for key, value in context.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("Nova companion temporal context must contain strings")
+        clean_key = key.strip()
+        clean_value = value.strip()
+        if (
+            clean_key not in NOVA_COMPANION_TEMPORAL_CONTEXT_FIELDS
+            or not clean_value
+            or len(clean_key) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_KEY_CHARS
+            or len(clean_value) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_VALUE_CHARS
+            or clean_key in bounded
+        ):
+            raise ValueError("Nova companion temporal context contains an invalid field")
+        bounded[clean_key] = clean_value
+    return bounded
+
+
+def _grounding_text(value: str) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip().casefold()
+
+
+_PRIOR_REMINDER_REFERENCE = re.compile(
+    r"\b(?:это|этом|этого|этому|этой|него|ней|забуд\w*|вспомин\w*|напом\w*)\b",
+    re.IGNORECASE,
+)
+
+
+class NovaCompanionBoundaryError(ValueError):
+    """Privacy-safe terminal validation error for the provider answer envelope."""
+
+    diagnostic_code: NovaCompanionDiagnosticCode = "invalid_answer"
+
+    def __init__(self) -> None:
+        super().__init__(self.diagnostic_code)
+
+
+def _proposal_model_value(value: BaseModel, allowed_keys: frozenset[str]) -> dict[str, object]:
+    """Read test/provider models without leaking fields marked ``exclude=True``."""
+
+    return {key: getattr(value, key) for key in allowed_keys if hasattr(value, key)}
+
+
+def _provider_response_parts(parsed: object) -> tuple[object, dict[str, object | None]]:
+    fields = tuple(_NOVA_COMPANION_PROPOSAL_KEYS)
+    if isinstance(parsed, NovaCompanionProviderResponse | NovaCompanionProviderTransport):
+        return parsed.answer, {field: getattr(parsed, field) for field in fields}
+    if not isinstance(parsed, Mapping):
+        raise NovaCompanionBoundaryError
+    allowed = {"answer", *fields}
+    if any(not isinstance(key, str) for key in parsed) or set(parsed) - allowed:
+        raise NovaCompanionBoundaryError
+    return parsed.get("answer"), {field: parsed.get(field) for field in fields}
+
+
+def _bounded_json_item_count(value: object, *, depth: int = 1) -> int:
+    if depth > NOVA_COMPANION_PROPOSAL_MAX_DEPTH:
+        raise ValueError("proposal_depth")
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("proposal_key_type")
+        count = len(value)
+        for item in value.values():
+            count += _bounded_json_item_count(item, depth=depth + 1)
+        return count
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        count = len(value)
+        for item in value:
+            count += _bounded_json_item_count(item, depth=depth + 1)
+        return count
+    if value is None or type(value) in {str, int, float, bool}:
+        return 1
+    raise ValueError("proposal_value_type")
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("proposal_constant")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("proposal_duplicate_key")
+        value[key] = item
+    return value
+
+
+def _bounded_proposal_value(name: str, value: object | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        decoded: object = _proposal_model_value(value, _NOVA_COMPANION_PROPOSAL_KEYS[name])
+    elif isinstance(value, str):
+        if not value or len(value.encode("utf-8")) > NOVA_COMPANION_PROPOSAL_MAX_BYTES:
+            raise ValueError("proposal_size")
+        decoded = json.loads(
+            value,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+    else:
+        decoded = value
+    if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
+        raise ValueError("proposal_type")
+    if set(decoded) - _NOVA_COMPANION_PROPOSAL_KEYS[name]:
+        raise ValueError("proposal_keys")
+    if _bounded_json_item_count(decoded) > NOVA_COMPANION_PROPOSAL_MAX_ITEMS:
+        raise ValueError("proposal_items")
+    serialized = json.dumps(
+        decoded,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if len(serialized.encode("utf-8")) > NOVA_COMPANION_PROPOSAL_MAX_BYTES:
+        raise ValueError("proposal_size")
+    return decoded
+
+
+def _validated_provider_model[ModelT: BaseModel](
+    name: str,
+    value: object | None,
+    schema: type[ModelT],
+) -> tuple[ModelT | None, bool]:
+    if value is None:
+        return None, False
+    try:
+        decoded = _bounded_proposal_value(name, value)
+        assert decoded is not None
+        return schema.model_validate(decoded, strict=True), False
+    except (AssertionError, TypeError, ValueError, ValidationError, json.JSONDecodeError):
+        return None, True
+
+
+def _validated_reminder_offer(
+    text: str,
+    offer: NovaCompanionProviderReminderOffer,
+    companion_context: NovaCompanionContextProjection,
+) -> NovaCompanionReminderOffer | None:
+    payload = companion_context.provider_payload()
+    recent = payload.get("recent_conversation")
+    raw_messages = recent.get("recent_messages", []) if isinstance(recent, dict) else []
+    safe_user_messages = [
+        str(item["content"])
+        for item in raw_messages
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and isinstance(item.get("content"), str)
+    ]
+    evidence = _grounding_text(offer.evidence)
+    title = _grounding_text(offer.title)
+    schedule = _grounding_text(offer.schedule_wording) if offer.schedule_wording else None
+    current_exact = _grounding_text(text) == evidence
+    prior_exact = [source for source in safe_user_messages if _grounding_text(source) == evidence]
+    prior_title_matches = [
+        source for source in safe_user_messages if title in _grounding_text(source)
+    ]
+    temporal_sources = {
+        _grounding_text(source)
+        for source in safe_user_messages
+        if re.search(
+            r"\b(?:сегодня|завтра|послезавтра|понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|\d{1,2}[:.]\d{2})\b",
+            source,
+            re.IGNORECASE,
+        )
+    }
+    ambiguous_prior = evidence != _grounding_text(text) and len(temporal_sources) > 1
+    if not (
+        (
+            current_exact
+            or (
+                len(prior_exact) == 1
+                and len(prior_title_matches) == 1
+                and _PRIOR_REMINDER_REFERENCE.search(text) is not None
+            )
+        )
+        and title
+        and title in evidence
+        and (schedule is None or schedule in evidence)
+        and not ambiguous_prior
+        and evidence not in {"я иногда всё забываю", "а вдруг забуду"}
+    ):
+        return None
+    return NovaCompanionReminderOffer(
+        title=offer.title,
+        schedule_wording=offer.schedule_wording,
+        evidence=offer.evidence,
+    )
+
+
+def validate_nova_companion_response(
+    text: str,
+    parsed: object,
+    companion_context: NovaCompanionContextProjection,
+    *,
+    brain_enabled: bool = False,
+) -> NovaCompanionResponse:
+    try:
+        raw_answer, raw_proposals = _provider_response_parts(parsed)
+        answer = _NOVA_COMPANION_ANSWER_ADAPTER.validate_python(raw_answer, strict=True)
+    except (TypeError, ValueError, ValidationError):
+        raise NovaCompanionBoundaryError from None
+
+    diagnostics: list[NovaCompanionDiagnosticCode] = []
+
+    def reject(code: NovaCompanionDiagnosticCode) -> None:
+        if code not in diagnostics:
+            diagnostics.append(code)
+
+    capture, capture_invalid = _validated_provider_model(
+        "capture", raw_proposals["capture"], NovaCompanionProviderCapture
+    )
+    reminder, reminder_invalid = _validated_provider_model(
+        "reminder_offer",
+        raw_proposals["reminder_offer"],
+        NovaCompanionProviderReminderOffer,
+    )
+    dialogue, dialogue_invalid = _validated_provider_model(
+        "dialogue_state_update",
+        raw_proposals["dialogue_state_update"],
+        NovaCompanionDialogueStateUpdate,
+    )
+    memory, memory_invalid = _validated_provider_model(
+        "memory_candidate",
+        raw_proposals["memory_candidate"],
+        NovaCompanionMemoryCandidate,
+    )
+    for field, invalid in (
+        ("capture", capture_invalid),
+        ("reminder_offer", reminder_invalid),
+        ("dialogue_state_update", dialogue_invalid),
+        ("memory_candidate", memory_invalid),
+    ):
+        if invalid:
+            reject(_NOVA_COMPANION_DIAGNOSTIC_BY_PROPOSAL[field])
+
+    suggestion: NovaCompanionCapture | None = None
+    if capture is not None:
+        message = _grounding_text(text)
+        evidence = _grounding_text(capture.evidence)
+        title = _grounding_text(capture.title)
+        next_step = _grounding_text(capture.next_step) if capture.next_step else None
+        grounded = bool(
+            evidence
+            and evidence in message
+            and title
+            and title in evidence
+            and (next_step is None or next_step in evidence)
+        )
+        validated = (
+            validate_capture_suggestion(
+                kind=capture.kind,
+                title=capture.title,
+                next_step=capture.next_step,
+                user_text=text,
+            )
+            if grounded
+            else None
+        )
+        if validated is None:
+            reject("invalid_capture")
+        else:
+            suggestion = NovaCompanionCapture(
+                kind=validated.kind,
+                title=validated.title,
+                next_step=validated.next_step,
+            )
+
+    reminder_offer = (
+        _validated_reminder_offer(text, reminder, companion_context)
+        if reminder is not None
+        else None
+    )
+    if reminder is not None and reminder_offer is None:
+        reject("invalid_reminder_offer")
+
+    if raw_proposals["capture"] is not None and raw_proposals["reminder_offer"] is not None:
+        suggestion = None
+        reminder_offer = None
+        reject("conflicting_actions")
+
+    visible_action = (
+        "reminder" if reminder_offer is not None else "capture" if suggestion is not None else None
+    )
+    validated_dialogue = (
+        validate_dialogue_state_update(
+            dialogue,
+            user_text=text,
+            assistant_answer=answer,
+            visible_action=visible_action,
+        )
+        if dialogue is not None
+        else None
+    )
+    # A structurally valid optional dialogue proposal is sanitized field by
+    # field. Ungrounded summaries are simply discarded; they must not turn an
+    # otherwise normal turn into a provider-boundary rejection diagnostic.
+    validated_memory = (
+        validate_memory_candidate(memory, user_text=text) if memory is not None else None
+    )
+    if memory is not None and validated_memory is None:
+        reject("invalid_memory_candidate")
+
+    dialogue_state_update = validated_dialogue if brain_enabled else None
+    memory_candidate = validated_memory if brain_enabled else None
+    memory_rejected = brain_enabled and memory is not None and validated_memory is None
+
+    return NovaCompanionResponse(
+        answer=answer,
+        capture=suggestion,
+        reminder_offer=reminder_offer,
+        dialogue_state_update=dialogue_state_update,
+        memory_candidate=memory_candidate,
+        memory_rejected=memory_rejected,
+        diagnostic_codes=tuple(diagnostics),
+    )
+
+
+def _reminder_timezone_input(fragment: str) -> str:
+    if not isinstance(fragment, str):
+        raise ValueError("reminder timezone fragment must be a string")
+    cleaned = " ".join(fragment.split())
+    if not cleaned:
+        raise ValueError("reminder timezone fragment must not be empty")
+    if len(cleaned) > REMINDER_TIMEZONE_MAX_INPUT_CHARS:
+        raise ValueError(
+            "reminder timezone fragment must not exceed "
+            f"{REMINDER_TIMEZONE_MAX_INPUT_CHARS} characters"
+        )
+    return cleaned
+
+
+def _weekly_review_temporal_context(context: dict[str, str]) -> dict[str, str]:
+    if not isinstance(context, dict):
+        raise ValueError("weekly review temporal context must be a mapping")
+    if len(context) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_ITEMS:
+        raise ValueError("weekly review temporal context has too many fields")
+    bounded: dict[str, str] = {}
+    for key, value in context.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("weekly review temporal context must contain strings")
+        clean_key = key.strip()
+        clean_value = value.strip()
+        if (
+            not clean_key
+            or not clean_value
+            or len(clean_key) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_KEY_CHARS
+            or len(clean_value) > WEEKLY_REVIEW_TEMPORAL_CONTEXT_MAX_VALUE_CHARS
+            or clean_key not in WEEKLY_REVIEW_TEMPORAL_CONTEXT_FIELDS
+            or clean_key in bounded
+        ):
+            raise ValueError("weekly review temporal context contains an invalid field")
+        bounded[clean_key] = clean_value
+    return bounded
+
+
+def _nova_catalog_payload(capability_catalog: NovaCatalog) -> dict[str, object]:
+    try:
+        capabilities = capability_catalog.capabilities
+        enabled_features = capability_catalog.enabled_features
+    except AttributeError as exc:
+        raise ValueError("invalid Nova capability catalog") from exc
+
+    serialized_capabilities: list[dict[str, str]] = []
+    for capability in capabilities:
+        try:
+            values = (capability.id, capability.label, capability.description)
+        except AttributeError as exc:
+            raise ValueError("invalid Nova capability") from exc
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError("invalid Nova capability")
+        serialized_capabilities.append(
+            {
+                "id": values[0].strip(),
+                "label": values[1].strip(),
+                "description": values[2].strip(),
+            }
+        )
+
+    feature_names: set[str] = set()
+    for feature in enabled_features:
+        if not isinstance(feature, str) or not feature.strip():
+            raise ValueError("invalid Nova runtime feature")
+        feature_names.add(feature.strip())
+
+    return {
+        "capabilities": serialized_capabilities,
+        "enabled_features": sorted(feature_names),
+    }
+
+
 class ProviderHealthCheck(BaseModel):
     ok: Literal[True]
 
@@ -47,6 +569,17 @@ class AIService(Protocol):
 
     async def resolve_timezone(self, location_text: str) -> TimezoneResolution: ...
 
+    async def resolve_reminder_timezone(
+        self,
+        timezone_fragment: str,
+    ) -> ReminderTimezoneResolution: ...
+
+    async def extract_weekly_review(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+    ) -> WeeklyReviewExtraction: ...
+
     async def propose_goals(self, profile: VisionSummary) -> GoalProposals: ...
 
     async def propose_routines(self, goals: GoalProposals) -> RoutineProposals: ...
@@ -56,6 +589,18 @@ class AIService(Protocol):
     async def guest_thought_breakdown(self, text: str) -> GuestThoughtBreakdown: ...
 
     async def guest_first_step(self, text: str) -> GuestFirstStep: ...
+
+    async def nova_help(self, question: str, capability_catalog: NovaCatalog) -> NovaHelpPlan: ...
+
+    async def companion_message(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+        companion_context: NovaCompanionContextProjection,
+        *,
+        discourse_anchor: NovaCompanionDiscourseAnchor | None = None,
+        brain_context: NovaBrainProjection | None = None,
+    ) -> NovaCompanionResponse: ...
 
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan: ...
 
@@ -71,6 +616,8 @@ class AIService(Protocol):
         text: str,
         temporal_context: dict[str, str],
         conversation_context: dict[str, object] | None = None,
+        *,
+        confirmed_memory: NovaMemoryProjection | None = None,
     ) -> AssistantAnswer: ...
 
 
@@ -119,6 +666,66 @@ class OpenAICompatibleAIService:
     async def resolve_timezone(self, location_text: str) -> TimezoneResolution:
         return await self._parse(TimezoneResolution, prompts.TIMEZONE_SYSTEM, location_text)
 
+    async def resolve_reminder_timezone(
+        self,
+        timezone_fragment: str,
+    ) -> ReminderTimezoneResolution:
+        fragment = _reminder_timezone_input(timezone_fragment)
+        client = self.client.with_options(max_retries=0)
+        async with asyncio.timeout(REMINDER_TIMEZONE_TIMEOUT_SECONDS):
+            response = await client.responses.parse(
+                model=self.model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": f"{prompts.REMINDER_TIMEZONE_SYSTEM}\nСтиль ответа: {self.tone}.",
+                    },
+                    {"role": "user", "content": fragment},
+                ],
+                text_format=ReminderTimezoneResolution,
+                timeout=REMINDER_TIMEZONE_TIMEOUT_SECONDS,
+            )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("The model returned no structured output")
+        return ReminderTimezoneResolution.model_validate(parsed)
+
+    async def extract_weekly_review(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+    ) -> WeeklyReviewExtraction:
+        clean = weekly_review_input(text)
+        payload = {
+            "text": clean,
+            "temporal_context": _weekly_review_temporal_context(temporal_context),
+        }
+        client = self.client.with_options(max_retries=0)
+        async with asyncio.timeout(WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS):
+            response = await client.responses.parse(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": prompts.WEEKLY_REVIEW_EXTRACTION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                text_format=WeeklyReviewExtraction,
+                timeout=WEEKLY_REVIEW_EXTRACTION_TIMEOUT_SECONDS,
+            )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("The model returned no structured output")
+        return validate_weekly_review_extraction(
+            clean,
+            WeeklyReviewExtraction.model_validate(parsed),
+        )
+
     async def health_check(self) -> ProviderHealthCheck:
         return await self._parse(
             ProviderHealthCheck,
@@ -151,8 +758,117 @@ class OpenAICompatibleAIService:
             max_retries=0,
         )
 
+    async def nova_help(self, question: str, capability_catalog: NovaCatalog) -> NovaHelpPlan:
+        cleaned_question = _nova_help_input(question)
+        payload = {
+            "question": cleaned_question,
+            **_nova_catalog_payload(capability_catalog),
+        }
+        client = self.client.with_options(max_retries=0)
+        async with asyncio.timeout(NOVA_HELP_TIMEOUT_SECONDS):
+            response = await client.responses.parse(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": prompts.NOVA_HELP_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    },
+                ],
+                text_format=NovaHelpPlan,
+                timeout=NOVA_HELP_TIMEOUT_SECONDS,
+            )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("The model returned no structured output")
+        return NovaHelpPlan.model_validate(parsed)
+
+    async def companion_message(
+        self,
+        text: str,
+        temporal_context: dict[str, str],
+        companion_context: NovaCompanionContextProjection,
+        *,
+        discourse_anchor: NovaCompanionDiscourseAnchor | None = None,
+        brain_context: NovaBrainProjection | None = None,
+    ) -> NovaCompanionResponse:
+        clean = _nova_companion_input(text)
+        if not isinstance(companion_context, NovaCompanionContextProjection):
+            raise ValueError("invalid Nova companion context")
+        payload = {
+            "temporal_context": _nova_companion_temporal_context(temporal_context),
+            "companion_context": (
+                companion_context.provider_context_payload()
+                if brain_context is not None
+                else companion_context.provider_payload()
+            ),
+        }
+        if brain_context is None:
+            payload["message"] = clean
+        else:
+            if not isinstance(brain_context, NovaBrainProjection):
+                raise ValueError("invalid Nova brain context")
+            payload["nova_brain_context"] = brain_context.provider_payload()
+        if discourse_anchor is not None:
+            if not isinstance(discourse_anchor, NovaCompanionDiscourseAnchor):
+                raise ValueError("invalid Nova companion discourse anchor")
+            payload["discourse_context"] = discourse_anchor.provider_payload()
+        native_input: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": f"{prompts.NOVA_COMPANION_SYSTEM}\nСтиль ответа: {self.tone}.",
+            }
+        ]
+        if brain_context is None:
+            native_input.append(
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+        else:
+            native_input.append(
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"untrusted_context": payload},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+            native_input.extend(companion_context.native_messages())
+            native_input.append({"role": "user", "content": clean})
+        client = self.client.with_options(max_retries=0)
+        async with asyncio.timeout(NOVA_COMPANION_TIMEOUT_SECONDS):
+            response = await client.responses.parse(
+                model=self.model,
+                input=native_input,
+                text_format=NovaCompanionProviderTransport,
+                timeout=NOVA_COMPANION_TIMEOUT_SECONDS,
+                **({"store": False} if brain_context is not None else {}),
+            )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("The model returned no structured output")
+        return validate_nova_companion_response(
+            clean,
+            parsed,
+            companion_context,
+            brain_enabled=brain_context is not None,
+        )
+
     async def make_today_plan(self, context: dict[str, object]) -> TodayPlan:
-        return await self._parse(TodayPlan, prompts.TODAY_SYSTEM, repr(context))
+        return await self._parse(
+            TodayPlan,
+            prompts.TODAY_SYSTEM,
+            repr(context),
+            max_retries=0,
+        )
 
     async def route_message(
         self,
@@ -174,12 +890,41 @@ class OpenAICompatibleAIService:
         text: str,
         temporal_context: dict[str, str],
         conversation_context: dict[str, object] | None = None,
+        *,
+        confirmed_memory: NovaMemoryProjection | None = None,
     ) -> AssistantAnswer:
         payload = {
             "message": text,
             "temporal_context": temporal_context,
             "conversation_context": conversation_context or {},
         }
+        if confirmed_memory is not None and confirmed_memory.records:
+            payload["confirmed_memory"] = confirmed_memory.provider_payload()
+            client = self.client.with_options(max_retries=0)
+            async with asyncio.timeout(NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS):
+                response = await client.responses.parse(
+                    model=self.model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": f"{prompts.ANSWER_SYSTEM}\nСтиль ответа: {self.tone}.",
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    ],
+                    text_format=AssistantAnswer,
+                    timeout=NOVA_MEMORY_ANSWER_TIMEOUT_SECONDS,
+                )
+            parsed = response.output_parsed
+            if parsed is None:
+                raise ValueError("The model returned no structured output")
+            return AssistantAnswer.model_validate(parsed)
         return await self._parse(
             AssistantAnswer,
             prompts.ANSWER_SYSTEM,

@@ -61,8 +61,9 @@ MVP принимает мысли текстом или голосом, ведё
   показ точного prompt до платного запроса, отдельные подтверждения генерации и
   сохранения, постоянная приватная библиотека именованных референсов с явным выбором
   до четырёх изображений на один запрос;
-- единая навигация `/menu` и кнопочный `/help`: разделы, быстрый старт, примеры,
-  owner-safe выход из незавершённых сценариев и компактное native Telegram-меню;
+- единая навигация `/menu` и Nova Guided Help через `/help`: локальный поиск функций
+  своими словами, безопасные CTA, owner-safe выход из незавершённых сценариев и
+  компактное native Telegram-меню;
 - текстовый и голосовой inbox с проверкой расшифровки и отдельным callback до сохранения;
 - персональный `/today` и пятишаговая неосуждающая рефлексия `/evening`;
 - async SQLAlchemy и Alembic; текущий production использует SQLite, PostgreSQL остаётся
@@ -364,6 +365,139 @@ PDF pipeline использует `pypdf` (BSD-3-Clause) для локально
 check-in, подготовка к врачу, карточка желания или другой пошаговый сценарий, `/menu`
 предлагает явно продолжить его либо выйти, очищая только текущее состояние.
 
+### Nova Guided Help
+
+Кнопка «❓ Помощь» и команда `/help` открывают Nova — помощника по существующим
+возможностям бота, а не общий AI-чат. Текст и распознанная голосовая фраза проходят один
+детерминированный classifier вопросов об интерфейсе. Пока Nova session активна, следующий
+вопрос обрабатывается в её каноническом сообщении; вне session требуется явное обращение
+или однозначный вопрос о доступной функции бота. Для первого голосового вопроса STT
+progress становится canonical, а при активной session переиспользуется её сообщение.
+Обычный пользовательский контент продолжает существующий content pipeline. Известные темы
+всегда разрешаются локально из единого navigation-каталога и не вызывают AI provider;
+raw transcript и ответы в Nova session не сохраняются.
+
+Опциональный fallback включается только через `ENABLE_NOVA_AI=true`. При безопасном
+default `NOVA_AI_ADMIN_ONLY=true` он доступен только tier `admin`; subscriber и guest
+получают локальную помощь, blocked — только существующий blocked screen. Provider видит
+лишь текущий вопрос, минимальные `id`/названия/описания разрешённых функций и имена
+включённых feature flags. Профиль, задачи, желания, health/labs/doctor data, Telegram ID,
+история диалога и данные изображений не передаются. Nova не сохраняет вопросы или ответы,
+не запускает destructive/admin actions и не предлагает ещё не реализованные функции.
+Подробный контракт: [docs/NOVA_HELP_GUIDE.md](docs/NOVA_HELP_GUIDE.md).
+
+### Nova Companion
+
+Stage 8B.1 adds a separately gated conversation-first route. It is disabled by default:
+
+```dotenv
+ENABLE_NOVA_COMPANION=false
+NOVA_COMPANION_ADMIN_ONLY=true
+```
+
+Stage 8C adds a separate, fail-closed conversation brain. It keeps bounded
+chat-scoped working state and owner-scoped observed memories in SQLite, while
+the existing confirmed profile, Vision, goals, weekly focus, and Nova Memory
+remain authoritative. The provider receives native bounded role messages with
+`store=false`, has no tools or write authority, and may only propose one
+server-validated state update and one observed-memory candidate. Keep the
+feature disabled and admin-only until a dedicated rollout:
+
+```env
+ENABLE_NOVA_CONVERSATION_BRAIN=false
+NOVA_CONVERSATION_BRAIN_ADMIN_ONLY=true
+NOVA_CONVERSATION_BRAIN_MAX_MEMORIES=100
+NOVA_CONVERSATION_BRAIN_RETRIEVAL_ITEMS=6
+NOVA_CONVERSATION_BRAIN_CONTEXT_BYTES=8192
+```
+
+Turning Stage 8C off (or denying it for the actor's tier) is an exact Stage 8B
+fallback: provider brain proposals are ignored, the conversational answer,
+capture/reminder offer and two-message exchange are unchanged, and no
+`NovaDialogueState` or `NovaObservedMemory` row is written.
+
+When Stage 8C is enabled for an eligible actor, automatic observed memory accepts
+only server-parsed structured fields: the user's explicitly declared display
+name, grammatical form of address, and closed-enum Nova settings for response
+length (`short/normal/detailed`), tone (`calm/direct/supportive`) and reminder
+style (`gentle/direct/brief`). This happens only after successful Telegram
+delivery and an atomic conversation exchange; access/context changes compensate
+the exact generation. The server parses the whole current user utterance after
+removing only a bounded Nova vocative, polite wrapper and final statement
+punctuation; provider-selected substrings, quotations and reported speech never
+establish automatic memory. Active response length, tone, reminder style and the
+merged identity record are server-enforced owner-scoped singletons; replacement
+is selected from persisted semantic keys, never from a provider supersedes hint.
+Arbitrary free-text facts, preferences, orientations and
+themes are never automatic memory, regardless of their wording or apparent
+sensitivity. They remain in bounded recent conversation or require the existing
+explicit Nova Memory preview-and-confirm flow. Observations are labelled as
+coming from the user's words and never overwrite the authoritative profile.
+
+Confirmed Nova Memory remains a separate explicit preview-and-confirm flow:
+`Nova, запомни …` does not become automatic observed memory. `Что ты обо мне
+помнишь?` shows a bounded, source-labelled summary of the profile, plans,
+confirmed Nova Memory and active observations. `Забудь …` opens an opaque,
+owner/chat/access-fenced confirmation before an observation is removed.
+
+When enabled for an eligible actor, ordinary statements receive a human conversational
+answer instead of being converted immediately into an inbox preview. Explicit capture and
+reminder commands keep their existing preview-and-confirm flows. Nova can offer at most one
+grounded `idea`, `task`, `desire` or `note` suggestion; rejecting it writes nothing, and
+accepting it opens the existing draft preview rather than saving immediately. Confirmed,
+owner-scoped profile, Vision, goals, current weekly focus, Nova Memory, recent conversation
+and eligible structured observed settings may be projected within strict bounds. They are
+treated as data, never as instructions. Automatic retention is limited to the closed
+structured policy above; free text requires an existing explicit confirmation flow or is
+not retained beyond bounded conversation.
+
+### Stage 7C: confirmed My Nova personalization
+
+Stage 7A introduced the owner-scoped durable memory domain. Stage 7B.1 adds its explicit
+Telegram CRUD UI: an access-aware `🧬 Моя Nova` menu, `/mynova` recovery, deterministic
+text/voice commands, preview-before-save, category and importance controls, paged lists,
+item editing, hard delete and revision-fenced delete-all. Stage 7C can apply a bounded,
+revision-fenced projection of confirmed records only to final conversational/question AI
+answers. Ordinary conversation is never captured automatically.
+
+The rollout gates are fail-closed and independent:
+
+```dotenv
+ENABLE_NOVA_MEMORY=false
+NOVA_MEMORY_ADMIN_ONLY=true
+ENABLE_NOVA_MEMORY_APPLICATION=false
+NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true
+NOVA_MEMORY_MAX_ITEMS=100
+```
+
+`ENABLE_NOVA_MEMORY` enables the CRUD surface. `NOVA_MEMORY_ADMIN_ONLY=true` keeps its
+menu and commands restricted to the admin pilot; setting it to false allows subscriber
+and admin tiers. `ENABLE_NOVA_MEMORY_APPLICATION` is the independent kill switch for
+using confirmed items in final answers, and `NOVA_MEMORY_APPLICATION_ADMIN_ONLY=true`
+keeps that use in the admin pilot. Both CRUD and application gates and both applicable
+tier policies must allow the actor. Enabling either flag alone must not apply memory. The
+Telegram `admin` tier
+does not grant cross-user browsing or mutation: admins, like subscribers, can access
+only their own items. Deleting an item hard-deletes its content from the active database,
+while separately retained backups can still contain an older copy until their retention
+period expires. The bounded conversation-expiry purge exists only as a service contract;
+it is not registered as a periodic runtime job.
+
+Root and help display the effective personalization state. When enabled, a maximum of 12
+whole confirmed records and 8 KiB of compact JSON are selected, with important records
+receiving priority and category coverage preserved where possible. `Важное` affects only
+selection priority; it does not force the answer to mention a record. The configured text
+AI provider receives only `category`, `important`, and `content`. Memory never enters
+intent/action routing, reminders, timezone resolution, durable flows, Tasks, workspaces,
+collections, Knowledge, Vision, guest/image/health paths, or guided Nova help. Users can
+inspect, edit, and delete records in `🧬 Моя Nova`; losing access preserves those records
+but stops their application. Provider retention depends on the configured provider and
+account—no Zero Data Retention guarantee is implied by this feature.
+
+The full UI, routing, access/revision fencing, Telegram compensation and privacy contract
+is documented in
+[docs/NOVA_MEMORY_GUIDE.md](docs/NOVA_MEMORY_GUIDE.md).
+
 `/collections` и `/spaces` не взаимозаменяемы. «Мои разделы» организуют только личные
 записи владельца, а workspace является отдельной границей доступа. Создатель получает
 роль owner; owner управляет участниками и приглашениями, owner/editor — проектами,
@@ -406,7 +540,7 @@ TRANSCRIPTION_PROVIDER=disabled
 Диалоговый контекст хранится в БД и переживает перезапуск процесса. В LLM передаются только последние сообщения в пределах настраиваемого окна; по умолчанию это 12 сообщений и TTL 24 часа:
 
 ```dotenv
-CONVERSATION_CONTEXT_MESSAGES=12
+CONVERSATION_CONTEXT_MESSAGES=20
 CONVERSATION_CONTEXT_TTL_HOURS=24
 ```
 
@@ -497,6 +631,20 @@ IMAGE_GENERATION_TIMEOUT_SECONDS=150
 ```
 
 Помимо провайдеров можно настроить строку БД, часовой пояс, имя и тон ассистента, расписание, ограничения аудио и feature flags.
+
+«Недельный обзор» управляется двумя независимыми rollout-настройками:
+
+```dotenv
+ENABLE_WEEKLY_REVIEW=true
+WEEKLY_REVIEW_ADMIN_ONLY=true
+```
+
+`ENABLE_WEEKLY_REVIEW=false` — полный kill switch: скрывает weekly UI и отключает
+команды, STT/text routing, callbacks, recovery, maintenance, proactive delivery и
+применение фокуса недели в `/today`. Пилот по умолчанию ограничен администраторами;
+`WEEKLY_REVIEW_ADMIN_ONLY=false` открывает функцию подписчикам. Ручной `/week` всегда
+относится к текущему локальному циклу понедельник–воскресенье, а scheduled review — к
+следующему циклу; `WEEKLY_REVIEW_WEEKDAY` задаёт только момент scheduled-запуска.
 
 PR #23 добавляет только Access/Workspace foundation. Его UI включается независимо через
 `ENABLE_WORKSPACE_ACCESS`; по умолчанию флаг выключен и команда/кнопки отсутствуют.

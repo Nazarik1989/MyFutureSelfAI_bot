@@ -1,13 +1,22 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from types import SimpleNamespace
 
 from autotester.fakes import FakeCallbackQuery, FakeMessage, ScriptedTranscription
 from sqlalchemy import select
 
+from future_self.access import SUBSCRIBER
 from future_self.bot import FutureSelfBot
 from future_self.config import Settings
 from future_self.drafts import DraftInboxService
-from future_self.models import InboxItem, TaskReminder, TaskState
+from future_self.models import (
+    InboxItem,
+    RecurringTaskReminderSchedule,
+    TaskActionToken,
+    TaskReminder,
+    TaskState,
+    User,
+)
+from future_self.recurring_reminders import RecurringTaskReminderService
 from future_self.schemas import ParsedThought, TemporalResolution
 
 
@@ -89,6 +98,37 @@ async def create_confirmed_task(
     return await service.confirm(draft.id, draft.version, user_id, user_id)
 
 
+async def create_daily_task(bot, db, *, user_id=701, local_time=time(20, 30)):
+    owner = await bot._user(user_id)
+    async with db.session() as session:
+        stored_owner = await session.get(User, owner.id)
+        stored_owner.access_tier = SUBSCRIBER
+        stored_owner.access_version = 3
+    owner.access_tier = SUBSCRIBER
+    owner.access_version = 3
+    draft_service = DraftInboxService(bot.db, 60)
+    draft = await draft_service.create(
+        user_id=owner.id,
+        telegram_user_id=user_id,
+        chat_id=user_id,
+        source="text",
+        raw_text="Заполнить дневник",
+        parsed=ParsedThought(
+            kind="task",
+            title="Заполнить дневник",
+            description=None,
+        ),
+    )
+    confirmed = await draft_service.confirm(draft.id, draft.version, user_id, user_id)
+    recurring = await RecurringTaskReminderService(db).create_daily(
+        owner.id,
+        confirmed.inbox_item.id,
+        local_time,
+    )
+    assert recurring.schedule is not None
+    return confirmed, recurring.schedule
+
+
 async def test_tasks_menu_has_required_buttons_and_creation_uses_existing_preview_guide(
     db, fake_ai
 ):
@@ -106,7 +146,7 @@ async def test_tasks_menu_has_required_buttons_and_creation_uses_existing_previe
         "Выполненные",
         "🧹 Очистить просроченные",
         "Создать задачу",
-        "Как работают напоминания",
+        "🔁 Ежедневные напоминания",
         "← Назад",
         "🏠 Главное меню",
     ]
@@ -262,3 +302,126 @@ async def test_stale_persistent_input_is_consumed_instead_of_capturing_future_te
     assert "задача уже изменилась" in message.replies[-1]["text"]
     assert await bot.task_service.pending_input(owner_id, 701) is None
     assert fake_ai.route_calls == []
+
+
+async def test_daily_schedule_card_mutations_use_opaque_version_fenced_actions(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created, schedule = await create_daily_task(bot, db)
+    owner_id = created.inbox_item.user_id
+
+    message = FakeMessage("/tasks")
+    await bot.tasks_command(update_for(message), context())
+    recurring_callback = callback_by_label(message, "🔁 Ежедневные напоминания")
+    assert recurring_callback == "task:recurring:0"
+
+    recurring_query = FakeCallbackQuery(recurring_callback, message)
+    await bot.task_callback(update_for(message, query=recurring_query), context())
+    assert len(recurring_query.answers) == 1
+    assert "Заполнить дневник — 20:30 · включено" in message.replies[-1]["text"]
+
+    open_callback = callback_by_label(message, "Открыть 1")
+    assert open_callback.count(":") == 1
+    assert len(open_callback.encode()) <= 64
+    open_query = FakeCallbackQuery(open_callback, message)
+    await bot.task_callback(update_for(message, query=open_query), context())
+    assert len(open_query.answers) == 1
+    card = message.replies[-1]["text"]
+    assert "Повтор: каждый день в 20:30 (Europe/Moscow)" in card
+    assert "Статус повтора: включено" in card
+    assert "Следующее срабатывание:" in card
+    assert callback_by_label(message, "← Назад к списку") == "task:recurring:0"
+
+    edit_callback = callback_by_label(message, "🕒 Изменить время")
+    disable_callback = callback_by_label(message, "⏸ Отключить")
+    assert edit_callback.count(":") == disable_callback.count(":") == 1
+    async with db.sessions() as session:
+        disable_token = await session.get(TaskActionToken, disable_callback.removeprefix("task:"))
+    assert disable_token.action == "recurring_disable"
+    assert disable_token.payload == {
+        "schedule_version": schedule.version,
+        "access_version": 3,
+    }
+
+    disable_query = FakeCallbackQuery(disable_callback, message)
+    await bot.task_callback(update_for(message, query=disable_query), context())
+    assert len(disable_query.answers) == 1
+    assert "Ежедневное напоминание отключено" in message.replies[-1]["text"]
+    assert "Статус повтора: отключено" in message.replies[-1]["text"]
+    assert "Следующее срабатывание: —" in message.replies[-1]["text"]
+    reenable_callback = callback_by_label(message, "▶️ Включить снова")
+
+    stale_edit_query = FakeCallbackQuery(edit_callback, message)
+    await bot.task_callback(update_for(message, query=stale_edit_query), context())
+    assert len(stale_edit_query.answers) == 1
+    assert await bot.task_service.pending_input(owner_id, 701) is None
+    async with db.sessions() as session:
+        unchanged = await session.get(RecurringTaskReminderSchedule, schedule.id)
+        assert (unchanged.status, unchanged.version, unchanged.local_time) == (
+            "disabled",
+            schedule.version + 1,
+            time(20, 30),
+        )
+
+    reenable_query = FakeCallbackQuery(reenable_callback, message)
+    await bot.task_callback(update_for(message, query=reenable_query), context())
+    assert len(reenable_query.answers) == 1
+    assert "снова включено" in message.replies[-1]["text"]
+    assert "Статус повтора: включено" in message.replies[-1]["text"]
+
+    time_callback = callback_by_label(message, "🕒 Изменить время")
+    time_query = FakeCallbackQuery(time_callback, message)
+    await bot.task_callback(update_for(message, query=time_query), context())
+    assert len(time_query.answers) == 1
+    assert "Пришли новое время, например: 19:30" in message.replies[-1]["text"]
+
+    input_message = FakeMessage("19.30")
+    assert await bot.task_pending_text(update_for(input_message))
+    assert "Время ежедневного напоминания обновлено" in input_message.replies[-1]["text"]
+    assert "Повтор: каждый день в 19:30" in input_message.replies[-1]["text"]
+    async with db.sessions() as session:
+        updated = await session.get(RecurringTaskReminderSchedule, schedule.id)
+        assert (updated.status, updated.version, updated.local_time) == (
+            "active",
+            schedule.version + 3,
+            time(19, 30),
+        )
+        assert (
+            await session.scalar(
+                select(TaskReminder).where(TaskReminder.inbox_item_id == created.inbox_item.id)
+            )
+            is None
+        )
+    assert fake_ai.route_calls == []
+
+
+async def test_recurring_mutation_rejects_access_version_bounce_after_token_claim(db, fake_ai):
+    bot = FutureSelfBot(settings(), db, fake_ai, ScriptedTranscription())
+    created, schedule = await create_daily_task(bot, db, user_id=702)
+    owner_id = created.inbox_item.user_id
+    async with db.sessions() as session:
+        state = await session.scalar(
+            select(TaskState).where(TaskState.inbox_item_id == created.inbox_item.id)
+        )
+    tokens = await bot.task_service.issue_actions(
+        owner_id,
+        702,
+        created.inbox_item.id,
+        state.version,
+        ("recurring_disable",),
+        payload={"schedule_version": schedule.version},
+    )
+    original_disable = bot.task_service.recurring_reminders.disable
+
+    async def bounce_then_disable(*args, **kwargs):
+        async with db.session() as session:
+            owner = await session.get(User, owner_id)
+            owner.access_version += 2
+        return await original_disable(*args, **kwargs)
+
+    bot.task_service.recurring_reminders.disable = bounce_then_disable
+    result = await bot.task_service.disable_recurring(tokens["recurring_disable"], owner_id, 702)
+
+    assert result.status == "stale"
+    async with db.sessions() as session:
+        unchanged = await session.get(RecurringTaskReminderSchedule, schedule.id)
+        assert (unchanged.status, unchanged.version) == ("active", schedule.version)
